@@ -5641,7 +5641,7 @@ theorem asmIstore_zero_noSpill_rel {lo : AssocList String Nat} {ps : PlanState}
     {vs : VenomState} {as : AsmState} {rest : List bytes32}
     (hrel : venomAsmRel lo ps vs as)
     (hstack : as.stack = (EvmYul.UInt256.ofNat 0) :: (EvmYul.UInt256.ofNat 0) :: rest)
-    (hvs0 : vs.memory.size = 0) (has0 : as.memory.size = 0)
+    (hvs0 : vs.memory.size = 0) (hasZero : ∀ j, readByte j as.memory = 0)
     (hnospill : ∀ op, alookup' ps.spilled op = none) :
     asmMstore as = AsmResult.AsmOK { asmNext as with stack := rest, memory := zwMem as }
     ∧ venomAsmRel lo { ps with stack := stackPop 2 ps.stack } { vs with immutables := ainsert vs.immutables 0 (EvmYul.UInt256.ofNat 0) } { asmNext as with stack := rest, memory := zwMem as } := by
@@ -5661,6 +5661,207 @@ theorem asmIstore_zero_noSpill_rel {lo : AssocList String Nat} {ps : PlanState}
     · intro i _
       rw [readByte_of_empty hvs0 i]
       exact (readByte_writeZeroWord _ i
-        (fun j => by rw [readByte_asmExpandMemory j _ as.memory hro]; exact readByte_of_empty has0 j)).symm
+        (fun j => by rw [readByte_asmExpandMemory j _ as.memory hro]; exact hasZero j)).symm
+
+
+namespace ExIS
+open EvmYul EvmYul.Venom.Hol
+
+/-! ### The ISTORE capstone (`entry: ISTORE (Lit 0)(Lit 0); STOP`)
+
+Closes the ISTORE gap. The walk carries the VENOM-side invariant `s.memory.size = 0`; `memoryRel`
+then forces the asm memory to read `0` too, which is exactly what `asmIstore_zero_noSpill_rel`
+consumes — so no `_invJ` joint invariant is needed. The body is driven by a BESPOKE chain
+(`isBody_sim`) rather than the generic `BodyStepHTo` fold, because that fold quantifies over ALL
+venom states and the ISTORE step is false for a state whose memory is non-zero at `[0,32)`. -/
+
+def isStore : Instruction := { id := 0, opcode := Opcode.ISTORE, operands := [L0, L0], outputs := [] }
+def isStop  : Instruction := { id := 1, opcode := Opcode.STOP, operands := [], outputs := [] }
+abbrev isSEnd (s : VenomState) : VenomState := { { s with instIdx := 0 } with immutables := ainsert ({ s with instIdx := 0 }).immutables 0 (EvmYul.UInt256.ofNat 0), instIdx := 1 }
+theorem isEntry_thread (s : VenomState) :
+    execBodyThread [isStore] 0 { s with instIdx := 0 } = some (isSEnd s) := rfl
+
+abbrev isPlan : List StackOp :=
+  [StackOp.SOPush L0, StackOp.SOPush L0, StackOp.SOSwap 1,
+   StackOp.SOEmit "SWAP1", StackOp.SOEmit "MSTORE"]
+
+theorem isBody_sim {lo : AssocList String Nat} {o2pc : AssocList Nat Nat} {prog : List AsmInst}
+    {s : VenomState} {asm : AsmState}
+    (hmem0 : s.memory.size = 0)
+    (hrel : venomAsmRel lo (initPlanState 0) { s with instIdx := 0 } asm)
+    (hbLabel : asmBlockAt prog asm.pc (executePlan [StackOp.SOLabel "entry"]))
+    (hblock : asmBlockAt prog (asm.pc + 1) (executePlan isPlan)) :
+    ∃ as', runAsm 6 o2pc prog asm = AsmResult.AsmOK as' ∧
+      venomAsmRel lo (releaseDeadSpills [] { (initPlanState 0 : PlanState) with stack := [] }) (isSEnd s) as' ∧
+      as'.pc = asm.pc + 6 := by
+  obtain ⟨as1, hrun1, hrel1, hpc1⟩ := soLabel_sim (offsetToPc := o2pc) lo (initPlanState 0)
+    { s with instIdx := 0 } asm prog "entry" hrel hbLabel
+  have hpc1' : as1.pc = asm.pc + 1 := by
+    rw [show (executePlan [StackOp.SOLabel "entry"]).length = 1 from rfl] at hpc1; exact hpc1
+  rw [show (executePlan [StackOp.SOLabel "entry"]).length = 1 from rfl] at hrun1
+  rw [show executePlan isPlan
+      = executePlan [StackOp.SOPush L0] ++ (executePlan [StackOp.SOPush L0]
+        ++ (executePlan [StackOp.SOSwap 1] ++ (executePlan [StackOp.SOEmit "SWAP1"]
+        ++ executePlan [StackOp.SOEmit "MSTORE"]))) from rfl] at hblock
+  obtain ⟨hbP1, hr1⟩ := asmBlockAt_append hblock
+  obtain ⟨hbP2, hr2⟩ := asmBlockAt_append hr1
+  obtain ⟨hbS1, hr3⟩ := asmBlockAt_append hr2
+  obtain ⟨hbS2, hbMS⟩ := asmBlockAt_append hr3
+  obtain ⟨as2, hrun2, hrel2, hpc2⟩ := emitOneInput_sim_lit_append (offsetToPc := o2pc)
+    (opc := Opcode.ISTORE) (nl := ([] : List String)) (v := EvmYul.UInt256.ofNat 0) hrel1
+    (by rw [hpc1']; exact hbP1)
+  obtain ⟨as3, hrun3, hrel3, hpc3⟩ := emitOneInput_sim_lit_append (offsetToPc := o2pc)
+    (opc := Opcode.ISTORE) (nl := ([] : List String)) (v := EvmYul.UInt256.ofNat 0) hrel2
+    (by rw [hpc2, hpc1']; exact hbP2)
+  have hns : ({ { (initPlanState 0 : PlanState) with stack := (initPlanState 0).stack ++ [L0] } with stack := ((initPlanState 0).stack ++ [L0]) ++ [L0] } : PlanState) = { (initPlanState 0 : PlanState) with stack := [L0, L0] } := rfl
+  rw [hns] at hrel3
+  have hswap : doSwap 1 ({ (initPlanState 0 : PlanState) with stack := [L0, L0] } : PlanState)
+      = ([StackOp.SOSwap 1], { (initPlanState 0 : PlanState) with stack := [L0, L0] }) := by
+    unfold doSwap; simp [show stackSwap 1 ([L0, L0] : List Operand) = [L0, L0] from rfl]
+  obtain ⟨as4, hrun4, hrel4, hpc4⟩ := doSwap_sim (offsetToPc := o2pc) hswap hrel3
+    (by rw [show ({ (initPlanState 0 : PlanState) with stack := [L0, L0] } : PlanState).stack = [L0, L0] from rfl]; decide) (by rw [hpc3, hpc2, hpc1']; exact hbS1) (fun h => absurd h (by omega))
+  obtain ⟨as5, hrun5, hrel5, hpc5⟩ := doSwap_sim (offsetToPc := o2pc) hswap hrel4
+    (by rw [show ({ (initPlanState 0 : PlanState) with stack := [L0, L0] } : PlanState).stack = [L0, L0] from rfl]; decide) (by rw [hpc4, hpc3, hpc2, hpc1']; exact hbS2) (fun h => absurd h (by omega))
+  -- the asm memory reads zero: memoryRel + empty venom memory + the empty spill window
+  have hasZero : ∀ j, readByte j as5.memory = 0 := by
+    intro j
+    obtain ⟨_, _, hMem, _⟩ := hrel5
+    have := hMem j (by simp [initPlanState, initSpillAlloc])
+    rw [← this]; exact readByte_of_empty hmem0 j
+  have hstk5 : as5.stack = (EvmYul.UInt256.ofNat 0) :: (EvmYul.UInt256.ofNat 0) :: as5.stack.drop 2 :=
+    asmStack_top2_zero hrel5 rfl
+  obtain ⟨hms, hrelMS⟩ := asmIstore_zero_noSpill_rel (lo := lo)
+    (ps := { (initPlanState 0 : PlanState) with stack := [L0, L0] }) (vs := { s with instIdx := 0 })
+    (as := as5) (rest := as5.stack.drop 2) hrel5 hstk5 hmem0 hasZero (fun op => rfl)
+  have hbMS' : asmBlockAt prog as5.pc (executePlan [StackOp.SOEmit "MSTORE"]) := by
+    rw [hpc5, hpc4, hpc3, hpc2, hpc1']; exact hbMS
+  obtain ⟨hltMS, hgetMS⟩ := asmBlockAt_one hbMS'
+  set as6 : AsmState := { asmNext as5 with stack := as5.stack.drop 2, memory := zwMem as5 } with has6
+  have hstep6 : asmStep o2pc prog as5 = AsmResult.AsmOK as6 := by
+    rw [asmStep_mstore_ok hltMS hgetMS]; exact hms
+  have hrun6 : runAsm 1 o2pc prog as5 = AsmResult.AsmOK as6 := by
+    rw [runAsm_succ_ok hltMS hstep6]; rfl
+  refine ⟨as6, ?_, ?_, ?_⟩
+  · rw [show (6:Nat) = 1 + (1 + (1 + (1 + (1 + 1)))) from rfl]
+    exact runAsm_compose hrun1 (runAsm_compose hrun2 (runAsm_compose hrun3
+      (runAsm_compose hrun4 (runAsm_compose hrun5 hrun6))))
+  · exact hrelMS
+  · rw [has6]; show as5.pc + 1 = asm.pc + 6
+    rw [hpc5, hpc4, hpc3, hpc2, hpc1']
+    simp only [show (executePlan [StackOp.SOPush L0]).length = 1 from rfl,
+      show (executePlan [StackOp.SOSwap 1]).length = 1 from rfl,
+      show (executePlan [StackOp.SOEmit "SWAP1"]).length = 1 from rfl]
+
+
+def isEntry : BasicBlock := { label := "entry", instructions := [isStore, isStop] }
+def isFn : IrFunction := { name := "main", blocks := [isEntry] }
+def isCtx : VenomContext := { functions := [isFn], entry := some "main" }
+
+theorem isNonterm : ∀ inst ∈ [isStore], isTerminator inst.opcode = false := by
+  intro i hi; simp only [List.mem_singleton] at hi; subst hi; decide
+
+set_option maxHeartbeats 1000000 in
+/-- **The ISTORE capstone.** `entry: ISTORE (Lit 0)(Lit 0); STOP` reaches `codegen_correct`. -/
+theorem codegen_correct_isFn_recipeW {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    (hvshalt : vs.halted = false) (hmem0 : vs.memory.size = 0)
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    (match runContext 10 isCtx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan isFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan isFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan isFn 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan isFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan isFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan isFn 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan isFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan isFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan isFn 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  have hfnready : ∀ bb ∈ isFn.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst := by
+    intro bb hbb inst hinst
+    simp only [isFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    subst hbb
+    simp only [isEntry, List.mem_cons, List.not_mem_nil, or_false] at hinst
+    rcases hinst with rfl | rfl <;> (unfold codegenReadyInst; decide)
+  have hgen : generateFnPlan isFn 0 0
+      = some ((generateFnPlan isFn 0 0).get!.1, (generateFnPlan isFn 0 0).get!.2) := rfl
+  have hpsE : psOfFn (fnPlanFuel isFn) isFn 0 0 "entry" = initPlanState 0 :=
+    psOfFn_entry rfl hfnready (by simp only [fnPlanFuel]; omega)
+  refine codegen_correct_ofBlocks_recipeW_invCur (fun s => s.memory.size = 0)
+    (lo := lo) (pcOf := pcOfLabel (asmResolve (executePlan (generateFnPlan isFn 0 0).get!.1)).1)
+    (psOf := psOfFn (fnPlanFuel isFn) isFn 0 0)
+    (wOf := fun l => (asmResolve (executePlan (generateFnPlan isFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan isFn 0 0).get!.1)).1 l)
+    (offsets := (computeLabelOffsets (executePlan (generateFnPlan isFn 0 0).get!.1)).2)
+    (fuel := 10) (ctx := isCtx) (fn := isFn) (fnEom := 0) (lblCtr := 0)
+    (entryName := "main") (entryLbl := "entry")
+    (ops := (generateFnPlan isFn 0 0).get!.1) (psFinal := (generateFnPlan isFn 0 0).get!.2)
+    hgen rfl rfl rfl ?_ ?_ ?_ ?_ hmem0
+  case _ =>
+    intro bb hbb s
+    simp only [isFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    subst hbb
+    simp [runBlock, evalPhis, execBlock, isEntry, isStore]
+  case _ =>
+    intro bb hbb s asm N k hE hinv hlbleq
+    obtain ⟨⟨bb0, hlk_s, hvrel, hpc_asm⟩, hwN, hhalt⟩ := hE
+    simp only [isFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    subst hbb
+    have hlbl : s.currentBb = "entry" := hlbleq
+    rw [hlbl] at hvrel hpc_asm
+    have hpc0 : asm.pc = 0 := by rw [hpc_asm]; exact pcOfLabel_entry_zero rfl hfnready hgen
+    match k with
+    | 0 => exact Or.inl (runBlock_oof isCtx _ 1 [isStore] isStop isStore [isStop] s (isSEnd s)
+             rfl rfl (by decide) isNonterm (isEntry_thread s) (by decide))
+    | (j+1) =>
+    rw [show j+1+1 = ([isStore] : List Instruction).length + (j+1) from by
+      simp only [List.length_cons, List.length_nil]; omega]
+    obtain ⟨as', hrunb, hrelb, hpcb⟩ := isBody_sim (lo := lo)
+      (o2pc := (asmResolve (executePlan (generateFnPlan isFn 0 0).get!.1)).2)
+      (prog := (asmResolve (executePlan (generateFnPlan isFn 0 0).get!.1)).1)
+      (s := s) (asm := asm) hinv (by rw [hpsE] at hvrel; exact hvrel)
+      (by rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
+          have hj2 : j < 1 := hj; interval_cases j; rfl)
+      (by rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
+          have hj2 : j < 5 := hj; interval_cases j <;> rfl)
+    have hstoppc : as'.pc < (asmResolve (executePlan (generateFnPlan isFn 0 0).get!.1)).1.length := by
+      rw [hpcb, hpc0]; decide
+    refine Or.inr ⟨as', _, isSEnd s, 6, hrunb, termRecipeW_stop_of_body
+      (front := [isStore]) (stopInst := isStop) (hd := isStore) (tl := [isStop])
+      rfl rfl rfl (by decide) isNonterm (isEntry_thread s) hrelb ?_ hstoppc ?_⟩
+    · rw [show isEntry.label = "entry" from rfl,
+        show pcOfLabel (asmResolve (executePlan (generateFnPlan isFn 0 0).get!.1)).1 "entry" = 0 from
+          pcOfLabel_entry_zero rfl hfnready hgen]
+      decide
+    · exact prog_get_transfer (by rw [hpcb, hpc0]) (show (asmResolve (executePlan (generateFnPlan isFn 0 0).get!.1)).1.get ⟨6, by decide⟩ = AsmInst.AsmOp "STOP" from rfl)
+  case _ =>
+    intro bb hbb s s' f' hinv hrun _
+    exfalso
+    rcases Nat.lt_or_ge f' 2 with h | h
+    · obtain ⟨e, he⟩ := runBlock_oof isCtx bb f' [isStore] isStop isStore [isStop] s (isSEnd s)
+        (by simp only [isFn, List.mem_cons, List.not_mem_nil, or_false] at hbb; subst hbb; rfl)
+        rfl (by decide) isNonterm (isEntry_thread s) (by simp; omega)
+      rw [he] at hrun; exact absurd hrun (by simp)
+    · obtain ⟨j, hj⟩ : ∃ j, f' = ([isStore] : List Instruction).length + (j + 1) := ⟨f' - 2, by simp; omega⟩
+      simp only [isFn, List.mem_cons, List.not_mem_nil, or_false] at hbb; subst hbb
+      rw [hj, runBlock_body_stop isCtx _ j [isStore] isStop isStore [isStop] s (isSEnd s)
+        rfl rfl rfl (by decide) isNonterm (isEntry_thread s)] at hrun
+      exact absurd hrun (by simp)
+  case _ =>
+    refine ⟨⟨isEntry, rfl, ?_, ?_⟩, ?_, hvshalt⟩
+    · show venomAsmRel lo (psOfFn (fnPlanFuel isFn) isFn 0 0 "entry") _ as
+      rw [hpsE]; exact hrel
+    · show as.pc = pcOfLabel (asmResolve (executePlan (generateFnPlan isFn 0 0).get!.1)).1 "entry"
+      rw [haspc]; exact (pcOfLabel_entry_zero rfl hfnready hgen).symm
+    · show (asmResolve (executePlan (generateFnPlan isFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan isFn 0 0).get!.1)).1 "entry" ≤ (asmResolve (executePlan (generateFnPlan isFn 0 0).get!.1)).1.length
+      omega
+
+theorem isFn_halts (vs : VenomState) (_hnh : vs.halted = false) :
+    ∃ vs', runContext 10 isCtx vs = ExecResult.Halt vs' := by
+  have h0 : runContext 10 isCtx vs
+      = runBlocks 10 isCtx isFn { vs with prevBb := none, currentBb := "entry", instIdx := 0 } := by
+    simp [runContext, runFunction, isCtx, isFn, isEntry, lookupFunction, fnEntryLabel]
+  set s0 : VenomState := { vs with prevBb := none, currentBb := "entry", instIdx := 0 } with hs0
+  have hlk0 : lookupBlock s0.currentBb isFn.blocks = some isEntry := rfl
+  have hhalt : runBlock 9 isCtx isEntry s0 = ExecResult.Halt (haltState (isSEnd s0)) := by
+    rw [show (9 : Nat) = ([isStore] : List Instruction).length + (7 + 1) from rfl]
+    exact runBlock_body_stop isCtx _ 7 [isStore] isStop isStore [isStop] s0 (isSEnd s0)
+      rfl rfl rfl (by decide) isNonterm (isEntry_thread s0)
+  rw [h0]
+  exact ⟨_, runBlocks_haltDirect_of_block hlk0 hhalt⟩
+
+end ExIS
 
 end EvmYul.Venom.Hol.Codegen
