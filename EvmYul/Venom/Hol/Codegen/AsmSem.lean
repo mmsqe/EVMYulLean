@@ -453,7 +453,7 @@ def asmStep (offsetToPc : AssocList Nat Nat) (instructions : List AsmInst) (s : 
     | AsmInst.AsmOp "EXTCODEHASH" =>
       asmStateUnop (λ addr s =>
         let acct := lookupAccount (AccountAddress.ofUInt256 addr) s.toVenomState.accounts
-        if acct.code.isEmpty then ⟨0⟩ else keccak256 (⟨acct.code.toArray⟩ : ByteArray)) s
+        if accountEmpty acct then ⟨0⟩ else keccak256 (⟨acct.code.toArray⟩ : ByteArray)) s
     | AsmInst.AsmOp "SELFBALANCE" =>
       asmPushVal (EvmYul.UInt256.ofNat (lookupAccount s.callCtx.contract s.accounts).balance) s
     -- Environment
@@ -469,6 +469,10 @@ def asmStep (offsetToPc : AssocList Nat Nat) (instructions : List AsmInst) (s : 
     | AsmInst.AsmOp "NUMBER"    => asmPushVal s.blockCtx.number s
     | AsmInst.AsmOp "GASLIMIT"  => asmPushVal s.blockCtx.gaslimit s
     | AsmInst.AsmOp "BASEFEE"   => asmPushVal s.blockCtx.basefee s
+    | AsmInst.AsmOp "PREVRANDAO" => asmPushVal s.blockCtx.prevrandao s
+    | AsmInst.AsmOp "BLOBBASEFEE" => asmPushVal s.blockCtx.blobbasefee s
+    | AsmInst.AsmOp "BLOCKHASH" =>
+      asmStateUnop (λ v s => s.blockCtx.blockhash v.toNat) s
     | AsmInst.AsmOp "MSIZE"     => asmPushVal (EvmYul.UInt256.ofNat ((s.memory.size + 31) / 32 * 32)) s
     -- Copy ops
     | AsmInst.AsmOp "CALLDATACOPY"  => asmCopyToMem s.callCtx.calldata s

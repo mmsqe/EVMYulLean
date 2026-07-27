@@ -574,7 +574,7 @@ def stepInstBase (inst : Instruction) (s : VenomState) : ExecResult :=
   | Opcode.EXTCODEHASH =>
     execRead1 (λ addr s =>
       let acct := lookupAccount (AccountAddress.ofUInt256 addr) s.accounts
-      if acct.code.isEmpty then ⟨0⟩
+      if accountEmpty acct then ⟨0⟩
       else keccak256 (⟨acct.code.toArray⟩ : ByteArray)) inst s
 
   -- Immutables

@@ -1217,6 +1217,18 @@ theorem asmStep_basefee_ok {o2pc prog s} (hpc : s.pc < prog.length)
     (hprog : prog.get ⟨s.pc, hpc⟩ = AsmInst.AsmOp "BASEFEE") :
     asmStep o2pc prog s = asmPushVal s.blockCtx.basefee s := by
   unfold asmStep; rw [dif_pos hpc, hprog]; rfl
+theorem asmStep_prevrandao_ok {o2pc prog s} (hpc : s.pc < prog.length)
+    (hprog : prog.get ⟨s.pc, hpc⟩ = AsmInst.AsmOp "PREVRANDAO") :
+    asmStep o2pc prog s = asmPushVal s.blockCtx.prevrandao s := by
+  unfold asmStep; rw [dif_pos hpc, hprog]; rfl
+theorem asmStep_blobbasefee_ok {o2pc prog s} (hpc : s.pc < prog.length)
+    (hprog : prog.get ⟨s.pc, hpc⟩ = AsmInst.AsmOp "BLOBBASEFEE") :
+    asmStep o2pc prog s = asmPushVal s.blockCtx.blobbasefee s := by
+  unfold asmStep; rw [dif_pos hpc, hprog]; rfl
+theorem asmStep_blockhash_ok {o2pc prog s} (hpc : s.pc < prog.length)
+    (hprog : prog.get ⟨s.pc, hpc⟩ = AsmInst.AsmOp "BLOCKHASH") :
+    asmStep o2pc prog s = asmStateUnop (λ v s => s.blockCtx.blockhash v.toNat) s := by
+  unfold asmStep; rw [dif_pos hpc, hprog]; rfl
 theorem asmStep_codesize_ok {o2pc prog s} (hpc : s.pc < prog.length)
     (hprog : prog.get ⟨s.pc, hpc⟩ = AsmInst.AsmOp "CODESIZE") :
     asmStep o2pc prog s = asmPushVal (EvmYul.UInt256.ofNat s.code.length) s := by
@@ -2220,7 +2232,7 @@ theorem asmStep_extcodehash_ok {o2pc prog s} (hpc : s.pc < prog.length)
     (hprog : prog.get ⟨s.pc, hpc⟩ = AsmInst.AsmOp "EXTCODEHASH") :
     asmStep o2pc prog s = asmStateUnop (fun addr s =>
       let acct := lookupAccount (AccountAddress.ofUInt256 addr) s.toVenomState.accounts
-      if acct.code.isEmpty then ⟨0⟩ else keccak256 (⟨acct.code.toArray⟩ : ByteArray)) s := by
+      if accountEmpty acct then ⟨0⟩ else keccak256 (⟨acct.code.toArray⟩ : ByteArray)) s := by
   unfold asmStep; rw [dif_pos hpc, hprog]; rfl
 
 /-- `asmStep` on a resolved `SELFBALANCE` op reduces to `asmPushVal` of the executing contract's

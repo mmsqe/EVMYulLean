@@ -996,6 +996,36 @@ theorem codegen_correct_r0_caller {lo : AssocList String Nat} {vs : VenomState} 
     _ _ rfl rfl rfl rfl rfl rfl (fun _ => rfl) rfl rfl
     hvshalt hzero hrel haspc
 
+theorem codegen_correct_pvrFn_recipeW {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    (hvshalt : vs.halted = false) (hzero : vs.callCtx.callvalue = EvmYul.UInt256.ofNat 0)
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    (match runContext 10 (r0Ctx Opcode.PREVRANDAO) vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan (r0Fn Opcode.PREVRANDAO) 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan (r0Fn Opcode.PREVRANDAO) 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan (r0Fn Opcode.PREVRANDAO) 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan (r0Fn Opcode.PREVRANDAO) 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan (r0Fn Opcode.PREVRANDAO) 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan (r0Fn Opcode.PREVRANDAO) 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan (r0Fn Opcode.PREVRANDAO) 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan (r0Fn Opcode.PREVRANDAO) 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan (r0Fn Opcode.PREVRANDAO) 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) :=
+  codegen_correct_r0 Opcode.PREVRANDAO "PREVRANDAO" (fun s => s.blockCtx.prevrandao) (fun s => s.blockCtx.prevrandao)
+    rfl (by decide) (by decide) rfl (by unfold codegenReadyInst; decide) (fun _ => rfl) (fun _ _ _ => rfl) (fun _ _ => rfl)
+    (fun _ _ => rfl) (fun _o2pc _prg _s h hg => asmStep_prevrandao_ok h hg)
+    (fun _ v s hr => by obtain ⟨_,_,_,_,_,_,_,_,_,h,_,_⟩ := hr; rw [h])
+    _ _ rfl rfl rfl rfl rfl rfl (fun _ => rfl) rfl rfl
+    hvshalt hzero hrel haspc
+
+theorem codegen_correct_bbfFn_recipeW {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    (hvshalt : vs.halted = false) (hzero : vs.callCtx.callvalue = EvmYul.UInt256.ofNat 0)
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    (match runContext 10 (r0Ctx Opcode.BLOBBASEFEE) vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan (r0Fn Opcode.BLOBBASEFEE) 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan (r0Fn Opcode.BLOBBASEFEE) 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan (r0Fn Opcode.BLOBBASEFEE) 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan (r0Fn Opcode.BLOBBASEFEE) 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan (r0Fn Opcode.BLOBBASEFEE) 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan (r0Fn Opcode.BLOBBASEFEE) 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan (r0Fn Opcode.BLOBBASEFEE) 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan (r0Fn Opcode.BLOBBASEFEE) 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan (r0Fn Opcode.BLOBBASEFEE) 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) :=
+  codegen_correct_r0 Opcode.BLOBBASEFEE "BLOBBASEFEE" (fun s => s.blockCtx.blobbasefee) (fun s => s.blockCtx.blobbasefee)
+    rfl (by decide) (by decide) rfl (by unfold codegenReadyInst; decide) (fun _ => rfl) (fun _ _ _ => rfl) (fun _ _ => rfl)
+    (fun _ _ => rfl) (fun _o2pc _prg _s h hg => asmStep_blobbasefee_ok h hg)
+    (fun _ v s hr => by obtain ⟨_,_,_,_,_,_,_,_,_,h,_,_⟩ := hr; rw [h])
+    _ _ rfl rfl rfl rfl rfl rfl (fun _ => rfl) rfl rfl
+    hvshalt hzero hrel haspc
+
 /-! ### ✅ The ACCOUNT-READ family via the generic `codegen_correct_racc` driver
 
 BALANCE / EXTCODESIZE / EXTCODEHASH share one driver, parametrized by the opcode `op`, its EVM
@@ -1466,7 +1496,7 @@ theorem codegen_correct_echFn_recipeW {lo : AssocList String Nat} {vs : VenomSta
      | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan (raccFn Opcode.EXTCODEHASH) 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan (raccFn Opcode.EXTCODEHASH) 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan (raccFn Opcode.EXTCODEHASH) 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
      | _ => True) :=
   codegen_correct_racc Opcode.EXTCODEHASH "EXTCODEHASH" (fun addr accts => let acct := lookupAccount (AccountAddress.ofUInt256 addr) accts;
-      if acct.code.isEmpty then (⟨0⟩ : bytes32) else keccak256 (⟨acct.code.toArray⟩ : ByteArray))
+      if accountEmpty acct then (⟨0⟩ : bytes32) else keccak256 (⟨acct.code.toArray⟩ : ByteArray))
     rfl (by decide) (by decide) rfl (by unfold codegenReadyInst; decide) (fun _ => rfl)
     (fun _o2pc _prg _s h hg => asmStep_extcodehash_ok h hg)
     _ _ rfl rfl rfl rfl rfl rfl (fun _ => rfl) rfl rfl

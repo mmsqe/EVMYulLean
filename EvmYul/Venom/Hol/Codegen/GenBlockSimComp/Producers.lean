@@ -1978,7 +1978,7 @@ theorem stackDisc_extcodehash_step_S
     (hcompute : computeOperands inst = inst.operands.reverse)
     (hdispatch : stepInstBase inst vs = execRead1 (fun addr s =>
         let acct := lookupAccount (AccountAddress.ofUInt256 addr) s.accounts
-        if acct.code.isEmpty then ⟨0⟩ else keccak256 (⟨acct.code.toArray⟩ : ByteArray)) inst vs)
+        if accountEmpty acct then ⟨0⟩ else keccak256 (⟨acct.code.toArray⟩ : ByteArray)) inst vs)
     (hops : inst.operands = [Operand.Var x])
     (houts : inst.outputs = [out])
     (hxS : x ∈ S) (houtS : out ∉ S)
@@ -1988,7 +1988,7 @@ theorem stackDisc_extcodehash_step_S
         prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp "EXTCODEHASH" →
           asmStep offsetToPc prog s = asmStateUnop (fun addr s =>
             let acct := lookupAccount (AccountAddress.ofUInt256 addr) s.toVenomState.accounts
-            if acct.code.isEmpty then ⟨0⟩ else keccak256 (⟨acct.code.toArray⟩ : ByteArray)) s)
+            if accountEmpty acct then ⟨0⟩ else keccak256 (⟨acct.code.toArray⟩ : ByteArray)) s)
     (hoptnoop : optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
         { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
           stack := ps.stack ++ [Operand.Var out] }
@@ -2019,12 +2019,12 @@ theorem stackDisc_extcodehash_step_S
   have hval : operandVal vs lo (Operand.Var x) = some w := hw
   have hstepEq : stepInstBase inst vs = ExecResult.OK (updateVar out
       (let acct := lookupAccount (AccountAddress.ofUInt256 w) vs.accounts
-       if acct.code.isEmpty then ⟨0⟩ else keccak256 (⟨acct.code.toArray⟩ : ByteArray)) vs) := by
+       if accountEmpty acct then ⟨0⟩ else keccak256 (⟨acct.code.toArray⟩ : ByteArray)) vs) := by
     rw [hdispatch]; unfold execRead1; rw [hops, houts]; simp only [evalOperand, hw]
   have hsim := genRegularInstPlan_accountRead_sim
     (fRead := fun addr accts =>
       let acct := lookupAccount (AccountAddress.ofUInt256 addr) accts
-      if acct.code.isEmpty then ⟨0⟩ else keccak256 (⟨acct.code.toArray⟩ : ByteArray))
+      if accountEmpty acct then ⟨0⟩ else keccak256 (⟨acct.code.toArray⟩ : ByteArray))
     hname hnjmp hcompute hops houts rfl hlive hnospill hlivex
     hdepth hsmall hpeek hlen hxmem hval hfresh hspill hdisp hoptnoop hrel hblock
   refine ⟨gvBodyStep_of_updateVar (idx := idx) hstepEq hsim, ?_, ?_⟩
@@ -2046,7 +2046,7 @@ theorem bodyStep_extcodehash
     (hcompute : computeOperands inst = inst.operands.reverse)
     (hdispatch : ∀ v, stepInstBase inst v = execRead1 (fun addr s =>
         let acct := lookupAccount (AccountAddress.ofUInt256 addr) s.accounts
-        if acct.code.isEmpty then ⟨0⟩ else keccak256 (⟨acct.code.toArray⟩ : ByteArray)) inst v)
+        if accountEmpty acct then ⟨0⟩ else keccak256 (⟨acct.code.toArray⟩ : ByteArray)) inst v)
     (hops : inst.operands = [Operand.Var x])
     (houts : inst.outputs = [out])
     (hxS : x ∈ S) (houtS : out ∉ S)
@@ -2056,7 +2056,7 @@ theorem bodyStep_extcodehash
         prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp "EXTCODEHASH" →
           asmStep offsetToPc prog s = asmStateUnop (fun addr s =>
             let acct := lookupAccount (AccountAddress.ofUInt256 addr) s.toVenomState.accounts
-            if acct.code.isEmpty then ⟨0⟩ else keccak256 (⟨acct.code.toArray⟩ : ByteArray)) s)
+            if accountEmpty acct then ⟨0⟩ else keccak256 (⟨acct.code.toArray⟩ : ByteArray)) s)
     (hoptnoop : ∀ p : PlanState, optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
         { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness p).2 with
           stack := p.stack ++ [Operand.Var out] }

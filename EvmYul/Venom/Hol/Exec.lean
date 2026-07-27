@@ -124,7 +124,20 @@ def execBlock (fuel : Nat) (ctx : VenomContext) (bb : BasicBlock) (s : VenomStat
 
 /-- **INVOKE step.** Operand `[0]` is the callee's entry `Label l`, the rest are argument operands.
     Evaluate the args, install them as the callee's `params`, run the callee to its internal `RET`
-    (`IntRet`), and bind the returned values to `INVOKE`'s outputs; callee `Halt`/`Abort` propagate. -/
+    (`IntRet`), and bind the returned values to `INVOKE`'s outputs; callee `Halt`/`Abort` propagate.
+
+    **Divergence from upstream HOL (documented decision, 2026-07-24).** HOL's
+    `setup_callee`/`merge_callee_state` give the callee a FRESH frame (`vars := FEMPTY`,
+    `allocas := FEMPTY`, `halted := F`) and restore the caller's vars/params/allocas on return,
+    merging back only heap effects; the callee is resolved by *function name*. Here the callee
+    inherits the caller's `vars`/`allocas`, the caller continues in the callee's final state
+    (params not restored), and resolution is by *entry label* (`lookupFunctionByEntry`). For
+    SSA-wf Venom (globally unique var names, `PARAM` only before any `INVOKE`, allocas hoisted)
+    the two disciplines are observationally equal; they differ only off the wf path (callee reads
+    of caller-locals succeed here / error in HOL; re-INVOKE of an ALLOCA-using callee reuses
+    offsets here / gets a fresh frame in HOL). Both systems' correctness theorems assume wf, so
+    no proven result depends on the difference; kept because changing it would rework the whole
+    invoke-simulation layer for no wf-path gain. See hol-port-audit.md (D2). -/
 def stepInvoke (fuel : Nat) (ctx : VenomContext) (inst : Instruction) (s : VenomState) : ExecResult :=
   match inst.operands with
   | Operand.Label l :: argOps =>

@@ -82,6 +82,11 @@ structure VenomAccount where
 
 abbrev Accounts := AssocList address VenomAccount
 
+/-- `account_empty` (HOL `vfmState`): EIP-161 emptiness — zero balance, zero nonce, no code.
+    Guards `EXTCODEHASH` (EIP-1052): empty account ↦ 0, existing code-less account ↦ keccak "". -/
+def accountEmpty (a : VenomAccount) : Bool :=
+  a.balance == 0 && a.nonce == 0 && a.code.isEmpty
+
 /- ===== Event/Log ===== -/
 
 structure Event where
