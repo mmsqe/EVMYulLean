@@ -1,0 +1,29 @@
+; Venom balance-slot access, ORIGINAL form (keccak slot).
+; Stages slot=2 at mem[0x00] and addr=0x1234 at mem[0x20], derives the
+; storage slot as sha3(slot ++ addr) (Venom spells keccak256 "sha3"),
+; stores 99 there, loads it back, and returns it.
+;
+;   lake exe venom_run EvmYul/Venom/examples/balance_orig.venom
+;   => RETURN 99
+;
+; Companion: balance_opt.venom (the ~addr peephole) returns the same value,
+; demonstrating the optimization's parity executably (cf. the proof
+; `venomBalanceLoad_orig_opt_equiv`).
+function main {
+  entry:
+    %slot = 2
+    %addr = 0x1234
+    %z = 0
+    %p = 0x20
+    mstore %z, %slot
+    mstore %p, %addr
+    %sz = 0x40
+    %h = sha3 %z, %sz
+    %v = 99
+    sstore %h, %v
+    %r = sload %h
+    %out = 0
+    mstore %out, %r
+    %rsz = 0x20
+    return %out, %rsz
+}

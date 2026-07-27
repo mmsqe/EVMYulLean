@@ -1,0 +1,29 @@
+; Venom balance-slot access, OPTIMIZED form (~addr peephole).
+; The patch keeps the staging `mstore 0x20, addr`, then replaces the keccak
+; tail `sha3 0x00, 0x40` with `mload 0x20; not` — reading the address back
+; from mem[0x20] and complementing it (the slot becomes ~addr). Stores 99
+; there, loads it back, returns it.
+;
+;   lake exe venom_run EvmYul/Venom/examples/balance_opt.venom
+;   => RETURN 99   (same as balance_orig.venom)
+;
+; The `mload 0x20` recovering exactly the staged address is the codec
+; round-trip proved as `Mem.loadWord_storeWord_self`.
+function main {
+  entry:
+    %slot = 2
+    %addr = 0x1234
+    %z = 0
+    %p = 0x20
+    mstore %z, %slot
+    mstore %p, %addr
+    %a = mload %p
+    %h = not %a
+    %v = 99
+    sstore %h, %v
+    %r = sload %h
+    %out = 0
+    mstore %out, %r
+    %rsz = 0x20
+    return %out, %rsz
+}

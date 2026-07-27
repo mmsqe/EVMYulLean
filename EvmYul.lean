@@ -47,6 +47,8 @@ import EvmYul.State.Withdrawal
 import EvmYul.State.TransactionOps
 import EvmYul.State.TrieRoot
 
+import EvmYul.Venom
+
 import EvmYul.Yul.Ast
 import EvmYul.Yul.Exception
 import EvmYul.Yul.Interpreter

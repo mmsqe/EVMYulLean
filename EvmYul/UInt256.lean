@@ -256,6 +256,19 @@ def isZero (a : UInt256) :=
 
 end UInt256
 
+/-! `toNat` of the wrapping arithmetic — the modular characterizations the Venom
+backend's address/gas reasoning needs. -/
+
+theorem uint256_add_toNat (a b : UInt256) : (a + b).toNat = (a.toNat + b.toNat) % 2 ^ 256 := by
+  show (UInt256.add a b).toNat = _; simp only [UInt256.add, UInt256.toNat]; rfl
+
+theorem uint256_mul_toNat (a b : UInt256) : (a * b).toNat = a.toNat * b.toNat % 2 ^ 256 := by
+  show (UInt256.mul a b).toNat = _; simp only [UInt256.mul, UInt256.toNat]; rfl
+
+theorem uint256_ofNat_toNat (n : ℕ) : (UInt256.ofNat n).toNat = n % 2 ^ 256 := by
+  simp only [UInt256.ofNat, UInt256.toNat, Id.run, Fin.ofNat]; rfl
+
+
 -- | Convert from a list of little-endian bytes to a natural number.
 def fromBytes' : List UInt8 → ℕ
 | [] => 0
@@ -356,6 +369,23 @@ private lemma fromBytes'_toBytes' {x : ℕ} : fromBytes' (toBytes' x) = x := by
     rw [fromBytes'_toBytes']
     simp [UInt8.size, add_comm]
     apply Nat.div_add_mod
+
+/-- Decoding the big-endian byte encoding of a natural number recovers it
+(`fromBytesBigEndian ∘ toBytesBigEndian = id`). Public companion to the private
+`fromBytes'_toBytes'`; used by the Venom `ByteArray` memory bridge to relate the
+EVM word encoding (`UInt256.toByteArray`) to the model's. -/
+theorem fromBytesBigEndian_toBytesBigEndian (n : ℕ) :
+    fromBytesBigEndian (toBytesBigEndian n) = n := by
+  unfold fromBytesBigEndian toBytesBigEndian
+  simp [Function.comp, fromBytes'_toBytes']
+
+/-- If `n < 2 ^ (8 * k)` then its big-endian encoding has at most `k` bytes.
+Public companion to the private `toBytes'_le` (the encoding is the reversed
+little-endian digits, so the length is unchanged). -/
+theorem toBytesBigEndian_length_le {n k : ℕ} (h : n < 2 ^ (8 * k)) :
+    (toBytesBigEndian n).length ≤ k := by
+  unfold toBytesBigEndian
+  simpa [Function.comp] using toBytes'_le h
 
 def fromBytes! (bs : List UInt8) : ℕ := fromBytes' (bs.take 32)
 

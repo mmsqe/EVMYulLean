@@ -84,3 +84,6 @@ lean_exe «conform» where
 
 lean_exe «yulSemanticsTests» where
   root := `EvmYul.Yul.YulSemanticsTests.Main
+
+lean_exe «venom_run» where
+  root := `EvmYul.Venom.Run
