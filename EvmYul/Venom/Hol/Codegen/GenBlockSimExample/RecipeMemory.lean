@@ -731,7 +731,7 @@ theorem asmExpandMemory_size_rounded (n : Nat) (mem : ByteArray)
     ((n + 31) / 32) * 32 ≤ (asmExpandMemory n mem).size := by
   unfold asmExpandMemory
   by_cases h : ((n + 31) / 32) * 32 ≤ mem.size
-  · simpa [h] using h
+  · simp [h]
   · simp only [h, if_false]
     have hpadsz : (ffi.ByteArray.zeroes ⟨(↑((n + 31) / 32 * 32) - ↑mem.size : BitVec System.Platform.numBits)⟩).size
         = (n + 31) / 32 * 32 - mem.size :=
@@ -4243,7 +4243,7 @@ theorem gRIP_halting_live_eq
       = generateRegularInstPlan liveness dfg cfg fn inst nl false nt lbl p := by
   have hmem : out ∈ nl := by simpa using hlive
   unfold generateRegularInstPlan
-  simp [houts, hlive, hmem, popmanyPlan_nil]
+  simp [houts, hmem, popmanyPlan_nil]
 
 /-- CV#1's optimistic swap is a no-op (`a` is both the output and the next scheduled var). -/
 theorem optimisticSwapPlan_dCv1_noop (p : PlanState) :
@@ -4828,7 +4828,7 @@ theorem dbEntry_thread (s : VenomState) :
   rw [h5]
   rfl
 
-theorem dbFn_halts (vs : VenomState) (hnh : vs.halted = false) :
+theorem dbFn_halts (vs : VenomState) (_hnh : vs.halted = false) :
     ∃ vs', runContext 10 dbCtx vs = ExecResult.Halt vs' := by
   have h0 : runContext 10 dbCtx vs
       = runBlocks 10 dbCtx deadBuriedFn { vs with prevBb := none, currentBb := "entry", instIdx := 0 } := by
@@ -5057,6 +5057,42 @@ theorem asmStack_top3_zero {lo : AssocList String Nat} {ps : PlanState} {vs : Ve
     rw [hpeek, show operandVal vs lo L0 = some (EvmYul.UInt256.ofNat 0) from rfl] at hp
     exact (Option.some.inj hp).symm
   conv_lhs => rw [list_eq_get3 as.stack hge, hpk 0 (by norm_num), hpk 1 (by norm_num), hpk 2 (by norm_num)]
+
+/-- The two-equal-literal reorder (on an empty base) emits a single `SWAP1` and leaves the
+    all-equal plan stack unchanged — the swap acts on equal literals. The 2-input sibling of
+    `reorderPlan_triple_lit0` (used by the LOG0 capstone's plan decomposition). -/
+theorem reorderPlan_pair_lit0 (ps : PlanState) (hstack : ps.stack = [L0, L0]) :
+    reorderPlan [L0, L0] ps = ([StackOp.SOSwap 1], { ps with stack := [L0, L0] }) := by
+  have hstep0 : reorderOne () [L0, L0] 0 L0 ps
+      = ([StackOp.SOSwap 1], { ps with stack := [L0, L0] }) := by
+    have hd : stackGetDepth L0 ps.stack = some 0 := by rw [hstack]; rfl
+    have hsw : stackSwap 1 ps.stack = [L0, L0] := by rw [hstack]; rfl
+    unfold reorderOne; simp [hd, doSwap, hsw]
+  have hstep1 : reorderOne () [L0, L0] 1 L0 ({ ps with stack := [L0, L0] } : PlanState)
+      = ([], { ps with stack := [L0, L0] }) := by
+    have hd : stackGetDepth L0 ([L0, L0] : List Operand) = some 0 := rfl
+    unfold reorderOne; simp [hd]
+  unfold reorderPlan
+  have henum : ([L0, L0] : List Operand).enum = [(0, L0), (1, L0)] := rfl
+  rw [henum]
+  simp only [List.foldl_cons, List.foldl_nil, hstep0, hstep1, List.nil_append, List.append_nil]
+
+/-- **Asm stack top two = two zeros**, when the plan stack is exactly `[L0, L0]`. The 2-input,
+    all-`Lit 0` extraction the LOG0 step needs (sibling of `asmStack_top3_zero`). -/
+theorem asmStack_top2_zero {lo : AssocList String Nat} {ps : PlanState} {vs : VenomState} {as : AsmState}
+    (hrel : venomAsmRel lo ps vs as) (hstack : ps.stack = [L0, L0]) :
+    as.stack = EvmYul.UInt256.ofNat 0 :: EvmYul.UInt256.ofNat 0 :: as.stack.drop 2 := by
+  obtain ⟨hStk, _⟩ := hrel
+  have hlen : ps.stack.length = as.stack.length := hStk.1
+  have hge : 2 ≤ as.stack.length := by rw [← hlen, hstack]; simp
+  have hpk : ∀ d, d < 2 → as.stack[d]! = EvmYul.UInt256.ofNat 0 := by
+    intro d hd
+    have hp := planStackRel_peek hStk (dist := d) (by rw [hstack]; simpa using hd)
+    rw [hstack] at hp
+    have hpeek : stackPeek d ([L0, L0] : List Operand) = L0 := by interval_cases d <;> rfl
+    rw [hpeek, show operandVal vs lo L0 = some (EvmYul.UInt256.ofNat 0) from rfl] at hp
+    exact (Option.some.inj hp).symm
+  conv_lhs => rw [list_eq_get2 as.stack hge, hpk 0 (by norm_num), hpk 1 (by norm_num)]
 
 namespace Example
 
@@ -5327,6 +5363,243 @@ theorem codegen_correct_mcpFn_recipeW {lo : AssocList String Nat} {vs : VenomSta
     · show as.pc = pcOfLabel (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1 "entry"
       rw [haspc]; exact (pcOfLabel_entry_zero rfl hfnready hgen).symm
     · show (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1 "entry" ≤ (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1.length
+      omega
+
+/-! ## The LOG capstone: a codegen-ready, tracked-effect opcode (`lg`)
+
+LOG is codegen-READY, lowered via the `generateEmitOps` `none`-branch to `LOG{topicCount}`, and its
+effect (the appended `Event`) is TRACKED by `venomAsmRel`'s `as.logs = vs.logs` conjunct — so unlike
+ISTORE it is NOT regime-blocked. Its per-instruction sim (`emit_log_sim`) already existed; the missing
+piece was a whole-function capstone. The degenerate `LOG0` (topic-count 0, offset 0, size 0) has empty
+data (`readWithPadding 0 0` is empty) and no topics, so `emit_log_sim`'s coverage/`fnEom`/size side
+conditions are all trivial (`0 + 0`) — the capstone even holds at ANY `fnEom` (no `fnEom = 0` wall).
+Operand[0] is the topic-count literal (`computeOperands` drops it via `.tail`), leaving the SHA3-shaped
+2-input reorder (`[SOSwap 1]` on equal literals) + MCOPY-shaped single-block STOP structure. base + M1 FFI. -/
+
+def lgLog : Instruction := { id := 0, opcode := Opcode.LOG, operands := [L0, L0, L0], outputs := [] }
+def lgStop : Instruction := { id := 1, opcode := Opcode.STOP, operands := [], outputs := [] }
+def lgEntry : BasicBlock := { label := "entry", instructions := [lgLog, lgStop] }
+def lgFn : IrFunction := { name := "main", blocks := [lgEntry] }
+def lgCtx : VenomContext := { functions := [lgFn], entry := some "main" }
+abbrev lgLive : DfState (List String) := livenessAnalyzeFuel (fnPlanFuel lgFn) lgFn
+abbrev lgDfg : DfgAnalysis := DfgAnalysis.buildFunction lgFn
+abbrev lgCfg : CfgAnalysis := cfgAnalyze lgFn
+abbrev lgGp : Instruction × Nat → PlanState → List StackOp × PlanState :=
+  fun z p => generateRegularInstPlan lgLive lgDfg lgCfg lgFn z.1 [] true true "entry" p
+
+/-- Plan decomposition for `LOG (Lit 0)(Lit 0)(Lit 0)` on an empty stack: two `PUSH0`, the `SWAP1`
+    reorder (identity on the equal literals), then the `LOG0` emit (via the `none`-mapped
+    `generateEmitOps_log` branch, since `opcodeToEvmName Opcode.LOG = none`). -/
+theorem genRegularInstPlan_lgLog_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {isHalting nextIsTerminator : Bool} {curBbLabel : String} {ps : PlanState}
+    (hstack : ps.stack = []) :
+    generateRegularInstPlan liveness dfg cfg fn lgLog [] isHalting nextIsTerminator curBbLabel ps
+      = ([StackOp.SOPush L0, StackOp.SOPush L0, StackOp.SOSwap 1, StackOp.SOEmit "LOG0"],
+         releaseDeadSpills [] { ps with stack := [] }) := by
+  have hemit : emitInputPlan Opcode.LOG [L0, L0] [] ps
+      = ([StackOp.SOPush L0, StackOp.SOPush L0], { ps with stack := [L0, L0] }) := by
+    rw [emitInputPlan_pair_lit_eq]; rw [hstack]; rfl
+  have hro : reorderPlan [L0, L0] ({ ps with stack := [L0, L0] } : PlanState)
+      = ([StackOp.SOSwap 1], { ps with stack := [L0, L0] }) :=
+    reorderPlan_pair_lit0 _ rfl
+  unfold generateRegularInstPlan
+  simp [show computeOperands lgLog = [L0, L0] from rfl,
+    show lgLog.opcode = Opcode.LOG from rfl, show lgLog.outputs = ([] : List String) from rfl,
+    show lgLog.operands.head! = L0 from rfl,
+    hemit, hro, stackPop, isCommutative,
+    generateEmitOps_log (inst := lgLog) (show lgLog.opcode = Opcode.LOG from rfl)]
+  rfl
+
+/-- **The LOG0 fold step**: `LOG (Lit 0)(Lit 0)(Lit 0)` from an empty stack — two `PUSH0`, the
+    `SWAP1` identity reorder, and the `LOG0` emit (`emit_log_sim` at `n = 0`: empty data, no topics).
+    Appends the log `Event` on the venom side, preserved by `venomAsmRel`'s `logs` conjunct. `[] ↦ []`.
+    Peak growth 2 ⇒ demand 2. -/
+theorem bodyStepHTo_lgLog {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat}
+    {prog : List AsmInst} :
+    BodyStepHTo lo offsetToPc prog lgGp 2 (lgLog, 0) [] [] := by
+  intro p v s j hsd hsv hrel hblock
+  have hstk : p.stack = [] := hsv
+  have hplan : lgGp (lgLog, 0) p
+      = ([StackOp.SOPush L0, StackOp.SOPush L0, StackOp.SOSwap 1, StackOp.SOEmit "LOG0"],
+         releaseDeadSpills [] { p with stack := [] }) := by
+    show generateRegularInstPlan lgLive lgDfg lgCfg lgFn lgLog [] true true "entry" p = _
+    rw [genRegularInstPlan_lgLog_eq hstk]
+  rw [hplan] at hblock
+  simp only [hplan]
+  rw [show executePlan [StackOp.SOPush L0, StackOp.SOPush L0, StackOp.SOSwap 1, StackOp.SOEmit "LOG0"]
+      = executePlan [StackOp.SOPush L0] ++ (executePlan [StackOp.SOPush L0]
+          ++ (executePlan [StackOp.SOSwap 1] ++ executePlan [StackOp.SOEmit "LOG0"])) from rfl] at hblock ⊢
+  obtain ⟨hbP1, hr1⟩ := asmBlockAt_append hblock
+  obtain ⟨hbP2, hr2⟩ := asmBlockAt_append hr1
+  obtain ⟨hbS1, hbLG⟩ := asmBlockAt_append hr2
+  obtain ⟨s1, hrun1, hrel1, hpc1⟩ := emitOneInput_sim_lit_append (offsetToPc := offsetToPc) (opc := Opcode.LOG) (nl := ([] : List String))
+    (v := EvmYul.UInt256.ofNat 0) hrel hbP1
+  obtain ⟨s2, hrun2, hrel2, hpc2⟩ := emitOneInput_sim_lit_append (offsetToPc := offsetToPc) (opc := Opcode.LOG) (nl := ([] : List String))
+    (v := EvmYul.UInt256.ofNat 0) hrel1 (by rw [hpc1]; exact hbP2)
+  have hns : ({ { p with stack := p.stack ++ [L0] } with stack := (p.stack ++ [L0]) ++ [L0] } : PlanState) = { p with stack := [L0, L0] } := by
+    rw [hstk]; rfl
+  rw [hns] at hrel2
+  have hswap1 : doSwap 1 ({ p with stack := [L0, L0] } : PlanState)
+      = ([StackOp.SOSwap 1], { p with stack := [L0, L0] }) := by
+    rw [doSwap_one_eq']; rfl
+  obtain ⟨s3, hrun3, hrel3, hpc3⟩ := doSwap_sim (offsetToPc := offsetToPc) hswap1 hrel2
+    (by rw [show ({ p with stack := [L0, L0] } : PlanState).stack = [L0, L0] from rfl]; decide)
+    (by rw [hpc2, hpc1]; exact hbS1) (fun h => absurd h (by omega))
+  have hasm3 : s3.stack = EvmYul.UInt256.ofNat 0 :: EvmYul.UInt256.ofNat 0 :: s3.stack.drop 2 :=
+    asmStack_top2_zero hrel3 rfl
+  have hbLG' : asmBlockAt prog s3.pc (executePlan [StackOp.SOEmit "LOG0"]) := by
+    rw [hpc3, hpc2, hpc1]; exact hbLG
+  obtain ⟨s4, hrun4, hrel4, hpc4⟩ := emit_log_sim (n := 0) (offsetToPc := offsetToPc)
+    (offset := EvmYul.UInt256.ofNat 0) (size := EvmYul.UInt256.ofNat 0) (topics := ([] : List bytes32))
+    (rest := s3.stack.drop 2) hrel3
+    hasm3 rfl
+    (by rw [show ((EvmYul.UInt256.ofNat 0).toNat + (EvmYul.UInt256.ofNat 0).toNat + 31) / 32 * 32 = 0 from rfl]; exact Nat.zero_le _)
+    (by rw [show (EvmYul.UInt256.ofNat 0).toNat + (EvmYul.UInt256.ofNat 0).toNat = 0 from rfl]; exact Nat.zero_le _)
+    (by rw [show (EvmYul.UInt256.ofNat 0).toNat = 0 from rfl]; exact USize.size_pos) (by decide) hbLG'
+  have hstepEq : stepInstBase lgLog v = ExecResult.OK { v with logs := v.logs ++ [{ logger := v.callCtx.contract, topics := ([] : List bytes32), data := (v.memory.readWithPadding 0 0).toList }] } := rfl
+  have hrel4' : venomAsmRel lo { p with stack := ([] : List Operand) } { v with logs := v.logs ++ [{ logger := v.callCtx.contract, topics := ([] : List bytes32), data := (v.memory.readWithPadding 0 0).toList }] } s4 := hrel4
+  have hrelR := releaseDeadSpills_sim (nextLiveness := ([] : List String)) hrel4'
+  have hrunAll : runAsm (executePlan [StackOp.SOPush L0] ++ (executePlan [StackOp.SOPush L0]
+      ++ (executePlan [StackOp.SOSwap 1] ++ executePlan [StackOp.SOEmit "LOG0"]))).length offsetToPc prog s
+      = AsmResult.AsmOK s4 := by
+    simp only [List.length_append]
+    exact runAsm_compose hrun1 (runAsm_compose hrun2 (runAsm_compose hrun3 hrun4))
+  have hpcAll : s4.pc = s.pc + (executePlan [StackOp.SOPush L0] ++ (executePlan [StackOp.SOPush L0]
+      ++ (executePlan [StackOp.SOSwap 1] ++ executePlan [StackOp.SOEmit "LOG0"]))).length := by
+    simp only [List.length_append]
+    rw [hpc4, hpc3, hpc2, hpc1]
+    simp only [show (executePlan [StackOp.SOPush L0]).length = 1 from rfl,
+      show (executePlan [StackOp.SOSwap 1]).length = 1 from rfl,
+      show (executePlan [StackOp.SOEmit ("LOG" ++ toString 0)]).length = 1 from rfl,
+      show (executePlan [StackOp.SOEmit "LOG0"]).length = 1 from rfl]
+  have hsplit : executePlan [StackOp.SOPush L0, StackOp.SOPush L0, StackOp.SOSwap 1, StackOp.SOEmit "LOG0"]
+      = executePlan [StackOp.SOPush L0] ++ (executePlan [StackOp.SOPush L0]
+      ++ (executePlan [StackOp.SOSwap 1] ++ executePlan [StackOp.SOEmit "LOG0"])) := rfl
+  refine ⟨gvBodyStep_of_ok (idx := 0)
+    (plan := [StackOp.SOPush L0, StackOp.SOPush L0, StackOp.SOSwap 1, StackOp.SOEmit "LOG0"])
+    hstepEq ⟨s4, by rw [hsplit]; exact hrunAll, hrelR, by rw [hsplit]; exact hpcAll⟩, ?_, ?_⟩
+  · refine ⟨fun op => releaseDeadSpills_noSpill [] ({ p with stack := ([] : List Operand) }) (fun o => hsd.noSpill o) op, ?_, ?_⟩
+    · rw [releaseDeadSpills_stack]
+      have := hsd.shallow; rw [hstk] at this
+      show (({ p with stack := ([] : List Operand) } : PlanState)).stack.length + j ≤ 15
+      simp only [List.length_nil]; omega
+    · intro z hz
+      rw [releaseDeadSpills_stack] at hz
+      simp at hz
+  · show (releaseDeadSpills [] { p with stack := ([] : List Operand) }).stack = ([] : List String).map Operand.Var
+    rw [releaseDeadSpills_stack]; rfl
+
+/-- The body-end state as the raw thread output (keeps `lgEntry_thread` — and hence the non-vacuity
+    `lgFn_halts` — `rfl` and base-axioms-only, matching `mcpFn_halts`). -/
+abbrev lgStepOut (v : VenomState) : VenomState :=
+  { v with logs := v.logs ++ [{ logger := v.callCtx.contract, topics := ([] : List bytes32), data := (v.memory.readWithPadding 0 0).toList }] }
+
+abbrev lgSEnd (s : VenomState) : VenomState := { lgStepOut { s with instIdx := 0 } with instIdx := 1 }
+
+theorem lgEntry_thread (s : VenomState) :
+    execBodyThread [lgLog] 0 { s with instIdx := 0 } = some (lgSEnd s) := rfl
+
+theorem lgReady {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat} {prog : List AsmInst} :
+    BodyStepsReadyHTo lo offsetToPc prog lgGp (fun _ => 2) ([lgLog].zipIdx 0) [] [] :=
+  ⟨[], bodyStepHTo_lgLog, rfl⟩
+
+theorem lgFn_halts (vs : VenomState) (_hnh : vs.halted = false) :
+    ∃ vs', runContext 10 lgCtx vs = ExecResult.Halt vs' := by
+  have h0 : runContext 10 lgCtx vs
+      = runBlocks 10 lgCtx lgFn { vs with prevBb := none, currentBb := "entry", instIdx := 0 } := by
+    simp [runContext, runFunction, lgCtx, lgFn, lgEntry, lookupFunction, fnEntryLabel]
+  set s0 : VenomState := { vs with prevBb := none, currentBb := "entry", instIdx := 0 } with hs0
+  have hlk0 : lookupBlock s0.currentBb lgFn.blocks = some lgEntry := rfl
+  have hhalt : runBlock 9 lgCtx lgEntry s0 = ExecResult.Halt (haltState (lgSEnd s0)) := by
+    rw [show (9 : Nat) = ([lgLog] : List Instruction).length + (7 + 1) from rfl]
+    exact runBlock_body_stop lgCtx _ 7 [lgLog] lgStop lgLog [lgStop] s0 (lgSEnd s0)
+      rfl rfl rfl (by decide)
+      (by intro i hi; simp only [List.mem_singleton] at hi; subst hi; decide)
+      (lgEntry_thread s0)
+  rw [h0]
+  exact ⟨_, runBlocks_haltDirect_of_block hlk0 hhalt⟩
+
+set_option maxHeartbeats 1000000 in
+/-- **The LOG capstone.** `codegen_correct` for the single block `entry: LOG (Lit 0)(Lit 0)(Lit 0); STOP` —
+    a codegen-ready, tracked-effect opcode reaching a whole-function capstone. The `LOG0` appends an
+    empty-data, no-topic `Event`, carried across the step by `venomAsmRel`'s `logs` conjunct; the
+    emitted program's `SWAP1` reorder acts on two equal literals (identity), and the fold runs it via
+    the f1a gp-abstract STOP slice. base + M1 FFI axioms. -/
+theorem codegen_correct_lgFn_recipeW {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    (hvshalt : vs.halted = false)
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    (match runContext 10 lgCtx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  have hfnready : ∀ bb ∈ lgFn.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst := by
+    intro bb hbb inst hinst
+    simp only [lgFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    subst hbb
+    simp only [lgEntry, List.mem_cons, List.not_mem_nil, or_false] at hinst
+    rcases hinst with rfl | rfl <;> (unfold codegenReadyInst; decide)
+  have hgen : generateFnPlan lgFn 0 0
+      = some ((generateFnPlan lgFn 0 0).get!.1, (generateFnPlan lgFn 0 0).get!.2) := rfl
+  have hpsE : psOfFn (fnPlanFuel lgFn) lgFn 0 0 "entry" = initPlanState 0 :=
+    psOfFn_entry rfl hfnready (by simp only [fnPlanFuel]; omega)
+  refine codegen_correct_ofBlocks_recipeW_invCur (fun _ => True)
+    (lo := lo) (pcOf := pcOfLabel (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1)
+    (psOf := psOfFn (fnPlanFuel lgFn) lgFn 0 0)
+    (wOf := fun l => (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1 l)
+    (offsets := (computeLabelOffsets (executePlan (generateFnPlan lgFn 0 0).get!.1)).2)
+    (fuel := 10) (ctx := lgCtx) (fn := lgFn) (fnEom := 0) (lblCtr := 0)
+    (entryName := "main") (entryLbl := "entry")
+    (ops := (generateFnPlan lgFn 0 0).get!.1) (psFinal := (generateFnPlan lgFn 0 0).get!.2)
+    hgen rfl rfl rfl ?_ ?_ (fun _ _ _ _ _ _ _ _ => trivial) ?_ trivial
+  case _ =>
+    intro bb hbb s
+    simp only [lgFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    subst hbb
+    simp [runBlock, evalPhis, execBlock, lgEntry, lgLog]
+  case _ =>
+    intro bb hbb s asm N k hE _ hlbleq
+    obtain ⟨⟨bb0, hlk_s, hvrel, hpc_asm⟩, hwN, hhalt⟩ := hE
+    simp only [lgFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    subst hbb
+    have hlbl : s.currentBb = "entry" := hlbleq
+    rw [hlbl] at hvrel hpc_asm
+    have hpc0 : asm.pc = 0 := by rw [hpc_asm]; exact pcOfLabel_entry_zero rfl hfnready hgen
+    have hnt : ∀ inst ∈ [lgLog], isTerminator inst.opcode = false := by
+      intro i hi; simp only [List.mem_singleton] at hi; subst hi; decide
+    match k with
+    | 0 => exact Or.inl (runBlock_oof lgCtx _ 1 [lgLog] lgStop lgLog [lgStop] s (lgSEnd s)
+             rfl rfl (by decide) hnt (lgEntry_thread s) (by decide))
+    | (j+1) =>
+    rw [show j+1+1 = ([lgLog] : List Instruction).length + (j+1) from by
+      simp only [List.length_cons, List.length_nil]; omega]
+    refine Or.inr (hsupplyW_regularStopToG
+      (gp := lgGp) (dem := fun _ => 2) (restFuel := j)
+      (front := [lgLog]) (stopI := lgStop) (hd := lgLog) (tl := [lgStop])
+      (ps0 := initPlanState 0) (sEnd := lgSEnd s) (S := []) (Sn := [])
+      (hbb := rfl) (hstopop := rfl) (hcons := rfl) (hphi := by decide)
+      (hnonterm := hnt) (hthread := lgEntry_thread s)
+      (hready := lgReady)
+      (hsd := ⟨fun op => rfl, by simp [initPlanState], fun z hz => by simp [initPlanState] at hz⟩)
+      (hsv := rfl)
+      (hrel := by rw [hpsE] at hvrel; exact hvrel)
+      (hbLabel := by rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
+                     have hj2 : j < 1 := hj; interval_cases j; rfl)
+      (hblock := by rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
+                    have hj2 : j < 4 := hj; interval_cases j <;> rfl)
+      (hpc := by rw [hpc0]; decide)
+      (hstop := prog_get_transfer (by rw [hpc0]; decide)
+        (show (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1.get ⟨5, by decide⟩
+          = AsmInst.AsmOp "STOP" from rfl))
+      (hw := by decide))
+  case _ =>
+    refine ⟨⟨lgEntry, rfl, ?_, ?_⟩, ?_, hvshalt⟩
+    · show venomAsmRel lo (psOfFn (fnPlanFuel lgFn) lgFn 0 0 "entry") _ as
+      rw [hpsE]; exact hrel
+    · show as.pc = pcOfLabel (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1 "entry"
+      rw [haspc]; exact (pcOfLabel_entry_zero rfl hfnready hgen).symm
+    · show (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1 "entry" ≤ (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1.length
       omega
 
 end Example
