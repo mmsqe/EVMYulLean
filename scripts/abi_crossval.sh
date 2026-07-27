@@ -2,18 +2,20 @@
 #
 # ABI cross-validation:  evm-abi-lean  vs  EVMYulLean, out-of-process.
 #
-# Two independent Lean projects (both on v4.31.0; abi-lean is ALSO an in-tree
+# Two independent Lean projects (both on v4.32.0; abi-lean is ALSO an in-tree
 # lake dependency checked by the `AbiCrossval` target) are cross-checked on the
 # ERC-20 wire format by shuttling raw bytes between them — this script is the
 # out-of-process, executable-oracle complement to the in-tree proofs (it runs
 # the compiled `venom_run` binary on real calldata, which no lake target does):
 #
 #   selectors — for the whole ERC-20 interface, EVMYulLean's keccak (venom_run's
-#               sha3) computes keccak256(signature) >> 224 and must equal both
-#               the pinned selector and abi-lean's functionSelector.
-#   argument  — abi-lean encodes transfer(addr, amount) into calldata
-#               (functionSelector + encodeArgs); EVMYulLean's venom_run then
-#               decodes it (CALLDATALOAD at offset 36) and must return `amount`.
+#               sha3) computes keccak256(signature) >> 224 and must equal the
+#               pinned selector. (The pure-Lean keccak it is checked against now
+#               lives in-tree as `AbiLean.Hash`, and `AbiCrossval` *proves* the
+#               two agree; abi-lean itself no longer ships a hash.)
+#   argument  — the pinned calldata's argument region is re-derived by abi-lean's
+#               codec (`encode` at `.tuple`); EVMYulLean's venom_run then decodes
+#               it (CALLDATALOAD at offset 36) and must return `amount`.
 #   dynamic   — abi-lean encodes sum(uint256[]) and mixed(uint256,uint256[])
 #               (its dynamic array/tuple roundtrips are now proved, sorry-free);
 #               venom_run follows the ABI offset pointer(s) to the length+data
@@ -22,8 +24,10 @@
 #
 # Usage:   scripts/abi_crossval.sh                     # use pinned references
 #
-#   Drift-guard modes (regenerate selectors/calldata/slot via abi-lean and
-#   check them against the pinned references) — pick ONE source for abi-lean:
+#   Drift-guard modes (re-derive the calldata *argument regions* with abi-lean's
+#   codec and check them against the pinned references — the selector, argument
+#   level and mapping slot moved in-tree to `EvmYul/Venom/AbiLean/`, so they are
+#   covered by `AbiCrossval` instead) — pick ONE source for abi-lean:
 #     ABI_LEAN=/path/to/evm-abi-lean scripts/abi_crossval.sh       # local checkout
 #     ABI_LEAN_GIT=<url> scripts/abi_crossval.sh                   # clone from git
 #         + ABI_LEAN_REF=<branch|tag>   (default: main)
@@ -124,81 +128,65 @@ if [ -z "${ABI_LEAN:-}" ] && [ -n "${ABI_LEAN_GIT:-}" ]; then
   ABI_LEAN="$CACHE"
 fi
 
-# Optional: regenerate the selectors + calldata with evm-abi-lean and check them
-# against the pinned references — a drift guard between the two repos' ABI code.
+# Optional drift guard: re-derive the calldata *argument regions* with the
+# abi-lean checkout under test and compare against the pinned references.
+#
+# Scope note: this checks what abi-lean still owns -- the codec. The 4-byte
+# selector, the function-argument level and the keccak mapping slot moved into
+# THIS repo (EvmYul/Venom/AbiLean/{Hash,Args,CodecEval}), because a hash is a
+# separate primitive from the codec and `encodeArgs` is definitionally the tuple
+# level. Those are covered in-build by `AbiCrossval` (proved, not merely checked)
+# and by the venom_run selector pass below, so the snippet here uses upstream API
+# only -- `encode`/`decode` at `.tuple` -- and therefore runs against ANY abi-lean
+# rev. That is the point: built with the checkout's own toolchain, it catches
+# drift between this repo's pinned rev and abi-lean's moving main.
 if [ -n "${ABI_LEAN:-}" ]; then
-  echo "== regenerate via evm-abi-lean ($ABI_LEAN) =="
+  echo "== re-derive argument regions via evm-abi-lean ($ABI_LEAN) =="
   [ -d "$ABI_LEAN" ] || { echo "FATAL: ABI_LEAN dir not found: $ABI_LEAN" >&2; exit 1; }
   GEN="$(mktemp -t abi_calldata.XXXXXX.lean)"
   trap 'rm -f "$GEN"' EXIT
   cat > "$GEN" <<'LEAN'
-import EvmAbi.Hash
-import EvmAbi.ABI
-import EvmAbi.Encode
-import EvmAbi.Decode
-open EvmAbi.Hash EvmAbi.ABI EvmAbi.ABI.Encode
-def recipient : ByteArray := (uint256ToBytes 1).extract 12 32
-#eval (["totalSupply()", "balanceOf(address)", "transfer(address,uint256)",
-        "approve(address,uint256)", "allowance(address,address)",
-        "transferFrom(address,address,uint256)", "mint(address,uint256)"] : List String).forM
-      (fun s => IO.println s!"{hexBytes (functionSelector s)} {s}")
+import EvmAbi.Codec
+open EvmAbi
+
+def u256 : Ty := .uint 256
+def u (n : Nat) (h : n < 2 ^ 256 := by decide) : Ty.Val u256 := ⟨n, h⟩
+def recipient : Ty.Val .address := ⟨1, by decide⟩
+
+def hexBytes (bs : List UInt8) : String :=
+  String.join (bs.map fun b =>
+    let s := Nat.toDigits 16 b.toNat
+    (if s.length == 1 then "0" else "") ++ String.ofList s)
+
+-- An argument list is exactly the tuple of its types, so the argument region is
+-- `encode (.tuple ts)` -- no argument-level wrapper needed from the library.
+#eval IO.println ("ARGS "   ++ hexBytes (encode (.tuple [.address, u256]) (recipient, u 100, ⟨⟩)))
+#eval IO.println ("DYNARR " ++ hexBytes (encode (.tuple [.array u256]) ([u 10, u 20, u 30], ⟨⟩)))
+#eval IO.println ("MIXED "  ++ hexBytes (encode (.tuple [u256, .array u256]) (u 7, [u 10, u 20, u 30], ⟨⟩)))
+
+-- Roundtrip drift guard: encode -> decode -> re-encode is a byte fixpoint.
 #eval do
-  let sel := functionSelector "transfer(address,uint256)"
-  match encodeArgs [ABIType.address, ABIType.uint (ByteSize.ofLen 32 (by decide))]
-                   [ABIValue.address recipient, ABIValue.uint 100] with
-  | .ok args => IO.println (hexBytes (sel ++ args))
-  | .error e => IO.eprintln s!"encode failed: {e}"
-#eval IO.println (hexBytes (keccak256 ((uint256ToBytes 1) ++ (uint256ToBytes 0))))
--- Dynamic arguments (abi-lean's dynamic array/tuple encoders, sorry-free):
-#eval do
-  let sel := functionSelector "sum(uint256[])"
-  match encodeArgs [ABIType.array (.uint (ByteSize.ofLen 32 (by decide)))]
-                   [ABIValue.array [.uint 10, .uint 20, .uint 30]] with
-  | .ok args => IO.println s!"DYNARR {hexBytes (sel ++ args)}"
-  | .error e => IO.eprintln s!"dynarr encode failed: {e}"
-#eval do
-  let u256 := ByteSize.ofLen 32 (by decide)
-  let sel := functionSelector "mixed(uint256,uint256[])"
-  match encodeArgs [ABIType.uint u256, ABIType.array (.uint u256)]
-                   [ABIValue.uint 7, ABIValue.array [.uint 10, .uint 20, .uint 30]] with
-  | .ok args => IO.println s!"MIXED {hexBytes (sel ++ args)}"
-  | .error e => IO.eprintln s!"mixed encode failed: {e}"
--- Roundtrip drift guard (the in-tree `AbiCrossval` proves this at the pin; here
--- it is re-CHECKED against the checkout under test): encode -> decode ->
--- re-encode is a byte fixpoint for the transfer arguments.
-#eval do
-  let tys := [ABIType.address, ABIType.uint (ByteSize.ofLen 32 (by decide))]
-  let vals := [ABIValue.address recipient, ABIValue.uint 100]
-  match encodeArgs tys vals with
-  | .ok args =>
-    match EvmAbi.ABI.Decode.decodeArgs tys args with
-    | .ok vals' =>
-      match encodeArgs tys vals' with
-      | .ok args' =>
-        if args'.toList == args.toList then IO.println "ROUNDTRIP OK"
-        else IO.eprintln "roundtrip re-encode mismatch"
-      | .error e => IO.eprintln s!"roundtrip re-encode failed: {e}"
-    | .error e => IO.eprintln s!"roundtrip decode failed: {e}"
-  | .error e => IO.eprintln s!"roundtrip encode failed: {e}"
+  let t : Ty := .tuple [.address, u256]
+  let v : Ty.Val t := (recipient, u 100, ⟨⟩)
+  let args := encode t v
+  match decode t args with
+  | some v' => if encode t v' == args then IO.println "ROUNDTRIP OK"
+               else IO.eprintln "roundtrip re-encode mismatch"
+  | none    => IO.eprintln "roundtrip decode failed"
 LEAN
-  ( cd "$ABI_LEAN" && lake build EvmAbi.Hash EvmAbi.ABI EvmAbi.Encode EvmAbi.Decode >/dev/null )
+  ( cd "$ABI_LEAN" && lake build EvmAbi.Codec >/dev/null )
   ABI_OUT="$( cd "$ABI_LEAN" && lake env lean "$GEN" )"
-  for entry in "${ERC20_SELECTORS[@]}"; do
-    sig="${entry%|*}"; want="${entry#*|}"
-    echo "$ABI_OUT" | grep -qF "0x${want} ${sig}" || {
-      echo "FATAL: abi-lean selector for $sig != 0x$want" >&2; exit 1; }
+  # The pinned references carry a 4-byte selector prefix ("0x" + 8 hex chars);
+  # the library re-derives only the argument region, so compare the suffix.
+  for pair in "ARGS|${CALLDATA}" "DYNARR|${DYNARR_CALLDATA}" "MIXED|${MIXED_CALLDATA}"; do
+    tag="${pair%%|*}"; ref="${pair#*|}"
+    echo "$ABI_OUT" | grep -qF "${tag} ${ref:10}" || {
+      echo "FATAL: abi-lean ${tag} argument region drifted from pinned reference" >&2
+      echo "  expected suffix: ${ref:10}" >&2; echo "$ABI_OUT" >&2; exit 1; }
   done
-  echo "$ABI_OUT" | grep -qF "$CALLDATA" || {
-    echo "FATAL: abi-lean calldata drifted from pinned reference" >&2; exit 1; }
-  echo "$ABI_OUT" | grep -qF "0x${SLOT}" || {
-    echo "FATAL: abi-lean mapping slot drifted from pinned reference" >&2; exit 1; }
-  echo "$ABI_OUT" | grep -qF "DYNARR ${DYNARR_CALLDATA}" || {
-    echo "FATAL: abi-lean dynamic-array calldata drifted from pinned reference" >&2; exit 1; }
-  echo "$ABI_OUT" | grep -qF "MIXED ${MIXED_CALLDATA}" || {
-    echo "FATAL: abi-lean mixed static+dynamic calldata drifted from pinned reference" >&2; exit 1; }
   echo "$ABI_OUT" | grep -qF "ROUNDTRIP OK" || {
     echo "FATAL: abi-lean encode->decode->re-encode roundtrip drifted" >&2; exit 1; }
-  echo "  OK: abi-lean selectors + calldata (incl. dynamic array + mixed) + mapping slot + roundtrip match pinned references"
+  echo "  OK: abi-lean argument regions (static + dynamic array + mixed) + roundtrip match pinned references"
 fi
 
 echo "== selectors: EVMYulLean keccak(sig)>>224 vs pinned =="

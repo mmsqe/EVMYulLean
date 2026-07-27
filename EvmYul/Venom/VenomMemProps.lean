@@ -1,4 +1,5 @@
 import EvmYul.Venom.Memory
+import EvmYul.Venom.BinaryBridge
 
 /-!
 # Venom IR — memory model properties
@@ -258,28 +259,55 @@ private theorem reverse_map_range (n : Nat) (g : Nat → UInt8) :
     congr 1
     omega
 
-/-- The big-endian 32-byte encoding, reversed, is the little-endian digit
-list. -/
-theorem toBytes32_reverse (v : UInt256) :
-    (toBytes32 v).reverse
-      = (List.range 32).map (fun j => UInt8.ofNat (v.toNat / 256 ^ j % 256)) := by
-  unfold toBytes32
-  exact reverse_map_range 32 (fun j => UInt8.ofNat (v.toNat / 256 ^ j % 256))
+/-- Every `UInt256` value fits 32 base-256 digits — the bound the word codec's
+roundtrips hang on. -/
+theorem toNat_lt_pow32 (v : UInt256) : v.toNat < 256 ^ 32 := by
+  have := v.val.isLt
+  simpa [UInt256.toNat, UInt256.size] using this
 
-/-- Decoding the 32-byte big-endian encoding recovers the underlying `Nat`. -/
+/-- Decoding the 32-byte big-endian encoding recovers the underlying `Nat`.
+Stated for the project's older decoder; it now follows from the library's
+roundtrip through the `BinaryBridge` agreement. -/
 theorem fromBytesBigEndian_toBytes32 (v : UInt256) :
     fromBytesBigEndian (toBytes32 v) = v.toNat := by
-  show fromBytes' (toBytes32 v).reverse = v.toNat
-  rw [toBytes32_reverse, fromBytes_digits 32 v.toNat]
-  have hlt : v.toNat < 256 ^ 32 := by
-    have := v.val.isLt
-    simpa [UInt256.toNat, UInt256.size] using this
-  exact Nat.mod_eq_of_lt hlt
+  rw [fromBytesBigEndian_eq_decodeBEU]
+  exact Binary.decodeBEU_encodeBEU (toNat_lt_pow32 v)
+
+/-- The old shape of `fromBytes32`, as a lemma: decode via the project's own
+big-endian decoder. Call sites written against the previous definition rewrite
+with this where they used to close by `rfl`. -/
+theorem fromBytes32_eq (bytes : Mem) :
+    fromBytes32 bytes = UInt256.ofNat (fromBytesBigEndian bytes) := by
+  rw [fromBytes32, fromBytesBigEndian_eq_decodeBEU]
+
+/-- The old shape of `toBytes32`, as a lemma: byte `i` is the `(31 - i)`-th
+base-256 digit. Derived from the library codec by `encodeBEU_decodeBEU`
+injectivity — the digit list has length 32 and decodes to `v.toNat`, so it IS
+the width-32 encoding. -/
+theorem toBytes32_digits (v : UInt256) :
+    toBytes32 v
+      = (List.range 32).map (fun i => UInt8.ofNat (v.toNat / 256 ^ (31 - i) % 256)) := by
+  have hdec : Binary.decodeBEU
+      ((List.range 32).map (fun i => UInt8.ofNat (v.toNat / 256 ^ (31 - i) % 256)))
+      = v.toNat := by
+    rw [← fromBytesBigEndian_eq_decodeBEU]
+    show fromBytes' _ = v.toNat
+    rw [reverse_map_range 32 (fun j => UInt8.ofNat (v.toNat / 256 ^ j % 256)),
+        fromBytes_digits 32 v.toNat]
+    exact Nat.mod_eq_of_lt (toNat_lt_pow32 v)
+  calc toBytes32 v
+      = Binary.encodeBEU 32 v.toNat := rfl
+    _ = Binary.encodeBEU
+          ((List.range 32).map (fun i => UInt8.ofNat (v.toNat / 256 ^ (31 - i) % 256))).length
+          (Binary.decodeBEU
+            ((List.range 32).map (fun i => UInt8.ofNat (v.toNat / 256 ^ (31 - i) % 256)))) := by
+        rw [hdec, List.length_map, List.length_range]
+    _ = _ := Binary.encodeBEU_decodeBEU _
 
 /-- The 32-byte word codec is a round-trip. -/
 theorem fromBytes32_toBytes32 (v : UInt256) : fromBytes32 (toBytes32 v) = v := by
-  unfold fromBytes32
-  rw [fromBytesBigEndian_toBytes32]
+  unfold fromBytes32 toBytes32
+  rw [Binary.decodeBEU_encodeBEU (toNat_lt_pow32 v)]
   cases v with | mk fv => simp [UInt256.ofNat, UInt256.toNat, Id.run]
 
 /-- **Opt-side round-trip**: loading a word from where it was just stored

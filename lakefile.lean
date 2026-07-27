@@ -2,16 +2,33 @@ import Lake
 open Lake DSL System
 
 require mathlib from git
-  "https://github.com/leanprover-community/mathlib4.git"@"v4.31.0"
+  "https://github.com/leanprover-community/mathlib4.git"@"v4.32.0"
 
--- In-tree ABI cross-validation (now that both repos pin Lean/mathlib v4.31.0):
--- pull evm-abi-lean's computable keccak/encoder so the ERC-20 selector *values*
--- are checked inside this build instead of only out-of-process (abi_crossval.sh).
--- Pinned to a commit for reproducible verification (see the `AbiCrossval` target);
--- The pin tracks upstream main (modular Roundtrip split + the general
--- `roundtrip_wf`/`roundtrip_args_wff` capstones); sorry-free at this pin.
+-- In-tree ABI cross-validation (both repos pin Lean/mathlib v4.32.0): pull
+-- evm-abi-lean's verified codec so the ERC-20 selector *values* and the calldata
+-- *layout* are checked inside this build, not only out-of-process (abi_crossval.sh).
+--
+-- Pinned to an upstream commit rather than a sibling path: everything `AbiCrossval`
+-- needs beyond the codec now lives HERE, under `EvmYul/Venom/AbiLean/` --
+--   * `AbiLean.Hash`      -- pure-Lean keccak + the 4-byte selector (a hash is a
+--                            separate primitive from the codec, and it is this repo
+--                            that needs it kernel-reducible, unlike our `ffi.KEC`);
+--   * `AbiLean.Args`      -- the function-argument level, definitionally the tuple
+--                            level, so `roundtrip_args` is a one-line corollary;
+--   * `AbiLean.CodecEval` -- the fuel-indexed `encodeF` mirror + `encodeF_eq_encode`
+--                            bridge that makes a concrete `encode` kernel-reducible.
+-- The library's own scope stays the codec roundtrip, so the dependency is plain
+-- upstream and reproducibly pinnable. `AbiCrossval` remains 0 `native_decide`.
 require «abi-lean» from git
-  "https://github.com/yihuang/evm-abi-lean.git" @ "eaef0ff"
+  "https://github.com/yihuang/evm-abi-lean.git" @ "da43ad6ed2c037b593548e65721c674a60fb488e"
+
+-- pull lean-endianness's verified BE/LE codecs (package `binary` since the
+-- Endianness -> Binary rename; same rev evm-abi-lean pins) so EVMYulLean's hand-rolled byte codecs
+-- (fromBytesBigEndian / encodeNumBytes / Mem.toBytes32 — the PUSH-literal and EVM-word
+-- encoders every layout proof rests on) are cross-validated in-build against an
+-- independently verified implementation (see the `EndiannessCrossval` target).
+require «binary» from git
+  "https://github.com/mmsqe/lean-endianness.git" @ "f888569d7d51070886a36c406a58df8b1e0bff1d"
 
 package «evmyul» {
   moreLeanArgs := #["-DautoImplicit=false"]
@@ -95,6 +112,12 @@ lean_lib «EvmYul»
 -- sibling `../evm-abi-lean` checkout; `lake build AbiCrossval` runs the check.
 lean_lib «AbiCrossval» where
   globs := #[.one `EvmYul.Venom.AbiCrossval]
+
+-- In-tree lean-endianness ↔ EVMYulLean byte-codec cross-validation (∀-theorems:
+-- decoder agreement, PUSH-literal roundtrip through the external decoder, and
+-- Mem.toBytes32 = the verified fixed-width BE codec). `lake build EndiannessCrossval`.
+lean_lib «EndiannessCrossval» where
+  globs := #[.one `EvmYul.Venom.EndiannessCrossval]
 
 -- Bridge from the native ABI dispatch front-end to the Hol codegen IR + the
 -- codegen-acceptance witness (a native_decide fact). Its own target so the

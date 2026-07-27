@@ -112,7 +112,7 @@ theorem fromBytesBigEndian_selectorBytes (sel : UInt256) (h : sel.toNat < 2 ^ 32
     have : (2 : Nat) ^ (8 * 4) ≤ UInt256.size := by decide
     omega
   have hc := congrArg UInt256.toNat hrt
-  simp only [Mem.fromBytes32, UInt256.ofNat, UInt256.toNat, Id.run, Fin.ofNat] at hc
+  simp only [Mem.fromBytes32_eq, UInt256.ofNat, UInt256.toNat, Id.run, Fin.ofNat] at hc
   rw [Nat.mod_eq_of_lt hbound] at hc
   exact hc
 
@@ -142,6 +142,7 @@ theorem calldataSelector_selectorBytes (s : VenomState) (sel : UInt256) (args : 
     unfold VenomState.calldataload
     rw [hcd, show (UInt256.ofNat 0).toNat = 0 by decide, readBytes_selector sel args hargs]
     unfold Mem.fromBytes32
+    rw [← fromBytesBigEndian_eq_decodeBEU]
     congr 1
     have hpow : 8 * (args.take 28).length = 224 := by rw [hlen28]
     rw [fromBytesBigEndian_append, fromBytesBigEndian_selectorBytes sel hsel, hpow]

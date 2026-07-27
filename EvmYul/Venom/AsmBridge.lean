@@ -42,10 +42,14 @@ theorem get?_toByteArray (code : List UInt8) (n : Nat) :
   have hdata : (List.toByteArray code).data.toList = code := by rw [← toList_eq_data, ltba_toList]
   rw [ba_get?_eq, ← Array.getElem?_toList, hdata]
 
-/-- `uInt256OfByteArray` is `Mem.fromBytes32` of the byte list (both are
-`UInt256.ofNat ∘ fromBytesBigEndian`). -/
+/-- `uInt256OfByteArray` is `Mem.fromBytes32` of the byte list. Was `rfl` when
+both sides were `UInt256.ofNat ∘ fromBytesBigEndian`; `fromBytes32` is now the
+library decoder, so the old shape comes back through `fromBytes32_eq`. -/
 theorem uInt256OfByteArray_eq (arr : ByteArray) :
-    uInt256OfByteArray arr = Mem.fromBytes32 arr.data.toList := rfl
+    uInt256OfByteArray arr = Mem.fromBytes32 arr.data.toList := by
+  rw [Mem.fromBytes32_eq]
+  unfold uInt256OfByteArray fromBytesBigEndian Function.comp
+  rfl
 
 /-- `extract'` of an assembled list (on the fast path) is list slicing. -/
 theorem extract'_toList (code : List UInt8) (s e : Nat) (hs : s < 2 ^ 64) (he : e < 2 ^ 64) :

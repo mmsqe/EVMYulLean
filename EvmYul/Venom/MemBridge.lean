@@ -216,7 +216,7 @@ word-load agrees with the `Mem` word-load under refinement — the read half of 
 bridge, now resting only on the M1 `ffi_zeroes_*` axioms. -/
 theorem load_agrees_discharged {m : Mem} {ba : ByteArray} (hr : MemRefines m ba) (a : UInt256) :
     m.loadWord a = machineLoad ba a := by
-  rw [machineLoad_eq, Mem.loadWord, Mem.fromBytes32,
+  rw [machineLoad_eq, Mem.loadWord, Mem.fromBytes32_eq,
       readWithPadding_toList hr a.toNat 32 (lt_of_lt_of_le (by norm_num) USize.le_size)]
 
 /-! ## The machine store realizes `Mem.storeWord`

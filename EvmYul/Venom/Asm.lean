@@ -182,8 +182,8 @@ theorem toBytes32_take_zero (v : UInt256) (n : Nat) (hfit : v.toNat < 256 ^ n) :
   · intro i hi hi2
     have hilt : i < 32 - n := by
       simp only [List.length_take, Mem.toBytes32_length] at hi; omega
-    simp only [List.getElem_take, List.getElem_replicate, Mem.toBytes32, List.getElem_map,
-      List.getElem_range]
+    simp only [List.getElem_take, List.getElem_replicate, Mem.toBytes32_digits,
+      List.getElem_map, List.getElem_range]
     have : v.toNat / 256 ^ (31 - i) = 0 := by
       apply Nat.div_eq_of_lt
       calc v.toNat < 256 ^ n := hfit
@@ -198,8 +198,8 @@ theorem fromBytes32_beBytesN (n : Nat) (v : UInt256) (hfit : v.toNat < 256 ^ n) 
     rw [toBytes32_take_zero v n hfit, beBytesN]
   calc Mem.fromBytes32 (beBytesN n v)
       = UInt256.ofNat (fromBytesBigEndian (List.replicate (32 - n) 0 ++ beBytesN n v)) := by
-          rw [fromBytesBigEndian_zeros_prefix]; rfl
-    _ = Mem.fromBytes32 (Mem.toBytes32 v) := by rw [← hsplit]; rfl
+          rw [Mem.fromBytes32_eq, fromBytesBigEndian_zeros_prefix]
+    _ = Mem.fromBytes32 (Mem.toBytes32 v) := by rw [← hsplit, ← Mem.fromBytes32_eq]
     _ = v := Mem.fromBytes32_toBytes32 v
 
 /-- **General minimal-width PUSH decode.** A `PUSHk` (`k = argOnNBytesOfInstr`)

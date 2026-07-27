@@ -1,4 +1,5 @@
 import EvmYul.UInt256
+import Binary
 
 /-!
 # Venom IR — a reasoning-friendly memory model
@@ -47,20 +48,24 @@ def readBytes (mem : Mem) (offset len : Nat) : Mem :=
 
 /-! ## 32-byte word codec
 
-`mstore`/`mload` move 256-bit words as 32 big-endian bytes. We define the
-encoder by direct indexing so its length is `32` definitionally and it is
-total (no dependence on the private byte-length lemmas in `UInt256.lean`).
+`mstore`/`mload` move 256-bit words as 32 big-endian bytes. Both directions are
+the independently verified lean-endianness codec (`Binary.encodeBEU`/`decodeBEU`)
+*by definition* — there is no hand-rolled implementation left to drift from it.
+`EndiannessCrossval.toBytes32_eq_encodeBEU`, which used to prove agreement with
+the previous direct-indexing encoder, survives as the (now definitional)
+regression guard; `BinaryBridge.fromBytesBigEndian_eq_decodeBEU` relates the
+project's older decoder to this one where proofs still speak in its terms.
 -/
 
-/-- The big-endian 32-byte encoding of a `UInt256`. Byte `i` is the
-`(31 - i)`-th base-256 digit, most-significant first. -/
+/-- The big-endian 32-byte encoding of a `UInt256`: the verified fixed-width
+codec at width 32. -/
 def toBytes32 (v : UInt256) : Mem :=
-  (List.range 32).map (fun i => UInt8.ofNat (v.toNat / 256 ^ (31 - i) % 256))
+  Binary.encodeBEU 32 v.toNat
 
-/-- Decode 32 big-endian bytes back to a `UInt256`
-(reusing `EvmYul.fromBytesBigEndian`). -/
+/-- Decode 32 big-endian bytes back to a `UInt256`: the verified decoder,
+wrapped modulo `2^256`. -/
 def fromBytes32 (bytes : Mem) : UInt256 :=
-  UInt256.ofNat (fromBytesBigEndian bytes)
+  UInt256.ofNat (Binary.decodeBEU bytes)
 
 /-- Store a 256-bit word at byte `addr` (32-byte big-endian). -/
 def storeWord (mem : Mem) (addr : UInt256) (v : UInt256) : Mem :=

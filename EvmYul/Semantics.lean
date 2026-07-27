@@ -216,7 +216,7 @@ def swap (n : ℕ) : Transformer .EVM :=
     .error .StackUnderflow
 
 -- TODO: Yul halting for `SELFDESTRUCT`
-def step {τ : OperationType} (op : Operation τ) (arg : Option (UInt256 × Nat) := .none) : Transformer τ := Id.run do
+def step {τ : OperationType} (op : Operation τ) (arg : Option (UInt256 × Nat) := .none) : Transformer τ :=
   let _ : Id Unit := -- For debug logging
     match τ with
       | .EVM => dbg_trace op.pretty; pure ()

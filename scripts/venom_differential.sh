@@ -9,6 +9,9 @@
 # whole differential suite (storage-slot keccak derivation + the memory ops
 # calldatacopy/mcopy/mload/mstore/sha3 + the corpus sweep).
 #
+# Prereq:  the pydefi checkout must be on its `venom_ir` branch (the suite,
+#          tests/test_venom_lean_differential.py, lives there — not on main).
+#
 # Usage:   scripts/venom_differential.sh            # build + run everything
 #          PYDEFI=/path/to/pydefi scripts/venom_differential.sh
 #
