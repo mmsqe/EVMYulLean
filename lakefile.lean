@@ -11,7 +11,7 @@ require mathlib from git
 -- The pin tracks upstream main (modular Roundtrip split + the general
 -- `roundtrip_wf`/`roundtrip_args_wff` capstones); sorry-free at this pin.
 require «abi-lean» from git
-  "https://github.com/yihuang/evm-abi-lean.git" @ "c6c2a9afa7cb725c5a515f56f8ee911a4e88feb0"
+  "https://github.com/yihuang/evm-abi-lean.git" @ "eaef0ff"
 
 package «evmyul» {
   moreLeanArgs := #["-DautoImplicit=false"]

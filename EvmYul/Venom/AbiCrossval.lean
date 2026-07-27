@@ -53,11 +53,17 @@ def erc20Selectors : List (String × Nat) :=
     ("transferFrom(address,address,uint256)", 0x23b872dd),
     ("mint(address,uint256)",                0x40c10f19) ]
 
+set_option maxRecDepth 1000000 in
+set_option maxHeartbeats 4000000 in
 /-- Every ERC-20 selector evm-abi-lean's keccak256 computes equals the pinned
-    4-byte value the dispatcher routes on. -/
+    4-byte value the dispatcher routes on. Proved by `decide +kernel`: abi-lean's keccak
+    is pure Lean (no `extern`/`opaque`), so the KERNEL reduces it — no `native_decide`
+    axiom, unlike the original. -/
 theorem erc20_selectors_match_keccak :
-    erc20Selectors.all (fun p => abiLeanSelector p.1 == UInt256.ofNat p.2) := by native_decide
+    erc20Selectors.all (fun p => abiLeanSelector p.1 == UInt256.ofNat p.2) := by decide +kernel
 
+set_option maxRecDepth 1000000 in
+set_option maxHeartbeats 4000000 in
 /-- **Cross-validation capstone.** The two selector constants the worked
     dispatcher `EvmYul.Venom.exFn` routes on (`AbiDispatch`) are exactly
     evm-abi-lean's keccak256 values for `transfer`/`balanceOf`. Composed with
@@ -67,7 +73,7 @@ theorem erc20_selectors_match_keccak :
 theorem exFn_selectors_are_keccak :
     abiLeanSelector "transfer(address,uint256)" = UInt256.ofNat 0xa9059cbb ∧
     abiLeanSelector "balanceOf(address)"        = UInt256.ofNat 0x70a08231 :=
-  ⟨by native_decide, by native_decide⟩
+  ⟨by decide +kernel, by decide +kernel⟩
 
 /-! ## Calldata argument cross-validation (encode → decode)
 
@@ -94,12 +100,14 @@ def abiLeanTransferArgs : Option (List UInt8) :=
      [.address, .uint (ByteSize.ofLen 32 (by omega))]
      [.address recvBytes, .uint amtU.toNat]).toOption.map (·.toList)
 
+set_option maxRecDepth 4000000 in
 /-- **Encoder agreement.** evm-abi-lean's `encodeArgs` produces byte-for-byte the
     same argument region as EVMYulLean's native `encodeAddress ++ encodeUint256`
-    — two independent encoders, checked by one `native_decide`. -/
+    — two independent encoders, checked by one `decide +kernel` (kernel reduction, no
+    `native_decide` axiom). -/
 theorem abiLeanTransferArgs_eq_native :
     abiLeanTransferArgs = some (Abi.encodeAddress recvU ++ Abi.encodeUint256 amtU) := by
-  native_decide
+  decide +kernel
 
 /-- `transfer` calldata whose 64-byte argument region is evm-abi-lean's
     `encodeArgs` output, after a 4-byte selector. -/
@@ -145,8 +153,9 @@ theorem abiLean_transferArgs_roundtrip_wff (data : ByteArray)
           · exact absurd h3 (by simp))
     hsz henc
 
+set_option maxRecDepth 4000000 in
 /-- **Roundtrip capstone, computed (concrete route).** Encode → decode → re-encode on the transfer
-    arguments is a byte-level fixpoint — the `native_decide` cross-check of the roundtrip on the
+    arguments is a byte-level fixpoint — the `decide +kernel` cross-check of the roundtrip on the
     same concrete data the encoder-agreement theorems feed (`ABIValue` equality is checked through
     the injective re-encoding, keeping the comparison on decidable `ByteArray`s). -/
 theorem abiLean_transferArgs_roundtrip_bytes :
@@ -160,7 +169,7 @@ theorem abiLean_transferArgs_roundtrip_bytes :
       = (EvmAbi.ABI.Encode.encodeArgs
         [.address, .uint (EvmAbi.ABI.ByteSize.ofLen 32 (by omega))]
         [.address recvBytes, .uint amtU.toNat]).toOption := by
-  native_decide
+  decide +kernel
 
 /-! ## Dynamic-array calldata cross-validation (offset → length → data)
 

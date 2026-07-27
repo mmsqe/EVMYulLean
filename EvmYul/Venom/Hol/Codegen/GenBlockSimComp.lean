@@ -1298,6 +1298,116 @@ theorem stackDisc_commBinopVar_step_S
     curBbLabel ps).2.stack = (S ++ [out]).map Operand.Var
   rw [hout, hsv, List.map_append]; rfl
 
+/-- `stepInstBase` on a commutative binop whose operands are BOTH literals: no lookups, the
+    result is direct. The Lit sibling of `stepInstBase_binopVar`. -/
+theorem stepInstBase_binopLit {inst : Instruction} {vs : VenomState}
+    {f : bytes32 → bytes32 → bytes32} {a b : bytes32} {out : String}
+    (hdispatch : stepInstBase inst vs = execPure2 f inst vs)
+    (hops : inst.operands = [Operand.Lit a, Operand.Lit b])
+    (houts : inst.outputs = [out]) :
+    stepInstBase inst vs = ExecResult.OK (updateVar out (f a b) vs) := by
+  rw [hdispatch]
+  simp [execPure2, hops, houts, evalOperand]
+
+/-- **Body step + invariant + stack-shape — commutative binop, both operands LITERAL.** The Lit
+    sibling of `stackDisc_commBinopVar_step_S`, and the first literal-operand member of the
+    `stackDisc_*_step` family (everything before it bound `Operand.Var` only). The plan is
+    `PUSH b ; PUSH a ; OP`: no DUPs, no stack-var interaction, so the operands need NO `∈ S`
+    membership and NO liveness side conditions — only the output's freshness (`out ∉ S`) and
+    liveness matter. The asm sim is the already-existing `genRegularInstPlan_commBinopLit_sim`;
+    what this adds is the `StackDiscH` threading (headroom `k+1 → k`: the plan stack grows by
+    exactly the one `Var out`) and the `StackIsVars (S ++ [out])` output the body fold
+    iterates on. -/
+theorem stackDisc_commBinopLit_step_S
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis}
+    {fn : IrFunction} {inst : Instruction} {nextLiveness : List String}
+    {nextIsTerminator : Bool} {curBbLabel : String} {ps : PlanState} {lo : AssocList String Nat}
+    {vs : VenomState} {as : AsmState} {prog : List AsmInst} {offsetToPc : AssocList Nat Nat}
+    {S : List String} {a b : bytes32} {out : String} {name : String} {k idx : Nat}
+    {f : bytes32 → bytes32 → bytes32}
+    (hsd : StackDiscH (k + 1) ps vs)
+    (hsv : StackIsVars S ps)
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hcomm : isCommutative inst.opcode = true)
+    (hdispatch : stepInstBase inst vs = execPure2 f inst vs)
+    (hops : inst.operands = [Operand.Lit a, Operand.Lit b])
+    (houts : inst.outputs = [out])
+    (hab : a ≠ b)
+    (houtS : out ∉ S)
+    (hlive : nextLiveness.contains out = true)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp name →
+        asmStep offsetToPc prog s = asmBinop f s)
+    (hoptnoop : optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+        { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+          stack := ps.stack ++ [Operand.Var out] }
+      = ([], { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+              stack := ps.stack ++ [Operand.Var out] }))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    (∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+              nextIsTerminator curBbLabel ps).1).length offsetToPc prog as
+              = AsmResult.AsmOK as' ∧
+            venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+              nextIsTerminator curBbLabel ps).2 (gvBodyStep (inst, idx) vs) as' ∧
+            as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+              nextLiveness false nextIsTerminator curBbLabel ps).1).length)
+    ∧ StackDiscH k
+        (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator
+          curBbLabel ps).2
+        (gvBodyStep (inst, idx) vs)
+    ∧ StackIsVars (S ++ [out])
+        (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator
+          curBbLabel ps).2 := by
+  have hfresh : ¬ Operand.Var out ∈ ps.stack := stackIsVars_not_mem hsv houtS
+  have hspill : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none := by
+    have := hsd.noSpill (Operand.Var out); simpa [alookup'] using this
+  have hrev : inst.operands.reverse = [Operand.Lit b, Operand.Lit a] := by rw [hops]; rfl
+  have hstateEq : (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).2
+      = releaseDeadSpills nextLiveness
+          { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+            stack := ps.stack ++ [Operand.Var out] } := by
+    rw [genRegularInstPlan_commBinopLit_eq hname hcomm hops houts hab rfl hlive]
+    simp only [hoptnoop]
+  have hps1spill : (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2.spilled
+      = ps.spilled := by rw [hrev, emitInputPlan_pair_lit_eq]
+  have hgv : gvBodyStep (inst, idx) vs = { updateVar out (f a b) vs with instIdx := idx + 1 } := by
+    simp only [gvBodyStep, stepInstBase_binopLit hdispatch hops houts]
+  obtain ⟨as', hrun, hrel', hpc⟩ := genRegularInstPlan_commBinopLit_sim hname hcomm hops houts hab
+    rfl hlive hfresh hspill hdisp hoptnoop hrel hblock
+  refine ⟨⟨as', hrun, ?_, hpc⟩, ⟨?_, ?_, ?_⟩, ?_⟩
+  · rw [hgv, venomAsmRel_instIdx]; exact hrel'
+  · rw [hstateEq]
+    apply releaseDeadSpills_noSpill
+    intro op
+    show alookup' (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2.spilled op
+      = none
+    rw [hps1spill]; exact hsd.noSpill op
+  · rw [hstateEq, releaseDeadSpills_stack]
+    show (ps.stack ++ [Operand.Var out]).length + k ≤ 15
+    simp only [List.length_append, List.length_cons, List.length_nil]
+    have := hsd.shallow; omega
+  · rw [hstateEq, releaseDeadSpills_stack]
+    intro z hz
+    rw [hgv]
+    show ∃ w, lookupVar z (updateVar out (f a b) vs) = some w
+    simp only [List.mem_append, List.mem_cons, List.not_mem_nil, or_false] at hz
+    rcases hz with hz | hz
+    · have hzout : z ≠ out := by rintro rfl; exact hfresh hz
+      rw [lookupVar_updateVar_ne vs out z (f a b) hzout]
+      exact hsd.defined z hz
+    · injection hz with hz'
+      rw [hz']
+      exact ⟨f a b, lookupVar_updateVar_self vs out (f a b)⟩
+  · show (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator
+      curBbLabel ps).2.stack = (S ++ [out]).map Operand.Var
+    rw [hstateEq, releaseDeadSpills_stack, hsv, List.map_append]
+    rfl
+
+
 /-! ## Non-commutative var-binop body atoms (SUB/DIV/MOD/LT/GT/SHL/…)
 
 The non-commutative counterparts of the commutative var-binop body atoms. A non-comm binop has the
@@ -4509,6 +4619,42 @@ theorem bodyStep_commBinop
   obtain ⟨hsim, hsd', hsv'⟩ := stackDisc_commBinopVar_step_S (idx := idx) hsd hsv hname hcomm
     (hdispatch v) hops houts hxy hxS hyS houtS hlive hlivex hlivey hdisp hopt hrel hblock
   exact ⟨hsim, hsd', by rw [hout]; exact hsv'⟩
+
+/-- The commutative both-literal binop as a `BodyStep` — the Lit sibling of
+    `bodyStep_commBinop`, dispatching to `stackDisc_commBinopLit_step_S`. First literal-operand
+    member of the `bodyStep_*` family. -/
+theorem bodyStep_commBinopLit
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat} {prog : List AsmInst}
+    {inst : Instruction} {nextLiveness : List String} {curBbLabel : String}
+    {S : List String} {a b : bytes32} {out name : String} {idx : Nat}
+    {f : bytes32 → bytes32 → bytes32}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hcomm : isCommutative inst.opcode = true)
+    (hdispatch : ∀ v, stepInstBase inst v = execPure2 f inst v)
+    (hops : inst.operands = [Operand.Lit a, Operand.Lit b])
+    (houts : inst.outputs = [out])
+    (hab : a ≠ b)
+    (houtS : out ∉ S)
+    (hlive : nextLiveness.contains out = true)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp name →
+        asmStep offsetToPc prog s = asmBinop f s) :
+    BodyStep lo offsetToPc prog
+      (fun z p => generateRegularInstPlan liveness dfg cfg fn z.1 nextLiveness false true curBbLabel p)
+      (inst, idx) S := by
+  intro p v s j hsd hsv hrel hblock
+  have hout : outOf (inst, idx) = out := by simp [outOf, houts]
+  have hopt : optimisticSwapPlan dfg inst nextLiveness true
+      { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness p).2 with
+        stack := p.stack ++ [Operand.Var out] }
+    = ([], { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness p).2 with
+            stack := p.stack ++ [Operand.Var out] }) := by
+    simp [optimisticSwapPlan]
+  obtain ⟨hsim, hsd', hsv'⟩ := stackDisc_commBinopLit_step_S (idx := idx) hsd hsv hname hcomm
+    (hdispatch v) hops houts hab houtS hlive hdisp hopt hrel hblock
+  exact ⟨hsim, hsd', by rw [hout]; exact hsv'⟩
+
 
 /-- **`BodyStep` for a var-unop** (ISZERO/NOT), factored from `stackDisc_unopVar_step_S`. The
     optimistic-swap no-op is hypothesised per plan state (`hoptnoop : ∀ p, …`). -/
@@ -17940,7 +18086,14 @@ def RegularStep (nextLiveness : List String) (offsetToPc : AssocList Nat Nat) (p
         x ≠ y ∧ y ≠ z ∧ x ≠ z ∧ x ∈ S ∧ y ∈ S ∧ z ∈ S ∧
         nextLiveness.contains x = true ∧ nextLiveness.contains y = true ∧ nextLiveness.contains z = true ∧
         (∀ (s : AsmState) (h : s.pc < prog.length),
-          prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp name → asmStep offsetToPc prog s = asmTernop f s)))
+          prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp name → asmStep offsetToPc prog s = asmTernop f s))
+    ∨ -- commutative binop, BOTH operands literal (compiled to `PUSH b ; PUSH a ; OP`): no DUPs,
+      -- no stack-var interaction, so the operands need no `∈ S` membership and no liveness.
+      (∃ (av bv : bytes32) (f : bytes32 → bytes32 → bytes32),
+        isCommutative inst.opcode = true ∧ (∀ v, stepInstBase inst v = execPure2 f inst v) ∧
+        inst.operands = [Operand.Lit av, Operand.Lit bv] ∧ av ≠ bv ∧
+        (∀ (s : AsmState) (h : s.pc < prog.length),
+          prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp name → asmStep offsetToPc prog s = asmBinop f s)))
 
 /-! ## Fully general 0/1-output regular body (arithmetic + storage stores)
 
@@ -17973,7 +18126,8 @@ theorem regularStep_toBodyStep
     ⟨x, y, f, hcomm, hdisp', hops, hxy, hxS, hyS, hlivex, hlivey, hdisp⟩ |
     ⟨x, y, f, hncomm, hnjmp, hcompute, hdisp', hops, hxy, hxS, hyS, hlivex, hlivey, hdisp⟩ |
     ⟨x, f, hnjmp, hcompute, hdisp', hops, hxS, hlivex, hdisp⟩ |
-    ⟨x, y, z, f, hncomm, hnjmp, hcompute, hdisp', hops, hxy, hyz, hxz, hxS, hyS, hzS, hlivex, hlivey, hlivez, hdisp⟩
+    ⟨x, y, z, f, hncomm, hnjmp, hcompute, hdisp', hops, hxy, hyz, hxz, hxS, hyS, hzS, hlivex, hlivey, hlivez, hdisp⟩ |
+    ⟨av, bv, f, hcomm, hdisp', hops, hab, hdisp⟩
   · exact bodyStep_commBinop (idx := k) hname hcomm hdisp' hops houts hxy hxS hyS houtS hlive hlivex hlivey hdisp
   · exact bodyStep_nonCommBinopVar (idx := k) (nextIsTerminator := true) hname hncomm hnjmp hcompute
       hdisp' hops houts hxy hxS hyS houtS hlive hlivex hlivey hdisp (fun p => by simp [optimisticSwapPlan])
@@ -17982,6 +18136,7 @@ theorem regularStep_toBodyStep
   · exact bodyStep_ternopVar (idx := k) (nextIsTerminator := true) hname hncomm hnjmp hcompute hdisp'
       hops houts hxy hyz hxz hxS hyS hzS houtS hlive hlivex hlivey hlivez hdisp
       (fun p => by simp [optimisticSwapPlan])
+  · exact bodyStep_commBinopLit (idx := k) hname hcomm hdisp' hops houts hab houtS hlive hdisp
 
 /-- **Invariant-threading prefix-body sim for the general 0/1-output fold.** The `BodyStepsReadyG`
     twin of `genBlockPrefixBody_sim_inv`: runs the block's `SOLabel` prefix then the body via

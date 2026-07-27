@@ -19403,6 +19403,340 @@ theorem codegen_correct_cvStop_recipeW {lo : AssocList String Nat} {vs : VenomSt
       omega
 
 
+/-! ### ✅ The LITERAL-operand body enters the recipe route — `codegen_correct_addStop_recipeW`
+
+`addStopFn` (`entry: %c = ADD 5 3 ; STOP`) is the documented witness of §6.2's operand-class gap: its
+literal ADD had NO `RegularStep` disjunct, so no `RegularBodyH` and no recipe-route capstone existed for it
+(only the canonical-route `codegen_correct_canonical_addStop`). With the new both-literal commutative-binop
+arm (`bodyStep_commBinopLit` / `stackDisc_commBinopLit_step_S` in `GenBlockSimComp`), the fold now covers
+it: `addStop_regularBodyH` is the first `RegularBodyH` whose body is a literal-operand instruction, and the
+capstone runs it end-to-end on the real generated `[JUMPDEST ; PUSH 3 ; PUSH 5 ; ADD ; STOP]`.
+
+The dead-output wrinkle is the `cvStop` one: `c` is dead at the STOP, the generator suppresses the POP via
+`isHalting`, and `nextLiveness := ["c"]` makes the fold's plan agree with the generator's (dead = []).
+
+Scope honesty: this closes the operand-class gap for the COMMUTATIVE BOTH-LITERAL binop — the shape the
+documented witness has. Mixed Var/Lit operands and the non-commutative/unop/ternop literal shapes remain
+outside the fold (each would be its own disjunct + sim; the mixed shapes also need DUP-vs-PUSH interleaving
+lemmas that do not exist yet). -/
+
+theorem addStop_regularBodyH {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat} :
+    RegularBodyH lo ["c"] offsetToPc
+      (asmResolve (executePlan (generateFnPlan addStopFn 0 0).get!.1)).1 1 [addInst] [] := by
+  refine ⟨Or.inl ⟨Or.inl ?_, by decide⟩, trivial⟩
+  exact ⟨"c", "ADD", rfl, rfl, by decide, rfl,
+    Or.inr (Or.inr (Or.inr (Or.inr ⟨UInt256.ofNat 5, UInt256.ofNat 3, (· + ·), rfl,
+      fun v => rfl, rfl, by decide, fun _ h hg => asmStep_add_ok h hg⟩)))⟩
+
+theorem codegen_correct_addStop_recipeW {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    (hvshalt : vs.halted = false)
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    (match runContext 10 addStopCtx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan addStopFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan addStopFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan addStopFn 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan addStopFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan addStopFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan addStopFn 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan addStopFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan addStopFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan addStopFn 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  have hfnready : ∀ bb ∈ addStopFn.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst := by
+    intro bb hbb inst hinst
+    simp only [addStopFn, List.mem_singleton] at hbb; subst hbb
+    simp only [addStopBB, List.mem_cons, List.not_mem_nil, or_false] at hinst
+    rcases hinst with rfl | rfl <;> (unfold codegenReadyInst; decide)
+  have hgen : generateFnPlan addStopFn 0 0
+      = some ((generateFnPlan addStopFn 0 0).get!.1, (generateFnPlan addStopFn 0 0).get!.2) := rfl
+  have hpsE : psOfFn (fnPlanFuel addStopFn) addStopFn 0 0 "entry" = initPlanState 0 :=
+    psOfFn_entry rfl hfnready (by simp only [fnPlanFuel]; omega)
+  refine codegen_correct_ofBlocks_recipeW
+    (lo := lo) (pcOf := pcOfLabel (asmResolve (executePlan (generateFnPlan addStopFn 0 0).get!.1)).1)
+    (psOf := psOfFn (fnPlanFuel addStopFn) addStopFn 0 0)
+    (wOf := fun l => (asmResolve (executePlan (generateFnPlan addStopFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan addStopFn 0 0).get!.1)).1 l)
+    (offsets := (computeLabelOffsets (executePlan (generateFnPlan addStopFn 0 0).get!.1)).2)
+    (fuel := 10) (ctx := addStopCtx) (fn := addStopFn) (fnEom := 0) (lblCtr := 0)
+    (entryName := "main") (entryLbl := "entry")
+    (ops := (generateFnPlan addStopFn 0 0).get!.1) (psFinal := (generateFnPlan addStopFn 0 0).get!.2)
+    hgen rfl rfl rfl ?_ ?_ ?_
+  case _ =>
+    intro bb hbb s
+    simp only [addStopFn, List.mem_singleton] at hbb; subst hbb
+    simp [runBlock, evalPhis, execBlock, addStopBB, addInst]
+  case _ =>
+    intro bb hbb s asm N k hE hlbleq
+    obtain ⟨⟨bb0, hlk_s, hvrel, hpc_asm⟩, hwN, hhalt⟩ := hE
+    simp only [addStopFn, List.mem_singleton] at hbb; subst hbb
+    have hlbl : s.currentBb = "entry" := hlbleq
+    rw [hlbl] at hvrel hpc_asm
+    have hpc0 : asm.pc = 0 := by rw [hpc_asm]; exact pcOfLabel_entry_zero rfl hfnready hgen
+    cases k with
+    | zero =>
+      exact Or.inl ⟨"out of fuel", by simp [runBlock, evalPhis, phiPrefixLength, execBlock,
+        getInstruction, addStopBB, addInst, stepInstBase, execPure2, evalOperand, isTerminator]⟩
+    | succ j =>
+    rw [show j + 1 + 1 = ([addInst] : List Instruction).length + (j + 1) from by
+      simp only [List.length_singleton]; omega]
+    refine Or.inr (hsupplyW_regularStop
+      (liveness := exLiveness) (dfg := DfgAnalysis.empty) (cfg := exCfg) (restFuel := j)
+      (front := [addInst]) (stopInst := stopInst) (hd := addInst) (tl := [stopInst])
+      (nextLiveness := ["c"]) (curBbLabel := "entry") (dem := 1) (S := []) (ps0 := initPlanState 0)
+      (sEnd := { updateVar "c" (UInt256.ofNat 5 + UInt256.ofNat 3) { s with instIdx := 0 } with
+        instIdx := 1 })
+      (hbb := rfl) (hstopop := rfl) (hcons := rfl) (hphi := by decide)
+      (hnonterm := by intro i hi; simp only [List.mem_singleton] at hi; subst hi; decide)
+      (hthread := by simp [execBodyThread, addInst, stepInstBase, execPure2, evalOperand])
+      (hreg := addStop_regularBodyH)
+      (hsd := ⟨by intro op; rfl, by simp [initPlanState], by intro z hz; simp [initPlanState] at hz⟩)
+      (hsv := by simp [StackIsVars, initPlanState])
+      (hrel := by rw [hpsE] at hvrel; exact hvrel)
+      (hbLabel := by
+        rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
+        have hj' : j < 1 := hj; interval_cases j; rfl)
+      (hblock := by
+        rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
+        have hj' : j < 3 := hj; interval_cases j <;> rfl)
+      (hpc := by rw [hpc0]; decide) (hstop := by simp only [hpc0]; rfl) (hw := by decide))
+  case _ =>
+    refine ⟨⟨addStopBB, rfl, ?_, ?_⟩, ?_, hvshalt⟩
+    · show venomAsmRel lo (psOfFn (fnPlanFuel addStopFn) addStopFn 0 0 "entry") _ as
+      rw [hpsE]; exact hrel
+    · show as.pc = pcOfLabel (asmResolve (executePlan (generateFnPlan addStopFn 0 0).get!.1)).1 "entry"
+      rw [haspc]; exact (pcOfLabel_entry_zero rfl hfnready hgen).symm
+    · show (asmResolve (executePlan (generateFnPlan addStopFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan addStopFn 0 0).get!.1)).1 "entry" ≤ (asmResolve (executePlan (generateFnPlan addStopFn 0 0).get!.1)).1.length
+      omega
+
+/-! ### ✅ THE FIRST LOOP THROUGH THE FUEL ROUTE — `codegen_correct_loopVFn_fuel` (§6.2 item (2))
+
+`loopVFn` is `entry: %a = CALLVALUE ; JNZ %a entry exit` / `exit: STOP` — its CFG has a REAL back-edge
+(`loopVFn_back_edge`: `entry` is its own successor). The ranked drivers provably cannot touch it: the
+taken arm's decrease `wOf entry + blockLen ≤ wOf entry` forces `blockLen = 0`, contradicting the block's
+own JUMPDEST (`ranked_walk_no_back_edge`). This is the note at the end of `GenBlockSim.lean` made good:
+"no loop has been driven end to end through `codegen_correct_fuel_sched`" — now one has.
+
+The proof drives BOTH JNZ arms on the real generated
+`[JUMPDEST; CALLVALUE; PUSH(→0); JUMPI; PUSH(→6); JUMP; JUMPDEST; STOP]`:
+the not-taken arm falls through to `exit` (blockLen 6 ≤ B = 8), and the TAKEN arm — the back-edge —
+lands the asm back at pc 0 with the entry relation re-established (blockLen 4 ≤ 8). No label ordering is
+used anywhere; the budget is `fuel * 8`, decreasing with the Venom fuel exactly as
+`runBlocks_walk_fuel`'s invariant prescribes. The per-block obligations are assembled BY HAND from the
+primitive sims (`labelThenBody_sim`, `resolved_jumpi_{taken,nottaken}_sim`, `resolved_jump_sim`,
+`runBlock_body_jnz_{taken,nottaken}`, `HbsimMatch_stop_from_body`); the fuel-shaped analogue of the
+ranked `hsupplyW_*`/`TermRecipeW` slice family is enumerable follow-up, not a design gap.
+
+NON-VACUITY (`| _ => True` catch-all): for `callvalue = 0` the run takes the fall-through and
+`runContext 10` evaluates to `Halt` — the REAL arm — with the asm halting within `10 * 8` steps
+(both `#eval`-checked). For `callvalue ≠ 0` the loop never terminates, Venom runs out of fuel, and the
+conclusion is honestly silent (`Error` hits the catch-all) — the statement speaks only about runs that
+finish, which is what fuel-indexed correctness means. The TAKEN arm is nonetheless genuinely exercised:
+the `by_cases` discharges it for every non-zero call value, which no ranked instantiation could do at
+all. -/
+
+def loopVJnz : Instruction :=
+  { id := 1, opcode := Opcode.JNZ,
+    operands := [Operand.Var "a", Operand.Label "entry", Operand.Label "exit"], outputs := [] }
+def loopVEntry : BasicBlock := { label := "entry", instructions := [cvInst2, loopVJnz] }
+def loopVExit : BasicBlock := { label := "exit", instructions := [stopInst] }
+def loopVFn : IrFunction := { name := "main", blocks := [loopVEntry, loopVExit] }
+def loopVCtx : VenomContext := { functions := [loopVFn], entry := some "main" }
+
+/-- The back-edge is real: `entry` is its own CFG successor. -/
+theorem loopVFn_back_edge : "entry" ∈ (cfgAnalyze loopVFn).succsOf "entry" := by decide
+
+set_option maxRecDepth 100000 in
+theorem codegen_correct_loopVFn_fuel {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    {fuel : Nat}
+    (hvshalt : vs.halted = false)
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    (match runContext fuel loopVCtx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (fuel * 8) (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (fuel * 8) (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (fuel * 8) (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  refine codegen_correct_fuel_sched (B := 8) (lo := lo)
+    (fuel := fuel) (ctx := loopVCtx) (fn := loopVFn) (fnEom := 0) (lblCtr := 0)
+    (ops := (generateFnPlan loopVFn 0 0).get!.1) (psFinal := (generateFnPlan loopVFn 0 0).get!.2)
+    (entryName := "main") (entryLbl := "entry")
+    (pcOf := pcOfLabel (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).1) (psOf := psOfFn (fnPlanFuel loopVFn) loopVFn 0 0)
+    rfl rfl rfl rfl ?hnd ?hwf ?hstep loopVEntry rfl ?hpc0 hvshalt ?hrel0
+  case hnd => decide
+  case hwf =>
+    intro b hb inst hinst hterm
+    simp only [loopVFn, List.mem_cons, List.not_mem_nil, or_false] at hb
+    rcases hb with rfl | rfl
+    · simp only [loopVEntry, List.mem_cons, List.not_mem_nil, or_false] at hinst
+      rcases hinst with rfl | rfl
+      · exact absurd hterm (by decide)
+      · rfl
+    · simp only [loopVExit, List.mem_singleton] at hinst; subst hinst; rfl
+  case hpc0 => rw [haspc]; decide
+  case hrel0 =>
+    show venomAsmRel lo (psOfFn (fnPlanFuel loopVFn) loopVFn 0 0 loopVEntry.label) _ as
+    rw [show psOfFn (fnPlanFuel loopVFn) loopVFn 0 0 loopVEntry.label = initPlanState 0 from by decide]
+    exact hrel
+  case hstep =>
+    intro bb s asm N f' hlk hpc hvrel hBN hnh _hreach
+    obtain ⟨hmem, hlbleq⟩ := lookupBlock_mem hlk
+    simp only [loopVFn, List.mem_cons, List.not_mem_nil, or_false] at hmem
+    rcases hmem with rfl | rfl
+    · -- ===== ENTRY: %a = CALLVALUE ; JNZ %a entry exit =====
+      have hpcE : asm.pc = 0 := hpc.trans (by decide)
+      have hvrelE : venomAsmRel lo (initPlanState 0) s asm := by
+        have h := hvrel
+        rwa [show psOfFn (fnPlanFuel loopVFn) loopVFn 0 0 loopVEntry.label = initPlanState 0 from
+          by decide] at h
+      match f' with
+      | 0 =>
+        have h0 : runBlock 0 loopVCtx loopVEntry s = ExecResult.Error "out of fuel" := by
+          simp [runBlock, evalPhis, execBlock, loopVEntry, cvInst2]
+        rw [h0]; exact trivial
+      | 1 =>
+        have h1 : runBlock 1 loopVCtx loopVEntry s = ExecResult.Error "out of fuel" := by
+          simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, loopVEntry,
+            cvInst2, loopVJnz, stepInstBase, execRead0, isTerminator]
+        rw [h1]; exact trivial
+      | (j+2) =>
+        rw [show j + 2 = 1 + (j + 1) from by omega]
+        obtain ⟨as', hbody, hrel', hpcas⟩ := labelThenBody_sim
+          (o2pc := (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).2) (prog := (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).1)
+          (liveness := exLiveness) (dfg := DfgAnalysis.empty) (cfg := exCfg) (fn := loopVFn)
+          (nextLiveness := ["a"]) (curBbLabel := "entry") (dem := 1) (ps0 := initPlanState 0)
+          (S := []) (bb := loopVEntry) (front := [cvInst2])
+          (sEnd := { updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 })
+          (by simp [execBodyThread, cvInst2, stepInstBase, execRead0])
+          ⟨cv_step (out := "a") (S := []) rfl (by decide) (by decide), trivial⟩
+          ⟨by intro op; rfl, by simp [initPlanState], by intro z hz; simp [initPlanState] at hz⟩
+          (by simp [StackIsVars, initPlanState])
+          hvrelE
+          (by rw [hpcE]; refine ⟨by decide, fun i hi => ?_⟩
+              have hi' : i < 1 := hi; interval_cases i; rfl)
+          (by rw [hpcE]; refine ⟨by decide, fun i hi => ?_⟩
+              have hi' : i < 1 := hi; interval_cases i; rfl)
+        have has'pc : as'.pc = 2 := by rw [hpcas, hpcE]; rfl
+        have hstk_c : as'.stack = s.callCtx.callvalue :: as'.stack.drop 1 :=
+          venomAsmRel_asmStack_top1_var hrel' rfl
+            (by show lookupVar "a" (updateVar "a" s.callCtx.callvalue { s with instIdx := 0 })
+                  = some s.callCtx.callvalue
+                exact lookupVar_updateVar_self _ _ _)
+        have hsucc' : venomAsmRel lo (initPlanState 0)
+            { updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 }
+            { as' with stack := as'.stack.drop 1 } :=
+          venomAsmRel_pop_tos hrel' hstk_c
+        have hlt2 : as'.pc < (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).1.length := by rw [has'pc]; decide
+        have hpushE : (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).1.get ⟨as'.pc, hlt2⟩
+            = resolveInst (computeLabelOffsets (executePlan (generateFnPlan loopVFn 0 0).get!.1)).2 (AsmInst.AsmPushLabel "entry") := by
+          conv_lhs => rw [show (⟨as'.pc, hlt2⟩ : Fin _) = ⟨2, by decide⟩ from Fin.ext has'pc]
+          rfl
+        have hlt3 : as'.pc + 1 < (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).1.length := by rw [has'pc]; decide
+        have hjumpi : (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).1.get ⟨as'.pc + 1, hlt3⟩ = AsmInst.AsmOp "JUMPI" := by
+          conv_lhs => rw [show (⟨as'.pc + 1, hlt3⟩ : Fin _) = ⟨3, by decide⟩ from
+            Fin.ext (show as'.pc + 1 = 3 by rw [has'pc])]
+          rfl
+        by_cases hc : s.callCtx.callvalue = EvmYul.UInt256.ofNat 0
+        · -- NOT TAKEN: fall through to exit
+          have hrb := runBlock_body_jnz_nottaken loopVCtx loopVEntry j [cvInst2] loopVJnz cvInst2
+            [loopVJnz] s { updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with
+              instIdx := 1 }
+            (Operand.Var "a") "entry" "exit" rfl rfl rfl
+            (by show lookupVar "a" (updateVar "a" s.callCtx.callvalue { s with instIdx := 0 })
+                  = some (EvmYul.UInt256.ofNat 0)
+                rw [lookupVar_updateVar_self, hc]) rfl (by decide)
+            (by intro i hi; simp only [List.mem_singleton] at hi; subst hi; decide)
+            (by simp [execBodyThread, cvInst2, stepInstBase, execRead0])
+            (by simpa [updateVar] using hnh)
+          simp only [List.length_singleton] at hrb
+          rw [hrb]
+          have hh' : (jumpTo "exit" ({ updateVar "a" s.callCtx.callvalue
+              { s with instIdx := 0 } with instIdx := 1 })).halted = false := by
+            simpa [jumpTo, updateVar] using hnh
+          simp only [hh', Bool.false_eq_true, if_false]
+          have hnt := resolved_jumpi_nottaken_sim (offsets := (computeLabelOffsets (executePlan (generateFnPlan loopVFn 0 0).get!.1)).2)
+            (offsetToPc := (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).2) (prog := (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).1) (s := as') (ifNz := "entry") (off := 0)
+            (stk := as'.stack.drop 1) (hc ▸ hstk_c) hlt2 hpushE (by decide) (by decide)
+            hlt3 hjumpi
+          have ha1pc : ({ as' with stack := as'.stack.drop 1, pc := as'.pc + 2 } : AsmState).pc = 4 := by
+            show as'.pc + 2 = 4; rw [has'pc]
+          have hlt4 : ({ as' with stack := as'.stack.drop 1, pc := as'.pc + 2 } : AsmState).pc
+              < (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).1.length := by rw [ha1pc]; decide
+          have hpushX : (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).1.get ⟨_, hlt4⟩ = resolveInst (computeLabelOffsets (executePlan (generateFnPlan loopVFn 0 0).get!.1)).2 (AsmInst.AsmPushLabel "exit") := by
+            conv_lhs => rw [show (⟨_, hlt4⟩ : Fin _) = ⟨4, by decide⟩ from Fin.ext ha1pc]
+            rfl
+          have hlt5 : ({ as' with stack := as'.stack.drop 1, pc := as'.pc + 2 } : AsmState).pc + 1
+              < (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).1.length := by rw [ha1pc]; decide
+          have hjmp : (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).1.get ⟨_, hlt5⟩ = AsmInst.AsmOp "JUMP" := by
+            conv_lhs => rw [show (⟨_, hlt5⟩ : Fin _) = ⟨5, by decide⟩ from
+              Fin.ext (show _ + 1 = 5 by rw [ha1pc])]
+            rfl
+          have hj := resolved_jump_sim (offsets := (computeLabelOffsets (executePlan (generateFnPlan loopVFn 0 0).get!.1)).2) (offsetToPc := (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).2)
+            (prog := (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).1) (s := { as' with stack := as'.stack.drop 1, pc := as'.pc + 2 })
+            (target := "exit") (off := 10) (idx := 6)
+            hlt4 hpushX (by decide) (by decide) hlt5 hjmp (by decide)
+          have htail : runAsm 4 (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).1 as'
+              = AsmResult.AsmOK { as' with stack := as'.stack.drop 1, pc := 6 } := by
+            rw [show (4 : Nat) = 2 + 2 from rfl, runAsm_append_ok hnt]
+            exact hj
+          refine ⟨loopVExit, { as' with stack := as'.stack.drop 1, pc := 6 }, _, rfl,
+            (runAsm_append_ok hbody).trans htail, ?_, ?_, ?_⟩
+          · decide
+          · show (6 : Nat) = pcOfLabel (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).1 loopVExit.label
+            decide
+          · exact venomAsmRel_jumpTo _ _ _ _ _ (venomAsmRel_setPc hsucc')
+        · -- TAKEN: the BACK-EDGE, entry -> entry
+          have hrb := runBlock_body_jnz_taken loopVCtx loopVEntry j [cvInst2] loopVJnz cvInst2
+            [loopVJnz] s { updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with
+              instIdx := 1 }
+            (Operand.Var "a") "entry" "exit" s.callCtx.callvalue rfl rfl rfl
+            (by show lookupVar "a" (updateVar "a" s.callCtx.callvalue { s with instIdx := 0 })
+                  = some s.callCtx.callvalue
+                exact lookupVar_updateVar_self _ _ _) hc rfl (by decide)
+            (by intro i hi; simp only [List.mem_singleton] at hi; subst hi; decide)
+            (by simp [execBodyThread, cvInst2, stepInstBase, execRead0])
+            (by simpa [updateVar] using hnh)
+          simp only [List.length_singleton] at hrb
+          rw [hrb]
+          have hh' : (jumpTo "entry" ({ updateVar "a" s.callCtx.callvalue
+              { s with instIdx := 0 } with instIdx := 1 })).halted = false := by
+            simpa [jumpTo, updateVar] using hnh
+          simp only [hh', Bool.false_eq_true, if_false]
+          have ht := resolved_jumpi_taken_sim (offsets := (computeLabelOffsets (executePlan (generateFnPlan loopVFn 0 0).get!.1)).2) (offsetToPc := (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).2)
+            (prog := (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).1) (s := as') (ifNz := "entry") (off := 0) (idx := 0)
+            (cond := s.callCtx.callvalue) (stk := as'.stack.drop 1)
+            hstk_c hc hlt2 hpushE (by decide) (by decide) hlt3 hjumpi (by decide)
+          refine ⟨loopVEntry, { as' with stack := as'.stack.drop 1, pc := 0 }, _, rfl,
+            (runAsm_append_ok hbody).trans ht, ?_, ?_, ?_⟩
+          · decide
+          · show (0 : Nat) = pcOfLabel (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).1 loopVEntry.label
+            decide
+          · exact venomAsmRel_jumpTo _ _ _ _ _ (venomAsmRel_setPc hsucc')
+    · -- ===== EXIT: STOP =====
+      have hpcX : asm.pc = 6 := hpc.trans (by decide)
+      have hvrelX : venomAsmRel lo (initPlanState 0) s asm := by
+        have h := hvrel
+        rwa [show psOfFn (fnPlanFuel loopVFn) loopVFn 0 0 loopVExit.label = initPlanState 0 from
+          by decide] at h
+      match f' with
+      | 0 =>
+        have h0 : runBlock 0 loopVCtx loopVExit s = ExecResult.Error "out of fuel" := by
+          simp [runBlock, evalPhis, execBlock, loopVExit, stopInst]
+        rw [h0]; exact trivial
+      | (j+1) =>
+        have hrb : runBlock (j+1) loopVCtx loopVExit s
+            = ExecResult.Halt (haltState { s with instIdx := 0 }) := by
+          have h := runBlock_body_stop loopVCtx loopVExit j [] stopInst stopInst [] s
+            { s with instIdx := 0 } rfl rfl rfl (by decide) (by intro i hi; cases hi)
+            (by simp [execBodyThread])
+          simpa using h
+        obtain ⟨as1, hrun1, hrel1, hpc1⟩ := soLabel_sim (offsetToPc := (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).2)
+          lo (initPlanState 0) { s with instIdx := 0 } asm (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).1 "exit" hvrelX
+          (by rw [hpcX]; refine ⟨by decide, fun i hi => ?_⟩
+              have hi' : i < 1 := hi; interval_cases i; rfl)
+        have hlen1 : (executePlan [StackOp.SOLabel "exit"]).length = 1 := rfl
+        rw [hlen1] at hrun1
+        have hpc7 : as1.pc = 7 := by rw [hlen1] at hpc1; rw [hpc1, hpcX]
+        have hlt7 : as1.pc < (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).1.length := by rw [hpc7]; decide
+        have hstop7 : (asmResolve (executePlan (generateFnPlan loopVFn 0 0).get!.1)).1.get ⟨as1.pc, hlt7⟩ = AsmInst.AsmOp "STOP" := by
+          conv_lhs => rw [show (⟨as1.pc, hlt7⟩ : Fin _) = ⟨7, by decide⟩ from Fin.ext hpc7]
+          rfl
+        have hm := HbsimMatch_stop_from_body (Entry := fun _ _ _ => True)
+          hrb hrun1 hrel1 hlt7 hstop7 (by omega : 1 + 1 ≤ N)
+        rw [hrb] at hm ⊢
+        exact hm
+
 def invInst2 : Instruction := { id := 3, opcode := Opcode.INVALID, operands := [], outputs := [] }
 def cvInvBB : BasicBlock := { label := "entry", instructions := [cvInst2, invInst2] }
 def cvInvFn : IrFunction := { name := "main", blocks := [cvInvBB] }

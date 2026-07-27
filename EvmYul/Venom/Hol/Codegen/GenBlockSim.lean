@@ -6986,6 +6986,11 @@ solution and did not follow it.
 
 The real open item was never the statement. It is that **no loop has been driven end to end through
 `codegen_correct_fuel_sched`** — the per-block obligations for a cyclic function at a loop-admitting
-budget. That is the work, and it was the work before this detour. -/
+budget. That is the work, and it was the work before this detour.
+
+**2026-07-17: done.** `codegen_correct_loopVFn_fuel` (`GenBlockSimExample`) drives
+`entry: %a = CALLVALUE ; JNZ %a entry exit` / `exit: STOP` — a real back-edge
+(`loopVFn_back_edge`) — end to end through this driver, both JNZ arms, on the real generated
+program, at budget `fuel * 8`. -/
 
 end EvmYul.Venom.Hol.Codegen
