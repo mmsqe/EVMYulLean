@@ -166,7 +166,10 @@ def generatePhiPlan (inst : Instruction) (nextLiveness : List String)
       let ps' := { ps with stack := stackPoke dist ret ps.stack }
       ([StackOp.SOPoke dist ret], ps')
 
-/-- `generate_offset_plan`: push `(label + offset)`. -/
+/-- `generate_offset_plan`: push `(label + offset)`. Only sound for the *data-section* form
+    `OFFSET (Lit n) (Label l)`; the general form is routed to `generateRegularInstPlan` by
+    `generateInstPlan` (see `isOffsetLabelForm`), since `OFFSET`'s semantics is `execPure2 (+)`
+    and the `_ => ([], ps)` fallback below would drop the output entirely. -/
 def generateOffsetPlan (inst : Instruction) (ps : PlanState) : List StackOp × PlanState :=
   let ofstVal := inst.operands.head!
   let labelOp := inst.operands[1]!
@@ -175,6 +178,15 @@ def generateOffsetPlan (inst : Instruction) (ps : PlanState) : List StackOp × P
   match labelOp with
   | Operand.Label l => ([StackOp.SOPushOfst l n], { ps with stack := stackPush ret ps.stack })
   | _ => ([], ps)
+
+/-- The *data-section* `OFFSET` shape `OFFSET _ (Label l)` — the only form `generateOffsetPlan`
+    lowers soundly. Any other shape is a plain addition (`execPure2 (+)`) and must go through the
+    regular path, or its output would never reach the stack (a silent miscompile: the emitted code
+    would consume operands that were never pushed). -/
+def isOffsetLabelForm (inst : Instruction) : Bool :=
+  match inst.operands with
+  | [_, Operand.Label _] => true
+  | _ => false
 
 /-- **DJMP comparison chain + pop-trampolines.** For each target label `lᵢ` (index `i`), emit a check
     `DUP1 ; PUSH i ; EQ ; PUSH tᵢ ; JUMPI` (the selector is DUP'd so it survives for the next check), and
@@ -236,6 +248,10 @@ def generateEmitOps (inst : Instruction) (logTopicCount : Nat)
       ([StackOp.SOEmit ("LOG" ++ toString logTopicCount)], ps)
     else if opc = Opcode.ISTORE then
       ([StackOp.SOEmit "SWAP1", StackOp.SOEmit "MSTORE"], ps)
+    else if opc = Opcode.OFFSET then
+      -- Non-data-section `OFFSET` is a plain addition (`execPure2 (+)`); the data-section form
+      -- `OFFSET _ (Label l)` never reaches here (intercepted by `generateInstPlan`).
+      ([StackOp.SOEmit "ADD"], ps)
     else ([], ps)
 
 /-- `compute_operands`: which operands go on the stack, in EVM **stack order** (TOS = rightmost).
@@ -374,7 +390,10 @@ def generateInstPlan (liveness : DfState (List String)) (dfg : DfgAnalysis) (cfg
     : Option (List StackOp × PlanState) :=
   if isPreCodegenOpcode inst.opcode then none
   else if inst.opcode = Opcode.PHI then some (generatePhiPlan inst nextLiveness ps)
-  else if inst.opcode = Opcode.OFFSET then some (generateOffsetPlan inst ps)
+  else if inst.opcode = Opcode.OFFSET then
+    (if isOffsetLabelForm inst then some (generateOffsetPlan inst ps)
+     else some (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness isHalting
+                  nextIsTerminator curBbLabel ps))
   else if inst.opcode = Opcode.PARAM then some ([], ps)
   else if inst.opcode = Opcode.NOP then some ([], ps)
   else some (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness isHalting

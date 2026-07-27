@@ -1252,6 +1252,10 @@ theorem generateEmitOps_not_jump (inst : Instruction) (k : Nat) (ps : PlanState)
     · -- ISTORE: SWAP1; MSTORE
       simp only [List.mem_cons, List.not_mem_nil, or_false] at hop
       rcases hop with hc | hc <;> subst hc <;> exact ⟨by decide, by decide⟩
+    · -- OFFSET (non-data-section form): a plain ADD
+      simp only [List.mem_singleton] at hop
+      subst hop
+      exact ⟨by decide, by decide⟩
     · simp at hop
 
 /-! ### …and the exclusions are NECESSARY, not merely cautious
@@ -1562,6 +1566,7 @@ theorem generateInstPlan_not_jump (liveness : DfState (List String)) (dfg : DfgA
      rw [← hq] at hop)
   · exact SOJumpFree_of_noEmit _ (generatePhiPlan_noEmit _ _ _ op hop)
   · exact SOJumpFree_of_noEmit _ (generateOffsetPlan_noEmit _ _ op hop)
+  · exact generateRegularInstPlan_not_jump _ _ _ _ _ _ _ _ _ _ h op hop
   · simp at hop
   · simp at hop
   · exact generateRegularInstPlan_not_jump _ _ _ _ _ _ _ _ _ _ h op hop

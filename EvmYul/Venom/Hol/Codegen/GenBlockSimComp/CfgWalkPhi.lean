@@ -3643,9 +3643,13 @@ theorem generateInstPlan_soLabel_is_fresh (liveness : DfState (List String)) (df
       obtain ⟨rfl, -⟩ := h
       exact absurd rfl (generatePhiPlan_no_soLabel _ _ _ _ hso m)
     · split at h
-      · simp only [Option.some.injEq, Prod.ext_iff] at h
-        obtain ⟨rfl, -⟩ := h
-        exact absurd rfl (generateOffsetPlan_no_soLabel _ _ _ hso m)
+      · split at h
+        · simp only [Option.some.injEq, Prod.ext_iff] at h
+          obtain ⟨rfl, -⟩ := h
+          exact absurd rfl (generateOffsetPlan_no_soLabel _ _ _ hso m)
+        · simp only [Option.some.injEq, Prod.ext_iff] at h
+          obtain ⟨rfl, -⟩ := h
+          exact generateRegularInstPlan_soLabel_is_fresh _ _ _ _ _ _ _ _ _ _ m hso
       · split at h
         · simp only [Option.some.injEq, Prod.ext_iff] at h
           obtain ⟨rfl, -⟩ := h

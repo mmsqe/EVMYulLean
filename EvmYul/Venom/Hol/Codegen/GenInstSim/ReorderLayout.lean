@@ -2283,9 +2283,14 @@ theorem generateInstPlan_no_soLabel (liveness : DfState (List String)) (dfg : Df
       obtain ⟨rfl, -⟩ := h
       exact generatePhiPlan_no_soLabel _ _ _ _ hso l rfl
     · split at h
-      · simp only [Option.some.injEq, Prod.ext_iff] at h
-        obtain ⟨rfl, -⟩ := h
-        exact generateOffsetPlan_no_soLabel _ _ _ hso l rfl
+      · split at h
+        · simp only [Option.some.injEq, Prod.ext_iff] at h
+          obtain ⟨rfl, -⟩ := h
+          exact generateOffsetPlan_no_soLabel _ _ _ hso l rfl
+        · simp only [Option.some.injEq, Prod.ext_iff] at h
+          obtain ⟨rfl, -⟩ := h
+          exact generateRegularInstPlan_no_soLabel _ _ _ _ _ _ _ _ _ _ hinv hau hdjmp
+            _ hso l rfl
       · split at h
         · simp only [Option.some.injEq, Prod.ext_iff] at h
           obtain ⟨rfl, -⟩ := h

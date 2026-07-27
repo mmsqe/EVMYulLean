@@ -3925,8 +3925,11 @@ theorem generateInstPlan_alloc_inv (liveness : DfState (List String)) (dfg : Dfg
     · simp only [Option.some.injEq, Prod.ext_iff] at h; obtain ⟨_, rfl⟩ := h
       exact generatePhiPlan_alloc_inv _ _ _
     · split at h
-      · simp only [Option.some.injEq, Prod.ext_iff] at h; obtain ⟨_, rfl⟩ := h
-        exact generateOffsetPlan_alloc_inv _ _
+      · split at h
+        · simp only [Option.some.injEq, Prod.ext_iff] at h; obtain ⟨_, rfl⟩ := h
+          exact generateOffsetPlan_alloc_inv _ _
+        · simp only [Option.some.injEq, Prod.ext_iff] at h; obtain ⟨_, rfl⟩ := h
+          exact generateRegularInstPlan_alloc_inv _ _ _ _ _ _ _ _ _ _
       · split at h
         · simp only [Option.some.injEq, Prod.ext_iff] at h; obtain ⟨_, rfl⟩ := h
           exact AllocInv.rfl' _
