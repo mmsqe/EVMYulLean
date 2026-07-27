@@ -53,6 +53,28 @@ def blockTerminatedWf (insts : List Instruction) : Prop :=
       ∀ inst ∈ insts.dropLast, isTerminator inst.opcode = false
   | none => False
 
+/-- The `Var` names an instruction reads, in operand order. -/
+def instVarOperands (inst : Instruction) : List String :=
+  inst.operands.filterMap (fun o => match o with | Operand.Var v => some v | _ => none)
+
+/-- **No variable occurs twice in one instruction's operand list.**
+
+    Upstream's `codegen_ready_fn` excludes *all* multi-use via `single_use_form`. This port is
+    deliberately more permissive — a variable used once in each of several instructions is compiled
+    correctly (the earlier uses emit a `DUP`, the last consumes in place) — but that extension is
+    incomplete at the INTRA-instruction repeat: `emitOneInput` sends a dead var down the
+    consume-in-place branch (emitting nothing and pushing nothing), and `emitInputPlan` folds with the
+    same `nextLiveness`, so `[Var a, Var a]` leaves ONE copy on the stack while the emit pops two.
+    Concretely `%a = ADD 1 2; SSTORE %a %a; STOP` compiles to an underflowing program (D7).
+
+    Until `emitInputPlan` is made occurrence-aware, this conjunct keeps such functions out of the
+    readiness contract, so no theorem assuming `codegenReadyFn` claims anything about them. -/
+def instNoRepeatedVarOperand (inst : Instruction) : Prop :=
+  (instVarOperands inst).Nodup
+
+instance (inst : Instruction) : Decidable (instNoRepeatedVarOperand inst) := by
+  unfold instNoRepeatedVarOperand; infer_instance
+
 /-- Per-function: structural WF + SSA + SUE + normalized CFG + no bad opcodes.
     These preconditions are discharged by earlier passes in the pipeline.
     For our property definitions, we state them as assumptions (Props). -/
@@ -61,7 +83,9 @@ def codegenReadyFn (fn : IrFunction) : Prop :=
   (∀ bb ∈ fn.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst) ∧
   -- Well-formedness: every block is properly terminated (was a `True` stub). The block simulator's
   -- structure hyps follow via `blockTerminatedWf_extract`.
-  (∀ bb ∈ fn.blocks, blockTerminatedWf bb.instructions)
+  (∀ bb ∈ fn.blocks, blockTerminatedWf bb.instructions) ∧
+  -- D7: no instruction repeats a `Var` in its own operand list (see `instNoRepeatedVarOperand`).
+  (∀ bb ∈ fn.blocks, ∀ inst ∈ bb.instructions, instNoRepeatedVarOperand inst)
 
 /-- **Block WF ⟹ the `front ++ [term]` decomposition.** Extracts exactly the structural facts
     `genBlockSimulation` consumes (`hbb`/`histerm`/`hnonterm`) from `blockTerminatedWf`: the block is
@@ -91,7 +115,7 @@ theorem codegenReadyFn_blockStruct {fn : IrFunction} (h : codegenReadyFn fn)
     {bb : BasicBlock} (hmem : bb ∈ fn.blocks) :
     ∃ front term, bb.instructions = front ++ [term] ∧ isTerminator term.opcode = true ∧
       ∀ inst ∈ front, isTerminator inst.opcode = false :=
-  blockTerminatedWf_extract (h.2 bb hmem)
+  blockTerminatedWf_extract (h.2.1 bb hmem)
 
 /-- Per-context: all functions ready. -/
 def codegenReady (ctx : VenomContext) : Prop :=
