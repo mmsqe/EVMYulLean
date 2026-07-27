@@ -1436,9 +1436,9 @@ theorem sloEntry_body {lo : AssocList String Nat} {offsetToPc : AssocList Nat Na
   refine ⟨cv_step (out := "a") (S := []) rfl (by decide) (by decide),
           cv_step (out := "b") (S := ["a"]) rfl (by decide) (by decide), ?_, trivial⟩
   refine Or.inl ⟨?_, by decide⟩
-  exact Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr
+  exact Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl
     ⟨"a", "c", rfl, by decide, rfl, fun _ => rfl, rfl, rfl,
-     by decide, by decide, by decide, by decide, fun _ h hg => asmStep_sload_ok h hg⟩)))))))))
+     by decide, by decide, by decide, by decide, fun _ h hg => asmStep_sload_ok h hg⟩))))))))))
 
 /-- Body-end state of `sloEntry`: `a,b := callvalue`, `c := sloVal s` (the transient read at key `a`). -/
 abbrev sloEntrySEnd (s : VenomState) : VenomState :=
@@ -1867,6 +1867,486 @@ theorem codegen_correct_sloFn_recipeW {lo : AssocList String Nat} {vs : VenomSta
       rw [haspc]; exact (pcOfLabel_entry_zero rfl hfnready hgen).symm
     · show (asmResolve (executePlan (generateFnPlan sloFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan sloFn 0 0).get!.1)).1 "entry" ≤ (asmResolve (executePlan (generateFnPlan sloFn 0 0).get!.1)).1.length
       omega
+
+/-! ### ✅ A BLOCKHASH (block-env read) via the recipe route — `codegen_correct_bkhFn_recipeW`
+
+The block-environment read `BLOCKHASH` (the newly-wired 12th `RegularStepG` arm, `asmStep_blockhash_ok` /
+`bodyStep_blockhash`), twin of `BLOCKHASH`/`TLOAD`:
+
+```
+entry:  %a = CALLVALUE ; %b = CALLVALUE ; %c = BLOCKHASH %a ; JMP next   -- a,b,c all live → delivered
+next:   %e = MUL %b %c ; RETURN %e, %a                               -- MUL consumes the TOP two (b,c)
+```
+
+`BLOCKHASH %a` is a 1-input read (`RegularStepG`'s BLOCKHASH arm, emitted `DUP2 ; BLOCKHASH`), leaving `[a, b, c]`
+with `c = bkhVal s` (the block hash at index `callvalue` — context-dependent, generally NON-zero, so
+`c` cannot itself be a RETURN operand). In `next` the consuming `MUL %b %c` eats the top two (`b, c`);
+since `b = 0`, `e = 0 * c = 0` (via `uint256_zero_mul`, regardless of `c`), emptying the return window.
+`a` (bottom) is never buried — no f1a reorder. `entry` via `hsupplyW_regularJmp`, `next` via
+`hsupplyW_regularReturnTo` fed the consuming `MUL` (`bkhNext_ready`). -/
+
+def bkhCvA : Instruction := { id := 0, opcode := Opcode.CALLVALUE, operands := [], outputs := ["a"] }
+def bkhCvB : Instruction := { id := 1, opcode := Opcode.CALLVALUE, operands := [], outputs := ["b"] }
+def bkhLoad : Instruction :=
+  { id := 2, opcode := Opcode.BLOCKHASH, operands := [Operand.Var "a"], outputs := ["c"] }
+def bkhJmp : Instruction := { id := 3, opcode := Opcode.JMP, operands := [Operand.Label "next"], outputs := [] }
+def bkhMul : Instruction :=
+  { id := 4, opcode := Opcode.MUL, operands := [Operand.Var "b", Operand.Var "c"], outputs := ["e"] }
+def bkhRet : Instruction :=
+  { id := 5, opcode := Opcode.RETURN, operands := [Operand.Var "e", Operand.Var "a"], outputs := [] }
+def bkhEntry : BasicBlock := { label := "entry", instructions := [bkhCvA, bkhCvB, bkhLoad, bkhJmp] }
+def bkhNext : BasicBlock := { label := "next", instructions := [bkhMul, bkhRet] }
+def bkhFn : IrFunction := { name := "main", blocks := [bkhEntry, bkhNext] }
+def bkhCtx : VenomContext := { functions := [bkhFn], entry := some "main" }
+
+theorem bkh_unresolved_asm : executePlan (generateFnPlan bkhFn 0 0).get!.1 =
+    [AsmInst.AsmLabel "entry", AsmInst.AsmOp "CALLVALUE", AsmInst.AsmOp "CALLVALUE",
+     AsmInst.AsmOp "DUP2", AsmInst.AsmOp "BLOCKHASH", AsmInst.AsmPushLabel "next",
+     AsmInst.AsmOp "JUMP", AsmInst.AsmLabel "next", AsmInst.AsmOp "MUL", AsmInst.AsmOp "RETURN"] := by rfl
+
+/-- The block hash BLOCKHASH reads at index `a` (= the call value); context-dependent, generally NON-zero. -/
+abbrev bkhVal (s : VenomState) : bytes32 := s.blockCtx.blockhash s.callCtx.callvalue.toNat
+
+/-- entry's body `[CV a; CV b; BLOCKHASH %a]` as a `RegularBodyH`: two `cv_step`s then the
+    BLOCKHASH read via `RegularStepG`'s BLOCKHASH arm (`asmStep_tload_ok`), output live. -/
+theorem bkhEntry_body {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat} :
+    RegularBodyH lo ["a", "b", "c"] offsetToPc
+      (asmResolve (executePlan (generateFnPlan bkhFn 0 0).get!.1)).1 1 [bkhCvA, bkhCvB, bkhLoad] [] := by
+  refine ⟨cv_step (out := "a") (S := []) rfl (by decide) (by decide),
+          cv_step (out := "b") (S := ["a"]) rfl (by decide) (by decide), ?_, trivial⟩
+  refine Or.inl ⟨?_, by decide⟩
+  exact Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr
+    ⟨"a", "c", rfl, by decide, rfl, fun _ => rfl, rfl, rfl,
+     by decide, by decide, by decide, by decide, fun _ h hg => asmStep_blockhash_ok h hg⟩))))))))))
+
+/-- Body-end state of `bkhEntry`: `a,b := callvalue`, `c := bkhVal s` (the block-hash read at index `a`). -/
+abbrev bkhEntrySEnd (s : VenomState) : VenomState :=
+  { updateVar "c" (bkhVal s)
+      { updateVar "b" s.callCtx.callvalue
+          { updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 }
+        with instIdx := 2 }
+    with instIdx := 3 }
+
+theorem bkhEntry_thread (s : VenomState) :
+    execBodyThread [bkhCvA, bkhCvB, bkhLoad] 0 { s with instIdx := 0 } = some (bkhEntrySEnd s) := by
+  have hla : lookupVar "a" ({ updateVar "b" s.callCtx.callvalue
+        { updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 }
+      with instIdx := 2 } : VenomState) = some s.callCtx.callvalue := by
+    show lookupVar "a" (updateVar "b" s.callCtx.callvalue
+      (updateVar "a" s.callCtx.callvalue { s with instIdx := 0 })) = some s.callCtx.callvalue
+    rw [lookupVar_updateVar_ne _ _ _ _ (by decide), lookupVar_updateVar_self]
+  have hlb : lookupVar "b" ({ updateVar "b" s.callCtx.callvalue
+        { updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 }
+      with instIdx := 2 } : VenomState) = some s.callCtx.callvalue :=
+    lookupVar_updateVar_self _ _ _
+  have hsub : stepInstBase bkhLoad ({ updateVar "b" s.callCtx.callvalue
+        { updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 }
+      with instIdx := 2 } : VenomState) = ExecResult.OK (updateVar "c" (bkhVal s)
+        ({ updateVar "b" s.callCtx.callvalue
+          { updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 }
+        with instIdx := 2 })) := by
+    have he : evalOperand (Operand.Var "a") ({ updateVar "b" s.callCtx.callvalue
+        { updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 }
+      with instIdx := 2 } : VenomState) = some s.callCtx.callvalue := hla
+    simp only [bkhLoad, stepInstBase, execRead1, he]
+    rfl
+  have h1 : stepInstBase bkhCvA { s with instIdx := 0 }
+      = ExecResult.OK (updateVar "a" s.callCtx.callvalue { s with instIdx := 0 }) := rfl
+  have h2 : stepInstBase bkhCvB ({ updateVar "a" s.callCtx.callvalue { s with instIdx := 0 }
+        with instIdx := 1 } : VenomState)
+      = ExecResult.OK (updateVar "b" s.callCtx.callvalue
+          ({ updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 })) := rfl
+  show (match stepInstBase bkhCvA { s with instIdx := 0 } with
+        | ExecResult.OK s' => execBodyThread [bkhCvB, bkhLoad] 1 { s' with instIdx := 1 }
+        | _ => none) = some (bkhEntrySEnd s)
+  rw [h1]
+  show (match stepInstBase bkhCvB ({ updateVar "a" s.callCtx.callvalue { s with instIdx := 0 }
+          with instIdx := 1 }) with
+        | ExecResult.OK s' => execBodyThread [bkhLoad] 2 { s' with instIdx := 2 }
+        | _ => none) = some (bkhEntrySEnd s)
+  rw [h2]
+  show (match stepInstBase bkhLoad ({ updateVar "b" s.callCtx.callvalue
+            { updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 }
+          with instIdx := 2 }) with
+        | ExecResult.OK s' => execBodyThread [] 3 { s' with instIdx := 3 }
+        | _ => none) = some (bkhEntrySEnd s)
+  rw [hsub]
+  rfl
+
+/-- `bkhEntry`'s OK result is `jumpTo "next"` of the body-end state (fuel ≥ 4). -/
+theorem bkhEntry_runBlock (s : VenomState) (j : Nat) (hnh : s.halted = false) :
+    runBlock (3 + (j + 1)) bkhCtx bkhEntry s = ExecResult.OK (jumpTo "next" (bkhEntrySEnd s)) :=
+  runBlock_body_jmp bkhCtx bkhEntry j [bkhCvA, bkhCvB, bkhLoad] bkhJmp bkhCvA [bkhCvB, bkhLoad, bkhJmp] s
+    (bkhEntrySEnd s) "next" rfl rfl rfl rfl (by decide)
+    (by intro i hi; simp only [List.mem_cons, List.not_mem_nil, or_false] at hi
+        rcases hi with rfl | rfl | rfl <;> decide)
+    (bkhEntry_thread s) (by simpa [updateVar] using hnh)
+
+/-- `next`'s consuming `MUL %b %c` (mirror order, `bytes32_mul_comm`) as a `BodyStepsReadyHTo`:
+    it eats the top two `[b, c]` off the entry stack `[a, b, c]`, leaving `[a, e]`. -/
+theorem bkhNext_ready {lo : AssocList String Nat} :
+    BodyStepsReadyHTo lo (asmResolve (executePlan (generateFnPlan bkhFn 0 0).get!.1)).2
+      (asmResolve (executePlan (generateFnPlan bkhFn 0 0).get!.1)).1
+      (fun z p => generateRegularInstPlan exLiveness DfgAnalysis.empty exCfg bkhFn z.1
+        ["e", "a"] false true "next" p)
+      (fun _ => 1) ([bkhMul].zipIdx 0) ["a", "b", "c"] ["a", "e"] :=
+  bodyStepsReadyHTo_singleton
+    (bodyStepHTo_commBinopDeadMirror (liveness := exLiveness) (dfg := DfgAnalysis.empty)
+      (cfg := exCfg) (fn := bkhFn) (curBbLabel := "next") (base := ["a"]) (x := "b") (y := "c")
+      (out := "e") (idx := 0)
+      rfl (by decide) bytes32_mul_comm (fun _ => rfl) rfl rfl (by decide) (by decide) (by decide)
+      (by decide) (by decide) (fun _ h hg => asmStep_mul_ok h hg))
+
+abbrev bkhNextSEnd (s : VenomState) (wb wc : bytes32) : VenomState :=
+  { updateVar "e" (wb * wc) { s with instIdx := 0 } with instIdx := 1 }
+
+theorem bkhNextSEnd_lookup (s : VenomState) (wb wc : bytes32) :
+    lookupVar "e" (bkhNextSEnd s wb wc) = some (wb * wc)
+    ∧ lookupVar "a" (bkhNextSEnd s wb wc) = lookupVar "a" s := by
+  refine ⟨lookupVar_updateVar_self _ _ _, ?_⟩
+  show lookupVar "a" (updateVar "e" (wb * wc) { s with instIdx := 0 }) = _
+  rw [lookupVar_updateVar_ne _ _ _ _ (by decide)]; rfl
+
+theorem bkhNext_thread (s : VenomState) (wb wc : bytes32)
+    (hb : lookupVar "b" s = some wb) (hc : lookupVar "c" s = some wc) :
+    execBodyThread [bkhMul] 0 { s with instIdx := 0 } = some (bkhNextSEnd s wb wc) := by
+  have hb' : lookupVar "b" { s with instIdx := 0 } = some wb := hb
+  have hc' : lookupVar "c" { s with instIdx := 0 } = some wc := hc
+  have hstep : stepInstBase bkhMul { s with instIdx := 0 }
+      = ExecResult.OK (updateVar "e" (wb * wc) { s with instIdx := 0 }) :=
+    stepInstBase_binopVar (inst := bkhMul) (f := fun a b => a * b) (x := "b") (y := "c")
+      (out := "e") rfl rfl rfl hb' hc'
+  show (match stepInstBase bkhMul { s with instIdx := 0 } with
+        | ExecResult.OK s' => execBodyThread [] 1 { s' with instIdx := 1 } | _ => none) = _
+  rw [hstep]; rfl
+
+/-- The MUL errors when `b` is undefined (the shape `runBlock_body_head_error` consumes). -/
+theorem bkhMul_error_b (s : VenomState) (hb : lookupVar "b" s = none) :
+    stepInstBase bkhMul { s with instIdx := 0 } = ExecResult.Error "undefined operand" := by
+  have hb' : lookupVar "b" { s with instIdx := 0 } = none := hb
+  simp [bkhMul, stepInstBase, execPure2, evalOperand, hb']
+
+/-- The MUL errors when `c` is undefined (given `b` defined). -/
+theorem bkhMul_error_c (s : VenomState) (wb : bytes32)
+    (hb : lookupVar "b" s = some wb) (hc : lookupVar "c" s = none) :
+    stepInstBase bkhMul { s with instIdx := 0 } = ExecResult.Error "undefined operand" := by
+  have hb' : lookupVar "b" { s with instIdx := 0 } = some wb := hb
+  have hc' : lookupVar "c" { s with instIdx := 0 } = none := hc
+  simp [bkhMul, stepInstBase, execPure2, evalOperand, hb', hc']
+
+/-- `next` halts when `a, b, c` are all defined: ADD then RETURN reads `e = b+c` and `a`. -/
+theorem bkhNext_halts (s : VenomState) (j : Nat) (wb wc wa : bytes32)
+    (hb : lookupVar "b" s = some wb) (hc : lookupVar "c" s = some wc)
+    (ha : lookupVar "a" s = some wa) :
+    runBlock (1 + (j + 1)) bkhCtx bkhNext s = ExecResult.Halt
+      (haltState (setReturndata (readMemory (wb * wc).toNat wa.toNat (bkhNextSEnd s wb wc))
+        (bkhNextSEnd s wb wc))) := by
+  obtain ⟨he, haa⟩ := bkhNextSEnd_lookup s wb wc
+  rw [ha] at haa
+  exact runBlock_body_return bkhCtx bkhNext j [bkhMul] bkhRet bkhMul [bkhRet] s (bkhNextSEnd s wb wc)
+    (Operand.Var "e") (Operand.Var "a") (wb * wc) wa rfl rfl rfl he haa rfl (by decide)
+    (by intro i hi; simp only [List.mem_singleton] at hi; subst hi; decide)
+    (bkhNext_thread s wb wc hb hc)
+
+/-- `next` errors when `a` is undefined (given `b, c` defined): ADD succeeds, RETURN faults on `a`. -/
+theorem bkhNext_error_a (s : VenomState) (j : Nat) (wb wc : bytes32)
+    (hb : lookupVar "b" s = some wb) (hc : lookupVar "c" s = some wc) (ha : lookupVar "a" s = none) :
+    runBlock (1 + (j + 1)) bkhCtx bkhNext s = ExecResult.Error "return: undefined operand" := by
+  obtain ⟨he, haa⟩ := bkhNextSEnd_lookup s wb wc
+  rw [ha] at haa
+  refine runBlock_body_term bkhCtx bkhNext j [bkhMul] bkhRet bkhMul [bkhRet] s (bkhNextSEnd s wb wc)
+    (ExecResult.Error "return: undefined operand") rfl rfl (by decide)
+    (by intro i hi; simp only [List.mem_singleton] at hi; subst hi; decide)
+    (bkhNext_thread s wb wc hb hc) ?_
+  intro inst hget
+  simp [execBlock, getInstruction_bodyEnd (by rfl : bkhNext.instructions = [bkhMul] ++ [bkhRet])
+    (bkhNext_thread s wb wc hb hc), bkhRet, stepInstBase, evalOperand, he, haa, isExternalCall]
+
+/-- lookupVar of `bkhEntrySEnd`: `a, b` are the call value, `c = callvalue - callvalue`. -/
+theorem bkhEntrySEnd_lookup (s : VenomState) :
+    lookupVar "a" (bkhEntrySEnd s) = some s.callCtx.callvalue
+    ∧ lookupVar "b" (bkhEntrySEnd s) = some s.callCtx.callvalue
+    ∧ lookupVar "c" (bkhEntrySEnd s) = some (bkhVal s) := by
+  refine ⟨?_, ?_, ?_⟩
+  · show lookupVar "a" (updateVar "c" (bkhVal s)
+      (updateVar "b" s.callCtx.callvalue (updateVar "a" s.callCtx.callvalue { s with instIdx := 0 }))) = _
+    rw [lookupVar_updateVar_ne _ _ _ _ (by decide), lookupVar_updateVar_ne _ _ _ _ (by decide),
+      lookupVar_updateVar_self]
+  · show lookupVar "b" (updateVar "c" (bkhVal s)
+      (updateVar "b" s.callCtx.callvalue (updateVar "a" s.callCtx.callvalue { s with instIdx := 0 }))) = _
+    rw [lookupVar_updateVar_ne _ _ _ _ (by decide), lookupVar_updateVar_self]
+  · show lookupVar "c" (updateVar "c" (bkhVal s)
+      (updateVar "b" s.callCtx.callvalue (updateVar "a" s.callCtx.callvalue { s with instIdx := 0 }))) = _
+    rw [lookupVar_updateVar_self]
+
+/-- The invariant: unhalted, zero call value, and at `next` the delivered `a, b, c` are all zero. -/
+def bkhInv (s : VenomState) : Prop :=
+  s.halted = false ∧ s.callCtx.callvalue = EvmYul.UInt256.ofNat 0 ∧
+  (s.currentBb = "next" → lookupVar "a" s = some (EvmYul.UInt256.ofNat 0)
+                        ∧ lookupVar "b" s = some (EvmYul.UInt256.ofNat 0)
+                        ∧ lookupVar "c" s = some (bkhVal s))
+
+theorem bkhInv_pres : ∀ bb ∈ bkhFn.blocks, ∀ (s s' : VenomState) (f' : Nat),
+    bkhInv s → runBlock f' bkhCtx bb s = ExecResult.OK s' → bkhInv s' := by
+  intro bb hbb s s' f' hinv hrun
+  obtain ⟨hnh, hcv, _⟩ := hinv
+  simp only [bkhFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+  rcases hbb with rfl | rfl
+  · -- entry: fuel ≤ 3 is out-of-fuel (Error); fuel ≥ 4 lands on `jumpTo "next" (bkhEntrySEnd s)`
+    have hnt : ∀ inst ∈ [bkhCvA, bkhCvB, bkhLoad], isTerminator inst.opcode = false := by
+      intro i hi; simp only [List.mem_cons, List.not_mem_nil, or_false] at hi
+      rcases hi with rfl | rfl | rfl <;> decide
+    match f' with
+    | 0 => obtain ⟨e, he⟩ := runBlock_oof bkhCtx bkhEntry 0 [bkhCvA, bkhCvB, bkhLoad] bkhJmp bkhCvA
+             [bkhCvB, bkhLoad, bkhJmp] s (bkhEntrySEnd s) rfl rfl (by decide) hnt (bkhEntry_thread s) (by decide)
+           rw [he] at hrun; exact absurd hrun (by simp)
+    | 1 => obtain ⟨e, he⟩ := runBlock_oof bkhCtx bkhEntry 1 [bkhCvA, bkhCvB, bkhLoad] bkhJmp bkhCvA
+             [bkhCvB, bkhLoad, bkhJmp] s (bkhEntrySEnd s) rfl rfl (by decide) hnt (bkhEntry_thread s) (by decide)
+           rw [he] at hrun; exact absurd hrun (by simp)
+    | 2 => obtain ⟨e, he⟩ := runBlock_oof bkhCtx bkhEntry 2 [bkhCvA, bkhCvB, bkhLoad] bkhJmp bkhCvA
+             [bkhCvB, bkhLoad, bkhJmp] s (bkhEntrySEnd s) rfl rfl (by decide) hnt (bkhEntry_thread s) (by decide)
+           rw [he] at hrun; exact absurd hrun (by simp)
+    | 3 => obtain ⟨e, he⟩ := runBlock_oof bkhCtx bkhEntry 3 [bkhCvA, bkhCvB, bkhLoad] bkhJmp bkhCvA
+             [bkhCvB, bkhLoad, bkhJmp] s (bkhEntrySEnd s) rfl rfl (by decide) hnt (bkhEntry_thread s) (by decide)
+           rw [he] at hrun; exact absurd hrun (by simp)
+    | (j+4) =>
+      rw [show j+4 = 3+(j+1) from by omega, bkhEntry_runBlock s j hnh] at hrun
+      injection hrun with h; subst h
+      obtain ⟨ha0, hb0, hc0⟩ := bkhEntrySEnd_lookup s
+      rw [hcv] at ha0 hb0
+      refine ⟨by simpa [jumpTo, updateVar] using hnh, by simp [jumpTo, updateVar, hcv], fun _ => ⟨ha0, hb0, ?_⟩⟩
+      rw [show lookupVar "c" (jumpTo "next" (bkhEntrySEnd s)) = lookupVar "c" (bkhEntrySEnd s) from rfl, hc0]
+      rfl
+  · -- next: RETURN never yields OK (ADD errors on undefined b/c, RETURN errors on undefined a, else Halt)
+    rcases hlb : lookupVar "b" s with _ | wb
+    · match f' with
+      | 0 => rw [runBlock_no_phi 0 bkhCtx bkhNext s bkhMul [bkhRet] rfl (by decide)] at hrun
+             simp [execBlock] at hrun
+      | (j+1) =>
+        rw [runBlock_body_head_error bkhCtx bkhNext bkhMul [bkhRet] s "undefined operand" j rfl
+          (by decide) (bkhMul_error_b s hlb) (by decide) (by decide)] at hrun
+        exact absurd hrun (by simp)
+    · rcases hlc : lookupVar "c" s with _ | wc
+      · match f' with
+        | 0 => rw [runBlock_no_phi 0 bkhCtx bkhNext s bkhMul [bkhRet] rfl (by decide)] at hrun
+               simp [execBlock] at hrun
+        | (j+1) =>
+          rw [runBlock_body_head_error bkhCtx bkhNext bkhMul [bkhRet] s "undefined operand" j rfl
+            (by decide) (bkhMul_error_c s wb hlb hlc) (by decide) (by decide)] at hrun
+          exact absurd hrun (by simp)
+      · rcases hla : lookupVar "a" s with _ | wa
+        · match f' with
+          | 0 => rw [runBlock_no_phi 0 bkhCtx bkhNext s bkhMul [bkhRet] rfl (by decide)] at hrun
+                 simp [execBlock] at hrun
+          | 1 => obtain ⟨e, he⟩ := runBlock_oof bkhCtx bkhNext 1 [bkhMul] bkhRet bkhMul [bkhRet] s
+                   (bkhNextSEnd s wb wc) rfl rfl (by decide)
+                   (by intro i hi; simp only [List.mem_singleton] at hi; subst hi; decide)
+                   (bkhNext_thread s wb wc hlb hlc) (by decide)
+                 rw [he] at hrun; exact absurd hrun (by simp)
+          | (j+2) =>
+            rw [show j+2 = 1+(j+1) from by omega, bkhNext_error_a s j wb wc hlb hlc hla] at hrun
+            exact absurd hrun (by simp)
+        · match f' with
+          | 0 => rw [runBlock_no_phi 0 bkhCtx bkhNext s bkhMul [bkhRet] rfl (by decide)] at hrun
+                 simp [execBlock] at hrun
+          | 1 => obtain ⟨e, he⟩ := runBlock_oof bkhCtx bkhNext 1 [bkhMul] bkhRet bkhMul [bkhRet] s
+                   (bkhNextSEnd s wb wc) rfl rfl (by decide)
+                   (by intro i hi; simp only [List.mem_singleton] at hi; subst hi; decide)
+                   (bkhNext_thread s wb wc hlb hlc) (by decide)
+                 rw [he] at hrun; exact absurd hrun (by simp)
+          | (j+2) =>
+            rw [show j+2 = 1+(j+1) from by omega, bkhNext_halts s j wb wc wa hlb hlc hla] at hrun
+            exact absurd hrun (by simp)
+
+/-- **Non-vacuity**: `runContext 10 bkhCtx vs` halts for every admitted state (callvalue zero).
+    Chains `entry → next`, ending in `next`'s RETURN halt. -/
+theorem bkhFn_halts (vs : VenomState) (hnh : vs.halted = false)
+    (hcv : vs.callCtx.callvalue = EvmYul.UInt256.ofNat 0) :
+    ∃ vs', runContext 10 bkhCtx vs = ExecResult.Halt vs' := by
+  have h0 : runContext 10 bkhCtx vs
+      = runBlocks 10 bkhCtx bkhFn { vs with prevBb := none, currentBb := "entry", instIdx := 0 } := by
+    simp [runContext, runFunction, bkhCtx, bkhFn, lookupFunction, fnEntryLabel, bkhEntry]
+  set s0 : VenomState := { vs with prevBb := none, currentBb := "entry", instIdx := 0 } with hs0
+  have hnh0 : s0.halted = false := by simpa [hs0] using hnh
+  have hcv0 : s0.callCtx.callvalue = EvmYul.UInt256.ofNat 0 := by simpa [hs0] using hcv
+  set s1 : VenomState := jumpTo "next" (bkhEntrySEnd s0) with hs1
+  have hentry : runBlock 9 bkhCtx bkhEntry s0 = ExecResult.OK s1 := by
+    rw [show (9 : Nat) = 3 + (5 + 1) from by omega]; exact bkhEntry_runBlock s0 5 hnh0
+  have hlk0 : lookupBlock s0.currentBb bkhFn.blocks = some bkhEntry := rfl
+  have hnh1 : s1.halted = false := by rw [hs1]; simpa [jumpTo, updateVar] using hnh0
+  have hstep0 : runBlocks 10 bkhCtx bkhFn s0 = runBlocks 9 bkhCtx bkhFn s1 :=
+    runBlocks_step_of_block (fuel := 9) hlk0 hentry hnh1
+  obtain ⟨ha1, hb1, hc1⟩ := bkhEntrySEnd_lookup s0
+  rw [hcv0] at ha1 hb1
+  have ha1' : lookupVar "a" s1 = some (EvmYul.UInt256.ofNat 0) := ha1
+  have hb1' : lookupVar "b" s1 = some (EvmYul.UInt256.ofNat 0) := hb1
+  have hc1' : lookupVar "c" s1 = some (bkhVal s0) := by
+    rw [show lookupVar "c" s1 = lookupVar "c" (bkhEntrySEnd s0) from rfl, hc1]
+  have hlk1 : lookupBlock s1.currentBb bkhFn.blocks = some bkhNext := rfl
+  have hhalt := bkhNext_halts s1 6 (EvmYul.UInt256.ofNat 0) (bkhVal s0)
+    (EvmYul.UInt256.ofNat 0) hb1' hc1' ha1'
+  rw [show (1 : Nat) + (6 + 1) = 8 from by omega] at hhalt
+  rw [h0, hstep0]
+  exact ⟨_, runBlocks_haltDirect_of_block hlk1 hhalt⟩
+
+set_option maxHeartbeats 4000000 in
+/-- **A BLOCKHASH capstone.** `codegen_correct` for
+    `entry: %a=CALLVALUE ; %b=CALLVALUE ; %c=BLOCKHASH %a ; JMP next` /
+    `next: %e=MUL %b %c ; RETURN %e, %a`. `entry`'s BLOCKHASH exercises the 1-input transient-read arm
+    (`RegularStepG`'s BLOCKHASH disjunct, `asmStep_tload_ok`), emitted `DUP2 ; BLOCKHASH`, leaving `c = bkhVal s`
+    (context-dependent). `next`'s MUL consumes the top two `[b, c]` (so `a` is never buried — no f1a
+    reorder); `b = 0` ⇒ `e = 0` (`uint256_zero_mul`) empties the return window. `next` ends in a
+    body-then-RETURN handled by `hsupplyW_regularReturnTo`; `entry` via `hsupplyW_regularJmp`. -/
+theorem codegen_correct_bkhFn_recipeW {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    (hvshalt : vs.halted = false) (hzero : vs.callCtx.callvalue = EvmYul.UInt256.ofNat 0)
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    (match runContext 10 bkhCtx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan bkhFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan bkhFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan bkhFn 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan bkhFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan bkhFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan bkhFn 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan bkhFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan bkhFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan bkhFn 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  have hfnready : ∀ bb ∈ bkhFn.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst := by
+    intro bb hbb inst hinst
+    simp only [bkhFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    rcases hbb with rfl | rfl
+    · simp only [bkhEntry, List.mem_cons, List.not_mem_nil, or_false] at hinst
+      rcases hinst with rfl | rfl | rfl | rfl <;> (unfold codegenReadyInst; decide)
+    · simp only [bkhNext, List.mem_cons, List.not_mem_nil, or_false] at hinst
+      rcases hinst with rfl | rfl <;> (unfold codegenReadyInst; decide)
+  have hgen : generateFnPlan bkhFn 0 0
+      = some ((generateFnPlan bkhFn 0 0).get!.1, (generateFnPlan bkhFn 0 0).get!.2) := rfl
+  have hpsE : psOfFn (fnPlanFuel bkhFn) bkhFn 0 0 "entry" = initPlanState 0 :=
+    psOfFn_entry rfl hfnready (by simp only [fnPlanFuel]; omega)
+  refine codegen_correct_ofBlocks_recipeW_inv bkhInv
+    (lo := lo) (pcOf := pcOfLabel (asmResolve (executePlan (generateFnPlan bkhFn 0 0).get!.1)).1)
+    (psOf := psOfFn (fnPlanFuel bkhFn) bkhFn 0 0)
+    (wOf := fun l => (asmResolve (executePlan (generateFnPlan bkhFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan bkhFn 0 0).get!.1)).1 l)
+    (offsets := (computeLabelOffsets (executePlan (generateFnPlan bkhFn 0 0).get!.1)).2)
+    (fuel := 10) (ctx := bkhCtx) (fn := bkhFn) (fnEom := 0) (lblCtr := 0)
+    (entryName := "main") (entryLbl := "entry")
+    (ops := (generateFnPlan bkhFn 0 0).get!.1) (psFinal := (generateFnPlan bkhFn 0 0).get!.2)
+    hgen rfl rfl rfl ?_ ?_ bkhInv_pres ?_
+    ⟨by simpa using hvshalt, by simpa using hzero, fun h => by simp at h⟩
+  case _ =>
+    intro bb hbb s
+    simp only [bkhFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    rcases hbb with rfl | rfl
+    · simp [runBlock, evalPhis, execBlock, bkhEntry, bkhCvA]
+    · simp [runBlock, evalPhis, execBlock, bkhNext, bkhMul]
+  case _ =>
+    intro bb hbb s asm N k hE hinv hlbleq
+    obtain ⟨⟨bb0, hlk_s, hvrel, hpc_asm⟩, hwN, hhalt⟩ := hE
+    simp only [bkhFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    rcases hbb with rfl | rfl
+    · -- entry: CALLVALUE ×2 + ADD (duplicating) + JMP next
+      have hlbl : s.currentBb = "entry" := hlbleq
+      rw [hlbl] at hvrel hpc_asm
+      have hpc0 : asm.pc = 0 := by rw [hpc_asm]; exact pcOfLabel_entry_zero rfl hfnready hgen
+      have hnt : ∀ inst ∈ [bkhCvA, bkhCvB, bkhLoad], isTerminator inst.opcode = false := by
+        intro i hi; simp only [List.mem_cons, List.not_mem_nil, or_false] at hi
+        rcases hi with rfl | rfl | rfl <;> decide
+      match k with
+      | 0 => exact Or.inl (runBlock_oof bkhCtx bkhEntry 1 [bkhCvA, bkhCvB, bkhLoad] bkhJmp bkhCvA
+               [bkhCvB, bkhLoad, bkhJmp] s (bkhEntrySEnd s) rfl rfl (by decide) hnt (bkhEntry_thread s) (by decide))
+      | 1 => exact Or.inl (runBlock_oof bkhCtx bkhEntry 2 [bkhCvA, bkhCvB, bkhLoad] bkhJmp bkhCvA
+               [bkhCvB, bkhLoad, bkhJmp] s (bkhEntrySEnd s) rfl rfl (by decide) hnt (bkhEntry_thread s) (by decide))
+      | 2 => exact Or.inl (runBlock_oof bkhCtx bkhEntry 3 [bkhCvA, bkhCvB, bkhLoad] bkhJmp bkhCvA
+               [bkhCvB, bkhLoad, bkhJmp] s (bkhEntrySEnd s) rfl rfl (by decide) hnt (bkhEntry_thread s) (by decide))
+      | (j+3) =>
+      rw [show j+3+1 = ([bkhCvA, bkhCvB, bkhLoad] : List Instruction).length + (j+1) from by
+        simp only [List.length_cons, List.length_nil]; omega]
+      refine Or.inr (hsupplyW_regularJmp
+        (liveness := exLiveness) (dfg := DfgAnalysis.empty) (cfg := exCfg) (restFuel := j)
+        (front := [bkhCvA, bkhCvB, bkhLoad]) (jmpInst := bkhJmp) (hd := bkhCvA) (tl := [bkhCvB, bkhLoad, bkhJmp])
+        (nextLiveness := ["a", "b", "c"]) (curBbLabel := "entry") (dem := 1) (S := [])
+        (ps0 := initPlanState 0) (lbl := "next") (off := 9) (bb' := bkhNext) (sEnd := bkhEntrySEnd s)
+        (hbb := rfl) (hjmpop := rfl) (hoperands := rfl) (hcons := rfl) (hphi := by decide)
+        (hnonterm := hnt) (hthread := bkhEntry_thread s) (hnothalt := by simpa [updateVar] using hhalt)
+        (hreg := bkhEntry_body)
+        (hsd := ⟨by intro op; rfl, by simp [initPlanState], by intro z hz; simp [initPlanState] at hz⟩)
+        (hsv := by simp [StackIsVars, initPlanState])
+        (hrel := by rw [hpsE] at hvrel; exact hvrel)
+        (hbLabel := by rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
+                       have hj' : j < 1 := hj; interval_cases j; rfl)
+        (hblock := by rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
+                      have hj' : j < 4 := hj; interval_cases j <;> rfl)
+        (hps := rfl) (hpc := by rw [hpc0]; decide) (hpush := by simp only [hpc0]; rfl)
+        (hoff_lk := by decide)
+        (hoff := by decide) (hpc2 := by rw [hpc0]; decide)
+        (hjump := by simp only [hpc0]; rfl)
+        (hidx_lk := by decide) (hlk' := rfl)
+        (hw := by decide))
+    · -- next: the CONSUMING ADD + body-then-RETURN
+      have hlbl : s.currentBb = "next" := hlbleq
+      rw [hlbl] at hvrel hpc_asm
+      obtain ⟨_, _, hnext⟩ := hinv
+      obtain ⟨ha0, hb0, hc0⟩ := hnext hlbl
+      have hpc7 : asm.pc = 7 := by rw [hpc_asm]; decide
+      match k with
+      | 0 => exact Or.inl (runBlock_oof bkhCtx bkhNext 1 [bkhMul] bkhRet bkhMul [bkhRet] s
+               (bkhNextSEnd s (EvmYul.UInt256.ofNat 0) (bkhVal s)) rfl rfl (by decide)
+               (by intro i hi; simp only [List.mem_singleton] at hi; subst hi; decide)
+               (bkhNext_thread s _ _ hb0 hc0) (by decide))
+      | (j+1) =>
+      rw [show j+1+1 = ([bkhMul] : List Instruction).length + (j+1) from by
+        simp only [List.length_cons, List.length_nil]; omega]
+      refine Or.inr (hsupplyW_regularReturnTo
+        (liveness := exLiveness) (dfg := DfgAnalysis.empty) (cfg := exCfg) (restFuel := j)
+        (front := [bkhMul]) (retInst := bkhRet) (hd := bkhMul) (tl := [bkhRet])
+        (nextLiveness := ["e", "a"]) (curBbLabel := "next") (dem := 1)
+        (S := ["a", "b", "c"]) (Sn := ["a", "e"])
+        (ps0 := psOfFn (fnPlanFuel bkhFn) bkhFn 0 0 "next") (offv := "e") (szv := "a") (base := [])
+        (woff := EvmYul.UInt256.ofNat 0) (wsz := EvmYul.UInt256.ofNat 0)
+        (sEnd := bkhNextSEnd s (EvmYul.UInt256.ofNat 0) (bkhVal s))
+        (hbb := rfl) (hop := rfl) (hoperands := rfl) (hcons := rfl) (hphi := by decide)
+        (hnonterm := by intro i hi; simp only [List.mem_singleton] at hi; subst hi; decide)
+        (hthread := bkhNext_thread s _ _ hb0 hc0)
+        (hevaloff := by rw [show evalOperand (Operand.Var "e")
+              (bkhNextSEnd s (EvmYul.UInt256.ofNat 0) (bkhVal s))
+            = lookupVar "e" (bkhNextSEnd s (EvmYul.UInt256.ofNat 0) (bkhVal s)) from rfl,
+            (bkhNextSEnd_lookup s (EvmYul.UInt256.ofNat 0) (bkhVal s)).1, uint256_zero_mul])
+        (hevalsz := by rw [show evalOperand (Operand.Var "a")
+              (bkhNextSEnd s (EvmYul.UInt256.ofNat 0) (bkhVal s))
+            = lookupVar "a" (bkhNextSEnd s (EvmYul.UInt256.ofNat 0) (bkhVal s)) from rfl,
+            (bkhNextSEnd_lookup s (EvmYul.UInt256.ofNat 0) (bkhVal s)).2]; exact ha0)
+        (hvoff := by rw [show operandVal (bkhNextSEnd s (EvmYul.UInt256.ofNat 0) (bkhVal s)) lo
+              (Operand.Var "e")
+            = lookupVar "e" (bkhNextSEnd s (EvmYul.UInt256.ofNat 0) (bkhVal s)) from rfl,
+            (bkhNextSEnd_lookup s (EvmYul.UInt256.ofNat 0) (bkhVal s)).1, uint256_zero_mul])
+        (hvsz := by rw [show operandVal (bkhNextSEnd s (EvmYul.UInt256.ofNat 0) (bkhVal s)) lo
+              (Operand.Var "a")
+            = lookupVar "a" (bkhNextSEnd s (EvmYul.UInt256.ofNat 0) (bkhVal s)) from rfl,
+            (bkhNextSEnd_lookup s (EvmYul.UInt256.ofNat 0) (bkhVal s)).2]; exact ha0)
+        (hready := bkhNext_ready)
+        (hsd := ⟨by intro op; rfl, by decide, by
+          intro z hz
+          rw [show (psOfFn (fnPlanFuel bkhFn) bkhFn 0 0 "next").stack
+            = [Operand.Var "a", Operand.Var "b", Operand.Var "c"] from rfl] at hz
+          simp only [List.mem_cons, List.not_mem_nil, or_false] at hz
+          rcases hz with h | h | h <;> injection h with h' <;> subst h'
+          · exact ⟨_, ha0⟩
+          · exact ⟨_, hb0⟩
+          · exact ⟨_, hc0⟩⟩)
+        (hsv := rfl)
+        (hrel := hvrel)
+        (hbLabel := by rw [hpc7]; refine ⟨by decide, fun j hj => ?_⟩
+                       have hj' : j < 1 := hj; interval_cases j; rfl)
+        (hblock := by rw [hpc7]; refine ⟨by decide, fun j hj => ?_⟩
+                      have hj' : j < 1 := hj; interval_cases j; rfl)
+        (hps'stack := by decide)
+        (hpc := by rw [hpc7]; decide) (hret := by simp only [hpc7]; rfl)
+        (hcov0 := Or.inl (by simp [EvmYul.uint256_ofNat_toNat]))
+        (hbelow := by simp [EvmYul.uint256_ofNat_toNat])
+        (hlenu := by simp [EvmYul.uint256_ofNat_toNat]) (hw := by decide))
+  case _ =>
+    refine ⟨⟨bkhEntry, rfl, ?_, ?_⟩, ?_, hvshalt⟩
+    · show venomAsmRel lo (psOfFn (fnPlanFuel bkhFn) bkhFn 0 0 "entry") _ as
+      rw [hpsE]; exact hrel
+    · show as.pc = pcOfLabel (asmResolve (executePlan (generateFnPlan bkhFn 0 0).get!.1)).1 "entry"
+      rw [haspc]; exact (pcOfLabel_entry_zero rfl hfnready hgen).symm
+    · show (asmResolve (executePlan (generateFnPlan bkhFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan bkhFn 0 0).get!.1)).1 "entry" ≤ (asmResolve (executePlan (generateFnPlan bkhFn 0 0).get!.1)).1.length
+      omega
+
 
 end Example
 

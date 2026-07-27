@@ -2327,17 +2327,96 @@ theorem HbsimMatch_and_inv {E : VenomState → AsmState → Nat → Prop} {Inv :
   | IntRet l s' => trivial
   | Error e => trivial
 
+/-- **Strengthening `HbsimMatch`'s Entry with a JOINT Venom/asm invariant** whose continuation
+    proof may not inspect the asm state: `hinv` must establish `Inv2 s' a` for EVERY asm state
+    `a` (the match's own `asm'` is existential, so nothing more is available). This is exactly
+    enough for currentBb-guarded joint invariants that turn vacuous after a block transition —
+    e.g. `fun s a => s.currentBb = "entry" → a.memory.size = 0`, the MEMTOP size pin: once the
+    walk leaves the entry block the guard is dead and preservation never mentions the asm run. -/
+theorem HbsimMatch_and_inv2 {E : VenomState → AsmState → Nat → Prop}
+    {Inv2 : VenomState → AsmState → Prop}
+    {o2pc : AssocList Nat Nat} {prog : List AsmInst} {asm : AsmState} {N : Nat} {r : ExecResult}
+    (h : HbsimMatch E o2pc prog asm N r)
+    (hinv : ∀ (s' : VenomState) (a : AsmState), r = ExecResult.OK s' → s'.halted = false → Inv2 s' a) :
+    HbsimMatch (fun s a n => E s a n ∧ Inv2 s a) o2pc prog asm N r := by
+  cases r with
+  | OK s' =>
+    by_cases hh : s'.halted
+    · simp only [HbsimMatch, hh, if_true] at h ⊢; exact h
+    · simp only [HbsimMatch, hh] at h ⊢
+      obtain ⟨asm', N', hrun, hE⟩ := h
+      exact ⟨asm', N', hrun, hE, hinv s' asm' rfl (by simpa using hh)⟩
+  | Halt s' => exact h
+  | Abort t s' => cases t <;> exact h
+  | IntRet l s' => trivial
+  | Error e => trivial
+
 
 set_option maxHeartbeats 1000000 in
-/-- **The invariant-carrying driver.** Same as `codegen_correct_ofBlocks_recipeW`, but the walk carries a
-    caller-chosen `Inv : VenomState → Prop`: `hsupply` receives `Inv s` (so a recipe may depend on the state's
+/-- **The invariant-carrying driver, currentBb-aware form.** Same as
+    `codegen_correct_ofBlocks_recipeW`, but the walk carries a caller-chosen
+    `Inv : VenomState → Prop`: `hsupply` receives `Inv s` (so a recipe may depend on the state's
     VALUES — e.g. RETURN's `hbelow : off + sz ≤ fnEom`, which is false for an arbitrary `s` and unprovable
     under the plain driver), and in exchange the caller discharges `hpres`, that `Inv` survives a block.
+    `hpres` additionally receives `s.currentBb = bb.label` (free at the walk's use site) — needed when a
+    middle block's exit-invariant depends on facts an earlier block established (first consumer: mlv's
+    store block, whose successor needs the entry-set `a`/`b` values).
 
     This is a strict generalisation: `Inv := fun _ => True` recovers the original. It works because
     `codegen_correct_ofBlocks_HbsimMatch` takes `Entry` as a FREE PARAMETER and `HbsimMatch` mentions `Entry`
     in exactly one arm, so `HbsimMatch_and_inv` conjoins the invariant wholesale — the eight dispatcher arms
     need no change. -/
+theorem codegen_correct_ofBlocks_recipeW_invCur
+    {fuel : Nat} {ctx : VenomContext} {fn : IrFunction} {fnEom lblCtr : Nat}
+    {ops : List StackOp} {psFinal : PlanState} {vs : VenomState} {as : AsmState}
+    {entryName entryLbl : String} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {offsets : AssocList String Nat} (Inv : VenomState → Prop)
+    (hplan : generateFnPlan fn fnEom lblCtr = some (ops, psFinal))
+    (hent : ctx.entry = some entryName)
+    (hlk : lookupFunction entryName ctx.functions = some fn)
+    (hlbl : fnEntryLabel fn = some entryLbl)
+    (hrun0 : ∀ bb ∈ fn.blocks, ∀ s : VenomState, runBlock 0 ctx bb s = ExecResult.Error "out of fuel")
+    (hsupply : ∀ bb ∈ fn.blocks, ∀ (s : VenomState) (asm : AsmState) (N k : Nat),
+        CanonEntryWH fn lo pcOf psOf wOf s asm N → Inv s → s.currentBb = bb.label →
+        (∃ e, runBlock (k+1) ctx bb s = ExecResult.Error e) ∨
+        (∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+          runAsm bodyLen (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 asm
+            = AsmResult.AsmOK as' ∧
+          TermRecipeW fn lo pcOf psOf wOf (asmResolve (executePlan ops)).2 offsets
+            (asmResolve (executePlan ops)).1 as' ps' vs' bodyLen (k+1) ctx bb s))
+    (hpres : ∀ bb ∈ fn.blocks, ∀ (s s' : VenomState) (f' : Nat),
+        Inv s → runBlock f' ctx bb s = ExecResult.OK s' → s.currentBb = bb.label → Inv s')
+    (hentry : CanonEntryWH fn lo pcOf psOf wOf
+        { vs with prevBb := none, currentBb := entryLbl, instIdx := 0 } as
+        (asmResolve (executePlan ops)).1.length)
+    (hinv0 : Inv { vs with prevBb := none, currentBb := entryLbl, instIdx := 0 }) :
+    (match runContext fuel ctx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length (asmResolve (executePlan ops)).2
+         (asmResolve (executePlan ops)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length (asmResolve (executePlan ops)).2
+         (asmResolve (executePlan ops)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length (asmResolve (executePlan ops)).2
+         (asmResolve (executePlan ops)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  refine codegen_correct_ofBlocks_HbsimMatch
+    (Entry := fun s a n => CanonEntryWH fn lo pcOf psOf wOf s a n ∧ Inv s)
+    hplan hent hlk hlbl ?_ ⟨hentry, hinv0⟩
+  intro bb hbb s asm N f' hE hlbleq
+  obtain ⟨hE', hinv⟩ := hE
+  have hcur : wOf bb.label ≤ N := by
+    obtain ⟨_, hwN, _⟩ := hE'; rw [hlbleq] at hwN; exact hwN
+  refine HbsimMatch_and_inv ?_ (fun s' hr _ => hpres bb hbb s s' f' hinv hr hlbleq)
+  cases f' with
+  | zero => rw [hrun0 bb hbb s]; simp [HbsimMatch]
+  | succ k =>
+    rcases hsupply bb hbb s asm N k hE' hinv hlbleq with ⟨e, herr⟩ | ⟨as', ps', vs', bodyLen, hbody, hrecipe⟩
+    · rw [herr]; simp [HbsimMatch]
+    · exact HbsimMatch_dispatchW hbody hcur hrecipe
+
+/-- **The invariant-carrying driver** (bare-`hpres` form): `hpres` shows `Inv` survives a block
+    with no `currentBb` information. Derived from `codegen_correct_ofBlocks_recipeW_invCur` by
+    ignoring the strengthened hypothesis; kept as the interface of the existing capstone family. -/
 theorem codegen_correct_ofBlocks_recipeW_inv
     {fuel : Nat} {ctx : VenomContext} {fn : IrFunction} {fnEom lblCtr : Nat}
     {ops : List StackOp} {psFinal : PlanState} {vs : VenomState} {as : AsmState}
@@ -2370,19 +2449,70 @@ theorem codegen_correct_ofBlocks_recipeW_inv
          (asmResolve (executePlan ops)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
      | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length (asmResolve (executePlan ops)).2
          (asmResolve (executePlan ops)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) :=
+  codegen_correct_ofBlocks_recipeW_invCur Inv hplan hent hlk hlbl hrun0 hsupply
+    (fun bb hbb s s' f' hinv hr _ => hpres bb hbb s s' f' hinv hr) hentry hinv0
+
+set_option maxHeartbeats 1000000 in
+/-- **The invariant-carrying driver with a JOINT Venom/asm invariant.** On top of
+    `codegen_correct_ofBlocks_recipeW_invCur`'s Venom-side `Inv`, the walk carries
+    `Inv2 : VenomState → AsmState → Prop` — so `hsupply` may additionally assume a fact about
+    the block-entry ASM state (e.g. its memory size). The price (`hpres2`): after every OK
+    block-run, `Inv2 s' a` must hold for EVERY asm state `a` — the walk's continuation asm
+    state is existential, so only asm-blind (e.g. currentBb-guarded, self-vacuifying) joint
+    invariants qualify. First consumer: MEMTOP's `fun s a => s.currentBb = "entry" →
+    a.memory.size = 0`, seeded by a top-level `as.memory.size = 0` hypothesis. -/
+theorem codegen_correct_ofBlocks_recipeW_invJ
+    {fuel : Nat} {ctx : VenomContext} {fn : IrFunction} {fnEom lblCtr : Nat}
+    {ops : List StackOp} {psFinal : PlanState} {vs : VenomState} {as : AsmState}
+    {entryName entryLbl : String} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {offsets : AssocList String Nat} (Inv : VenomState → Prop)
+    (Inv2 : VenomState → AsmState → Prop)
+    (hplan : generateFnPlan fn fnEom lblCtr = some (ops, psFinal))
+    (hent : ctx.entry = some entryName)
+    (hlk : lookupFunction entryName ctx.functions = some fn)
+    (hlbl : fnEntryLabel fn = some entryLbl)
+    (hrun0 : ∀ bb ∈ fn.blocks, ∀ s : VenomState, runBlock 0 ctx bb s = ExecResult.Error "out of fuel")
+    (hsupply : ∀ bb ∈ fn.blocks, ∀ (s : VenomState) (asm : AsmState) (N k : Nat),
+        CanonEntryWH fn lo pcOf psOf wOf s asm N → Inv s → Inv2 s asm → s.currentBb = bb.label →
+        (∃ e, runBlock (k+1) ctx bb s = ExecResult.Error e) ∨
+        (∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+          runAsm bodyLen (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 asm
+            = AsmResult.AsmOK as' ∧
+          TermRecipeW fn lo pcOf psOf wOf (asmResolve (executePlan ops)).2 offsets
+            (asmResolve (executePlan ops)).1 as' ps' vs' bodyLen (k+1) ctx bb s))
+    (hpres : ∀ bb ∈ fn.blocks, ∀ (s s' : VenomState) (f' : Nat),
+        Inv s → runBlock f' ctx bb s = ExecResult.OK s' → s.currentBb = bb.label → Inv s')
+    (hpres2 : ∀ bb ∈ fn.blocks, ∀ (s s' : VenomState) (f' : Nat),
+        Inv s → runBlock f' ctx bb s = ExecResult.OK s' → s.currentBb = bb.label →
+        ∀ a : AsmState, Inv2 s' a)
+    (hentry : CanonEntryWH fn lo pcOf psOf wOf
+        { vs with prevBb := none, currentBb := entryLbl, instIdx := 0 } as
+        (asmResolve (executePlan ops)).1.length)
+    (hinv0 : Inv { vs with prevBb := none, currentBb := entryLbl, instIdx := 0 })
+    (hinv20 : Inv2 { vs with prevBb := none, currentBb := entryLbl, instIdx := 0 } as) :
+    (match runContext fuel ctx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length (asmResolve (executePlan ops)).2
+         (asmResolve (executePlan ops)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length (asmResolve (executePlan ops)).2
+         (asmResolve (executePlan ops)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length (asmResolve (executePlan ops)).2
+         (asmResolve (executePlan ops)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
      | _ => True) := by
   refine codegen_correct_ofBlocks_HbsimMatch
-    (Entry := fun s a n => CanonEntryWH fn lo pcOf psOf wOf s a n ∧ Inv s)
-    hplan hent hlk hlbl ?_ ⟨hentry, hinv0⟩
+    (Entry := fun s a n => (CanonEntryWH fn lo pcOf psOf wOf s a n ∧ Inv s) ∧ Inv2 s a)
+    hplan hent hlk hlbl ?_ ⟨⟨hentry, hinv0⟩, hinv20⟩
   intro bb hbb s asm N f' hE hlbleq
-  obtain ⟨hE', hinv⟩ := hE
+  obtain ⟨⟨hE', hinv⟩, hinv2⟩ := hE
   have hcur : wOf bb.label ≤ N := by
     obtain ⟨_, hwN, _⟩ := hE'; rw [hlbleq] at hwN; exact hwN
-  refine HbsimMatch_and_inv ?_ (fun s' hr _ => hpres bb hbb s s' f' hinv hr)
+  refine HbsimMatch_and_inv2 (HbsimMatch_and_inv ?_ (fun s' hr _ => hpres bb hbb s s' f' hinv hr hlbleq))
+    (fun s' a hr _ => hpres2 bb hbb s s' f' hinv hr hlbleq a)
   cases f' with
   | zero => rw [hrun0 bb hbb s]; simp [HbsimMatch]
   | succ k =>
-    rcases hsupply bb hbb s asm N k hE' hinv hlbleq with ⟨e, herr⟩ | ⟨as', ps', vs', bodyLen, hbody, hrecipe⟩
+    rcases hsupply bb hbb s asm N k hE' hinv hinv2 hlbleq with ⟨e, herr⟩ | ⟨as', ps', vs', bodyLen, hbody, hrecipe⟩
     · rw [herr]; simp [HbsimMatch]
     · exact HbsimMatch_dispatchW hbody hcur hrecipe
 

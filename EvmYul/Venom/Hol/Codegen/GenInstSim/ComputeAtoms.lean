@@ -1127,6 +1127,54 @@ theorem emit_read0_sim {name out v ps lo vs as prog offsetToPc}
   show runAsm 1 offsetToPc prog as = _
   rw [runAsm_succ_ok hpc hstep]; rfl
 
+/-- `emit_read0_sim` with the (trivially true) memory-preservation conjunct exposed: the pushed
+    value never touches memory, but the plain `∃ as'` hides it — consumers that must TRACK the
+    asm memory size across the push (MEMTOP) need it named. -/
+theorem emit_read0_sim_mem {name out v ps lo vs as prog offsetToPc}
+    (hrel : venomAsmRel lo ps vs as)
+    (hfresh : ¬ (Operand.Var out) ∈ ps.stack)
+    (hspill : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none)
+    (hblock : asmBlockAt prog as.pc (executePlan [StackOp.SOEmit name]))
+    (hdisp : ∀ (h : as.pc < prog.length), prog.get ⟨as.pc, h⟩ = AsmInst.AsmOp name →
+              asmStep offsetToPc prog as = asmPushVal v as) :
+    ∃ as', runAsm (executePlan [StackOp.SOEmit name]).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+           venomAsmRel lo { ps with stack := stackPush (Operand.Var out) ps.stack } (updateVar out v vs) as' ∧
+           as'.pc = as.pc + (executePlan [StackOp.SOEmit name]).length ∧
+           as'.memory = as.memory := by
+  obtain ⟨hpc, hget⟩ := asmBlockAt_one hblock
+  have hstep : asmStep offsetToPc prog as = AsmResult.AsmOK { asmNext as with stack := v :: as.stack } := by
+    rw [hdisp hpc hget]; rfl
+  refine ⟨{ asmNext as with stack := v :: as.stack }, ?_, venomAsmRel_read0 hrel hfresh hspill, rfl, rfl⟩
+  show runAsm 1 offsetToPc prog as = _
+  rw [runAsm_succ_ok hpc hstep]; rfl
+
+/-- `emit_ctx_push_sim` with the memory-preservation conjunct (see `emit_read0_sim_mem`). -/
+theorem emit_ctx_push_sim_mem {name out ps lo vs as prog offsetToPc}
+    {fAsm : AsmState → bytes32} {fV : VenomState → bytes32}
+    (hrel : venomAsmRel lo ps vs as)
+    (hfresh : ¬ (Operand.Var out) ∈ ps.stack)
+    (hspill : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none)
+    (hblock : asmBlockAt prog as.pc (executePlan [StackOp.SOEmit name]))
+    (hdispatch : ∀ (h : as.pc < prog.length), prog.get ⟨as.pc, h⟩ = AsmInst.AsmOp name →
+              asmStep offsetToPc prog as = asmPushVal (fAsm as) as)
+    (hfield : fAsm as = fV vs) :
+    ∃ as', runAsm (executePlan [StackOp.SOEmit name]).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+           venomAsmRel lo { ps with stack := stackPush (Operand.Var out) ps.stack }
+             (updateVar out (fV vs) vs) as' ∧
+           as'.pc = as.pc + (executePlan [StackOp.SOEmit name]).length ∧
+           as'.memory = as.memory := by
+  have hdisp : ∀ (h : as.pc < prog.length), prog.get ⟨as.pc, h⟩ = AsmInst.AsmOp name →
+              asmStep offsetToPc prog as = asmPushVal (fV vs) as := by
+    intro h hg; rw [hdispatch h hg, hfield]
+  exact emit_read0_sim_mem (v := fV vs) hrel hfresh hspill hblock hdisp
+
+/-- `asmStep` at `AsmOp "MSIZE"` dispatches to the rounded-memory-size push (the `hdisp` for the
+    MEMTOP capstone's `emit_ctx_push_sim_mem` step). -/
+theorem asmStep_msize_ok {o2pc prog s} (hpc : s.pc < prog.length)
+    (hprog : prog.get ⟨s.pc, hpc⟩ = AsmInst.AsmOp "MSIZE") :
+    asmStep o2pc prog s = asmPushVal (EvmYul.UInt256.ofNat ((s.memory.size + 31) / 32 * 32)) s := by
+  unfold asmStep; rw [dif_pos hpc, hprog]; rfl
+
 /-- `asmStep` at `AsmOp "CALLVALUE"` dispatches to `asmPushVal s.callCtx.callvalue` (the concrete
     `hdisp` for `emit_read0_sim` on `CALLVALUE`; CALLER/ADDRESS/GAS/ORIGIN/… are identical up to the
     pushed field). -/
@@ -1642,6 +1690,46 @@ theorem venomAsmRel_mstore {lo ps vs as} {offset value rest}
     rw [hvmem]
     exact mstore_readByte_congr value vs.memory as.memory offset.toNat i hcovV hcovA (hMem i hi)
 
+/-- **The no-spill MSTORE step + relation, without any `fnEom` bound.** Under `noSpill`
+    (`StackDiscH`'s first component) `planSpillRel` is vacuous, and `memoryRel` survives the
+    paired identical write unconditionally — the `hsafe : off+32 ≤ fnEom` of
+    `venomAsmRel_mstore` exists only to protect spilled slots, which this regime never has.
+    Stated against `asmMstore`'s actual (expanding) result; `readByte_asmExpandMemory` bridges
+    the expansion. Coverage hypotheses are trivial (`Nat.zero_le`) at literal offset 0. -/
+theorem asmMstore_noSpill_rel {lo : AssocList String Nat} {ps : PlanState}
+    {vs : VenomState} {as : AsmState} {offset value : bytes32} {rest : List bytes32}
+    (hrel : venomAsmRel lo ps vs as)
+    (hstack : as.stack = offset :: value :: rest)
+    (hnospill : ∀ op, alookup' ps.spilled op = none)
+    (hcovV : offset.toNat ≤ vs.memory.size)
+    (hcovA : offset.toNat ≤ (asmExpandMemory (offset.toNat + 32) as.memory).size)
+    (hro : ((offset.toNat + 32 + 31) / 32) * 32 < USize.size) :
+    asmMstore as = AsmResult.AsmOK { asmNext as with stack := rest, memory := (wordToBytes value).write 0 (asmExpandMemory (offset.toNat + 32) as.memory) offset.toNat 32 }
+    ∧ venomAsmRel lo { ps with stack := stackPop 2 ps.stack } (mstore offset.toNat value vs)
+        { asmNext as with stack := rest, memory := (wordToBytes value).write 0 (asmExpandMemory (offset.toNat + 32) as.memory) offset.toNat 32 } := by
+  constructor
+  · simp only [asmMstore, hstack]
+  · obtain ⟨hStk, hSpill, hMem, hAcc, hTrans, hRet, hLog, hCall, hTx, hBlk, hCode, hPrev⟩ := hrel
+    have hlen2 : 2 ≤ ps.stack.length := by rw [hStk.1, hstack]; simp
+    have hps := planStackRel_popN hStk hlen2
+    rw [hstack] at hps
+    refine ⟨hps, ?_, ?_, hAcc, hTrans, hRet, hLog, hCall, hTx, hBlk, hCode, hPrev⟩
+    · -- planSpillRel: vacuous under noSpill
+      intro op off' hlook
+      rw [show AssocList.lookup Operand Nat ps.spilled op = alookup' ps.spilled op from rfl,
+          hnospill op] at hlook
+      exact absurd hlook (by simp)
+    · -- memoryRel: paired identical write; expansion is readByte-invariant
+      intro i hi
+      have hvmem : (mstore offset.toNat value vs).memory
+          = (wordToBytes value).write 0 vs.memory offset.toNat 32 := by
+        simp only [mstore, writeMemoryWithExpansion, length_wordToBytes]
+      rw [hvmem]
+      refine mstore_readByte_congr value vs.memory
+        (asmExpandMemory (offset.toNat + 32) as.memory) offset.toNat i hcovV hcovA ?_
+      rw [readByte_asmExpandMemory i _ as.memory hro]
+      exact hMem i hi
+
 /-- The runnable compute-step sim for MSTORE: running the emitted `[SOEmit "MSTORE"]` from a
     state with `offset`/`value` on top advances the pc by 1 and preserves `venomAsmRel` across
     the (memory-safe) store. The memory analog of `emit_sstore_sim`; `hdisp` is supplied by
@@ -2073,6 +2161,59 @@ theorem emit_tload_sim {ps lo vs as prog key rest out}
   · show runAsm 1 offsetToPc prog as = _
     rw [runAsm_succ_ok hpc hstep]; rfl
   · exact venomAsmRel_tload hrel hstack hfresh hspill
+  · rfl
+
+/-! ## BLOCKHASH (a 1-input read of `blockCtx.blockhash`)
+
+Like TLOAD, a 1-input read into a fresh output, but of the block environment: the asm/Venom
+reads agree via the `blockCtx` conjunct of `venomAsmRel` directly (no congr lemma needed). -/
+
+/-- **The BLOCKHASH compute-step relation.** Pop `idx`, push `blockCtx.blockhash idx`; the
+    reads agree via `as.blockCtx = vs.blockCtx`. The block-env twin of `venomAsmRel_tload`. -/
+theorem venomAsmRel_blockhash {lo ps vs as out} {key rest}
+    (hrel : venomAsmRel lo ps vs as)
+    (hstack : as.stack = key :: rest)
+    (hfresh : ¬ (Operand.Var out) ∈ ps.stack)
+    (hspill : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none) :
+    venomAsmRel lo { ps with stack := stackPush (Operand.Var out) (stackPop 1 ps.stack) }
+      (updateVar out (vs.blockCtx.blockhash key.toNat) vs)
+      { asmNext as with stack := as.blockCtx.blockhash key.toNat :: rest } := by
+  obtain ⟨hStk, hSpill, hMem, hAcc, hTrans, hRet, hLog, hCall, hTx, hBlk, hCode, hPrev⟩ := hrel
+  have hval : vs.blockCtx.blockhash key.toNat = as.blockCtx.blockhash key.toNat := by rw [hBlk]
+  have hlen1 : 1 ≤ ps.stack.length := by rw [hStk.1, hstack]; simp
+  obtain ⟨hStk', hSpill', hMem', hAcc', hTrans', hRet', hLog', hCall', hTx', hBlk', hCode', hPrev'⟩ :=
+    venomAsmRel_updateVar lo ps vs as out (vs.blockCtx.blockhash key.toNat)
+      ⟨hStk, hSpill, hMem, hAcc, hTrans, hRet, hLog, hCall, hTx, hBlk, hCode, hPrev⟩ hfresh hspill
+  refine ⟨?_, hSpill', hMem', hAcc', hTrans', hRet', hLog', hCall', hTx', hBlk', hCode', hPrev'⟩
+  have hout : operandVal (updateVar out (vs.blockCtx.blockhash key.toNat) vs) lo (Operand.Var out)
+      = some (as.blockCtx.blockhash key.toNat) := by
+    simp only [operandVal, lookupVar_updateVar_self]; rw [hval]
+  have hps := planStackRel_unop hStk' hlen1 hout
+  rw [hstack] at hps
+  simpa using hps
+
+/-- The runnable compute-step sim for BLOCKHASH; `hdisp` is supplied by `asmStep_blockhash_ok`. -/
+theorem emit_blockhash_sim {ps lo vs as prog key rest out}
+    (hrel : venomAsmRel lo ps vs as)
+    (hstack : as.stack = key :: rest)
+    (hfresh : ¬ (Operand.Var out) ∈ ps.stack)
+    (hspill : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none)
+    (hblock : asmBlockAt prog as.pc (executePlan [StackOp.SOEmit "BLOCKHASH"]))
+    (hdisp : ∀ (h : as.pc < prog.length), prog.get ⟨as.pc, h⟩ = AsmInst.AsmOp "BLOCKHASH" →
+              asmStep offsetToPc prog as = asmStateUnop (fun v s => s.blockCtx.blockhash v.toNat) as) :
+    ∃ as', runAsm (executePlan [StackOp.SOEmit "BLOCKHASH"]).length offsetToPc prog as
+             = AsmResult.AsmOK as' ∧
+           venomAsmRel lo { ps with stack := stackPush (Operand.Var out) (stackPop 1 ps.stack) }
+             (updateVar out (vs.blockCtx.blockhash key.toNat) vs) as' ∧
+           as'.pc = as.pc + (executePlan [StackOp.SOEmit "BLOCKHASH"]).length := by
+  obtain ⟨hpc, hget⟩ := asmBlockAt_one hblock
+  have hstep : asmStep offsetToPc prog as
+      = AsmResult.AsmOK { asmNext as with stack := as.blockCtx.blockhash key.toNat :: rest } := by
+    rw [hdisp hpc hget]; exact asmStateUnop_ok hstack
+  refine ⟨{ asmNext as with stack := as.blockCtx.blockhash key.toNat :: rest }, ?_, ?_, ?_⟩
+  · show runAsm 1 offsetToPc prog as = _
+    rw [runAsm_succ_ok hpc hstep]; rfl
+  · exact venomAsmRel_blockhash hrel hstack hfresh hspill
   · rfl
 
 /-! ## CALLDATALOAD (a 1-input read of `callCtx.calldata`)

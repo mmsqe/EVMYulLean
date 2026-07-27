@@ -130,6 +130,32 @@ theorem asmExpandMemory_of_covered (needed : Nat) (mem : ByteArray)
     asmExpandMemory needed mem = mem := by
   simp [asmExpandMemory, h]
 
+/-- **Expansion is `readByte`-invariant**: `asmExpandMemory` only appends zero bytes, and
+    `readByte` zero-pads past the end anyway. -/
+theorem readByte_asmExpandMemory (i n : Nat) (mem : ByteArray)
+    (hro : ((n + 31) / 32) * 32 < USize.size) :
+    readByte i (asmExpandMemory n mem) = readByte i mem := by
+  unfold asmExpandMemory
+  by_cases h : ((n + 31) / 32) * 32 ≤ mem.size
+  · simp only [h, if_true]
+  · simp only [h, if_false]
+    have hpadsz : (ffi.ByteArray.zeroes ⟨(↑((n + 31) / 32 * 32) - ↑mem.size : BitVec System.Platform.numBits)⟩).size
+        = (n + 31) / 32 * 32 - mem.size :=
+      ByteArray.zeroes_bvsub_size ((n + 31) / 32 * 32) mem.size (by omega) hro
+    set pad := ffi.ByteArray.zeroes ⟨(↑((n + 31) / 32 * 32) - ↑mem.size : BitVec System.Platform.numBits)⟩ with hpad
+    have hkpos : 0 < pad.size := by rw [hpadsz]; omega
+    have hlen : pad.write 0 mem mem.size ((n + 31) / 32 * 32 - mem.size)
+        = pad.write 0 mem mem.size pad.size := by rw [hpadsz]
+    rw [hlen, readByte_eq_getElem?_getD, readByte_eq_getElem?_getD]
+    by_cases hi : i < mem.size
+    · rw [EvmYul.byteArray_write_getElem?_disjoint pad mem mem.size i hkpos (Nat.le_refl _) (Or.inl hi)]
+    · by_cases hi2 : i < mem.size + pad.size
+      · rw [EvmYul.byteArray_write_getElem?_inWindow pad mem mem.size i hkpos (Nat.le_refl _) ⟨by omega, hi2⟩,
+            ByteArray.zeroes_getElem? _ _ (by rw [hpadsz]; omega),
+            getElem?_neg mem i (by omega)]
+        rfl
+      · rw [EvmYul.byteArray_write_getElem?_disjoint pad mem mem.size i hkpos (Nat.le_refl _) (Or.inr (by omega))]
+
 /-- A 32-aligned offset rounds `off + 32` exactly: `⌈(off+32)/32⌉·32 = off + 32`. -/
 theorem rounded_add_32_of_aligned {off : Nat} (halign : 32 ∣ off) :
     ((off + 32 + 31) / 32) * 32 = off + 32 := by

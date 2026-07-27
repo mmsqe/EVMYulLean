@@ -266,6 +266,95 @@ theorem genRegularInstPlan_tload_sim
   · rw [executePlan_append, List.length_append]; exact runAsm_compose hrunI hrunE
   · rw [executePlan_append, List.length_append, hpcE, hpcI]; omega
 
+/-- **BLOCKHASH instruction sim** — the block-env twin of `genRegularInstPlan_tload_sim`:
+    DUP the index var, emit `BLOCKHASH`; the generated plan preserves `venomAsmRel` across the
+    Venom step `out := blockCtx.blockhash w`. -/
+theorem genRegularInstPlan_blockhash_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {x out : String} {base : List Operand} {dist : Nat} {w : bytes32}
+    (hname : opcodeToEvmName inst.opcode = some "BLOCKHASH")
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x])
+    (houts : inst.outputs = [out])
+    (hstack0 : ps.stack = base)
+    (hlive : nextLiveness.contains out = true)
+    (hnospill : alookup' ps.spilled (Operand.Var x) = none)
+    (hlivex : nextLiveness.contains x = true)
+    (hdepth : stackGetDepth (Operand.Var x) ps.stack = some dist)
+    (hsmall : dist ≤ 15)
+    (hpeek : stackPeek dist ps.stack = Operand.Var x)
+    (hlen : dist < base.length)
+    (hxbase : Operand.Var x ∈ base)
+    (hval : operandVal vs lo (Operand.Var x) = some w)
+    (hfresh : ¬ (Operand.Var out) ∈ base)
+    (hspill : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp "BLOCKHASH" →
+          asmStep offsetToPc prog s = asmStateUnop (fun v s => s.blockCtx.blockhash v.toNat) s)
+    (hoptnoop : optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+        { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+          stack := base ++ [Operand.Var out] }
+      = ([], { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+              stack := base ++ [Operand.Var out] }))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as
+             = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2 (updateVar out (vs.blockCtx.blockhash w.toNat) vs) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  have hrev : inst.operands.reverse = [Operand.Var x] := by rw [hops]; rfl
+  have hdo : doDup dist ps
+      = ([StackOp.SODup (dist + 1)], { ps with stack := stackDup dist ps.stack }) := by
+    unfold doDup; rw [if_pos hsmall]
+  have hemiteq : emitInputPlan inst.opcode [Operand.Var x] nextLiveness ps = doDup dist ps := by
+    unfold emitInputPlan
+    simp only [List.foldl_cons, List.foldl_nil, List.nil_append]
+    rcases hdd : doDup dist ps with ⟨dupOps, ps2⟩
+    unfold emitOneInput
+    simp only [isVarOperand, hnospill, Option.isSome_none, Bool.and_false, Bool.false_eq_true,
+      if_false, hlivex, if_true, hdepth, hdd, List.nil_append]
+  rw [genRegularInstPlan_unopVar_eq hname hnjmp hcompute hops houts hstack0 hlive hnospill hlivex
+      hdepth hsmall hpeek, hoptnoop, hrev] at hblock ⊢
+  simp only [List.append_nil] at hblock ⊢
+  set ps1 := (emitInputPlan inst.opcode [Operand.Var x] nextLiveness ps).2 with hps1def
+  have hps1stack : ps1.stack = base ++ [Operand.Var x] := by
+    rw [hps1def, hemiteq, hdo]
+    show stackDup dist ps.stack = base ++ [Operand.Var x]
+    simp only [stackDup]; rw [hpeek, hstack0]
+  have hps1spill : AssocList.lookup Operand Nat ps1.spilled (Operand.Var out) = none := by
+    rw [hps1def, hemiteq, hdo]; exact hspill
+  rw [executePlan_append] at hblock
+  obtain ⟨hbI, hbE⟩ := asmBlockAt_append hblock
+  obtain ⟨as1, hrunI, hrelI, hpcI⟩ :=
+    emitInputPlan_single_var_sim hnospill hlivex hdepth hsmall hrel (by rw [hstack0]; exact hlen) hbI
+  have hstacktop : as1.stack = w :: as1.stack.drop 1 :=
+    venomAsmRel_asmStack_top1_var hrelI hps1stack hval
+  have hfresh1 : ¬ (Operand.Var out) ∈ ps1.stack := by
+    rw [hps1stack]; simp only [List.mem_append, List.mem_cons, List.not_mem_nil, or_false]
+    rintro (h | h)
+    · exact hfresh h
+    · rw [← h] at hxbase; exact hfresh hxbase
+  have hbE' : asmBlockAt prog as1.pc (executePlan [StackOp.SOEmit "BLOCKHASH"]) := by
+    rw [hpcI]; exact hbE
+  obtain ⟨as2, hrunE, hrelE, hpcE⟩ :=
+    emit_blockhash_sim hrelI hstacktop hfresh1 hps1spill hbE' (fun h hg => hdisp as1 h hg)
+  have hps6 : ({ ps1 with stack := stackPush (Operand.Var out) (stackPop 1 ps1.stack) } : PlanState)
+      = { ps1 with stack := base ++ [Operand.Var out] } := by
+    rw [hps1stack, stackPop_1_append_single]; rfl
+  rw [hps6] at hrelE
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrelE
+  refine ⟨as2, ?_, hrelR, ?_⟩
+  · rw [executePlan_append, List.length_append]; exact runAsm_compose hrunI hrunE
+  · rw [executePlan_append, List.length_append, hpcE, hpcI]; omega
+
 /-- **Spilled TLOAD instruction sim — the first spill-aware `genRegularInstPlan` producer.** The
     `x`-spilled reroute of `genRegularInstPlan_tload_sim`: the operand is *restored* from its spill slot
     (not DUP'd), transitions onto the stack, and the TLOAD runs — the whole generated plan preserves

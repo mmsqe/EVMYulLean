@@ -1453,6 +1453,102 @@ theorem bodyStep_tload
     (hdispatch v) hops houts hxS houtS hlive hlivex hdisp (hoptnoop p) hrel hblock
   exact ⟨hsim, hsd', by rw [hout]; exact hsv'⟩
 
+/-- The `StackIsVars`-aware body step for BLOCKHASH (block-env read): the twin of
+    `stackDisc_tload_step_S`, using `genRegularInstPlan_blockhash_sim` and the read-generic
+    `stackDisc_read1_preserve` / `genRegularInstPlan_read1_outStack`. -/
+theorem stackDisc_blockhash_step_S
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {offsetToPc : AssocList Nat Nat}
+    {S : List String} {x out : String} {k idx : Nat}
+    (hsd : StackDiscH (k + 1) ps vs)
+    (hsv : StackIsVars S ps)
+    (hname : opcodeToEvmName inst.opcode = some "BLOCKHASH")
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hdispatch : stepInstBase inst vs = execRead1 (fun v s => s.blockCtx.blockhash v.toNat) inst vs)
+    (hops : inst.operands = [Operand.Var x])
+    (houts : inst.outputs = [out])
+    (hxS : x ∈ S) (houtS : out ∉ S)
+    (hlive : nextLiveness.contains out = true)
+    (hlivex : nextLiveness.contains x = true)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp "BLOCKHASH" →
+          asmStep offsetToPc prog s = asmStateUnop (fun v s => s.blockCtx.blockhash v.toNat) s)
+    (hoptnoop : optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+        { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+          stack := ps.stack ++ [Operand.Var out] }
+      = ([], { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+              stack := ps.stack ++ [Operand.Var out] }))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    (∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+              nextIsTerminator curBbLabel ps).1).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+            venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+              nextIsTerminator curBbLabel ps).2 (gvBodyStep (inst, idx) vs) as' ∧
+            as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+              nextLiveness false nextIsTerminator curBbLabel ps).1).length)
+    ∧ StackDiscH k (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).2 (gvBodyStep (inst, idx) vs)
+    ∧ StackIsVars (S ++ [out]) (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).2 := by
+  have hxmem : Operand.Var x ∈ ps.stack := stackIsVars_mem hsv hxS
+  have hfresh : ¬ Operand.Var out ∈ ps.stack := stackIsVars_not_mem hsv houtS
+  obtain ⟨dist, hdepth, hlen⟩ := stackGetDepth_of_mem hxmem
+  have hpeek : stackPeek dist ps.stack = Operand.Var x := stackGetDepth_peek hdepth
+  have hsmall : dist ≤ 15 := by have := hsd.shallow; omega
+  have hnospill : alookup' ps.spilled (Operand.Var x) = none := hsd.noSpill _
+  have hspill : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none := hsd.noSpill _
+  obtain ⟨w, hw⟩ := hsd.defined x hxmem
+  have hval : operandVal vs lo (Operand.Var x) = some w := hw
+  have hstepEq : stepInstBase inst vs = ExecResult.OK (updateVar out (vs.blockCtx.blockhash w.toNat) vs) := by
+    rw [hdispatch]; unfold execRead1; rw [hops, houts]; simp only [evalOperand, hw]
+  have hsim := genRegularInstPlan_blockhash_sim hname hnjmp hcompute hops houts rfl hlive hnospill hlivex
+    hdepth hsmall hpeek hlen hxmem hval hfresh hspill hdisp hoptnoop hrel hblock
+  refine ⟨gvBodyStep_of_updateVar (idx := idx) hstepEq hsim, ?_, ?_⟩
+  · exact stackDisc_read1_preserve (idx := idx) hsd hname hnjmp hcompute hops houts hlive hnospill
+      hlivex hdepth hsmall hpeek hfresh hstepEq hoptnoop
+  · show (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator
+      curBbLabel ps).2.stack = (S ++ [out]).map Operand.Var
+    rw [genRegularInstPlan_read1_outStack hname hnjmp hcompute hops houts hlive hnospill hlivex
+      hdepth hsmall hpeek hoptnoop, hsv, List.map_append]; rfl
+
+/-- **`BodyStep` for BLOCKHASH.** The block-env-read body-fold producer; the twin of `bodyStep_sload`
+    via `stackDisc_blockhash_step_S`. -/
+theorem bodyStep_blockhash
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat} {prog : List AsmInst}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {S : List String} {x out : String} {idx : Nat}
+    (hname : opcodeToEvmName inst.opcode = some "BLOCKHASH")
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hdispatch : ∀ v, stepInstBase inst v = execRead1 (fun v s => s.blockCtx.blockhash v.toNat) inst v)
+    (hops : inst.operands = [Operand.Var x])
+    (houts : inst.outputs = [out])
+    (hxS : x ∈ S) (houtS : out ∉ S)
+    (hlive : nextLiveness.contains out = true)
+    (hlivex : nextLiveness.contains x = true)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp "BLOCKHASH" →
+          asmStep offsetToPc prog s = asmStateUnop (fun v s => s.blockCtx.blockhash v.toNat) s)
+    (hoptnoop : ∀ p : PlanState, optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+        { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness p).2 with
+          stack := p.stack ++ [Operand.Var out] }
+      = ([], { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness p).2 with
+              stack := p.stack ++ [Operand.Var out] })) :
+    BodyStep lo offsetToPc prog
+      (fun w p => generateRegularInstPlan liveness dfg cfg fn w.1 nextLiveness false nextIsTerminator curBbLabel p)
+      (inst, idx) S := by
+  intro p v s j hsd hsv hrel hblock
+  have hout : outOf (inst, idx) = out := by simp [outOf, houts]
+  obtain ⟨hsim, hsd', hsv'⟩ := stackDisc_blockhash_step_S (idx := idx) hsd hsv hname hnjmp hcompute
+    (hdispatch v) hops houts hxS houtS hlive hlivex hdisp (hoptnoop p) hrel hblock
+  exact ⟨hsim, hsd', by rw [hout]; exact hsv'⟩
+
 /-- **Spill-aware body step for a spilled TLOAD.** The reroute of `stackDisc_tload_step_S` off
     `StackDiscH.noSpill`: when the operand `x` is *spilled*, `StackDiscHS (k+2)` drives the restore+dup
     emit, the transient-load, and the invariant re-establishment — bundling `StackDiscHS k` inside the
@@ -2635,6 +2731,308 @@ theorem bodyStepHTo_commBinopDeadMirror
     simp [optimisticSwapPlan]
   exact stackDisc_commBinopDeadMirror_step_S (idx := idx) hsd hsv hname hcomm hfcomm (hdispatch v)
     hops houts hxy houtS hlive hdead_x hdead_y hdisp hopt hrel hblock
+
+/-! ### The consuming-lit MSTORE fold step (`MSTORE (Lit a) %y`, `y` dying at TOS)
+
+The memory-op counterpart of the SSTORE producer chain, with NO `fnEom` bound: the input plan is
+one `PUSH` (the dying value is consumed in place), and the relation step is
+`asmMstore_noSpill_rel` — under the fold's `noSpill` discipline `planSpillRel` is vacuous and
+`memoryRel` survives the paired identical write unconditionally. Feeds `BodyStepsReadyHTo`
+(→ `hsupplyW_regularReturnTo`-style walkers) directly — no `RegularStepG` arm involved. -/
+
+/-- Input plan for `[Var y (dying, unspilled), Lit a]`: the dead var is consumed in place
+    (no ops), the literal is pushed — `[SOPush (Lit a)]`, stack grows by the literal only. -/
+theorem emitInputPlan_pair_deadVarLit_eq {opc nl ps} {y : String} {a : bytes32}
+    (hnospill : alookup' ps.spilled (Operand.Var y) = none)
+    (hdead : nl.contains y = false) :
+    emitInputPlan opc [Operand.Var y, Operand.Lit a] nl ps
+      = ([StackOp.SOPush (Operand.Lit a)], { ps with stack := ps.stack ++ [Operand.Lit a] }) := by
+  unfold emitInputPlan
+  simp only [List.foldl_cons, List.foldl_nil,
+    emitOneInput_deadVar_eq hnospill hdead, emitOneInput_lit_eq opc nl a ps,
+    List.nil_append, stackPush]
+
+/-- Plan reduction for a 0-output store `MSTORE (Lit a) %y` with `y` dying at TOS:
+    `[SOPush (Lit a), SOEmit name]`, model stack back to `base`. The consuming-lit sibling of
+    `genRegularInstPlan_sstore_eq` (no DUPs, no reorder — the stack is already in operand order). -/
+theorem genRegularInstPlan_mstoreLit_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {y : String} {a : bytes32} {base : List Operand} {name : String}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Lit a, Operand.Var y])
+    (houts : inst.outputs = [])
+    (hstack0 : ps.stack = base ++ [Operand.Var y])
+    (hnospill_y : alookup' ps.spilled (Operand.Var y) = none)
+    (hdead_y : nextLiveness.contains y = false) :
+    generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator curBbLabel ps
+      = ([StackOp.SOPush (Operand.Lit a), StackOp.SOEmit name],
+         releaseDeadSpills nextLiveness
+           { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with stack := base }) := by
+  have hrev : inst.operands.reverse = [Operand.Var y, Operand.Lit a] := by rw [hops]; rfl
+  have hpair := emitInputPlan_pair_deadVarLit_eq (opc := inst.opcode) (nl := nextLiveness)
+    (a := a) hnospill_y hdead_y
+  have hps1 : (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2.stack
+      = base ++ [Operand.Var y, Operand.Lit a] := by
+    rw [hrev, hpair]; simp [hstack0]
+  unfold generateRegularInstPlan
+  simp only [hcompute, hrev, houts]
+  rcases hemit : emitInputPlan inst.opcode [Operand.Var y, Operand.Lit a] nextLiveness ps
+    with ⟨inputOps, ps1⟩
+  have hps1' : ps1.stack = base ++ [Operand.Var y, Operand.Lit a] := by
+    have h2 : (emitInputPlan inst.opcode [Operand.Var y, Operand.Lit a] nextLiveness ps).2 = ps1 := by
+      rw [hemit]
+    rw [hrev] at hps1; rw [← h2]; exact hps1
+  have hops1 : inputOps = [StackOp.SOPush (Operand.Lit a)] := by
+    have h1 : (emitInputPlan inst.opcode [Operand.Var y, Operand.Lit a] nextLiveness ps).1 = inputOps := by
+      rw [hemit]
+    rw [hpair] at h1; exact h1.symm
+  simp [hops1, generateEmitOps_evmName hname,
+        reorderPlan_pair_varLit_nil base y a ps1 hps1',
+        hps1', stackPop_2_append_pair, hncomm, hnjmp]
+/-- Runnable sim for `MSTORE (Lit a) %y` (y dying at TOS, `a.toNat = 0`, no spills):
+    `PUSH a ; MSTORE`, applying `mstore a.toNat wy`. Uses `asmMstore_noSpill_rel` — no
+    `fnEom` bound; the no-spill hypothesis makes `planSpillRel` vacuous. -/
+theorem genRegularInstPlan_mstoreLit_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {offsetToPc : AssocList Nat Nat}
+    {y : String} {a wy : bytes32} {base : List Operand}
+    (hname : opcodeToEvmName inst.opcode = some "MSTORE")
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Lit a, Operand.Var y])
+    (houts : inst.outputs = [])
+    (hstack0 : ps.stack = base ++ [Operand.Var y])
+    (hnospill : ∀ op, alookup' ps.spilled op = none)
+    (hdead_y : nextLiveness.contains y = false)
+    (hwz : a.toNat = 0)
+    (hvy : operandVal vs lo (Operand.Var y) = some wy)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp "MSTORE" → asmStep offsetToPc prog s = asmMstore s)
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as
+             = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2 (mstore a.toNat wy vs) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  have hrev : inst.operands.reverse = [Operand.Var y, Operand.Lit a] := by rw [hops]; rfl
+  have hgen := genRegularInstPlan_mstoreLit_eq (liveness := liveness) (dfg := dfg) (cfg := cfg)
+    (fn := fn) (nextIsTerminator := nextIsTerminator) (curBbLabel := curBbLabel)
+    hname hncomm hnjmp hcompute hops houts hstack0 (hnospill _) hdead_y
+  rw [hgen] at hblock ⊢
+  set ps1 := (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with hps1def
+  have hpair := emitInputPlan_pair_deadVarLit_eq (opc := inst.opcode) (nl := nextLiveness)
+    (a := a) (hnospill _) hdead_y
+  have hps1stack : ps1.stack = base ++ [Operand.Var y, Operand.Lit a] := by
+    rw [hps1def, hrev, hpair]; simp [hstack0]
+  have hps1spill : ps1.spilled = ps.spilled := by
+    rw [hps1def, hrev, hpair]
+  -- split the block: [AsmPush …] ++ [AsmOp "MSTORE"]
+  have hsplit : ([StackOp.SOPush (Operand.Lit a), StackOp.SOEmit "MSTORE"] : List StackOp)
+      = [StackOp.SOPush (Operand.Lit a)] ++ [StackOp.SOEmit "MSTORE"] := rfl
+  rw [hsplit, executePlan_append] at hblock
+  obtain ⟨hbI, hbE⟩ := asmBlockAt_append hblock
+  -- step 1: the literal push
+  obtain ⟨as1, hrunI, hrelI', hpcI⟩ := emitOneInput_sim_lit_append (opc := inst.opcode)
+    (nl := nextLiveness) (v := a) hrel hbI
+  have hrelI : venomAsmRel lo ps1 vs as1 := by
+    have : ({ ps with stack := ps.stack ++ [Operand.Lit a] } : PlanState) = ps1 := by
+      rw [hps1def, hrev, hpair]; try simp [stackPush]
+    rwa [this] at hrelI'
+  -- step 2: the store
+  have hstacktop : as1.stack = a :: wy :: as1.stack.drop 2 :=
+    venomAsmRel_asmStack_top2 hrelI hps1stack hvy rfl
+  have hbE' : asmBlockAt prog as1.pc (executePlan [StackOp.SOEmit "MSTORE"]) := by
+    rw [hpcI]; exact hbE
+  obtain ⟨hpcE, hgetE⟩ := asmBlockAt_one hbE'
+  have hnospill1 : ∀ op, alookup' ps1.spilled op = none := by
+    intro op; rw [hps1spill]; exact hnospill op
+  obtain ⟨hmst, hrelE⟩ := asmMstore_noSpill_rel (lo := lo) (ps := ps1) (vs := vs) (as := as1)
+    hrelI hstacktop hnospill1
+    (by rw [hwz]; exact Nat.zero_le _)
+    (by rw [hwz]; exact Nat.zero_le _)
+    (by rw [hwz]; try (rcases USize.size_eq with h | h <;> omega))
+  have hstepE : asmStep offsetToPc prog as1 = AsmResult.AsmOK ({ asmNext as1 with
+      stack := as1.stack.drop 2,
+      memory := (wordToBytes wy).write 0 (asmExpandMemory (a.toNat + 32) as1.memory) a.toNat 32 }) := by
+    rw [hdisp as1 hpcE hgetE, hmst]
+  have hps5 : ({ ps1 with stack := stackPop 2 ps1.stack } : PlanState) = { ps1 with stack := base } := by
+    rw [hps1stack, stackPop_2_append_pair]
+  rw [hps5] at hrelE
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrelE
+  refine ⟨_, ?_, hrelR, ?_⟩
+  · show runAsm (executePlan ([StackOp.SOPush (Operand.Lit a)] ++ [StackOp.SOEmit "MSTORE"])).length
+        offsetToPc prog as = _
+    rw [executePlan_append, List.length_append]
+    exact runAsm_compose hrunI (by
+      show runAsm (executePlan [StackOp.SOEmit "MSTORE"]).length offsetToPc prog as1 = _
+      rw [show (executePlan [StackOp.SOEmit "MSTORE"]).length = 1 from rfl,
+          runAsm_succ_ok hpcE hstepE]; rfl)
+  · show ({ asmNext as1 with stack := as1.stack.drop 2, memory := (wordToBytes wy).write 0 (asmExpandMemory (a.toNat + 32) as1.memory) a.toNat 32 } : AsmState).pc = as.pc + (executePlan ([StackOp.SOPush (Operand.Lit a)] ++ [StackOp.SOEmit "MSTORE"])).length
+    rw [executePlan_append, List.length_append]
+    show (asmNext as1).pc = _
+    simp only [asmNext, hpcI]
+    rw [show (executePlan [StackOp.SOEmit "MSTORE"]).length = 1 from rfl]
+    omega
+
+/-- `{ (emitInputPlan (reverse=[Var y, Lit a]) nl ps).2 with stack := base } = { ps with stack := base }`. -/
+private theorem mstoreLit_state_eq {inst : Instruction} {nextLiveness : List String} {ps : PlanState}
+    {y : String} {a : bytes32} {base : List Operand}
+    (hops : inst.operands = [Operand.Lit a, Operand.Var y])
+    (hnospill_y : alookup' ps.spilled (Operand.Var y) = none)
+    (hdead_y : nextLiveness.contains y = false) :
+    ({ (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with stack := base } : PlanState)
+      = { ps with stack := base } := by
+  have hrev : inst.operands.reverse = [Operand.Var y, Operand.Lit a] := by rw [hops]; rfl
+  rw [hrev, emitInputPlan_pair_deadVarLit_eq hnospill_y hdead_y]
+
+/-- Output stack of an `MSTORE (Lit a) %y` (y dying at TOS): `base` (both inputs consumed). -/
+theorem genRegularInstPlan_mstoreLit_outStack
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {y : String} {a : bytes32} {base : List Operand} {name : String}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Lit a, Operand.Var y])
+    (houts : inst.outputs = [])
+    (hstack0 : ps.stack = base ++ [Operand.Var y])
+    (hnospill_y : alookup' ps.spilled (Operand.Var y) = none)
+    (hdead_y : nextLiveness.contains y = false) :
+    (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator
+      curBbLabel ps).2.stack = base := by
+  rw [genRegularInstPlan_mstoreLit_eq hname hncomm hnjmp hcompute hops houts hstack0 hnospill_y hdead_y]
+  rw [releaseDeadSpills_stack]
+
+/-- Headroom preservation for the consuming-lit store: stack shrinks by one (`base ++ [y] → base`). -/
+theorem stackDisc_mstoreLit_preserve
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {vs : VenomState} {y : String} {a wy : bytes32} {base : List Operand} {name : String}
+    {idx j : Nat}
+    (hsd : StackDiscH (j + 1) ps vs)
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Lit a, Operand.Var y])
+    (houts : inst.outputs = [])
+    (hstack0 : ps.stack = base ++ [Operand.Var y])
+    (hnospill_y : alookup' ps.spilled (Operand.Var y) = none)
+    (hdead_y : nextLiveness.contains y = false)
+    (hstepEq : stepInstBase inst vs = ExecResult.OK (mstore a.toNat wy vs)) :
+    StackDiscH j (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+      nextIsTerminator curBbLabel ps).2 (gvBodyStep (inst, idx) vs) := by
+  rw [genRegularInstPlan_mstoreLit_eq hname hncomm hnjmp hcompute hops houts hstack0 hnospill_y hdead_y]
+  apply releaseDeadSpills_stackDiscH
+  rw [mstoreLit_state_eq hops hnospill_y hdead_y]
+  have hgv : gvBodyStep (inst, idx) vs = { mstore a.toNat wy vs with instIdx := idx + 1 } := by
+    unfold gvBodyStep; rw [hstepEq]
+  rw [hgv]
+  refine ⟨fun op => hsd.noSpill op, ?_, ?_⟩
+  · show base.length + j ≤ 15
+    have := hsd.shallow
+    rw [hstack0] at this
+    simp only [List.length_append, List.length_cons, List.length_nil] at this
+    omega
+  · intro z hz
+    show ∃ w, lookupVar z vs = some w
+    exact hsd.defined z (by rw [hstack0]; exact List.mem_append_left _ hz)
+
+/-- **The `StackIsVars`-aware body step for `MSTORE (Lit a) %y`** — the consuming-lit,
+    no-`fnEom` store step. The 0-output analog of `stackDisc_sstore_step_S` at the layout
+    `S ++ [y] → S` (the dying value is consumed). -/
+theorem stackDisc_mstoreLit_step_S
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {offsetToPc : AssocList Nat Nat}
+    {baseS : List String} {y : String} {a : bytes32} {j idx : Nat}
+    (hsd : StackDiscH (j + 1) ps vs)
+    (hsv : StackIsVars (baseS ++ [y]) ps)
+    (hname : opcodeToEvmName inst.opcode = some "MSTORE")
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hdispatch : stepInstBase inst vs = execWrite2 (fun addr val s => mstore addr.toNat val s) inst vs)
+    (hops : inst.operands = [Operand.Lit a, Operand.Var y])
+    (houts : inst.outputs = [])
+    (hdead_y : nextLiveness.contains y = false)
+    (hwz : a.toNat = 0)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp "MSTORE" → asmStep offsetToPc prog s = asmMstore s)
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    (∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+              nextIsTerminator curBbLabel ps).1).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+            venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+              nextIsTerminator curBbLabel ps).2 (gvBodyStep (inst, idx) vs) as' ∧
+            as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+              nextLiveness false nextIsTerminator curBbLabel ps).1).length)
+    ∧ StackDiscH j (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).2 (gvBodyStep (inst, idx) vs)
+    ∧ StackIsVars baseS (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).2 := by
+  have hstack0 : ps.stack = (baseS.map Operand.Var) ++ [Operand.Var y] := by
+    have h := hsv
+    unfold StackIsVars at h
+    rw [h, List.map_append]; rfl
+  have hymem : Operand.Var y ∈ ps.stack := by rw [hstack0]; simp
+  have hnospill_y : alookup' ps.spilled (Operand.Var y) = none := hsd.noSpill _
+  obtain ⟨wy, hwy⟩ := hsd.defined y hymem
+  have hvy : operandVal vs lo (Operand.Var y) = some wy := hwy
+  have hnospill : ∀ op, alookup' ps.spilled op = none := fun op => hsd.noSpill op
+  have hstepEq : stepInstBase inst vs = ExecResult.OK (mstore a.toNat wy vs) := by
+    rw [hdispatch]; unfold execWrite2; rw [hops]; simp only [evalOperand, hwy]
+  have hsim := genRegularInstPlan_mstoreLit_sim hname hncomm hnjmp hcompute hops houts hstack0
+    hnospill hdead_y hwz hvy hdisp hrel hblock
+  refine ⟨gvBodyStep_of_ok (idx := idx) hstepEq hsim, ?_, ?_⟩
+  · exact stackDisc_mstoreLit_preserve (idx := idx) hsd hname hncomm hnjmp hcompute hops houts
+      hstack0 hnospill_y hdead_y hstepEq
+  · show (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator
+      curBbLabel ps).2.stack = baseS.map Operand.Var
+    rw [genRegularInstPlan_mstoreLit_outStack hname hncomm hnjmp hcompute hops houts hstack0
+      hnospill_y hdead_y]
+
+/-- **`BodyStepHTo` for the consuming-lit store** `MSTORE (Lit a) %y` (`a.toNat = 0`, `y` dying
+    at TOS): the fold emits `PUSH a ; MSTORE`, the layout steps `S ++ [y] → S`. No `RegularStepG`
+    arm and no `fnEom` bound — the noSpill discipline carries the memory relation. -/
+theorem bodyStepHTo_mstoreLit
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat} {prog : List AsmInst}
+    {inst : Instruction} {nextLiveness : List String} {curBbLabel : String}
+    {baseS : List String} {y : String} {a : bytes32} {idx : Nat}
+    (hname : opcodeToEvmName inst.opcode = some "MSTORE")
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hdispatch : ∀ v, stepInstBase inst v = execWrite2 (fun addr val s => mstore addr.toNat val s) inst v)
+    (hops : inst.operands = [Operand.Lit a, Operand.Var y])
+    (houts : inst.outputs = [])
+    (hdead_y : nextLiveness.contains y = false)
+    (hwz : a.toNat = 0)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp "MSTORE" → asmStep offsetToPc prog s = asmMstore s) :
+    BodyStepHTo lo offsetToPc prog
+      (fun z p => generateRegularInstPlan liveness dfg cfg fn z.1 nextLiveness false true curBbLabel p)
+      1 (inst, idx) (baseS ++ [y]) baseS := by
+  intro p v s j hsd hsv hrel hblock
+  exact stackDisc_mstoreLit_step_S (idx := idx) hsd hsv hname hncomm hnjmp hcompute (hdispatch v)
+    hops houts hdead_y hwz hdisp hrel hblock
 
 /-! ### `BodyStepG` producer for SSTORE (the first 0-output producer)
 
