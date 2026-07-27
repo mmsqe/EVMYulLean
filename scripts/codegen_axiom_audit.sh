@@ -15,7 +15,18 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$HERE"
 
-OUT="$(lake env lean EvmYul/Venom/Hol/CodegenAudit.lean 2>&1)"
+AUDIT_FILE="EvmYul/Venom/Hol/CodegenAudit.lean"
+# Expected number of results = the `#print axioms` lines in the file. Asserting this
+# catches a RENAMED/typo'd capstone, which would otherwise just error on its own line
+# while the other results still print (leaving a non-zero count and a false PASS).
+EXPECTED="$(grep -c '^#print axioms ' "$AUDIT_FILE")"
+set +e
+OUT="$(lake env lean "$AUDIT_FILE" 2>&1)"; LEAN_RC=$?
+set -e
+if [ "$LEAN_RC" -ne 0 ] || echo "$OUT" | grep -qE '^[^ ]*error'; then
+  echo "FAIL: $AUDIT_FILE did not elaborate cleanly (a renamed/removed result?)." >&2
+  echo "$OUT" | grep -iE 'error|unknown' | head -10 >&2; exit 1
+fi
 
 # Collapse each wrapped `'name' depends on axioms: [ ... ]` record onto one line.
 NORM="$(echo "$OUT" | awk '
@@ -24,9 +35,9 @@ NORM="$(echo "$OUT" | awk '
 ')"
 
 TOTAL="$(echo "$NORM" | grep -c 'depends on axioms:' || true)"
-if [ "$TOTAL" -eq 0 ]; then
-  echo "FAIL: no results audited — did CodegenAudit.lean fail to elaborate?" >&2
-  echo "$OUT" | tail -20 >&2; exit 1
+if [ "$TOTAL" -ne "$EXPECTED" ]; then
+  echo "FAIL: audited $TOTAL results but the file lists $EXPECTED — a result was dropped." >&2
+  exit 1
 fi
 
 if echo "$OUT" | grep -q 'sorryAx'; then
