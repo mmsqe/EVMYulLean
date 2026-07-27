@@ -1,6 +1,7 @@
 import EvmYul.Frame.StepShapes
 import EvmYul.Venom.BalanceSlot
 import EvmYul.Venom.SlotAbstraction
+import EvmYul.Venom.MemBridge
 
 /-!
 # Lifting the balance peephole to EVM bytecode
@@ -35,7 +36,7 @@ Instead:
 -/
 
 namespace EvmYul.Venom
-open EvmYul EvmYul.EVM EvmYul.Frame
+open EvmYul EvmYul.EVM EvmYul.Frame EvmYul.Venom.MemBridge
 
 /-- The value `SLOAD key` pushes: `storage[key]` of the executing account
 (the form `step_SLOAD_shape_strong` exposes). -/
@@ -138,5 +139,63 @@ theorem evm_sload_equiv_of_realizes
     s_o'.stack.head? = s_p'.stack.head? :=
   evm_sload_equiv s_o s_o' s_p s_p' f' cost argO argP (fslot a) (UInt256.lnot a) tlO tlP
     hOstk hPstk hOstep hPstep (evmStorageRel_of_realizes s_o s_p B fslot hO hP a)
+
+/-! ## Discharging the keccak-value residual on the ByteArray machine
+
+The demo assumed the `KECCAK256` result IS `keccak256(slot ++ addr)` (`hOrig`/
+`hkeyO`). These discharge it on the real ByteArray machine: after the two staging
+stores, the read region's keccak equals the Venom reference value, using only the
+M1 `ffi_zeroes_*` axioms + the raw opaque `ffi.KEC` (no bespoke keccak-value axiom). -/
+
+/-- ByteArrays with equal `toList` are equal. -/
+theorem byteArray_eq_of_toList {X Y : ByteArray} (h : X.toList = Y.toList) : X = Y := by
+  apply ByteArray.ext
+  have hd : X.data.toList = Y.data.toList := by
+    rw [← toList_eq_data, ← toList_eq_data]; exact h
+  have := congrArg List.toArray hd
+  simpa [Array.toArray_toList] using this
+
+/-- **The EVM keccak region IS the reference preimage.** After `MSTORE 0x00 slot;
+MSTORE 0x20 addr`, reading `[0x00, 0x40)` from the ByteArray machine memory yields
+exactly the ByteArray of `toBytes32 slot ++ toBytes32 addr` — the SAME preimage the
+Venom reference model hashes. Proved (no keccak-value axiom) via the M1 memory
+bridge: `store_refines_discharged` (×2) threads the refinement, `readWithPadding_toList`
+crosses to the `List` model, `readBytes_storeWord_storeWord` computes the content. -/
+theorem machine_keccak_region_eq (ba0 : ByteArray) (slot addr : UInt256) :
+    (machineStore (machineStore ba0 (UInt256.ofNat 0x00) slot) (UInt256.ofNat 0x20) addr).readWithPadding
+        (UInt256.ofNat 0x00).toNat (UInt256.ofNat 0x40).toNat
+      = (Mem.toBytes32 slot ++ Mem.toBytes32 addr).toByteArray := by
+  have h0 : (UInt256.ofNat 0x00).toNat < USize.size := by
+    rw [show (UInt256.ofNat 0x00).toNat = 0 from by decide]
+    exact Nat.lt_of_lt_of_le (by norm_num) USize.le_size
+  have h20 : (UInt256.ofNat 0x20).toNat < USize.size := by
+    rw [show (UInt256.ofNat 0x20).toNat = 32 from by decide]
+    exact Nat.lt_of_lt_of_le (by norm_num) USize.le_size
+  have href : MemRefines
+      (Mem.storeWord (Mem.storeWord (ba0.data.toList) (UInt256.ofNat 0x00) slot) (UInt256.ofNat 0x20) addr)
+      (machineStore (machineStore ba0 (UInt256.ofNat 0x00) slot) (UInt256.ofNat 0x20) addr) :=
+    store_refines_discharged (UInt256.ofNat 0x20) addr h20
+      (store_refines_discharged (UInt256.ofNat 0x00) slot h0 (memRefines_self ba0))
+  apply byteArray_eq_of_toList
+  rw [ltba_toList]
+  rw [show (UInt256.ofNat 0x00).toNat = 0 from by decide,
+      show (UInt256.ofNat 0x40).toNat = 64 from by decide]
+  rw [readWithPadding_toList href 0 64 (by exact Nat.lt_of_lt_of_le (by norm_num) USize.le_size),
+      Mem.readBytes_storeWord_storeWord (ba0.data.toList) slot addr
+        (UInt256.ofNat 0x00) (UInt256.ofNat 0x20) (by decide) (by decide)]
+
+/-- **The EVM keccak value IS the Venom reference value** — no bespoke keccak
+assumption. Combining `machine_keccak_region_eq` with `ffi.KEC` congruence: the
+hash the ByteArray machine computes over `[0x00,0x40)` after the two staging stores
+equals `venomKeccakOf (toBytes32 slot ++ toBytes32 addr)`. The only residual trust
+is the raw opaque `ffi.KEC` (unavoidable) + the M1 `ffi_zeroes_*` axioms; the *value
+identification* the demo assumed (`hOrig`/`hkeyO`) is now discharged. -/
+theorem machine_keccak_value_eq_venom (ba0 : ByteArray) (slot addr : UInt256) :
+    UInt256.ofNat (fromByteArrayBigEndian
+        (ffi.KEC ((machineStore (machineStore ba0 (UInt256.ofNat 0x00) slot) (UInt256.ofNat 0x20) addr).readWithPadding
+          (UInt256.ofNat 0x00).toNat (UInt256.ofNat 0x40).toNat)))
+      = venomKeccakOf (Mem.toBytes32 slot ++ Mem.toBytes32 addr) := by
+  unfold venomKeccakOf
+  rw [machine_keccak_region_eq]
 
 end EvmYul.Venom

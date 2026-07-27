@@ -98,7 +98,7 @@ def dfJoinedVal {α γ : Type} (dir : Direction) (bottom : α) (join : α → α
   | none => base
   | some (evLbl, v) => if lbl = evLbl then join v base else base
 
-private def findBlock (lbl : String) (bbs : List BasicBlock) : Option BasicBlock :=
+def findBlock (lbl : String) (bbs : List BasicBlock) : Option BasicBlock :=
   bbs.find? (·.label == lbl)
 
 /-- `df_process_block`: one block update (join inputs, fold, refresh boundary). -/
@@ -154,5 +154,28 @@ def dfAnalyzeFuel {α γ : Type} [BEq α] (fuel : Nat) (dir : Direction) (bottom
     | Direction.Backward => cfg.dfsPost
   let boundaryResult := (wlIterateFuel fuel changed process deps wl0 st0').2
   dfPopulateInst dir bottom join transfer edgeTransfer ctx entryVal cfg bbs lbls boundaryResult
+
+/-- The `.inst` field of a `DfState`-prepend fold is the corresponding pure list-prepend fold. -/
+theorem foldl_dfstate_inst {α} (f : String → AssocList (String × Nat) α) (lbls : List String)
+    (st0 : DfState α) :
+    (lbls.foldl (fun st' lbl => { st' with inst := f lbl ++ st'.inst }) st0).inst
+      = lbls.foldl (fun acc lbl => f lbl ++ acc) st0.inst := by
+  induction lbls generalizing st0 with
+  | nil => rfl
+  | cons l ls ih => rw [List.foldl_cons, List.foldl_cons, ih]
+
+/-- **`dfPopulateInst`'s instruction map is the per-block prepend fold.** Exposes the `.inst` field as
+    the concatenation (newest-first) of each block's `dfFoldBlock` map — the shape the `liveVarsAt`
+    lift resolves with `foldl_prepend_lookup_*`. -/
+theorem dfPopulateInst_inst_eq {α γ} [BEq α] (dir : Direction) (bottom : α) (join : α → α → α)
+    (transfer : γ → Instruction → α → α) (edgeTransfer : γ → String → String → α → α)
+    (ctx : γ) (entryVal : Option (String × α)) (cfg : CfgAnalysis) (bbs : List BasicBlock)
+    (lbls : List String) (st : DfState α) :
+    (dfPopulateInst dir bottom join transfer edgeTransfer ctx entryVal cfg bbs lbls st).inst
+      = lbls.foldl (fun acc lbl =>
+          (dfFoldBlock dir (transfer ctx) lbl
+            (match findBlock lbl bbs with | none => [] | some bb => bb.instructions)
+            (dfJoinedVal dir bottom join edgeTransfer ctx entryVal cfg st lbl)).2 ++ acc) st.inst := by
+  exact foldl_dfstate_inst _ lbls st
 
 end EvmYul.Venom.Hol.Codegen

@@ -259,4 +259,42 @@ theorem foldArith_C'_le (s : EVM.State) (op : Op) (h : op.isArith) :
 theorem foldExp_C'_le (s : EVM.State) : C' s (.Push .PUSH1) ≤ C' s (evmOpOf .exp) := by
   rw [C'_push]; exact le_trans (by decide : Gverylow ≤ Gexp) (Gexp_le_C'_exp s)
 
+/-! ## The composed optimizer — the M6 × M7 capstone
+
+The four verified passes composed into a single `optimizeFn`. Read
+right-to-left: constant-fold pure ops, apply the algebraic peephole, drop the
+resulting nops, then truncate dead code after each block's terminator. The two
+headline theorems tie M6 (each pass preserves semantics) and M7 (each pass is
+gas-non-increasing) into the property a verified optimizer needs end to end:
+**it preserves whole-function execution exactly and never increases static gas.**
+-/
+
+/-- The optimizer: constant folding → algebraic simplification → nop removal →
+dead-code truncation, all as `Function.mapBlocks` passes. -/
+def optimizeFn : Function → Function :=
+  truncFn ∘ removeNopsFn ∘ simplifyFn ∘ foldPureFn
+
+/-- **Semantics preservation, end to end.** Running the optimized function equals
+running the original, for any fuel and start state — each pass preserves
+`Function.exec` exactly, so the composition does too. -/
+theorem exec_optimizeFn (fn : Function) (fuel : Nat) (s : VenomState) :
+    (optimizeFn fn).exec fuel s = fn.exec fuel s := by
+  unfold optimizeFn Function.comp
+  rw [exec_truncFn, exec_removeNopsFn, exec_simplifyFn, exec_foldPureFn]
+
+/-- **Gas non-increasing, end to end.** The optimized function's static gas never
+exceeds the original's — each pass is gas-non-increasing, chained by transitivity. -/
+theorem progGas_optimizeFn_le (fn : Function) : progGas (optimizeFn fn) ≤ progGas fn := by
+  unfold optimizeFn Function.comp
+  exact le_trans (progGas_truncFn_le _)
+    (le_trans (progGas_removeNopsFn_le _)
+      (le_trans (progGas_simplifyFn_le _) (progGas_foldPureFn_le _)))
+
+/-- **The verified-optimizer capstone**: for every function, the optimizer both
+preserves execution and does not increase gas — the two properties together. -/
+theorem optimizeFn_correct_and_gas (fn : Function) :
+    (∀ (fuel : Nat) (s : VenomState), (optimizeFn fn).exec fuel s = fn.exec fuel s)
+      ∧ progGas (optimizeFn fn) ≤ progGas fn :=
+  ⟨exec_optimizeFn fn, progGas_optimizeFn_le fn⟩
+
 end EvmYul.Venom

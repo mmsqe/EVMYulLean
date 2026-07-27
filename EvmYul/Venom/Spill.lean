@@ -65,6 +65,27 @@ theorem step_MSTORE_shape_strong (s s' : EVM.State) (f' cost : ℕ) (arg : Optio
   subst hStep
   refine ⟨rfl, rfl, rfl, rfl⟩
 
+/-- **Strong `KECCAK256` shape.** Unlike `step_KECCAK256_shape` (which exposes only
+`∃ v` for the pushed hash), this pins the value to `ffi.KEC` of the read memory
+region — the SAME opaque `ffi.KEC` the Venom reference model uses (`venomKeccakOf`),
+so a keccak-block equivalence needs no bespoke value assumption: it reduces to a
+memory-content fact plus `ffi.KEC` congruence, with the raw hash the only residual. -/
+theorem step_KECCAK256_shape_strong (s s' : EVM.State) (f' cost : ℕ) (arg : Option (UInt256 × Nat))
+    (hd1 hd2 : UInt256) (tl : Stack UInt256) (hStk : s.stack = hd1 :: hd2 :: tl)
+    (hStep : EVM.step (f' + 1) cost (some (.KECCAK256, arg)) s = .ok s') :
+    s'.stack = UInt256.ofNat (fromByteArrayBigEndian
+        (ffi.KEC (s.toMachineState.memory.readWithPadding hd1.toNat hd2.toNat))) :: tl ∧
+    s'.executionEnv = s.executionEnv := by
+  unfold EVM.step at hStep
+  simp only [bind, Except.bind, pure, Except.pure] at hStep
+  unfold EvmYul.step at hStep
+  simp only [Id.run] at hStep
+  unfold dispatchBinaryMachineStateOp' EVM.binaryMachineStateOp' at hStep
+  rw [hStk] at hStep
+  simp only [Stack.pop2, Id_run_ok, Except.ok.injEq] at hStep
+  subst hStep
+  refine ⟨rfl, rfl⟩
+
 /-- `PUSH1` preserves the memory and active-word count (so `lookupMemory` is
 unchanged across it) and the account map. -/
 theorem step_PUSH1_mem (s s' : EVM.State) (f' cost : ℕ) (v : UInt256)

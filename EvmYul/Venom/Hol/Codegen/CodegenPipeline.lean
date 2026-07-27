@@ -43,14 +43,55 @@ def isPreCodegenOpcode : Opcode → Bool
 def codegenReadyInst (inst : Instruction) : Prop :=
   ¬ isPreCodegenOpcode inst.opcode
 
+/-- **Block termination well-formedness.** A basic block is properly terminated: its last instruction
+    is a terminator and no earlier instruction is (so control leaves exactly once, at the end). The
+    checkable structural fact the block simulator needs — `genBlockSimulation`'s block-structure
+    hyps (`hbb`/`histerm`/`hnonterm`) are exactly its extraction (`blockTerminatedWf_extract`). -/
+def blockTerminatedWf (insts : List Instruction) : Prop :=
+  match insts.getLast? with
+  | some term => isTerminator term.opcode = true ∧
+      ∀ inst ∈ insts.dropLast, isTerminator inst.opcode = false
+  | none => False
+
 /-- Per-function: structural WF + SSA + SUE + normalized CFG + no bad opcodes.
     These preconditions are discharged by earlier passes in the pipeline.
     For our property definitions, we state them as assumptions (Props). -/
 def codegenReadyFn (fn : IrFunction) : Prop :=
   -- All instructions satisfy codegen_ready_inst
   (∀ bb ∈ fn.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst) ∧
-  -- Well-formedness conditions (stated as Props, to be proved by earlier passes)
-  True
+  -- Well-formedness: every block is properly terminated (was a `True` stub). The block simulator's
+  -- structure hyps follow via `blockTerminatedWf_extract`.
+  (∀ bb ∈ fn.blocks, blockTerminatedWf bb.instructions)
+
+/-- **Block WF ⟹ the `front ++ [term]` decomposition.** Extracts exactly the structural facts
+    `genBlockSimulation` consumes (`hbb`/`histerm`/`hnonterm`) from `blockTerminatedWf`: the block is
+    `front ++ [term]` with `term` a terminator and no `front` instruction a terminator. -/
+theorem blockTerminatedWf_extract {insts : List Instruction} (h : blockTerminatedWf insts) :
+    ∃ front term, insts = front ++ [term] ∧ isTerminator term.opcode = true ∧
+      ∀ inst ∈ front, isTerminator inst.opcode = false := by
+  unfold blockTerminatedWf at h
+  cases hlast : insts.getLast? with
+  | none => rw [hlast] at h; exact absurd h not_false
+  | some term =>
+    rw [hlast] at h
+    obtain ⟨hterm, hfront⟩ := h
+    have hne : insts ≠ [] := by
+      intro he; rw [he] at hlast; simp at hlast
+    refine ⟨insts.dropLast, term, ?_, hterm, hfront⟩
+    have hgl : insts.getLast hne = term :=
+      Option.some.inj ((List.getLast?_eq_some_getLast hne).symm.trans hlast)
+    conv_lhs => rw [← List.dropLast_append_getLast hne]
+    rw [hgl]
+
+/-- **A codegen-ready function yields each block's simulator structure.** For any block of a
+    `codegenReadyFn` function, the `front ++ [term]` termination decomposition `genBlockSimulation`
+    consumes (`hbb`/`histerm`/`hnonterm`) follows from the strengthened WF conjunct — closing the
+    loop from `codegenReadyFn` to the block simulator's structural hypotheses. -/
+theorem codegenReadyFn_blockStruct {fn : IrFunction} (h : codegenReadyFn fn)
+    {bb : BasicBlock} (hmem : bb ∈ fn.blocks) :
+    ∃ front term, bb.instructions = front ++ [term] ∧ isTerminator term.opcode = true ∧
+      ∀ inst ∈ front, isTerminator inst.opcode = false :=
+  blockTerminatedWf_extract (h.2 bb hmem)
 
 /-- Per-context: all functions ready. -/
 def codegenReady (ctx : VenomContext) : Prop :=
@@ -135,6 +176,28 @@ def generateOffsetPlan (inst : Instruction) (ps : PlanState) : List StackOp × P
   | Operand.Label l => ([StackOp.SOPushOfst l n], { ps with stack := stackPush ret ps.stack })
   | _ => ([], ps)
 
+/-- **DJMP comparison chain + pop-trampolines.** For each target label `lᵢ` (index `i`), emit a check
+    `DUP1 ; PUSH i ; EQ ; PUSH tᵢ ; JUMPI` (the selector is DUP'd so it survives for the next check), and
+    a trampoline `tᵢ : POP ; PUSH lᵢ ; JUMP` that pops the leftover selector before jumping to `lᵢ` — so
+    the successor block never sees the selector. `tᵢ` is a fresh label (`freshLabel`, threading
+    `labelCounter`). Returns `(comparison-chain, trampolines, ps')`. -/
+def djmpChain : Nat → List String → PlanState → (List StackOp × List StackOp × PlanState)
+  | _, [], ps => ([], [], ps)
+  | i, l :: rest, ps =>
+    let (t, ps1) := freshLabel "djmp_tramp" ps
+    let (chain, tramps, ps2) := djmpChain (i + 1) rest ps1
+    ([StackOp.SODup 1, StackOp.SOPush (Operand.Lit (UInt256.ofNat i)), StackOp.SOEmit "EQ",
+      StackOp.SOPushLabel t, StackOp.SOEmit "JUMPI"] ++ chain,
+     [StackOp.SOLabel t, StackOp.SOPop 1, StackOp.SOPushLabel l, StackOp.SOEmit "JUMP"] ++ tramps, ps2)
+
+/-- **DJMP jump-table lowering** (`OK (jumpTo labels[selector])`, matching the interpreter's *index*
+    semantics — the old stub `[SOEmit "JUMP"]` wrongly treated the selector as an address). The
+    comparison switch (`djmpChain`), then a `POP ; PUSH revert ; JUMP` default for the out-of-range case
+    (which the interpreter reports as `Error`, i.e. the trivial `hbsim` arm), then the trampolines. -/
+def generateDjmpPlan (labels : List String) (ps : PlanState) : List StackOp × PlanState :=
+  let (chain, tramps, ps') := djmpChain 0 labels ps
+  (chain ++ [StackOp.SOPop 1, StackOp.SOPushLabel "revert", StackOp.SOEmit "JUMP"] ++ tramps, ps')
+
 /-- `generate_emit_ops`: per-opcode EVM emission. -/
 def generateEmitOps (inst : Instruction) (logTopicCount : Nat)
     (ps : PlanState) : List StackOp × PlanState :=
@@ -152,7 +215,9 @@ def generateEmitOps (inst : Instruction) (logTopicCount : Nat)
       match inst.operands with
       | [Operand.Label target] => ([StackOp.SOPushLabel target, StackOp.SOEmit "JUMP"], ps)
       | _ => ([], ps)
-    else if opc = Opcode.DJMP then ([StackOp.SOEmit "JUMP"], ps)
+    else if opc = Opcode.DJMP then
+      generateDjmpPlan (inst.operands.filterMap
+        (fun o => match o with | Operand.Label l => some l | _ => none)) ps
     else if opc = Opcode.INVOKE then
       match inst.operands.head! with
       | Operand.Label l =>

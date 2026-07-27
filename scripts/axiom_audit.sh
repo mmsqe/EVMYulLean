@@ -66,13 +66,22 @@ recs = re.findall(r"'([^']+)' depends on axioms: \[([^\]]*)\]", text)
 # axiom-free results (the strongest rigor — not even propext) print differently.
 free = re.findall(r"'([^']+)' does not depend on any axioms", text)
 STD = {"propext", "Classical.choice", "Quot.sound"}
-M1  = {"EvmYul.M1.ffi_zeroes_size", "EvmYul.M1.ffi_zeroes_get"}
+# the M1 axioms print namespace-shortened depending on Audit.lean's `open`
+# context (EvmYul.M1.ffi_zeroes_get / M1.ffi_zeroes_get / ffi_zeroes_get) —
+# canonicalize on the suffix so classification is context-independent.
+M1  = {"ffi_zeroes_size", "ffi_zeroes_get"}
+def canon(a):
+    a = a.strip()
+    for m in M1:
+        if a == m or a.endswith("." + m):
+            return m
+    return a
 rig, m1, srr, oth = [], [], [], []
 for name in free:
     rig.append(name.replace("EvmYul.Venom.", "").replace("EvmYul.", ""))
 nfree = len(rig)
 for name, ax in recs:
-    s = {a.strip() for a in ax.split(",") if a.strip()}
+    s = {canon(a) for a in ax.split(",") if a.strip()}
     short = name.replace("EvmYul.Venom.", "").replace("EvmYul.", "")
     if "sorryAx" in s: srr.append(short)
     elif s <= STD:     rig.append(short)
@@ -84,6 +93,7 @@ print(f"  + the isolated M1 FFI axioms ONLY (memset_zero: ffi_zeroes_size/get): 
 print(f"  depend on sorry (a hole):                                                    {len(srr)}")
 if oth:
     print(f"  !! UNEXPECTED footprints: {oth}")
+    sys.exit(1)
 print()
 print("  the M1 FFI axioms appear on exactly these results — the whole trust boundary:")
 for n in m1:

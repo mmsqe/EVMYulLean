@@ -12,6 +12,7 @@ and the opcode execution logic.
 
 import EvmYul.Venom.Hol.Types
 import EvmYul.Venom.Hol.Semantics
+import EvmYul.Venom.Hol.SubEvm
 import EvmYul.Venom.Hol.Codegen.AsmIR
 import EvmYul.UInt256
 import EvmYul.Wheels
@@ -164,6 +165,79 @@ def asmMstore8 (s : AsmState) : AsmResult :=
     AsmResult.AsmOK ({ asmNext s with stack := stk, memory := newmem })
   | _ => AsmResult.AsmError "MSTORE8: stack underflow"
 
+/- ===== External calls (asm side): delegate to the shared sub-EVM (`evmCall`/`evmCreate`) =====
+
+These mirror the Venom-side `stepExternalCall` exactly — same `evmCall`/`evmCreate` arguments, same
+calldata read (`readWithPadding`) and returndata writeback (`bytes.write`, matching
+`writeMemoryWithExpansion`) — over the *shared* `Accounts`/memory model. So on corresponding states
+(asm stack top = the Venom operands, equal memory/accounts) both sides produce the same effect, which
+is what the per-block CALL correspondence needs. The pushed success flag / new address is the EVM
+stack result. -/
+
+/-- Writeback shared by the message-call arms: record `returndata`, copy the first `retSize` bytes to
+    memory at `retOff` (matching `writeMemoryWithExpansion`), push `success`, install new accounts. -/
+def asmCallWriteback (rOff rSz : Nat) (success : bytes32) (newAccs : Accounts) (ret : List byte)
+    (stk : List bytes32) (s : AsmState) : AsmResult :=
+  let retBytes : ByteArray := ⟨(ret.take rSz).toArray⟩
+  let newmem := retBytes.write 0 s.memory rOff retBytes.size
+  let s' := { asmNext s with stack := success :: stk, accounts := newAccs }
+  AsmResult.AsmOK { s' with returndata := ⟨ret.toArray⟩, memory := newmem }
+
+/-- `CALL` (asm): pop `gas addr value argsOff argsSize retOff retSize`, run the sub-EVM, push success. -/
+def asmCall (s : AsmState) : AsmResult :=
+  match s.stack with
+  | gas :: addr :: value :: aOff :: aSz :: rOff :: rSz :: stk =>
+    let calldata := (s.memory.readWithPadding aOff.toNat aSz.toNat).toList
+    let (success, newAccs, ret) := evmCall subEvmFuel s.accounts s.callCtx.contract s.txCtx.origin
+      (AccountAddress.ofUInt256 addr) (AccountAddress.ofUInt256 addr) gas value value calldata
+      s.txCtx.gasprice 0 (!s.callCtx.static)
+    asmCallWriteback rOff.toNat rSz.toNat success newAccs ret stk s
+  | _ => AsmResult.AsmError "CALL: stack underflow"
+
+/-- `STATICCALL` (asm): pop `gas addr argsOff argsSize retOff retSize`, run the sub-EVM (no value,
+    `perm = false`), push success. -/
+def asmStaticCall (s : AsmState) : AsmResult :=
+  match s.stack with
+  | gas :: addr :: aOff :: aSz :: rOff :: rSz :: stk =>
+    let calldata := (s.memory.readWithPadding aOff.toNat aSz.toNat).toList
+    let (success, newAccs, ret) := evmCall subEvmFuel s.accounts s.callCtx.contract s.txCtx.origin
+      (AccountAddress.ofUInt256 addr) (AccountAddress.ofUInt256 addr) gas ⟨0⟩ ⟨0⟩ calldata
+      s.txCtx.gasprice 0 false
+    asmCallWriteback rOff.toNat rSz.toNat success newAccs ret stk s
+  | _ => AsmResult.AsmError "STATICCALL: stack underflow"
+
+/-- `DELEGATECALL` (asm): pop `gas addr argsOff argsSize retOff retSize`, run `addr`'s code in the
+    caller's own context (recipient = self, sender = caller's caller, apparent value = own callvalue). -/
+def asmDelegateCall (s : AsmState) : AsmResult :=
+  match s.stack with
+  | gas :: addr :: aOff :: aSz :: rOff :: rSz :: stk =>
+    let calldata := (s.memory.readWithPadding aOff.toNat aSz.toNat).toList
+    let (success, newAccs, ret) := evmCall subEvmFuel s.accounts s.callCtx.caller s.txCtx.origin
+      s.callCtx.contract (AccountAddress.ofUInt256 addr) gas ⟨0⟩ s.callCtx.callvalue calldata
+      s.txCtx.gasprice 0 (!s.callCtx.static)
+    asmCallWriteback rOff.toNat rSz.toNat success newAccs ret stk s
+  | _ => AsmResult.AsmError "DELEGATECALL: stack underflow"
+
+/-- `CREATE` (asm): pop `value off size`, run the sub-EVM creation, push the new address (0 on fail). -/
+def asmCreate (s : AsmState) : AsmResult :=
+  match s.stack with
+  | value :: off :: size :: stk =>
+    let initCode := (s.memory.readWithPadding off.toNat size.toNat).toList
+    let (addrOrZero, newAccs, _ret) := evmCreate subEvmFuel s.accounts s.callCtx.contract s.txCtx.origin
+      value initCode s.txCtx.gasprice 0 none
+    AsmResult.AsmOK { asmNext s with stack := addrOrZero :: stk, accounts := newAccs }
+  | _ => AsmResult.AsmError "CREATE: stack underflow"
+
+/-- `CREATE2` (asm): pop `value off size salt`, run the sub-EVM creation with salt, push the address. -/
+def asmCreate2 (s : AsmState) : AsmResult :=
+  match s.stack with
+  | value :: off :: size :: salt :: stk =>
+    let initCode := (s.memory.readWithPadding off.toNat size.toNat).toList
+    let (addrOrZero, newAccs, _ret) := evmCreate subEvmFuel s.accounts s.callCtx.contract s.txCtx.origin
+      value initCode s.txCtx.gasprice 0 (some (wordToBytes salt).toList)
+    AsmResult.AsmOK { asmNext s with stack := addrOrZero :: stk, accounts := newAccs }
+  | _ => AsmResult.AsmError "CREATE2: stack underflow"
+
 def asmSload (s : AsmState) : AsmResult :=
   match s.stack with
   | key :: stk =>
@@ -279,6 +353,14 @@ def asmCopyToMem (src : List byte) (s : AsmState) : AsmResult :=
     AsmResult.AsmOK ({ asmNext s with stack := stk, memory := newmem })
   | _ => AsmResult.AsmError "COPY: stack underflow"
 
+/-- EXTCODECOPY: pop the address, then copy the referenced account's code into memory (delegates to
+    `asmCopyToMem` with the account code as the source, on the remaining 3-input stack). -/
+def asmExtcodecopy (s : AsmState) : AsmResult :=
+  match s.stack with
+  | addr :: rest =>
+    asmCopyToMem (lookupAccount (AccountAddress.ofUInt256 addr) s.accounts).code { s with stack := rest }
+  | _ => AsmResult.AsmError "EXTCODECOPY: stack underflow"
+
 /-- RETURNDATACOPY with OOB check. -/
 def asmReturndatacopy (s : AsmState) : AsmResult :=
   match s.stack with
@@ -350,12 +432,30 @@ def asmStep (offsetToPc : AssocList Nat Nat) (instructions : List AsmInst) (s : 
     | AsmInst.AsmOp "SLOAD"  => asmSload s
     | AsmInst.AsmOp "SSTORE" => asmSstore s
     | AsmInst.AsmOp "TLOAD"  => asmStateUnop (λ k s => tload k s.toVenomState) s
+    | AsmInst.AsmOp "CALLDATALOAD" =>
+      asmStateUnop (λ offset s =>
+        wordOfBytes ((⟨s.callCtx.calldata.toArray⟩ : ByteArray).readWithPadding offset.toNat 32)) s
     | AsmInst.AsmOp "TSTORE" =>
       match s.stack with
       | key :: value :: stk =>
         let s' := tstore key value s.toVenomState
         AsmResult.AsmOK ({ asmNext s with stack := stk, transient := s'.transient })
       | _ => AsmResult.AsmError "TSTORE: stack underflow"
+    -- Account queries
+    | AsmInst.AsmOp "BALANCE" =>
+      asmStateUnop (λ addr s =>
+        EvmYul.UInt256.ofNat
+          (lookupAccount (AccountAddress.ofUInt256 addr) s.toVenomState.accounts).balance) s
+    | AsmInst.AsmOp "EXTCODESIZE" =>
+      asmStateUnop (λ addr s =>
+        EvmYul.UInt256.ofNat
+          (lookupAccount (AccountAddress.ofUInt256 addr) s.toVenomState.accounts).code.length) s
+    | AsmInst.AsmOp "EXTCODEHASH" =>
+      asmStateUnop (λ addr s =>
+        let acct := lookupAccount (AccountAddress.ofUInt256 addr) s.toVenomState.accounts
+        if acct.code.isEmpty then ⟨0⟩ else keccak256 (⟨acct.code.toArray⟩ : ByteArray)) s
+    | AsmInst.AsmOp "SELFBALANCE" =>
+      asmPushVal (EvmYul.UInt256.ofNat (lookupAccount s.callCtx.contract s.accounts).balance) s
     -- Environment
     | AsmInst.AsmOp "CALLER"    => asmPushVal (addressToWord s.callCtx.caller) s
     | AsmInst.AsmOp "ADDRESS"   => asmPushVal (addressToWord s.callCtx.contract) s
@@ -373,6 +473,7 @@ def asmStep (offsetToPc : AssocList Nat Nat) (instructions : List AsmInst) (s : 
     -- Copy ops
     | AsmInst.AsmOp "CALLDATACOPY"  => asmCopyToMem s.callCtx.calldata s
     | AsmInst.AsmOp "CODECOPY"      => asmCopyToMem s.code s
+    | AsmInst.AsmOp "EXTCODECOPY"   => asmExtcodecopy s
     | AsmInst.AsmOp "RETURNDATACOPY"=> asmReturndatacopy s
     | AsmInst.AsmOp "MCOPY"         => asmMcopy s
     | AsmInst.AsmOp "CALLDATASIZE"  => asmPushVal (EvmYul.UInt256.ofNat s.callCtx.calldata.length) s
@@ -405,6 +506,12 @@ def asmStep (offsetToPc : AssocList Nat Nat) (instructions : List AsmInst) (s : 
     | AsmInst.AsmDataHeader _ => AsmResult.AsmOK (asmNext s)
     | AsmInst.AsmDataItem _   => AsmResult.AsmOK (asmNext s)
     | AsmInst.AsmDataLabel _  => AsmResult.AsmError "unresolved data label"
+    -- External calls (delegate to the shared sub-EVM)
+    | AsmInst.AsmOp "CALL"         => asmCall s
+    | AsmInst.AsmOp "STATICCALL"   => asmStaticCall s
+    | AsmInst.AsmOp "DELEGATECALL" => asmDelegateCall s
+    | AsmInst.AsmOp "CREATE"       => asmCreate s
+    | AsmInst.AsmOp "CREATE2"      => asmCreate2 s
     -- DUP/SWAP via table
     | AsmInst.AsmOp name =>
       match assocLookup dupTable name with
@@ -493,5 +600,181 @@ theorem asmBlockAt_cons_drop {prog pc inst insts}
     have heq : (inst :: insts)[j + 1]? = insts[j]? := List.getElem?_cons_succ
     rw [heq] at h1
     exact h1
+
+/-- **Asm `CALL` step dispatch.** `asmStep` on a `CALL` opcode runs `asmCall` (the shared sub-EVM),
+    mirroring the Venom-side `stepExternalCall`. The asm-side step-correctness building block for the
+    per-block CALL correspondence. -/
+theorem asmStep_call_ok {offsetToPc : AssocList Nat Nat} {prog : List AsmInst} {s : AsmState}
+    (hpc : s.pc < prog.length) (hg : prog.get ⟨s.pc, hpc⟩ = AsmInst.AsmOp "CALL") :
+    asmStep offsetToPc prog s = asmCall s := by
+  simp only [asmStep, hg]
+  split
+  · rfl
+  · rename_i h; exact absurd hpc h
+
+/-- **Asm `STATICCALL` step dispatch.** `asmStep` on a `STATICCALL` opcode runs `asmStaticCall`
+    (the shared sub-EVM), mirroring the Venom-side `stepExternalCall`. -/
+theorem asmStep_staticcall_ok {offsetToPc : AssocList Nat Nat} {prog : List AsmInst} {s : AsmState}
+    (hpc : s.pc < prog.length) (hg : prog.get ⟨s.pc, hpc⟩ = AsmInst.AsmOp "STATICCALL") :
+    asmStep offsetToPc prog s = asmStaticCall s := by
+  simp only [asmStep, hg]
+  split
+  · rfl
+  · rename_i h; exact absurd hpc h
+
+/-- **Asm `DELEGATECALL` step dispatch.** `asmStep` on a `DELEGATECALL` opcode runs `asmDelegateCall`
+    (the shared sub-EVM), mirroring the Venom-side `stepExternalCall`. -/
+theorem asmStep_delegatecall_ok {offsetToPc : AssocList Nat Nat} {prog : List AsmInst} {s : AsmState}
+    (hpc : s.pc < prog.length) (hg : prog.get ⟨s.pc, hpc⟩ = AsmInst.AsmOp "DELEGATECALL") :
+    asmStep offsetToPc prog s = asmDelegateCall s := by
+  simp only [asmStep, hg]
+  split
+  · rfl
+  · rename_i h; exact absurd hpc h
+
+/-- **Asm `CREATE` step dispatch.** `asmStep` on a `CREATE` opcode runs `asmCreate` (the shared
+    sub-EVM creation), mirroring the Venom-side `stepExternalCall`. -/
+theorem asmStep_create_ok {offsetToPc : AssocList Nat Nat} {prog : List AsmInst} {s : AsmState}
+    (hpc : s.pc < prog.length) (hg : prog.get ⟨s.pc, hpc⟩ = AsmInst.AsmOp "CREATE") :
+    asmStep offsetToPc prog s = asmCreate s := by
+  simp only [asmStep, hg]
+  split
+  · rfl
+  · rename_i h; exact absurd hpc h
+
+/-- **Asm `CREATE2` step dispatch.** `asmStep` on a `CREATE2` opcode runs `asmCreate2` (the shared
+    sub-EVM creation), mirroring the Venom-side `stepExternalCall`. -/
+theorem asmStep_create2_ok {offsetToPc : AssocList Nat Nat} {prog : List AsmInst} {s : AsmState}
+    (hpc : s.pc < prog.length) (hg : prog.get ⟨s.pc, hpc⟩ = AsmInst.AsmOp "CREATE2") :
+    asmStep offsetToPc prog s = asmCreate2 s := by
+  simp only [asmStep, hg]
+  split
+  · rfl
+  · rename_i h; exact absurd hpc h
+
+/-- **CALL correspondence core: both interpreters run the identical sub-EVM.** Given corresponding
+    states (the Venom `CALL` operands evaluate to the same 7 words the compiled asm has on its stack
+    top, and the shared `accounts`/`memory`/`callCtx`/`txCtx` agree), the Venom driver step
+    `stepExternalCall` and the asm step `asmCall` both reduce to their *writeback* parameterised by the
+    **same** `evmCall` result `(success, newAccs, ret)` — i.e. both invoke the identical sub-EVM
+    (`evmCall subEvmFuel` on the shared accounts, equal args, equal calldata) and structure the
+    writeback identically. Composed with `callWriteback_asmCallWriteback_agree`, this is the sub-EVM
+    half of a `venomAsmRel`-preserving CALL block sim (the remaining half being the plan-side
+    `planStackRel`/`memoryRel` bookkeeping over the compiled operand pushes). -/
+theorem asmCall_stepExternalCall_same_evmCall {vs : VenomState} {s : AsmState} {inst : Instruction}
+    {out : String} {gas addr value aOff aSz rOff rSz : bytes32} {stk : List bytes32}
+    {success : bytes32} {newAccs : Accounts} {ret : List byte}
+    (hopc : inst.opcode = Opcode.CALL)
+    (heval : evalOperands inst.operands vs = some [gas, addr, value, aOff, aSz, rOff, rSz])
+    (hout : inst.outputs = [out])
+    (hstk : s.stack = gas :: addr :: value :: aOff :: aSz :: rOff :: rSz :: stk)
+    (hacc : vs.accounts = s.accounts) (hmem : vs.memory = s.memory)
+    (hcc : vs.callCtx = s.callCtx) (htx : vs.txCtx = s.txCtx)
+    (hcall : evmCall subEvmFuel s.accounts s.callCtx.contract s.txCtx.origin
+      (AccountAddress.ofUInt256 addr) (AccountAddress.ofUInt256 addr) gas value value
+      (s.memory.readWithPadding aOff.toNat aSz.toNat).toList s.txCtx.gasprice 0 (!s.callCtx.static)
+      = (success, newAccs, ret)) :
+    stepExternalCall subEvmFuel inst vs
+        = some (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs)
+      ∧ asmCall s = asmCallWriteback rOff.toNat rSz.toNat success newAccs ret stk s := by
+  have hcallV : evmCall subEvmFuel vs.accounts vs.callCtx.contract vs.txCtx.origin
+      (AccountAddress.ofUInt256 addr) (AccountAddress.ofUInt256 addr) gas value value
+      (readMemory aOff.toNat aSz.toNat vs).toList vs.txCtx.gasprice 0 (!vs.callCtx.static)
+      = (success, newAccs, ret) := by
+    rw [hacc, hcc, htx, readMemory, hmem]; exact hcall
+  refine ⟨?_, ?_⟩
+  · unfold stepExternalCall; rw [heval]; simp only [bind, Option.bind, hopc, hout, hcallV]
+  · unfold asmCall; rw [hstk]; simp only [hcall]
+
+/-- **CALL writeback agreement.** For the same `evmCall` result and equal memories, the Venom
+    `callWriteback` state and the asm `asmCallWriteback` state agree on every shared field
+    (`accounts`/`memory`/`returndata`), the Venom output var reads back the success flag the asm side
+    pushes, and the residual stack is `stk`. Composes with `asmCall_stepExternalCall_same_evmCall` to
+    give the full shared-state CALL correspondence. -/
+theorem callWriteback_asmCallWriteback_agree (out : String) (rOff rSz : Nat) (success : bytes32)
+    (newAccs : Accounts) (ret : List byte) (stk : List bytes32) (vs : VenomState) (s : AsmState)
+    (hmem : vs.memory = s.memory) :
+    ∃ s'', asmCallWriteback rOff rSz success newAccs ret stk s = AsmResult.AsmOK s''
+      ∧ (callWriteback out rOff rSz success newAccs ret vs).accounts = s''.accounts
+      ∧ (callWriteback out rOff rSz success newAccs ret vs).memory = s''.memory
+      ∧ (callWriteback out rOff rSz success newAccs ret vs).returndata = s''.returndata
+      ∧ lookupVar out (callWriteback out rOff rSz success newAccs ret vs) = some success
+      ∧ s''.stack = success :: stk := by
+  refine ⟨_, rfl, ?_, ?_, ?_, ?_, rfl⟩
+  · show (callWriteback _ _ _ _ _ _ _).accounts = newAccs
+    simp only [callWriteback, updateVar, writeMemoryWithExpansion]
+  · show (callWriteback _ _ _ _ _ _ _).memory = _
+    simp only [callWriteback, updateVar, writeMemoryWithExpansion, hmem]
+  · show (callWriteback _ _ _ _ _ _ _).returndata = ⟨ret.toArray⟩
+    simp only [callWriteback, updateVar, writeMemoryWithExpansion]
+  · simp only [callWriteback, updateVar, writeMemoryWithExpansion, lookupVar, alookup, ainsert,
+      AssocList.insert, AssocList.lookup, beq_self_eq_true, if_true]
+
+/-- **CALL step: full shared-state correspondence.** Composing the two CALL-core lemmas
+    (`asmCall_stepExternalCall_same_evmCall` + `callWriteback_asmCallWriteback_agree`) with the
+    environment-field preservation of both writebacks: for corresponding states (the 7 CALL operands
+    evaluate to the 7 asm stack-top words and every shared field agrees), the Venom `stepExternalCall`
+    and asm `asmCall` reach states agreeing on **all** shared `venomAsmRel` fields — accounts, memory,
+    returndata, transient, logs, callCtx, txCtx, blockCtx, code, prevHashes — with the output var
+    reading back the pushed success flag over the residual stack `stk`. (Both writebacks leave the
+    environment fields untouched, so they carry through from the input equalities.) Memory-agreement is
+    an explicit hypothesis, exactly as the store disjuncts carry `hmemsafe`; the residual for a full
+    per-block capstone is the plan-level `planStackRel`/`planSpillRel` bookkeeping over the operand-emit
+    plus the user-memory write-safety establishing that agreement. -/
+theorem call_step_stateAgree {vs : VenomState} {as : AsmState}
+    {inst : Instruction} {out : String} {gas addr value aOff aSz rOff rSz : bytes32}
+    {stk : List bytes32} {success : bytes32} {newAccs : Accounts} {ret : List byte}
+    (hopc : inst.opcode = Opcode.CALL)
+    (heval : evalOperands inst.operands vs = some [gas, addr, value, aOff, aSz, rOff, rSz])
+    (hout : inst.outputs = [out])
+    (hstk : as.stack = gas :: addr :: value :: aOff :: aSz :: rOff :: rSz :: stk)
+    (hacc : vs.accounts = as.accounts) (hmem : vs.memory = as.memory)
+    (hcc : vs.callCtx = as.callCtx) (htx : vs.txCtx = as.txCtx)
+    (htr : vs.transient = as.transient)
+    (hlg : vs.logs = as.logs) (hbc : vs.blockCtx = as.blockCtx)
+    (hcode : vs.code = as.code) (hph : vs.prevHashes = as.prevHashes)
+    (hcall : evmCall subEvmFuel as.accounts as.callCtx.contract as.txCtx.origin
+      (AccountAddress.ofUInt256 addr) (AccountAddress.ofUInt256 addr) gas value value
+      (as.memory.readWithPadding aOff.toNat aSz.toNat).toList as.txCtx.gasprice 0 (!as.callCtx.static)
+      = (success, newAccs, ret)) :
+    ∃ s'',
+      stepExternalCall subEvmFuel inst vs
+        = some (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs)
+      ∧ asmCall as = AsmResult.AsmOK s''
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).accounts = s''.accounts
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).memory = s''.memory
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).returndata = s''.returndata
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).transient = s''.transient
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).logs = s''.logs
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).callCtx = s''.callCtx
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).txCtx = s''.txCtx
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).blockCtx = s''.blockCtx
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).code = s''.code
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).prevHashes = s''.prevHashes
+      ∧ lookupVar out (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs) = some success
+      ∧ s''.stack = success :: stk := by
+  obtain ⟨hstep, hasmeq⟩ :=
+    asmCall_stepExternalCall_same_evmCall hopc heval hout hstk hacc hmem hcc htx hcall
+  obtain ⟨s'', hs''eq, hacc', hmem', hrd', hout', hstk'⟩ :=
+    callWriteback_asmCallWriteback_agree out rOff.toNat rSz.toNat success newAccs ret stk vs as hmem
+  -- expose s'' fields by unfolding asmCallWriteback
+  have hconcrete := hs''eq
+  simp only [asmCallWriteback] at hconcrete
+  injection hconcrete with hc
+  refine ⟨s'', hstep, by rw [hasmeq]; exact hs''eq, hacc', hmem', hrd', ?_, ?_, ?_, ?_, ?_, ?_, ?_, hout', hstk'⟩
+  · show (callWriteback _ _ _ _ _ _ _).transient = s''.transient
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact htr
+  · show (callWriteback _ _ _ _ _ _ _).logs = s''.logs
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact hlg
+  · show (callWriteback _ _ _ _ _ _ _).callCtx = s''.callCtx
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact hcc
+  · show (callWriteback _ _ _ _ _ _ _).txCtx = s''.txCtx
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact htx
+  · show (callWriteback _ _ _ _ _ _ _).blockCtx = s''.blockCtx
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact hbc
+  · show (callWriteback _ _ _ _ _ _ _).code = s''.code
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact hcode
+  · show (callWriteback _ _ _ _ _ _ _).prevHashes = s''.prevHashes
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact hph
 
 end EvmYul.Venom.Hol.Codegen

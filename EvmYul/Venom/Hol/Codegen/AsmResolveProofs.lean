@@ -448,4 +448,157 @@ theorem computeLabelOffsets_lookup (pre : List AsmInst) (lbl : String) (suf : Li
   rw [List.foldl_cons, hLstep, computeLabelOffsets_preserved suf lbl (P.1 + 1) _ hsuf, hP1,
       assocLookup_insert_self]
 
+/-- **Resolved-JUMP destination = the target label's list index (`pcOf`).** The `offsetToPc` round-trip
+    for a JMP/JNZ target: composing `computeLabelOffsets_lookup` (label `lbl` → its byte offset
+    `(pre.map asmInstSize).sum`) with `buildOffsetToPc_lookup` (that byte offset → its list index
+    `pre.length`), the destination the resolved JUMP jumps to — `offsetToPc.lookup (offsets.lookup lbl)`
+    — is exactly `lbl`'s list index `pre.length` in the program. This is the well-scheduling label-offset
+    fact `idx = pcOf bb'.label`: `pcOf bb'.label = pre.length` (the position of `bb'`'s `AsmLabel` in
+    `prog`), and the JMP lands there. -/
+theorem resolvedJump_target_index (pre : List AsmInst) (lbl : String) (suf : List AsmInst)
+    (hsuf : ∀ inst ∈ suf, inst ≠ AsmInst.AsmLabel lbl ∧ inst ≠ AsmInst.AsmDataHeader lbl) :
+    AssocList.lookup Nat Nat (asmResolve (pre ++ AsmInst.AsmLabel lbl :: suf)).2
+      ((AssocList.lookup String Nat
+        (computeLabelOffsets (pre ++ AsmInst.AsmLabel lbl :: suf)).2 lbl).getD 0)
+      = some pre.length := by
+  rw [computeLabelOffsets_lookup pre lbl suf hsuf, Option.getD_some]
+  exact buildOffsetToPc_lookup pre lbl suf
+
+/-- **Concrete scheduled entry pc** — the uniform `pcOf` instantiating `hfsim_venomAsmRelSched`'s
+    abstract parameter: a block label's scheduled entry pc is the list index of its `AsmLabel` marker
+    in the assembled program. -/
+def pcOfLabel (prog : List AsmInst) (lbl : String) : Nat :=
+  prog.findIdx (fun i => match i with | AsmInst.AsmLabel l => l == lbl | _ => false)
+
+/-- For a program that contains `lbl`'s `AsmLabel` exactly once (none in the `pre` prefix),
+    `pcOfLabel` is the prefix length — the marker's position. -/
+theorem pcOfLabel_of_decomp (pre : List AsmInst) (lbl : String) (suf : List AsmInst)
+    (hpre : ∀ x ∈ pre, x ≠ AsmInst.AsmLabel lbl) :
+    pcOfLabel (pre ++ AsmInst.AsmLabel lbl :: suf) lbl = pre.length := by
+  unfold pcOfLabel
+  have hb : ∀ x ∈ pre, (match x with | AsmInst.AsmLabel l => l == lbl | _ => false) = false := by
+    intro x hx
+    cases x with
+    | AsmLabel l =>
+      show (l == lbl) = false
+      exact beq_eq_false_iff_ne.mpr (fun h => hpre _ hx (by rw [h]))
+    | _ => rfl
+  rw [List.findIdx_append, List.findIdx_eq_length.mpr hb, if_neg (by omega)]
+  simp [List.findIdx_cons]
+
+/-- **Resolved JMP lands at `pcOfLabel` (concrete `idx = pcOf bb'.label`).** Packages
+    `resolvedJump_target_index` against the concrete `pcOfLabel`: for a program with `lbl`'s marker
+    unique, the destination a resolved JUMP to `lbl` computes — `offsetToPc.lookup (offsets.lookup lbl)`
+    — is exactly `some (pcOfLabel prog lbl)`. This is the well-scheduling pc fact
+    `hfsim_venomAsmRelSched` abstracts, now with a concrete uniform `pcOf` — the JMP branch of the
+    global assembly's per-block obligation is discharged by this (via `wellsched_jmp_ok_continue`'s
+    `hidx`). -/
+theorem resolvedJump_pcOf (pre : List AsmInst) (lbl : String) (suf : List AsmInst)
+    (hsuf : ∀ inst ∈ suf, inst ≠ AsmInst.AsmLabel lbl ∧ inst ≠ AsmInst.AsmDataHeader lbl)
+    (hpre : ∀ x ∈ pre, x ≠ AsmInst.AsmLabel lbl) :
+    AssocList.lookup Nat Nat (asmResolve (pre ++ AsmInst.AsmLabel lbl :: suf)).2
+      ((AssocList.lookup String Nat
+        (computeLabelOffsets (pre ++ AsmInst.AsmLabel lbl :: suf)).2 lbl).getD 0)
+      = some (pcOfLabel (pre ++ AsmInst.AsmLabel lbl :: suf) lbl) := by
+  rw [pcOfLabel_of_decomp pre lbl suf hpre]
+  exact resolvedJump_target_index pre lbl suf hsuf
+
+/-- **`block_jmp_sim`'s target index is the concrete scheduled entry pc.** For the resolved program,
+    the `idx` that `block_jmp_sim` lands the JMP at (`offsetToPc.lookup off = some idx`, where
+    `off = offsets.lookup target`) is exactly `pcOfLabel prog target`. This is `wellsched_jmp_ok_continue`'s
+    `hidx : idx = pcOf bb'.label` with the concrete `pcOf := pcOfLabel prog` — the last gap between
+    `block_jmp_sim`'s output language and the well-scheduling pc obligation. -/
+theorem resolvedJump_idx_eq_pcOfLabel (pre suf : List AsmInst) (target : String) (off idx : Nat)
+    (hsuf : ∀ inst ∈ suf, inst ≠ AsmInst.AsmLabel target ∧ inst ≠ AsmInst.AsmDataHeader target)
+    (hpre : ∀ x ∈ pre, x ≠ AsmInst.AsmLabel target)
+    (hoff_lk : AssocList.lookup String Nat
+      (computeLabelOffsets (pre ++ AsmInst.AsmLabel target :: suf)).2 target = some off)
+    (hidx_lk : AssocList.lookup Nat Nat
+      (asmResolve (pre ++ AsmInst.AsmLabel target :: suf)).2 off = some idx) :
+    idx = pcOfLabel (pre ++ AsmInst.AsmLabel target :: suf) target := by
+  have hp := resolvedJump_pcOf pre target suf hsuf hpre
+  rw [hoff_lk, Option.getD_some, hidx_lk] at hp
+  exact Option.some.inj hp
+
+/-- **`asmResolve` preserves `AsmLabel` positions.** `resolveInst` only rewrites label *pushes*
+    (`AsmPushLabel`/`AsmPushOfst` → `AsmPush`), leaving `AsmLabel` markers in place, and `List.map`
+    preserves positions — so a label's list index (`pcOfLabel`) is the same before and after resolution.
+    This bridges the resolved program's `pcOfLabel` to the *unresolved* plan's offsets. -/
+theorem pcOfLabel_asmResolve (X : List AsmInst) (lbl : String) :
+    pcOfLabel (asmResolve X).1 lbl = pcOfLabel X lbl := by
+  unfold pcOfLabel asmResolve
+  rw [List.findIdx_map]
+  congr 1
+  funext i
+  cases i with
+  | AsmPushLabel l =>
+    simp only [Function.comp_apply, resolveInst]
+    cases AssocList.lookup String Nat (computeLabelOffsets X).2 l <;> rfl
+  | AsmPushOfst l d =>
+    simp only [Function.comp_apply, resolveInst]
+    cases AssocList.lookup String Nat (computeLabelOffsets X).2 l <;> rfl
+  | _ => rfl
+
+
+/-- **Resolved JNZ taken branch lands at `pcOfLabel` (§5 JNZ pc side).** The JNZ analog of the JMP pc
+    bridge: for the resolved program, a taken JUMPI to `ifNz` (`cond ≠ 0`) runs 2 asm steps to
+    `pc = pcOfLabel prog ifNz`, consuming the condition. Composes `resolved_jumpi_taken_sim` with the
+    concrete pc bridge `resolvedJump_pcOf` (the destination = the label's list index). -/
+theorem resolved_jumpi_taken_pcOfLabel (pre suf : List AsmInst) (ifNz : String)
+    (s : AsmState) (off : Nat) (cond : bytes32) (stk : List bytes32)
+    (hsuf : ∀ inst ∈ suf, inst ≠ AsmInst.AsmLabel ifNz ∧ inst ≠ AsmInst.AsmDataHeader ifNz)
+    (hpre : ∀ x ∈ pre, x ≠ AsmInst.AsmLabel ifNz)
+    (hstack : s.stack = cond :: stk) (hcond : cond ≠ EvmYul.UInt256.ofNat 0)
+    (hpc1 : s.pc < (pre ++ AsmInst.AsmLabel ifNz :: suf).length)
+    (hpush : (pre ++ AsmInst.AsmLabel ifNz :: suf).get ⟨s.pc, hpc1⟩
+      = resolveInst (computeLabelOffsets (pre ++ AsmInst.AsmLabel ifNz :: suf)).2
+          (AsmInst.AsmPushLabel ifNz))
+    (hoff_lk : AssocList.lookup String Nat
+      (computeLabelOffsets (pre ++ AsmInst.AsmLabel ifNz :: suf)).2 ifNz = some off)
+    (hoff : off < 2 ^ 256)
+    (hpc2 : s.pc + 1 < (pre ++ AsmInst.AsmLabel ifNz :: suf).length)
+    (hjumpi : (pre ++ AsmInst.AsmLabel ifNz :: suf).get ⟨s.pc + 1, hpc2⟩ = AsmInst.AsmOp "JUMPI") :
+    runAsm 2 (asmResolve (pre ++ AsmInst.AsmLabel ifNz :: suf)).2
+        (pre ++ AsmInst.AsmLabel ifNz :: suf) s
+      = AsmResult.AsmOK
+          { s with stack := stk,
+                   pc := pcOfLabel (pre ++ AsmInst.AsmLabel ifNz :: suf) ifNz } := by
+  have hidx_lk : AssocList.lookup Nat Nat (asmResolve (pre ++ AsmInst.AsmLabel ifNz :: suf)).2 off
+      = some (pcOfLabel (pre ++ AsmInst.AsmLabel ifNz :: suf) ifNz) := by
+    have h := resolvedJump_pcOf pre ifNz suf hsuf hpre
+    rw [hoff_lk, Option.getD_some] at h; exact h
+  exact resolved_jumpi_taken_sim hstack hcond hpc1 hpush hoff_lk hoff hpc2 hjumpi hidx_lk
+
+/-- **A block's asm segment sits at the preceding length in the whole-function resolved program.** The
+    AsmResolve layout for a general function: when the whole-function plan decomposes as
+    `precedingOps ++ blockOps ++ followingOps` (the DFS concatenation), the resolved whole program has
+    the block's resolved asm at pc `(executePlan precedingOps).length`. This is the position half of the
+    layout discharge — the `hblock` that a per-block `hstep` needs, generalized from the concrete-case
+    `hblock_twoBlock_next_discharged` to an arbitrary plan decomposition. -/
+theorem asmBlockAt_of_plan_decomp (precedingOps blockOps followingOps : List StackOp) :
+    asmBlockAt (asmResolve (executePlan (precedingOps ++ blockOps ++ followingOps))).1
+      (executePlan precedingOps).length
+      ((executePlan blockOps).map
+        (resolveInst (computeLabelOffsets
+          (executePlan (precedingOps ++ blockOps ++ followingOps))).2)) := by
+  have he : executePlan (precedingOps ++ blockOps ++ followingOps)
+      = executePlan precedingOps ++ executePlan blockOps ++ executePlan followingOps := by
+    rw [executePlan_append, executePlan_append]
+  rw [he]
+  exact asmBlockAt_resolved_of_middle _ _ _
+
+/-- **Label-push-free block segment sits *unchanged* at the preceding length.** For a terminal block
+    whose asm has no label pushes (STOP/INVALID-terminated, no internal JMP), resolution is the
+    identity, so its asm `executePlan blockOps` appears verbatim at pc `(executePlan precedingOps).length`
+    in the whole-function resolved program. The `hblock`/`hget` for a terminal block, generalized to any
+    plan decomposition — the STOP-block half of the layout discharge (a terminal block's whole-program
+    halt sim then runs over this segment via `hasm_stop`-style lemmas). -/
+theorem asmBlockAt_of_plan_decomp_no_label (precedingOps blockOps followingOps : List StackOp)
+    (h1 : ∀ a ∈ executePlan blockOps, ∀ lbl, a ≠ AsmInst.AsmPushLabel lbl)
+    (h2 : ∀ a ∈ executePlan blockOps, ∀ lbl d, a ≠ AsmInst.AsmPushOfst lbl d) :
+    asmBlockAt (asmResolve (executePlan (precedingOps ++ blockOps ++ followingOps))).1
+      (executePlan precedingOps).length (executePlan blockOps) := by
+  have h := asmBlockAt_of_plan_decomp precedingOps blockOps followingOps
+  rwa [map_resolveInst_eq_self _ (executePlan blockOps) h1 h2] at h
+
 end EvmYul.Venom.Hol.Codegen

@@ -2,9 +2,11 @@
 #
 # ABI cross-validation:  evm-abi-lean  vs  EVMYulLean, out-of-process.
 #
-# Two independent, differently-versioned Lean projects (abi-lean v4.31.0 vs
-# EVMYulLean v4.22.0) are cross-checked on the ERC-20 wire format by shuttling
-# raw bytes between them:
+# Two independent Lean projects (both on v4.31.0; abi-lean is ALSO an in-tree
+# lake dependency checked by the `AbiCrossval` target) are cross-checked on the
+# ERC-20 wire format by shuttling raw bytes between them — this script is the
+# out-of-process, executable-oracle complement to the in-tree proofs (it runs
+# the compiled `venom_run` binary on real calldata, which no lake target does):
 #
 #   selectors — for the whole ERC-20 interface, EVMYulLean's keccak (venom_run's
 #               sha3) computes keccak256(signature) >> 224 and must equal both
@@ -27,12 +29,11 @@
 #         + ABI_LEAN_REF=<branch|tag>   (default: main)
 #         + ABI_LEAN_CACHE=<dir>        (default: $XDG_CACHE_HOME/evmyullean/abi-lean)
 #
-# Why git-clone and not a lake `require ... from git` dependency: abi-lean pins
-# leanprover/lean4 v4.31.0 while EVMYulLean pins v4.22.0, so a single lake build
-# can't span both. A separate checkout, built with its own toolchain (elan reads
-# the checkout's lean-toolchain automatically), is exactly what sidesteps that.
-# First git run also materializes abi-lean's lake deps (mathlib et al.); the
-# cache dir makes subsequent runs cheap.
+# The drift-guard checkout is built with its own toolchain (elan reads the
+# checkout's lean-toolchain), independent of this repo's lake dependency pin —
+# so it also catches drift between the pinned rev and abi-lean's moving main.
+# First git run materializes abi-lean's lake deps (mathlib et al.); the cache
+# dir makes subsequent runs cheap.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"     # EVMYulLean root
@@ -134,12 +135,13 @@ if [ -n "${ABI_LEAN:-}" ]; then
 import EvmAbi.Hash
 import EvmAbi.ABI
 import EvmAbi.Encode
+import EvmAbi.Decode
 open EvmAbi.Hash EvmAbi.ABI EvmAbi.ABI.Encode
 def recipient : ByteArray := (uint256ToBytes 1).extract 12 32
 #eval (["totalSupply()", "balanceOf(address)", "transfer(address,uint256)",
         "approve(address,uint256)", "allowance(address,address)",
         "transferFrom(address,address,uint256)", "mint(address,uint256)"] : List String).forM
-      (fun s => IO.println s!"{selectorHex s} {s}")
+      (fun s => IO.println s!"{hexBytes (functionSelector s)} {s}")
 #eval do
   let sel := functionSelector "transfer(address,uint256)"
   match encodeArgs [ABIType.address, ABIType.uint (ByteSize.ofLen 32 (by decide))]
@@ -161,9 +163,25 @@ def recipient : ByteArray := (uint256ToBytes 1).extract 12 32
                    [ABIValue.uint 7, ABIValue.array [.uint 10, .uint 20, .uint 30]] with
   | .ok args => IO.println s!"MIXED {hexBytes (sel ++ args)}"
   | .error e => IO.eprintln s!"mixed encode failed: {e}"
+-- Roundtrip drift guard (the in-tree `AbiCrossval` proves this at the pin; here
+-- it is re-CHECKED against the checkout under test): encode -> decode ->
+-- re-encode is a byte fixpoint for the transfer arguments.
+#eval do
+  let tys := [ABIType.address, ABIType.uint (ByteSize.ofLen 32 (by decide))]
+  let vals := [ABIValue.address recipient, ABIValue.uint 100]
+  match encodeArgs tys vals with
+  | .ok args =>
+    match EvmAbi.ABI.Decode.decodeArgs tys args with
+    | .ok vals' =>
+      match encodeArgs tys vals' with
+      | .ok args' =>
+        if args'.toList == args.toList then IO.println "ROUNDTRIP OK"
+        else IO.eprintln "roundtrip re-encode mismatch"
+      | .error e => IO.eprintln s!"roundtrip re-encode failed: {e}"
+    | .error e => IO.eprintln s!"roundtrip decode failed: {e}"
+  | .error e => IO.eprintln s!"roundtrip encode failed: {e}"
 LEAN
-  # only the sorry-free encoder modules (avoid the Roundtrip capstone)
-  ( cd "$ABI_LEAN" && lake build EvmAbi.Hash EvmAbi.ABI EvmAbi.Encode >/dev/null )
+  ( cd "$ABI_LEAN" && lake build EvmAbi.Hash EvmAbi.ABI EvmAbi.Encode EvmAbi.Decode >/dev/null )
   ABI_OUT="$( cd "$ABI_LEAN" && lake env lean "$GEN" )"
   for entry in "${ERC20_SELECTORS[@]}"; do
     sig="${entry%|*}"; want="${entry#*|}"
@@ -178,7 +196,9 @@ LEAN
     echo "FATAL: abi-lean dynamic-array calldata drifted from pinned reference" >&2; exit 1; }
   echo "$ABI_OUT" | grep -qF "MIXED ${MIXED_CALLDATA}" || {
     echo "FATAL: abi-lean mixed static+dynamic calldata drifted from pinned reference" >&2; exit 1; }
-  echo "  OK: abi-lean selectors + calldata (incl. dynamic array + mixed) + mapping slot match pinned references"
+  echo "$ABI_OUT" | grep -qF "ROUNDTRIP OK" || {
+    echo "FATAL: abi-lean encode->decode->re-encode roundtrip drifted" >&2; exit 1; }
+  echo "  OK: abi-lean selectors + calldata (incl. dynamic array + mixed) + mapping slot + roundtrip match pinned references"
 fi
 
 echo "== selectors: EVMYulLean keccak(sig)>>224 vs pinned =="

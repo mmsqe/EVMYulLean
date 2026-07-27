@@ -24,6 +24,7 @@ import EvmYul.Venom.Hol.CoreAxioms
 import EvmYul.Venom.Hol.Types
 import EvmYul.Venom.Hol.Semantics
 import EvmYul.Venom.Hol.Exec
+import EvmYul.Venom.Hol.SubEvm
 
 import EvmYul.Venom.Hol.Codegen.AsmIR
 import EvmYul.Venom.Hol.Codegen.StackModel

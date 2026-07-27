@@ -151,13 +151,13 @@ theorem runBlocks_walk {ctx : VenomContext} {fn : IrFunction} {prog : List AsmIn
       | _ => True := by
   intro fuel
   induction fuel with
-  | zero => intro s asm N _; exact trivial
+  | zero => intro s asm N _; rw [runBlocks]; exact trivial
   | succ f' ih =>
     intro s asm N hE
     cases hlk : lookupBlock s.currentBb fn.blocks with
     | none =>
       have hE2 : runBlocks (f' + 1) ctx fn s = ExecResult.Error "block not found" := by
-        unfold runBlocks; rw [hlk]
+        rw [runBlocks, hlk]
       rw [hE2]; exact trivial
     | some bb =>
       have hb := hbsim s asm N f' bb hE hlk
@@ -340,6 +340,90 @@ lemmas below are the entry-less base cases + witnesses, kept as the simplest non
 the `entry = none` case is fully discharged unconditionally (Venom errors out, hitting the trivial
 `Error` arm — no `hbsim` needed); the Halt/Abort arms for a non-trivial entry are the genuine
 simulation obligation (`hbsim`, packaged by `genFnSimulation`). -/
+
+/-- **Whole-function hfsim ⇒ top-level `codegen_correct` conclusion.** The reusable
+adapter between the two shapes the development produces at different levels: every
+whole-function capstone (`hfsim_*`) concludes the `match runBlocks fn {entry}` shape
+with `venomAsmTerminalRel`; the top-level `codegen_correct` conclusion is the
+`match runContext ctx` shape with `finalStateRel`. This lifts the former to the
+latter by peeling `runContext` to the entry function's `runBlocks` (`hent`/`hlk`/
+`hlbl`) and using `finalStateRel = venomAsmTerminalRel` (definitional). So any
+capstone — this session's spill-aware / external-call whole-function results
+included — yields the top-level `codegen_correct` conclusion for its function with
+no separate `hbsim`/`runBlocks_walk` re-derivation: the per-block obligation is
+already discharged *inside* the hfsim. -/
+theorem codegen_correct_of_wholeFn_hfsim
+    {fuel : Nat} {ctx : VenomContext} {fn : IrFunction}
+    {ops : List StackOp} {vs : VenomState} {as : AsmState}
+    {entryName entryLbl : String} {offsetToPc : AssocList Nat Nat} {prog : List AsmInst} {N : Nat}
+    (hent : ctx.entry = some entryName)
+    (hlk : lookupFunction entryName ctx.functions = some fn)
+    (hlbl : fnEntryLabel fn = some entryLbl)
+    (hprog : prog = (asmResolve (executePlan ops)).1)
+    (hoff : offsetToPc = (asmResolve (executePlan ops)).2)
+    (hN : N = (asmResolve (executePlan ops)).1.length)
+    (hfsim : match runBlocks fuel ctx fn
+              { vs with prevBb := none, currentBb := entryLbl, instIdx := 0 } with
+      | ExecResult.Halt vs' =>
+          ∃ as', runAsm N offsetToPc prog as = AsmResult.AsmHalt as' ∧ venomAsmTerminalRel vs' as'
+      | ExecResult.Abort AbortType.RevertAbort vs' =>
+          ∃ as', runAsm N offsetToPc prog as = AsmResult.AsmRevert as' ∧ venomAsmTerminalRel vs' as'
+      | ExecResult.Abort AbortType.ExHaltAbort vs' =>
+          ∃ as', runAsm N offsetToPc prog as = AsmResult.AsmFault as' ∧ venomAsmTerminalRel vs' as'
+      | _ => True) :
+    (match runContext fuel ctx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length
+         (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 as
+           = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length
+         (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 as
+           = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length
+         (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 as
+           = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  have hrc : runContext fuel ctx vs
+      = runBlocks fuel ctx fn { vs with prevBb := none, currentBb := entryLbl, instIdx := 0 } := by
+    simp only [runContext, hent, hlk, runFunction, hlbl]
+  rw [hrc]
+  subst hprog hoff hN
+  exact hfsim
+
+/-- **General-program sibling**: lift a whole-function hfsim (against ITS OWN
+resolved program `prog`/`offsetToPc`, as the concrete `hfsim_*_example`s state it)
+to a `runContext` correspondence. Same peel, without the `codegen_correct`-specific
+`prog = asmResolve (executePlan ops)` wiring — the form a concrete example applies
+directly. `codegen_correct_of_wholeFn_hfsim` is the special case
+`prog = asmResolve (executePlan ops)`. -/
+theorem runContext_correct_of_hfsim
+    {fuel : Nat} {ctx : VenomContext} {fn : IrFunction}
+    {vs : VenomState} {as : AsmState}
+    {entryName entryLbl : String} {offsetToPc : AssocList Nat Nat} {prog : List AsmInst} {N : Nat}
+    (hent : ctx.entry = some entryName)
+    (hlk : lookupFunction entryName ctx.functions = some fn)
+    (hlbl : fnEntryLabel fn = some entryLbl)
+    (hfsim : match runBlocks fuel ctx fn
+              { vs with prevBb := none, currentBb := entryLbl, instIdx := 0 } with
+      | ExecResult.Halt vs' =>
+          ∃ as', runAsm N offsetToPc prog as = AsmResult.AsmHalt as' ∧ venomAsmTerminalRel vs' as'
+      | ExecResult.Abort AbortType.RevertAbort vs' =>
+          ∃ as', runAsm N offsetToPc prog as = AsmResult.AsmRevert as' ∧ venomAsmTerminalRel vs' as'
+      | ExecResult.Abort AbortType.ExHaltAbort vs' =>
+          ∃ as', runAsm N offsetToPc prog as = AsmResult.AsmFault as' ∧ venomAsmTerminalRel vs' as'
+      | _ => True) :
+    (match runContext fuel ctx vs with
+     | ExecResult.Halt vs' =>
+         ∃ as', runAsm N offsetToPc prog as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' =>
+         ∃ as', runAsm N offsetToPc prog as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' =>
+         ∃ as', runAsm N offsetToPc prog as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  have hrc : runContext fuel ctx vs
+      = runBlocks fuel ctx fn { vs with prevBb := none, currentBb := entryLbl, instIdx := 0 } := by
+    simp only [runContext, hent, hlk, runFunction, hlbl]
+  rw [hrc]
+  exact hfsim
 
 /-- The real context-plan generator on a function-free context yields exactly the shared revert
     postamble (the foldl never iterates, leaving `some ([] ++ revertPostamble)`). -/

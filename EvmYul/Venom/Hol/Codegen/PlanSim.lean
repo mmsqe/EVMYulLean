@@ -1449,6 +1449,58 @@ theorem foldl_ops_sim {α} (lo : AssocList String Nat) (vs : VenomState) (prog :
       exact runAsm_compose hrun1 hrun'
     · rw [List.length_append]; omega
 
+/-- **Fold-simulation harness with a state invariant.** Like `foldl_ops_sim`, but the per-step asm sim
+    `hstep` need only hold for plan states satisfying `Inv` (preserved by each step, `hInvStep`) — so a
+    genuine reorder, whose per-`reorderOne` swap is only bounded on *reachable* states, can be discharged
+    where the unrestricted `∀ p` `hstep` cannot (an unbounded `p` admits swap distances > 16). -/
+theorem foldl_ops_sim_inv {α} (lo : AssocList String Nat) (vs : VenomState) (prog : List AsmInst)
+    (offsetToPc : AssocList Nat Nat)
+    (g : PlanState → α → List StackOp × PlanState)
+    (Inv : PlanState → Prop)
+    (hInvStep : ∀ (a : α) (p : PlanState), Inv p → Inv (g p a).2)
+    (hstep : ∀ (a : α) (p : PlanState) (s : AsmState),
+        Inv p → venomAsmRel lo p vs s →
+        asmBlockAt prog s.pc (executePlan (g p a).1) →
+        ∃ s', runAsm (executePlan (g p a).1).length offsetToPc prog s
+                = AsmResult.AsmOK s' ∧
+              venomAsmRel lo (g p a).2 vs s' ∧
+              s'.pc = s.pc + (executePlan (g p a).1).length)
+    (l : List α) (ps0 : PlanState) (as0 : AsmState)
+    (hInv0 : Inv ps0)
+    (hrel0 : venomAsmRel lo ps0 vs as0)
+    (hblock : asmBlockAt prog as0.pc
+      (executePlan (l.foldl (fun acc a => (acc.1 ++ (g acc.2 a).1, (g acc.2 a).2)) ([], ps0)).1)) :
+    ∃ as', runAsm
+            (executePlan (l.foldl (fun acc a => (acc.1 ++ (g acc.2 a).1, (g acc.2 a).2)) ([], ps0)).1).length
+            offsetToPc prog as0 = AsmResult.AsmOK as' ∧
+           venomAsmRel lo
+            (l.foldl (fun acc a => (acc.1 ++ (g acc.2 a).1, (g acc.2 a).2)) ([], ps0)).2 vs as' ∧
+           as'.pc = as0.pc +
+            (executePlan (l.foldl (fun acc a => (acc.1 ++ (g acc.2 a).1, (g acc.2 a).2)) ([], ps0)).1).length := by
+  induction l generalizing ps0 as0 with
+  | nil =>
+    refine ⟨as0, ?_, ?_, ?_⟩
+    · simp [executePlan, runAsm]
+    · simpa using hrel0
+    · simp [executePlan]
+  | cons a as ih =>
+    have key : ∀ (p : PlanState),
+        (a :: as).foldl (fun acc b => (acc.1 ++ (g acc.2 b).1, (g acc.2 b).2)) ([], p)
+        = ((g p a).1 ++ (as.foldl (fun acc b => (acc.1 ++ (g acc.2 b).1, (g acc.2 b).2)) ([], (g p a).2)).1,
+           (as.foldl (fun acc b => (acc.1 ++ (g acc.2 b).1, (g acc.2 b).2)) ([], (g p a).2)).2) := by
+      intro p; rw [List.foldl_cons]; exact foldl_ops_acc g as (g p a).1 (g p a).2
+    simp only [key ps0] at hblock ⊢
+    rw [executePlan_append] at hblock ⊢
+    obtain ⟨hb1, hb2⟩ := asmBlockAt_append hblock
+    obtain ⟨as1, hrun1, hrel1, hpc1⟩ := hstep a ps0 as0 hInv0 hrel0 hb1
+    have hb2' : asmBlockAt prog as1.pc
+        (executePlan (as.foldl (fun acc b => (acc.1 ++ (g acc.2 b).1, (g acc.2 b).2)) ([], (g ps0 a).2)).1) := by
+      rw [hpc1]; exact hb2
+    obtain ⟨as', hrun', hrel', hpc'⟩ := ih (g ps0 a).2 as1 (hInvStep a ps0 hInv0) hrel1 hb2'
+    refine ⟨as', ?_, hrel', ?_⟩
+    · rw [List.length_append]; exact runAsm_compose hrun1 hrun'
+    · rw [List.length_append]; omega
+
 /-- `foldl_ops_sim` in `(ops, ps')`-equation form: once the fold is known to
     collapse to `(ops, ps')`, the run over `ops` simulates. Lets the per-fold
     theorems apply it directly to their `… = (ops, ps')` hypothesis. -/

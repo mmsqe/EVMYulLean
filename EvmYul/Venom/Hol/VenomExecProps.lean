@@ -30,7 +30,7 @@ theorem run_blocks_unfold {fuel ctx fn s} : runBlocks (fuel+1) ctx fn s =
     | ExecResult.OK s' => (if s'.halted then ExecResult.Halt s' else runBlocks fuel ctx fn s')
     | ExecResult.IntRet vals s' => ExecResult.IntRet vals s'
     | other => other := by
-  rfl
+  rw [runBlocks]; rfl
 
 /- ===== step_inst_base preserves inst_idx for non-terminators ===== -/
 
@@ -68,7 +68,23 @@ theorem exec_block_OK_not_halted {fuel ctx bb s s'} (hr : execBlock fuel ctx bb 
       · simp [h_step] at hr
       · simp [h_step] at hr
       · simp [h_step] at hr
-      · simp [h_step] at hr
+      · -- Error: `stepInstBase` errored; `INVOKE` runs the callee (recurse → `ih`), else genuine error
+        simp only [h_step] at hr
+        by_cases hinv : inst.opcode = Opcode.INVOKE
+        · rw [if_pos hinv] at hr
+          cases h_inv : stepInvoke fuel ctx inst s with
+          | OK s'' => rw [h_inv] at hr; exact ih hr
+          | Halt s'' => simp [h_inv] at hr
+          | Abort a s'' => simp [h_inv] at hr
+          | IntRet v s'' => simp [h_inv] at hr
+          | Error e' => simp [h_inv] at hr
+        · rw [if_neg hinv] at hr
+          by_cases hcall : isExternalCall inst.opcode
+          · rw [if_pos hcall] at hr
+            cases h_call : stepExternalCall subEvmFuel inst s with
+            | none => rw [h_call] at hr; simp at hr
+            | some s'' => rw [h_call] at hr; exact ih hr
+          · rw [if_neg hcall] at hr; simp at hr
 
 /- If runBlock returns OK, the result state is not halted.
    (HOL4: exec_block_OK_not_halted) -/

@@ -674,6 +674,93 @@ theorem emitOneInput_sim_var {opc nextLiveness v ps ops ps' dist labelOffsets vs
   rw [hemiteq] at hemit
   exact doDup_sim hemit hsmall hrel hlen hblock
 
+/-- **`emitOneInput` sim for a SPILLED live var** — the missing connective for spilling. When the input
+    var is spilled, `emitOneInput` first `doRestore`s it (`SORestore` = PUSH slot + MLOAD, pushing the
+    var freshly on top) then DUPs the restored value; this composes the proven `doRestore_sim` +
+    `doDup_sim`. Complements `emitOneInput_sim_var` (which assumes `hnospill`), covering the case every
+    existing body producer excludes. `hspillWf` (32-aligned, in-bounds spill slots) is the runtime
+    precondition, exactly as `doRestore_sim` needs. -/
+theorem emitOneInput_sim_var_spilled {opc nextLiveness v ps ops ps' off labelOffsets vs as prog}
+    (hspill : alookup' ps.spilled (Operand.Var v) = some off)
+    (hlive : nextLiveness.contains v = true)
+    (hemit : emitOneInput opc nextLiveness (Operand.Var v) ps = (ops, ps'))
+    (hrel : venomAsmRel labelOffsets ps vs as)
+    (hspillWf : ∀ o off, alookup' ps.spilled o = some off →
+        32 ∣ off ∧ off + 32 ≤ as.memory.size ∧ off < 2 ^ 256)
+    (hblock : asmBlockAt prog as.pc (executePlan ops)) :
+    ∃ as', runAsm (executePlan ops).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+           venomAsmRel labelOffsets ps' vs as' ∧
+           as'.pc = as.pc + (executePlan ops).length := by
+  set ps1 : PlanState := (doRestore (Operand.Var v) ps).2 with hps1def
+  have hres : doRestore (Operand.Var v) ps = ([StackOp.SORestore off], ps1) := by
+    rw [hps1def]; unfold doRestore; rw [hspill]
+  have hps1stack : ps1.stack = stackPush (Operand.Var v) ps.stack := by
+    rw [hps1def]; unfold doRestore; rw [hspill]
+  have hgd : stackGetDepth (Operand.Var v) ps1.stack = some 0 := by
+    rw [hps1stack]
+    simp only [stackGetDepth, stackPush, List.reverse_append, List.reverse_cons, List.reverse_nil,
+      List.nil_append, List.cons_append, stackFind, beq_self_eq_true, if_true]
+  set ps2 : PlanState := (doDup 0 ps1).2 with hps2def
+  have hdd : doDup 0 ps1 = ([StackOp.SODup 1], ps2) := by
+    rw [hps2def]; unfold doDup; rw [if_pos (by omega : (0 : Nat) ≤ 15)]
+  have hemiteq : emitOneInput opc nextLiveness (Operand.Var v) ps
+      = ([StackOp.SORestore off] ++ [StackOp.SODup 1], ps2) := by
+    unfold emitOneInput
+    simp only [isVarOperand, hspill, Option.isSome_some, Bool.and_true, if_true, hres, hlive,
+      hgd, hdd]
+  rw [hemiteq, Prod.mk.injEq] at hemit
+  obtain ⟨hops, hps'⟩ := hemit
+  subst ops; subst ps'
+  rw [executePlan_append] at hblock ⊢
+  obtain ⟨hbR, hbD⟩ := asmBlockAt_append hblock
+  obtain ⟨as1, hrunR, hrelR, hpcR⟩ := doRestore_sim (offsetToPc := offsetToPc) hres hrel hbR hspillWf
+  have hbD' : asmBlockAt prog as1.pc (executePlan [StackOp.SODup 1]) := by rw [hpcR]; exact hbD
+  have hlen1 : 0 < ps1.stack.length := by rw [hps1stack, stackPush, List.length_append]; simp
+  obtain ⟨as2, hrunD, hrelD, hpcD⟩ := doDup_sim (offsetToPc := offsetToPc) hdd (by omega) hrelR hlen1 hbD'
+  refine ⟨as2, ?_, hrelD, ?_⟩
+  · rw [List.length_append]; exact runAsm_compose hrunR hrunD
+  · rw [List.length_append, hpcD, hpcR]; omega
+
+/-- **Explicit reduction of `emitOneInput` on a spilled live var.** Restore (`SORestore off`, pushing
+    the var, dropping its spill entry, freeing the slot) then DUP the restored value (`SODup 1`). The
+    var ends on top (`ps.stack ++ [Var v, Var v]`); its spill entry is removed. Extracted from the body
+    of `emitOneInput_sim_var_spilled` so the fold can compose the resulting state with later operands. -/
+theorem emitOneInput_var_spilled_eq {opc nl v ps off}
+    (hspill : alookup' ps.spilled (Operand.Var v) = some off)
+    (hlive : nl.contains v = true) :
+    emitOneInput opc nl (Operand.Var v) ps
+      = ([StackOp.SORestore off, StackOp.SODup 1],
+         { ps with stack := ps.stack ++ [Operand.Var v, Operand.Var v],
+                   spilled := aremove ps.spilled (Operand.Var v),
+                   alloc := freeSpillSlot off ps.alloc }) := by
+  set ps1 : PlanState := (doRestore (Operand.Var v) ps).2 with hps1def
+  have hres : doRestore (Operand.Var v) ps = ([StackOp.SORestore off], ps1) := by
+    rw [hps1def]; unfold doRestore; rw [hspill]
+  have hps1stack : ps1.stack = stackPush (Operand.Var v) ps.stack := by
+    rw [hps1def]; unfold doRestore; rw [hspill]
+  have hgd : stackGetDepth (Operand.Var v) ps1.stack = some 0 := by
+    rw [hps1stack]
+    simp only [stackGetDepth, stackPush, List.reverse_append, List.reverse_cons, List.reverse_nil,
+      List.nil_append, List.cons_append, stackFind, beq_self_eq_true, if_true]
+  set ps2 : PlanState := (doDup 0 ps1).2 with hps2def
+  have hdd : doDup 0 ps1 = ([StackOp.SODup 1], ps2) := by
+    rw [hps2def]; unfold doDup; rw [if_pos (by omega : (0 : Nat) ≤ 15)]
+  have hemiteq : emitOneInput opc nl (Operand.Var v) ps
+      = ([StackOp.SORestore off] ++ [StackOp.SODup 1], ps2) := by
+    unfold emitOneInput
+    simp only [isVarOperand, hspill, Option.isSome_some, Bool.and_true, if_true, hres, hlive, hgd, hdd]
+  rw [hemiteq]
+  congr 1
+  rw [hps2def]; unfold doDup; rw [if_pos (by omega : (0 : Nat) ≤ 15)]
+  simp only []
+  rw [hps1def]; unfold doRestore; rw [hspill]
+  simp only [stackPush, stackDup, stackPeek]
+  congr 1
+  · rw [show ((ps.stack ++ [Operand.Var v]).length - 1 - 0) = ps.stack.length from by simp]
+    rw [show (ps.stack ++ [Operand.Var v])[ps.stack.length]! = Operand.Var v from by
+          rw [List.getElem!_eq_getElem?_getD, List.getElem?_append_right (by omega)]; simp]
+    simp
+
 /-- `UInt256` round-trip: `ofNat` of `toNat` is the identity. -/
 theorem uint256_ofNat_toNat_self (w : bytes32) : UInt256.ofNat w.toNat = w := by
   obtain ⟨⟨n, hn⟩⟩ := w
@@ -1740,6 +1827,98 @@ theorem emit_mload_sim {ps lo vs as prog offset rest out}
   · exact venomAsmRel_mload hrel hstack hbelow hfresh hspill
   · rfl
 
+/-! ## SHA3 compute step (a 2-input, variable-length memory *hash*)
+
+The memory-hashing twin of MLOAD, but 2-input (offset, size) and variable-length: pop `offset`/`size`,
+push `keccak256` of the memory slice. Under coverage the `asmSha3` expansion is a no-op
+(`asmExpandMemory_of_covered`), so memory is unchanged; the reads agree below the spill region
+(`memoryRel_readWithPadding_slice`), so the hashes agree (`keccak256` is applied to equal bytes — it
+stays opaque, no keccak axiom). The stack shape is a non-commutative binop's (pop 2, push 1). -/
+
+/-- `asmSha3` under coverage: the `asmExpandMemory` is a no-op, so memory is unchanged and the pushed
+    value is `keccak256` of the (unexpanded) memory slice. The 2-input, variable-length twin of
+    `asmMload_ok`. -/
+theorem asmSha3_ok {off sz stk s} (hs : s.stack = off :: sz :: stk)
+    (hcov : ((off.toNat + sz.toNat + 31) / 32) * 32 ≤ s.memory.size) :
+    asmSha3 s = AsmResult.AsmOK { asmNext s with
+        stack := keccak256 (s.memory.readWithPadding off.toNat sz.toNat) :: stk, memory := s.memory } := by
+  unfold asmSha3; rw [hs]
+  have hmem : (if sz.toNat = 0 then s.memory
+      else asmExpandMemory (off.toNat + sz.toNat) s.memory) = s.memory := by
+    split
+    · rfl
+    · exact asmExpandMemory_of_covered (off.toNat + sz.toNat) s.memory hcov
+  simp only [hmem]
+
+/-- `asmStep` on a resolved `SHA3` op dispatches to `asmSha3`. -/
+theorem asmStep_sha3_ok {o2pc prog s} (hpc : s.pc < prog.length)
+    (hprog : prog.get ⟨s.pc, hpc⟩ = AsmInst.AsmOp "SHA3") :
+    asmStep o2pc prog s = asmSha3 s := by
+  unfold asmStep; rw [dif_pos hpc, hprog]; rfl
+
+/-- **The SHA3 compute-step relation.** Pop `offset` and `size`, push `keccak256` of the memory slice.
+    The reads agree (below-spill, `memoryRel_readWithPadding_slice`) so the hashes agree; memory is
+    unchanged (covered ⇒ expansion no-op). The 2-input, memory-hashing twin of `venomAsmRel_mload`. -/
+theorem venomAsmRel_sha3 {lo ps vs as out} {off sz rest}
+    (hrel : venomAsmRel lo ps vs as)
+    (hstack : as.stack = off :: sz :: rest)
+    (hbelow : off.toNat + sz.toNat ≤ ps.alloc.fnEom)
+    (hsize : sz.toNat < USize.size)
+    (hfresh : ¬ (Operand.Var out) ∈ ps.stack)
+    (hspill : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none) :
+    venomAsmRel lo { ps with stack := stackPush (Operand.Var out) (stackPop 2 ps.stack) }
+      (updateVar out (keccak256 (readMemory off.toNat sz.toNat vs)) vs)
+      { asmNext as with
+          stack := keccak256 (as.memory.readWithPadding off.toNat sz.toNat) :: rest, memory := as.memory } := by
+  obtain ⟨hStk, hSpill, hMem, hAcc, hTrans, hRet, hLog, hCall, hTx, hBlk, hCode, hPrev⟩ := hrel
+  have hread : vs.memory.readWithPadding off.toNat sz.toNat
+      = as.memory.readWithPadding off.toNat sz.toNat :=
+    memoryRel_readWithPadding_slice hMem hbelow hsize
+  have hval : keccak256 (readMemory off.toNat sz.toNat vs)
+      = keccak256 (as.memory.readWithPadding off.toNat sz.toNat) := by
+    simp only [readMemory, hread]
+  have hlen2 : 2 ≤ ps.stack.length := by rw [hStk.1, hstack]; simp
+  obtain ⟨hStk', hSpill', hMem', hAcc', hTrans', hRet', hLog', hCall', hTx', hBlk', hCode', hPrev'⟩ :=
+    venomAsmRel_updateVar lo ps vs as out (keccak256 (readMemory off.toNat sz.toNat vs))
+      ⟨hStk, hSpill, hMem, hAcc, hTrans, hRet, hLog, hCall, hTx, hBlk, hCode, hPrev⟩ hfresh hspill
+  refine ⟨?_, hSpill', hMem', hAcc', hTrans', hRet', hLog', hCall', hTx', hBlk', hCode', hPrev'⟩
+  have hout : operandVal (updateVar out (keccak256 (readMemory off.toNat sz.toNat vs)) vs)
+      lo (Operand.Var out)
+      = some (keccak256 (as.memory.readWithPadding off.toNat sz.toNat)) := by
+    simp only [operandVal, lookupVar_updateVar_self]; rw [hval]
+  have hps := planStackRel_binop hStk' hlen2 hout
+  rw [hstack] at hps
+  simpa using hps
+
+/-- The runnable compute-step sim for SHA3; `hdisp` is supplied by `asmStep_sha3_ok`. -/
+theorem emit_sha3_sim {ps lo vs as prog off sz rest out}
+    (hrel : venomAsmRel lo ps vs as)
+    (hstack : as.stack = off :: sz :: rest)
+    (hcov : ((off.toNat + sz.toNat + 31) / 32) * 32 ≤ as.memory.size)
+    (hbelow : off.toNat + sz.toNat ≤ ps.alloc.fnEom)
+    (hsize : sz.toNat < USize.size)
+    (hfresh : ¬ (Operand.Var out) ∈ ps.stack)
+    (hspill : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none)
+    (hblock : asmBlockAt prog as.pc (executePlan [StackOp.SOEmit "SHA3"]))
+    (hdisp : ∀ (h : as.pc < prog.length), prog.get ⟨as.pc, h⟩ = AsmInst.AsmOp "SHA3" →
+              asmStep offsetToPc prog as = asmSha3 as) :
+    ∃ as', runAsm (executePlan [StackOp.SOEmit "SHA3"]).length offsetToPc prog as
+             = AsmResult.AsmOK as' ∧
+           venomAsmRel lo { ps with stack := stackPush (Operand.Var out) (stackPop 2 ps.stack) }
+             (updateVar out (keccak256 (readMemory off.toNat sz.toNat vs)) vs) as' ∧
+           as'.pc = as.pc + (executePlan [StackOp.SOEmit "SHA3"]).length := by
+  obtain ⟨hpc, hget⟩ := asmBlockAt_one hblock
+  have hstep : asmStep offsetToPc prog as = AsmResult.AsmOK { asmNext as with
+      stack := keccak256 (as.memory.readWithPadding off.toNat sz.toNat) :: rest, memory := as.memory } := by
+    rw [hdisp hpc hget]; exact asmSha3_ok hstack hcov
+  refine ⟨{ asmNext as with
+      stack := keccak256 (as.memory.readWithPadding off.toNat sz.toNat) :: rest, memory := as.memory },
+    ?_, ?_, ?_⟩
+  · show runAsm 1 offsetToPc prog as = _
+    rw [runAsm_succ_ok hpc hstep]; rfl
+  · exact venomAsmRel_sha3 hrel hstack hbelow hsize hfresh hspill
+  · rfl
+
 /-! ## Storage / transient load compute step (SLOAD, TLOAD — read shared state to a fresh output)
 
 SLOAD/TLOAD pop a `key` and push a *shared-state* read (`sload`/`tload`), consuming no memory. Unlike
@@ -1879,6 +2058,174 @@ theorem emit_tload_sim {ps lo vs as prog key rest out}
   · exact venomAsmRel_tload hrel hstack hfresh hspill
   · rfl
 
+/-! ## CALLDATALOAD (a 1-input read of `callCtx.calldata`)
+
+Like TLOAD, a 1-input read into a fresh output, but the read is a 32-byte word of `callCtx.calldata`
+(no memory model): the asm/Venom reads agree via the `callCtx` conjunct of `venomAsmRel`. -/
+
+/-- `asmStep` on a resolved `CALLDATALOAD` op reduces to the calldata-word `asmStateUnop`. -/
+theorem asmStep_calldataload_ok {o2pc prog s} (hpc : s.pc < prog.length)
+    (hprog : prog.get ⟨s.pc, hpc⟩ = AsmInst.AsmOp "CALLDATALOAD") :
+    asmStep o2pc prog s = asmStateUnop (fun offset s =>
+      wordOfBytes ((⟨s.callCtx.calldata.toArray⟩ : ByteArray).readWithPadding offset.toNat 32)) s := by
+  unfold asmStep; rw [dif_pos hpc, hprog]; rfl
+
+/-- **The CALLDATALOAD compute-step relation.** Pop `offset`, push the 32-byte calldata word; the reads
+    agree via the `callCtx` conjunct (`as.callCtx = vs.callCtx`). The calldata twin of `venomAsmRel_tload`. -/
+theorem venomAsmRel_calldataload {lo ps vs as out} {key rest}
+    (hrel : venomAsmRel lo ps vs as)
+    (hstack : as.stack = key :: rest)
+    (hfresh : ¬ (Operand.Var out) ∈ ps.stack)
+    (hspill : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none) :
+    venomAsmRel lo { ps with stack := stackPush (Operand.Var out) (stackPop 1 ps.stack) }
+      (updateVar out (wordOfBytes
+        ((⟨vs.callCtx.calldata.toArray⟩ : ByteArray).readWithPadding key.toNat 32)) vs)
+      { asmNext as with stack :=
+          (wordOfBytes ((⟨as.callCtx.calldata.toArray⟩ : ByteArray).readWithPadding key.toNat 32)) :: rest } := by
+  obtain ⟨hStk, hSpill, hMem, hAcc, hTrans, hRet, hLog, hCall, hTx, hBlk, hCode, hPrev⟩ := hrel
+  have hval : wordOfBytes ((⟨vs.callCtx.calldata.toArray⟩ : ByteArray).readWithPadding key.toNat 32)
+      = wordOfBytes ((⟨as.callCtx.calldata.toArray⟩ : ByteArray).readWithPadding key.toNat 32) := by
+    rw [hCall]
+  have hlen1 : 1 ≤ ps.stack.length := by rw [hStk.1, hstack]; simp
+  obtain ⟨hStk', hSpill', hMem', hAcc', hTrans', hRet', hLog', hCall', hTx', hBlk', hCode', hPrev'⟩ :=
+    venomAsmRel_updateVar lo ps vs as out
+      (wordOfBytes ((⟨vs.callCtx.calldata.toArray⟩ : ByteArray).readWithPadding key.toNat 32))
+      ⟨hStk, hSpill, hMem, hAcc, hTrans, hRet, hLog, hCall, hTx, hBlk, hCode, hPrev⟩ hfresh hspill
+  refine ⟨?_, hSpill', hMem', hAcc', hTrans', hRet', hLog', hCall', hTx', hBlk', hCode', hPrev'⟩
+  have hout : operandVal (updateVar out
+      (wordOfBytes ((⟨vs.callCtx.calldata.toArray⟩ : ByteArray).readWithPadding key.toNat 32)) vs)
+      lo (Operand.Var out)
+      = some (wordOfBytes ((⟨as.callCtx.calldata.toArray⟩ : ByteArray).readWithPadding key.toNat 32)) := by
+    simp only [operandVal, lookupVar_updateVar_self]; rw [hval]
+  have hps := planStackRel_unop hStk' hlen1 hout
+  rw [hstack] at hps
+  simpa using hps
+
+/-- The runnable compute-step sim for CALLDATALOAD; `hdisp` from `asmStep_calldataload_ok`. -/
+theorem emit_calldataload_sim {ps lo vs as prog key rest out}
+    (hrel : venomAsmRel lo ps vs as)
+    (hstack : as.stack = key :: rest)
+    (hfresh : ¬ (Operand.Var out) ∈ ps.stack)
+    (hspill : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none)
+    (hblock : asmBlockAt prog as.pc (executePlan [StackOp.SOEmit "CALLDATALOAD"]))
+    (hdisp : ∀ (h : as.pc < prog.length), prog.get ⟨as.pc, h⟩ = AsmInst.AsmOp "CALLDATALOAD" →
+              asmStep offsetToPc prog as = asmStateUnop (fun offset s =>
+                wordOfBytes ((⟨s.callCtx.calldata.toArray⟩ : ByteArray).readWithPadding offset.toNat 32)) as) :
+    ∃ as', runAsm (executePlan [StackOp.SOEmit "CALLDATALOAD"]).length offsetToPc prog as
+             = AsmResult.AsmOK as' ∧
+           venomAsmRel lo { ps with stack := stackPush (Operand.Var out) (stackPop 1 ps.stack) }
+             (updateVar out (wordOfBytes
+               ((⟨vs.callCtx.calldata.toArray⟩ : ByteArray).readWithPadding key.toNat 32)) vs) as' ∧
+           as'.pc = as.pc + (executePlan [StackOp.SOEmit "CALLDATALOAD"]).length := by
+  obtain ⟨hpc, hget⟩ := asmBlockAt_one hblock
+  have hstep : asmStep offsetToPc prog as = AsmResult.AsmOK { asmNext as with stack :=
+      (wordOfBytes ((⟨as.callCtx.calldata.toArray⟩ : ByteArray).readWithPadding key.toNat 32)) :: rest } := by
+    rw [hdisp hpc hget]; exact asmStateUnop_ok hstack
+  refine ⟨{ asmNext as with stack :=
+      (wordOfBytes ((⟨as.callCtx.calldata.toArray⟩ : ByteArray).readWithPadding key.toNat 32)) :: rest },
+    ?_, ?_, ?_⟩
+  · show runAsm 1 offsetToPc prog as = _
+    rw [runAsm_succ_ok hpc hstep]; rfl
+  · exact venomAsmRel_calldataload hrel hstack hfresh hspill
+  · rfl
+
+/-! ## Account reads (BALANCE / EXTCODESIZE / EXTCODEHASH): a 1-input read of the accounts map
+
+The account-query twins of the TLOAD/SLOAD reads: pop an address, push a pure function of the account
+(balance / code length / code hash). The asm machine gained a case per opcode (`asmStateUnop` reading
+`s.toVenomState.accounts`), and the asm/Venom reads agree via the `accounts` conjunct of `venomAsmRel`
+(`as.accounts = vs.accounts`) — the account analog of `tload_congr`'s `transient` conjunct. The bridge
+(`venomAsmRel_accountRead` / `emit_accountRead_sim`) is generic over the read `fRead`; only the
+per-opcode `asmStep_*_ok` dispatch differs. -/
+
+/-- `asmStep` on a resolved `BALANCE` op reduces to the account-balance `asmStateUnop`. -/
+theorem asmStep_balance_ok {o2pc prog s} (hpc : s.pc < prog.length)
+    (hprog : prog.get ⟨s.pc, hpc⟩ = AsmInst.AsmOp "BALANCE") :
+    asmStep o2pc prog s = asmStateUnop (fun addr s =>
+      EvmYul.UInt256.ofNat
+        (lookupAccount (AccountAddress.ofUInt256 addr) s.toVenomState.accounts).balance) s := by
+  unfold asmStep; rw [dif_pos hpc, hprog]; rfl
+
+/-- **Generic account-read compute-step relation.** For any read that is a pure function of the address
+    and the accounts map (`fRead`), the asm read (over `as.toVenomState.accounts`) agrees with the Venom
+    read (over `vs.accounts`) via the `accounts` conjunct — the account analog of `tload_congr`'s
+    `transient` conjunct. BALANCE/EXTCODESIZE/EXTCODEHASH instantiate `fRead`. -/
+theorem venomAsmRel_accountRead {lo ps vs as out} {key rest} {fRead : bytes32 → Accounts → bytes32}
+    (hrel : venomAsmRel lo ps vs as)
+    (hstack : as.stack = key :: rest)
+    (hfresh : ¬ (Operand.Var out) ∈ ps.stack)
+    (hspill : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none) :
+    venomAsmRel lo { ps with stack := stackPush (Operand.Var out) (stackPop 1 ps.stack) }
+      (updateVar out (fRead key vs.accounts) vs)
+      { asmNext as with stack := fRead key as.toVenomState.accounts :: rest } := by
+  obtain ⟨hStk, hSpill, hMem, hAcc, hTrans, hRet, hLog, hCall, hTx, hBlk, hCode, hPrev⟩ := hrel
+  have hval : fRead key vs.accounts = fRead key as.toVenomState.accounts := by
+    have hacc' : as.toVenomState.accounts = vs.accounts := hAcc
+    rw [hacc']
+  have hlen1 : 1 ≤ ps.stack.length := by rw [hStk.1, hstack]; simp
+  obtain ⟨hStk', hSpill', hMem', hAcc', hTrans', hRet', hLog', hCall', hTx', hBlk', hCode', hPrev'⟩ :=
+    venomAsmRel_updateVar lo ps vs as out (fRead key vs.accounts)
+      ⟨hStk, hSpill, hMem, hAcc, hTrans, hRet, hLog, hCall, hTx, hBlk, hCode, hPrev⟩ hfresh hspill
+  refine ⟨?_, hSpill', hMem', hAcc', hTrans', hRet', hLog', hCall', hTx', hBlk', hCode', hPrev'⟩
+  have hout : operandVal (updateVar out (fRead key vs.accounts) vs) lo (Operand.Var out)
+      = some (fRead key as.toVenomState.accounts) := by
+    simp only [operandVal, lookupVar_updateVar_self]; rw [hval]
+  have hps := planStackRel_unop hStk' hlen1 hout
+  rw [hstack] at hps
+  simpa using hps
+
+/-- **Generic account-read emit sim.** The runnable step for any account-read opcode `name` whose asm
+    lowering is `asmStateUnop (fun addr s => fRead addr s.toVenomState.accounts)`; `hdisp` is supplied
+    by the per-opcode `asmStep_*_ok`. -/
+theorem emit_accountRead_sim {ps lo vs as prog key rest out} {name : String}
+    {fRead : bytes32 → Accounts → bytes32}
+    (hrel : venomAsmRel lo ps vs as)
+    (hstack : as.stack = key :: rest)
+    (hfresh : ¬ (Operand.Var out) ∈ ps.stack)
+    (hspill : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none)
+    (hblock : asmBlockAt prog as.pc (executePlan [StackOp.SOEmit name]))
+    (hdisp : ∀ (h : as.pc < prog.length), prog.get ⟨as.pc, h⟩ = AsmInst.AsmOp name →
+              asmStep offsetToPc prog as
+                = asmStateUnop (fun addr s => fRead addr s.toVenomState.accounts) as) :
+    ∃ as', runAsm (executePlan [StackOp.SOEmit name]).length offsetToPc prog as
+             = AsmResult.AsmOK as' ∧
+           venomAsmRel lo { ps with stack := stackPush (Operand.Var out) (stackPop 1 ps.stack) }
+             (updateVar out (fRead key vs.accounts) vs) as' ∧
+           as'.pc = as.pc + (executePlan [StackOp.SOEmit name]).length := by
+  obtain ⟨hpc, hget⟩ := asmBlockAt_one hblock
+  have hstep : asmStep offsetToPc prog as
+      = AsmResult.AsmOK { asmNext as with stack := fRead key as.toVenomState.accounts :: rest } := by
+    rw [hdisp hpc hget]; exact asmStateUnop_ok hstack
+  refine ⟨{ asmNext as with stack := fRead key as.toVenomState.accounts :: rest }, ?_, ?_, ?_⟩
+  · show runAsm 1 offsetToPc prog as = _
+    rw [runAsm_succ_ok hpc hstep]; rfl
+  · exact venomAsmRel_accountRead hrel hstack hfresh hspill
+  · rfl
+
+/-- `asmStep` on a resolved `EXTCODESIZE` op reduces to the account-code-length `asmStateUnop`. -/
+theorem asmStep_extcodesize_ok {o2pc prog s} (hpc : s.pc < prog.length)
+    (hprog : prog.get ⟨s.pc, hpc⟩ = AsmInst.AsmOp "EXTCODESIZE") :
+    asmStep o2pc prog s = asmStateUnop (fun addr s =>
+      EvmYul.UInt256.ofNat
+        (lookupAccount (AccountAddress.ofUInt256 addr) s.toVenomState.accounts).code.length) s := by
+  unfold asmStep; rw [dif_pos hpc, hprog]; rfl
+
+/-- `asmStep` on a resolved `EXTCODEHASH` op reduces to the account-code-hash `asmStateUnop`. -/
+theorem asmStep_extcodehash_ok {o2pc prog s} (hpc : s.pc < prog.length)
+    (hprog : prog.get ⟨s.pc, hpc⟩ = AsmInst.AsmOp "EXTCODEHASH") :
+    asmStep o2pc prog s = asmStateUnop (fun addr s =>
+      let acct := lookupAccount (AccountAddress.ofUInt256 addr) s.toVenomState.accounts
+      if acct.code.isEmpty then ⟨0⟩ else keccak256 (⟨acct.code.toArray⟩ : ByteArray)) s := by
+  unfold asmStep; rw [dif_pos hpc, hprog]; rfl
+
+/-- `asmStep` on a resolved `SELFBALANCE` op reduces to `asmPushVal` of the executing contract's
+    balance (a 0-input env-push reading `callCtx.contract` + `accounts`). -/
+theorem asmStep_selfbalance_ok {o2pc prog s} (hpc : s.pc < prog.length)
+    (hprog : prog.get ⟨s.pc, hpc⟩ = AsmInst.AsmOp "SELFBALANCE") :
+    asmStep o2pc prog s
+      = asmPushVal (EvmYul.UInt256.ofNat (lookupAccount s.callCtx.contract s.accounts).balance) s := by
+  unfold asmStep; rw [dif_pos hpc, hprog]; rfl
+
 /-! ## LOG compute step (append an event to the log; observable side effect)
 
 `LOGn` pops `offset`, `size`, and `n` topics, and appends an `Event` built from a memory slice
@@ -2004,6 +2351,106 @@ theorem asmCopyToMem_ok {src : List byte} {destOff srcOff sz stk s} (hs : s.stac
   have hmem : (if sz.toNat = 0 then s.memory else asmExpandMemory (destOff.toNat + sz.toNat) s.memory) = s.memory := by
     rw [if_neg (by omega : ¬ sz.toNat = 0), asmExpandMemory_of_covered (destOff.toNat + sz.toNat) s.memory hcov]
   simp only [hmem]
+
+/-- `asmStep` on a resolved `EXTCODECOPY` op dispatches to `asmExtcodecopy`. -/
+theorem asmStep_extcodecopy_ok {o2pc prog s} (hpc : s.pc < prog.length)
+    (hprog : prog.get ⟨s.pc, hpc⟩ = AsmInst.AsmOp "EXTCODECOPY") :
+    asmStep o2pc prog s = asmExtcodecopy s := by
+  unfold asmStep; rw [dif_pos hpc, hprog]; rfl
+
+/-- `asmExtcodecopy` on a 4-deep stack (`addr :: dst :: src :: sz :: stk`), nonzero covered copy: pops
+    4 and writes the `sz`-byte slice of the referenced account's code at `dst` (expansion no-op). Pops
+    the address, then delegates to `asmCopyToMem_ok` with the account code as the source. -/
+theorem asmExtcodecopy_ok {addr destOff srcOff sz stk s}
+    (hs : s.stack = addr :: destOff :: srcOff :: sz :: stk)
+    (hpos : 0 < sz.toNat)
+    (hcov : ((destOff.toNat + sz.toNat + 31) / 32) * 32 ≤ s.memory.size) :
+    asmExtcodecopy s = AsmResult.AsmOK
+      { asmNext s with
+        stack := stk,
+        memory := ((⟨(lookupAccount (AccountAddress.ofUInt256 addr) s.accounts).code.toArray⟩ : ByteArray).readWithPadding srcOff.toNat sz.toNat).write 0 s.memory destOff.toNat sz.toNat } := by
+  unfold asmExtcodecopy
+  rw [hs]
+  exact asmCopyToMem_ok (src := (lookupAccount (AccountAddress.ofUInt256 addr) s.accounts).code) rfl hpos hcov
+
+/-- **The EXTCODECOPY compute-step relation.** The 4-input (`addr :: dst :: src :: sz`) account-code →
+    memory copy. Pops 4; the written bytes are a slice of the referenced account's code, which agrees on
+    both sides via the `accounts` conjunct. The account-source, 4-input twin of `venomAsmRel_copyToMem`. -/
+theorem venomAsmRel_extcodecopy {lo ps vs as} {wa wb wc wd rest}
+    (hrel : venomAsmRel lo ps vs as)
+    (hstack : as.stack = wa :: wb :: wc :: wd :: rest)
+    (hcovV : wb.toNat ≤ vs.memory.size)
+    (hcovA : wb.toNat ≤ as.memory.size)
+    (hsafe : wb.toNat + wd.toNat ≤ ps.alloc.fnEom)
+    (hpos : 0 < wd.toNat) (hsize : wd.toNat < USize.size)
+    (hspillReg : ∀ op off', AssocList.lookup Operand Nat ps.spilled op = some off' →
+                  ps.alloc.fnEom ≤ off') :
+    venomAsmRel lo { ps with stack := stackPop 4 ps.stack }
+      (writeMemoryWithExpansion wb.toNat
+        ((⟨(lookupAccount (AccountAddress.ofUInt256 wa) vs.accounts).code.toArray⟩ : ByteArray).readWithPadding wc.toNat wd.toNat) vs)
+      { asmNext as with
+        stack := rest,
+        memory := ((⟨(lookupAccount (AccountAddress.ofUInt256 wa) vs.accounts).code.toArray⟩ : ByteArray).readWithPadding wc.toNat wd.toNat).write 0 as.memory wb.toNat wd.toNat } := by
+  obtain ⟨hStk, hSpill, hMem, hAcc, hTrans, hRet, hLog, hCall, hTx, hBlk, hCode, hPrev⟩ := hrel
+  set src := (lookupAccount (AccountAddress.ofUInt256 wa) vs.accounts).code with hsrc
+  have hbssz : ((⟨src.toArray⟩ : ByteArray).readWithPadding wc.toNat wd.toNat).size = wd.toNat :=
+    ByteArray.readWithPadding_size _ _ _ hsize
+  have hlen4 : 4 ≤ ps.stack.length := by rw [hStk.1, hstack]; simp
+  have hps := planStackRel_popN hStk hlen4
+  rw [hstack] at hps
+  have hstate : writeMemoryWithExpansion wb.toNat ((⟨src.toArray⟩ : ByteArray).readWithPadding wc.toNat wd.toNat) vs
+      = { vs with memory := ((⟨src.toArray⟩ : ByteArray).readWithPadding wc.toNat wd.toNat).write 0 vs.memory wb.toNat wd.toNat } := by
+    unfold writeMemoryWithExpansion; rw [hbssz]
+  rw [hstate]
+  refine ⟨?_, ?_, ?_, hAcc, hTrans, hRet, hLog, hCall, hTx, hBlk, hCode, hPrev⟩
+  · exact hps
+  · intro op off' hlook
+    obtain ⟨v, hopv, hval⟩ := hSpill op off' hlook
+    refine ⟨v, hopv, ?_⟩
+    have hd := EvmYul.byteArray_readWithPadding_write_disjoint
+      ((⟨src.toArray⟩ : ByteArray).readWithPadding wc.toNat wd.toNat) as.memory wb.toNat off' 32
+      (by rw [hbssz]; exact hpos) hcovA (by rcases USize.size_eq with h | h <;> omega)
+      (Or.inr (by rw [hbssz]; have := hspillReg op off' hlook; omega))
+    rw [hbssz] at hd
+    rw [hd]; exact hval
+  · intro i hi
+    have hc := readByte_write_congr ((⟨src.toArray⟩ : ByteArray).readWithPadding wc.toNat wd.toNat)
+      vs.memory as.memory wb.toNat i (by rw [hbssz]; exact hpos) hcovV hcovA (hMem i hi)
+    rw [hbssz] at hc
+    exact hc
+
+/-- The runnable EXTCODECOPY sim; the asm source (`account[addr].code` over `as.accounts`) is bridged to
+    the Venom one via the `accounts` conjunct. `hdisp` from `asmStep_extcodecopy_ok`. -/
+theorem emit_extcodecopy_sim {ps lo vs as prog wa wb wc wd rest offsetToPc}
+    (hrel : venomAsmRel lo ps vs as)
+    (hstack : as.stack = wa :: wb :: wc :: wd :: rest)
+    (hcovV : wb.toNat ≤ vs.memory.size)
+    (hcovA : ((wb.toNat + wd.toNat + 31) / 32) * 32 ≤ as.memory.size)
+    (hsafe : wb.toNat + wd.toNat ≤ ps.alloc.fnEom)
+    (hpos : 0 < wd.toNat) (hsize : wd.toNat < USize.size)
+    (hspillReg : ∀ op off', AssocList.lookup Operand Nat ps.spilled op = some off' → ps.alloc.fnEom ≤ off')
+    (hblock : asmBlockAt prog as.pc (executePlan [StackOp.SOEmit "EXTCODECOPY"])) :
+    ∃ as', runAsm (executePlan [StackOp.SOEmit "EXTCODECOPY"]).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+           venomAsmRel lo { ps with stack := stackPop 4 ps.stack }
+             (writeMemoryWithExpansion wb.toNat
+               ((⟨(lookupAccount (AccountAddress.ofUInt256 wa) vs.accounts).code.toArray⟩ : ByteArray).readWithPadding wc.toNat wd.toNat) vs) as' ∧
+           as'.pc = as.pc + (executePlan [StackOp.SOEmit "EXTCODECOPY"]).length := by
+  obtain ⟨hpc, hget⟩ := asmBlockAt_one hblock
+  have hcode : (lookupAccount (AccountAddress.ofUInt256 wa) as.accounts).code
+      = (lookupAccount (AccountAddress.ofUInt256 wa) vs.accounts).code := by rw [hrel.2.2.2.1]
+  have hcovA' : wb.toNat ≤ as.memory.size := by omega
+  have hstep : asmStep offsetToPc prog as = AsmResult.AsmOK
+      { asmNext as with
+        stack := rest,
+        memory := ((⟨(lookupAccount (AccountAddress.ofUInt256 wa) vs.accounts).code.toArray⟩ : ByteArray).readWithPadding wc.toNat wd.toNat).write 0 as.memory wb.toNat wd.toNat } := by
+    rw [asmStep_extcodecopy_ok hpc hget, asmExtcodecopy_ok hstack hpos hcovA, hcode]
+  refine ⟨{ asmNext as with
+      stack := rest,
+      memory := ((⟨(lookupAccount (AccountAddress.ofUInt256 wa) vs.accounts).code.toArray⟩ : ByteArray).readWithPadding wc.toNat wd.toNat).write 0 as.memory wb.toNat wd.toNat }, ?_, ?_, ?_⟩
+  · show runAsm 1 offsetToPc prog as = _
+    rw [runAsm_succ_ok hpc hstep]; rfl
+  · exact venomAsmRel_extcodecopy hrel hstack hcovV hcovA' hsafe hpos hsize hspillReg
+  · rfl
 
 /-- `asmReturndatacopy` on a 3+-deep stack, nonzero **in-bounds** copy: pops 3 and writes the `sz`-byte
     `returndata` slice at `destOff` (expansion no-op). The OOB fault branch is excluded by `hnooob`. -/
@@ -2404,6 +2851,74 @@ theorem reorderOne_sim_swap {targetOps idx op ps lo vs as prog dist}
   · rw [executePlan_append, List.length_append]; exact runAsm_compose hrun1 hrun2
   · rw [executePlan_append, List.length_append, hpc2, hpc1]; omega
 
+/-! ### General reorder plan-stack effect (`perm_reaches` building blocks)
+
+The no-op reorder (already-positioned body) is fully handled (`reorderPlan_vars_nil` &c.). The general
+permutation reorder synthesises the target layout from any arrangement — a selection-sort over
+`reorderOne`. These lemmas give the per-step *plan-stack* transition (the asm-side per-step sims are
+`reorderOne_sim_positioned`/`reorderOne_sim_swap`); the remaining `perm_reaches` content is that this
+transition positions `op` at `finalDist` and that the fold reaches `base ++ targetOps`. -/
+
+/-- **`doSwap` plan-stack effect (small, non-zero case).** For `0 < dist ≤ 16` (the no-spill case),
+    `doSwap` swaps TOS with the element at distance `dist`, leaving `stackSwap dist ps.stack`. -/
+theorem doSwap_stack_small {dist : Nat} {ps : PlanState} (h0 : dist ≠ 0) (h : dist ≤ 16) :
+    (doSwap dist ps).2.stack = stackSwap dist ps.stack := by
+  unfold doSwap; rw [if_neg h0, if_pos h]
+
+/-- `doSwap 0` is a plan-stack no-op. -/
+theorem doSwap_stack_zero {ps : PlanState} : (doSwap 0 ps).2.stack = ps.stack := by
+  unfold doSwap; rw [if_pos rfl]
+
+/-- **`doSwap` plan-stack effect, the big-swap case (`dist > 16`).** The spill/restore bulk swap nets
+    to `stackSwap dist ps.stack` — offset-independent (`bigSwap_stack_spec`), so no `freeSlots`
+    precondition is needed for the *stack* (unlike `doSwap_big_eq`, which fixes the offsets). -/
+theorem doSwap_stack_big {dist : Nat} {ps : PlanState} (hd : 16 < dist)
+    (hlen : dist < ps.stack.length) :
+    (doSwap dist ps).2.stack = stackSwap dist ps.stack := by
+  unfold doSwap
+  rw [if_neg (by omega), if_neg (by omega)]
+  show ps.stack.take (ps.stack.length - (dist + 1)) ++
+      ([dist + 1 - 1] ++ (List.range (dist + 1 - 2)).map (· + 1) ++ [0]).map
+        (fun idx => (topN (dist + 1) ps.stack)[idx]!) = stackSwap dist ps.stack
+  rw [show dist + 1 - 1 = dist from by omega, show dist + 1 - 2 = dist - 1 from by omega]
+  exact bigSwap_stack_spec ps.stack dist (by omega) hlen
+
+/-- **`doSwap` plan-stack effect, any non-zero distance in range.** Unifies the small-swap
+    (`doSwap_stack_small`) and big-swap (`doSwap_stack_big`) cases: `(doSwap dist ps).2.stack =
+    stackSwap dist ps.stack` for any `0 < dist < ps.stack.length`. This is what lets the reorder
+    lemmas drop the `≤ 16` / `≤ 17` bounds and apply at arbitrary stack depth. -/
+theorem doSwap_stack_ne0 {dist : Nat} {ps : PlanState} (h0 : dist ≠ 0)
+    (hlen : dist < ps.stack.length) :
+    (doSwap dist ps).2.stack = stackSwap dist ps.stack := by
+  by_cases h16 : dist ≤ 16
+  · exact doSwap_stack_small h0 h16
+  · exact doSwap_stack_big (by omega) hlen
+
+/-- `doSwap` preserves the stack length (for `dist < length`). -/
+theorem doSwap_length {dist : Nat} {ps : PlanState} (hlen : dist < ps.stack.length) :
+    (doSwap dist ps).2.stack.length = ps.stack.length := by
+  by_cases h0 : dist = 0
+  · subst h0; rw [doSwap_stack_zero]
+  · rw [doSwap_stack_ne0 h0 hlen]; unfold stackSwap; simp [List.length_set]
+
+/-- **`reorderOne` plan-stack effect, the 2-swap case.** When `op` is on the stack at depth
+    `dist ≠ finalDist`, both non-zero and in range, `reorderOne` composes the two swaps: it first
+    brings `op` to TOS (`stackSwap dist`), then swaps TOS to its final depth `finalDist =
+    targetOps.length - 1 - idx` (`stackSwap finalDist`). This is the per-step plan-stack transition the
+    general reorder's selection-sort fold (`perm_reaches`) iterates. Uses `doSwap_stack_ne0`, so it
+    holds at arbitrary stack depth (big swaps included). -/
+theorem reorderOne_stack_swap {targetOps : List Operand} {idx : Nat} {op : Operand} {ps : PlanState}
+    {dist : Nat}
+    (hdepth : stackGetDepth op ps.stack = some dist)
+    (hne : dist ≠ targetOps.length - 1 - idx)
+    (hd0 : dist ≠ 0) (hdlt : dist < ps.stack.length)
+    (hf0 : targetOps.length - 1 - idx ≠ 0) (hflt : targetOps.length - 1 - idx < ps.stack.length) :
+    (reorderOne () targetOps idx op ps).2.stack
+      = stackSwap (targetOps.length - 1 - idx) (stackSwap dist ps.stack) := by
+  unfold reorderOne
+  simp only [hdepth, if_neg hne]
+  rw [doSwap_stack_ne0 hf0 (by rw [doSwap_length hdlt]; exact hflt), doSwap_stack_ne0 hd0 hdlt]
+
 /-! ## Output handling: optimistic swap
 
 The live-output branch of `generateRegularInstPlan` ends with `optimisticSwapPlan`, which
@@ -2788,6 +3303,41 @@ theorem stackSwap_1_append_pair (base : List Operand) (x y : Operand) :
       show base.length + 1 - 1 = base.length from by omega,
       htop, htgt, hset1, hset2]
 
+/-- `reorderOne` when the operand is already on top (`dist = 0`) but its target depth `f` is nonzero
+    (`≤ 16`): `doSwap 0` is a no-op, so it emits one `SWAP f`. -/
+theorem reorderOne_dist0 {targetOps : List Operand} {idx : Nat} {op : Operand} {ps : PlanState}
+    {f : Nat} (hf : targetOps.length - 1 - idx = f)
+    (hd : stackGetDepth op ps.stack = some 0) (hf0 : f ≠ 0) (hf16 : f ≤ 16) :
+    reorderOne () targetOps idx op ps
+      = ([StackOp.SOSwap f], { ps with stack := stackSwap f ps.stack }) := by
+  simp only [reorderOne, hf, hd, if_neg (Ne.symm hf0)]
+  rw [show doSwap 0 ps = ([], ps) from by rw [doSwap, if_pos rfl]]
+  simp only [List.nil_append]
+  rw [show doSwap f ps = ([StackOp.SOSwap f], { ps with stack := stackSwap f ps.stack })
+      from by rw [doSwap, if_neg hf0, if_pos hf16]]
+
+/-- **The reorder for a *repeated* operand pair `[Var x, Var x]` is one `SWAP1` — a semantic no-op**
+    (the two identical operands are already at the store's target depths; the swap exchanges equal
+    values, leaving the plan state unchanged). Same-var analogue of `reorderPlan_pair_var_nil` (which
+    needs `x ≠ y` and yields `[]`). Together with `emitInputPlan_pair_var_same_sim` this pins the
+    same-var 2-input plan to `emit [x,x] ++ [SWAP1] ++ [op]` with the swap a no-op — the reorder half
+    of the `x = y` coverage gap. -/
+theorem reorderPlan_pair_var_same (base : List Operand) (x : String) (ps : PlanState)
+    (hstack : ps.stack = base ++ [Operand.Var x, Operand.Var x]) :
+    reorderPlan [Operand.Var x, Operand.Var x] ps = ([StackOp.SOSwap 1], ps) := by
+  have hd0 : stackGetDepth (Operand.Var x) ps.stack = some 0 := by
+    rw [hstack]; simp [stackGetDepth, stackFind, List.reverse_append]
+  have hswap : stackSwap 1 ps.stack = ps.stack := by rw [hstack, stackSwap_1_append_pair]
+  unfold reorderPlan
+  rw [show [Operand.Var x, Operand.Var x].enum = [(0, Operand.Var x), (1, Operand.Var x)] from rfl]
+  simp only [List.foldl_cons, List.foldl_nil, List.nil_append]
+  rw [reorderOne_dist0 (targetOps := [Operand.Var x, Operand.Var x]) (idx := 0) (f := 1) rfl hd0
+      (by decide) (by decide)]
+  have hps0 : ({ ps with stack := stackSwap 1 ps.stack } : PlanState) = ps := by rw [hswap]
+  rw [hps0, reorderOne_nil_of_positioned (targetOps := [Operand.Var x, Operand.Var x]) (idx := 1)
+    (by simpa using hd0)]
+  rfl
+
 /-! ## Swapped-order reorder (commutative branch `opsB`)
 
 The commutative optimization compares `reorderPlan operands` (cost 0 when positioned) with
@@ -2849,6 +3399,46 @@ theorem stackGetDepth_lt_length {op : Operand} {stk : List Operand} {d : Nat}
   have := (stackFind_some h).1
   rwa [List.length_reverse] at this
 
+/-- **Per-`reorderOne` asm discharge, small-swap case — base-independent.** The only requirement is that
+    the operand's depth `dist` and its final depth are both `≤ 16` (small swaps, no spilling); the *total*
+    stack depth is irrelevant. So a reorder region sitting atop an arbitrarily deep base still runs, as
+    long as the region itself is `≤ 16` deep (which a JMP-join's live-var layout always is). Generalises
+    `reorderOne_asm_bounded` (which conservatively bounded the whole stack by 17). -/
+theorem reorderOne_asm_smallswap {targetOps : List Operand} {idx : Nat} {op : Operand} {ps : PlanState}
+    {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat} {vs : VenomState} {as : AsmState}
+    {prog : List AsmInst} {dist : Nat}
+    (hdist : stackGetDepth op ps.stack = some dist)
+    (hd16 : dist ≤ 16) (hf16 : targetOps.length - 1 - idx ≤ 16)
+    (hflen : targetOps.length - 1 - idx < ps.stack.length)
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc (executePlan (reorderOne () targetOps idx op ps).1)) :
+    ∃ as', runAsm (executePlan (reorderOne () targetOps idx op ps).1).length offsetToPc prog as
+             = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (reorderOne () targetOps idx op ps).2 vs as' ∧
+           as'.pc = as.pc + (executePlan (reorderOne () targetOps idx op ps).1).length := by
+  by_cases hpos : dist = targetOps.length - 1 - idx
+  · rw [hpos] at hdist; exact reorderOne_sim_positioned hdist hrel
+  · exact reorderOne_sim_swap hdist hpos hd16 hf16 hrel (stackGetDepth_lt_length hdist) hflen hblock
+
+/-- **Per-`reorderOne` asm discharge, bounded case** (`ps.stack.length ≤ 17` ⇒ `dist ≤ 16`). The
+    conservative corollary of `reorderOne_asm_smallswap` used by the JMP-join fold: bounding the whole
+    stack by 17 is enough for the join case (the reorder region *is* the whole live-var stack), and gives
+    `dist ≤ 16` from `dist < ps.stack.length`. -/
+theorem reorderOne_asm_bounded {targetOps : List Operand} {idx : Nat} {op : Operand} {ps : PlanState}
+    {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat} {vs : VenomState} {as : AsmState}
+    {prog : List AsmInst} {dist : Nat}
+    (hdist : stackGetDepth op ps.stack = some dist)
+    (hfbound : targetOps.length - 1 - idx ≤ 16)
+    (hflen : targetOps.length - 1 - idx < ps.stack.length)
+    (hsbound : ps.stack.length ≤ 17)
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc (executePlan (reorderOne () targetOps idx op ps).1)) :
+    ∃ as', runAsm (executePlan (reorderOne () targetOps idx op ps).1).length offsetToPc prog as
+             = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (reorderOne () targetOps idx op ps).2 vs as' ∧
+           as'.pc = as.pc + (executePlan (reorderOne () targetOps idx op ps).1).length :=
+  reorderOne_asm_smallswap hdist (by have := stackGetDepth_lt_length hdist; omega) hfbound hflen hrel hblock
+
 /-- Depth-shift under a DUP: appending a *different* var to the bottom-to-top stack pushes every
     other var's depth up by one. `stackDup d s = s ++ [peek]`, so the second operand of a var pair
     sits one deeper after the first DUP — this is the `hdepth_x'` relation the var-binop input needs,
@@ -2873,6 +3463,719 @@ foundation is that a **nodup** operand list is positioned as itself: `stackFind`
 exactly the queried index, so `stackGetDepth L[i] L = some (length-1-i)` — every element is at its own
 target depth. -/
 
+
+/-- First hit after a miss-prefix: scanning `xs ++ y :: ys` with every `xs` element failing and
+    `y` matching finds index `xs.length`. -/
+theorem stackFind_prefix_hit {p : Operand → Bool} :
+    ∀ {xs : List Operand} {y : Operand} {ys : List Operand},
+      (∀ x ∈ xs, p x = false) → p y = true →
+      stackFind p (xs ++ y :: ys) = some xs.length := by
+  intro xs
+  induction xs with
+  | nil =>
+    intro y ys _ hy
+    show stackFind p (y :: ys) = some 0
+    unfold stackFind
+    simp [hy]
+  | cons x xs ih =>
+    intro y ys hmiss hy
+    show stackFind p (x :: (xs ++ y :: ys)) = some (xs.length + 1)
+    unfold stackFind
+    rw [show p x = false from hmiss x List.mem_cons_self]
+    simp only [Bool.false_eq_true, if_false]
+    rw [ih (fun w hw => hmiss w (List.mem_cons_of_mem x hw)) hy]
+
+/-- **Middle-position depth**: an operand whose every occurrence above it is absent sits at depth
+    `B.length` in `A ++ op :: B` (the scan from the TOS crosses `B` first). The segment-general
+    form of the pair/triple/quad depth computations — the workhorse for the N-ary doubles-reorder
+    fold invariant. -/
+theorem stackGetDepth_middle {A : List Operand} {op : Operand} {B : List Operand}
+    (hnotB : op ∉ B) : stackGetDepth op (A ++ op :: B) = some B.length := by
+  unfold stackGetDepth
+  rw [show (A ++ op :: B).reverse = B.reverse ++ op :: A.reverse from by simp]
+  rw [show B.length = B.reverse.length from by simp]
+  apply stackFind_prefix_hit
+  · intro x hx
+    simp only [beq_eq_false_iff_ne, ne_eq]
+    intro hc
+    exact hnotB (by rw [← hc]; exact List.mem_reverse.mp hx)
+  · exact beq_self_eq_true op
+
+/-- getElem! at the seam of `C ++ a :: D`. -/
+theorem getbang_append_middle (C : List Operand) (a : Operand) (D : List Operand) :
+    (C ++ a :: D)[C.length]! = a := by
+  rw [List.getElem!_eq_getElem?_getD, List.getElem?_append_right (Nat.le_refl _)]
+  simp
+
+/-- getElem! at the top of `C ++ a :: (D ++ [t])`. -/
+theorem getbang_middle_top (C : List Operand) (a : Operand) (D : List Operand) (t : Operand) :
+    (C ++ a :: (D ++ [t]))[C.length + D.length + 1]! = t := by
+  rw [List.getElem!_eq_getElem?_getD, List.getElem?_append_right (by omega)]
+  rw [show C.length + D.length + 1 - C.length = D.length + 1 from by omega]
+  rw [show (a :: (D ++ [t]))[D.length + 1]? = (D ++ [t])[D.length]? from rfl]
+  rw [List.getElem?_append_right (Nat.le_refl _)]
+  simp
+
+/-- set at the seam of `C ++ a :: D`. -/
+theorem set_append_middle (C : List Operand) (a b : Operand) (D : List Operand) :
+    (C ++ a :: D).set C.length b = C ++ b :: D := by
+  rw [List.set_append_right _ _ (Nat.le_refl _)]
+  simp
+
+/-- set at the top of `C ++ a :: (D ++ [t])`. -/
+theorem set_middle_top (C : List Operand) (a : Operand) (D : List Operand) (t b : Operand) :
+    (C ++ a :: (D ++ [t])).set (C.length + D.length + 1) b = C ++ a :: (D ++ [b]) := by
+  rw [List.set_append_right _ _ (by omega)]
+  rw [show C.length + D.length + 1 - C.length = D.length + 1 from by omega]
+  rw [show (a :: (D ++ [t])).set (D.length + 1) b = a :: ((D ++ [t]).set D.length b) from rfl]
+  rw [List.set_append_right _ _ (Nat.le_refl _)]
+  simp
+
+/-- **Middle-position swap**: swapping the TOS with the element at depth `D.length + 1` in
+    `C ++ a :: (D ++ [t])` exchanges `a` and `t` across the untouched middle segment `D`. The
+    segment-general form of the `stackSwap_{1,2,3}_append_*` family. -/
+theorem stackSwap_middle (C : List Operand) (a : Operand) (D : List Operand) (t : Operand) :
+    stackSwap (D.length + 1) (C ++ a :: (D ++ [t])) = C ++ t :: (D ++ [a]) := by
+  have hlen : (C ++ a :: (D ++ [t])).length = C.length + D.length + 2 := by
+    simp; omega
+  have htop : (C ++ a :: (D ++ [t]))[C.length + D.length + 1]! = t :=
+    getbang_middle_top C a D t
+  have htgt : (C ++ a :: (D ++ [t]))[C.length]! = a := getbang_append_middle C a (D ++ [t])
+  have hset1 : (C ++ a :: (D ++ [t])).set (C.length + D.length + 1) a
+      = C ++ a :: (D ++ [a]) := set_middle_top C a D t a
+  have hset2 : (C ++ a :: (D ++ [a])).set C.length t = C ++ t :: (D ++ [a]) :=
+    set_append_middle C a t (D ++ [a])
+  unfold stackSwap
+  simp only [hlen,
+    show C.length + D.length + 2 - 1 = C.length + D.length + 1 from by omega,
+    show C.length + D.length + 1 - (D.length + 1) = C.length from by omega,
+    htop, htgt, hset1, hset2]
+
+/-- **The seat-and-hoist step**: the fold's current operand sits at the TOS (hoisted by the
+    previous step); one `SWAP (D.length + 1)` seats it at its final slot and hoists the seam
+    element `next`. The generic per-step reduction of the doubles-reorder pre-phase. -/
+theorem reorderOne_seat_hoist {tgt : List Operand} {i : Nat} {cur next : Operand} {ps : PlanState}
+    {C D : List Operand}
+    (htos : ps.stack = C ++ next :: (D ++ [cur]))
+    (hdist : D.length + 1 = tgt.length - 1 - i)
+    (hd16 : D.length + 1 ≤ 16) :
+    reorderOne () tgt i cur ps
+      = ([StackOp.SOSwap (D.length + 1)], { ps with stack := C ++ cur :: (D ++ [next]) }) := by
+  have hdepth : stackGetDepth cur ps.stack = some 0 := by
+    rw [htos, show C ++ next :: (D ++ [cur]) = (C ++ next :: D) ++ cur :: [] from by simp]
+    simpa using stackGetDepth_middle (A := C ++ next :: D) (op := cur) (B := []) (by simp)
+  have hds0 : doSwap 0 ps = ([], ps) := by rw [doSwap, if_pos rfl]
+  have hswapfin : doSwap (tgt.length - 1 - i) ps
+      = ([StackOp.SOSwap (D.length + 1)], { ps with stack := C ++ cur :: (D ++ [next]) }) := by
+    rw [← hdist]
+    unfold doSwap
+    rw [if_neg (by omega), if_pos hd16]
+    rw [htos, stackSwap_middle]
+  have h0ne : ¬ ((0 : Nat) = tgt.length - 1 - i) := by omega
+  unfold reorderOne
+  simp only [hdepth, hds0, hswapfin, if_neg h0ne, List.nil_append]
+
+/-- **The park-and-seat step** (the doubles-reorder phase opener): the current operand sits at
+    full depth; the first swap brings it to the TOS (parking the old TOS at the bottom slot),
+    the second seats it one below, hoisting the seam element `next`. Two `stackSwap_middle`
+    applications at shifted segmentations. -/
+theorem reorderOne_park_seat {tgt : List Operand} {i : Nat} {cur next t : Operand}
+    {ps : PlanState} {C D : List Operand}
+    (htos : ps.stack = C ++ cur :: next :: (D ++ [t]))
+    (habsent : cur ∉ next :: (D ++ [t]))
+    (hdist : D.length + 2 = tgt.length - 1 - i + 1)
+    (hd16 : D.length + 2 ≤ 16) :
+    reorderOne () tgt i cur ps
+      = ([StackOp.SOSwap (D.length + 2), StackOp.SOSwap (D.length + 1)],
+         { ps with stack := C ++ t :: cur :: (D ++ [next]) }) := by
+  have hdepth : stackGetDepth cur ps.stack = some (D.length + 2) := by
+    rw [htos]
+    have h := stackGetDepth_middle (A := C) (op := cur) (B := next :: (D ++ [t])) habsent
+    simpa using h
+  have hswap1 : doSwap (D.length + 2) ps
+      = ([StackOp.SOSwap (D.length + 2)],
+         { ps with stack := C ++ t :: next :: (D ++ [cur]) }) := by
+    unfold doSwap
+    rw [if_neg (by omega), if_pos hd16]
+    rw [htos,
+        show C ++ cur :: next :: (D ++ [t]) = C ++ cur :: ((next :: D) ++ [t]) from by simp,
+        show (D.length + 2 : Nat) = (next :: D).length + 1 from by simp,
+        stackSwap_middle C cur (next :: D) t]
+    simp
+  have hswap2 : doSwap (tgt.length - 1 - i)
+        ({ ps with stack := C ++ t :: next :: (D ++ [cur]) } : PlanState)
+      = ([StackOp.SOSwap (D.length + 1)],
+         { ps with stack := C ++ t :: cur :: (D ++ [next]) }) := by
+    rw [show tgt.length - 1 - i = D.length + 1 from by omega]
+    unfold doSwap
+    rw [if_neg (by omega), if_pos (by omega)]
+    rw [show ({ ps with stack := C ++ t :: next :: (D ++ [cur]) } : PlanState).stack
+          = (C ++ [t]) ++ next :: (D ++ [cur]) from by simp,
+        stackSwap_middle (C ++ [t]) next D cur]
+    simp
+  have hne : ¬ (D.length + 2 = tgt.length - 1 - i) := by omega
+  unfold reorderOne
+  simp only [hdepth, if_neg hne, hswap1, hswap2, List.nil_append]
+  rfl
+
+/-- **The seated no-op**: the operand already sits at its target depth — `reorderOne` emits
+    nothing. (Covers the trailing post-operands and the `q = 0` v-step.) -/
+theorem reorderOne_seated {tgt : List Operand} {i : Nat} {cur : Operand} {ps : PlanState}
+    {d : Nat}
+    (hdepth : stackGetDepth cur ps.stack = some d)
+    (hfin : d = tgt.length - 1 - i) :
+    reorderOne () tgt i cur ps = ([], ps) := by
+  unfold reorderOne
+  simp only [hdepth, if_pos hfin]
+
+/-- Descending swap run: `descSwaps n = [SWAP n, SWAP n-1, …, SWAP 1]`. -/
+def descSwaps : Nat → List StackOp
+  | 0 => []
+  | n + 1 => StackOp.SOSwap (n + 1) :: descSwaps n
+
+/-- **The seat-and-hoist chain** (fold form, accumulator-generalized): from the invariant stack,
+    folding the remaining enum entries seats each hoisted element in one descending swap and ends
+    with the seated `w`-step — emitting exactly `descSwaps hs.length` and landing at
+    `B ++ placed ++ hs ++ [w]`. -/
+theorem reorderFold_chain (tgt : List Operand) (B : List Operand) (w : Operand) :
+    ∀ (hs : List Operand) (placed : List Operand) (i : Nat) (ps : PlanState)
+      (ops0 : List StackOp),
+      (match hs with
+       | [] => ps.stack = B ++ placed ++ [w]
+       | c :: cs => ps.stack = B ++ placed ++ ((cs ++ [w]) ++ [c])) →
+      i + hs.length + 1 = tgt.length →
+      hs.length ≤ 15 →
+      ((hs ++ [w]).zipIdx i).foldl
+          (fun acc x => (acc.1 ++ (reorderOne () tgt x.2 x.1 acc.2).1,
+            (reorderOne () tgt x.2 x.1 acc.2).2)) (ops0, ps)
+        = (ops0 ++ descSwaps hs.length, { ps with stack := B ++ (placed ++ hs) ++ [w] }) := by
+  intro hs
+  induction hs with
+  | nil =>
+    intro placed i ps ops0 hstk hidx _
+    simp only at hstk
+    simp only [List.length_nil] at hidx
+    have hdepth : stackGetDepth w ps.stack = some 0 := by
+      rw [hstk, show B ++ placed ++ [w] = (B ++ placed) ++ w :: [] from by simp]
+      simpa using stackGetDepth_middle (A := B ++ placed) (op := w) (B := []) (by simp)
+    have hseated : reorderOne () tgt i w ps = ([], ps) := by
+      refine reorderOne_seated hdepth ?_
+      omega
+    show ([(w, i)]).foldl _ (ops0, ps) = _
+    simp only [List.foldl_cons, List.foldl_nil, hseated, List.append_nil, descSwaps,
+      Prod.mk.injEq]
+    refine ⟨by simp [descSwaps], ?_⟩
+    rw [← hstk]
+  | cons c cs ih =>
+    intro placed i ps ops0 hstk hidx h16
+    simp only at hstk
+    simp only [List.length_cons] at hidx h16
+    show (((c :: (cs ++ [w]))).zipIdx i).foldl _ (ops0, ps) = _
+    rw [List.zipIdx_cons, List.foldl_cons]
+    cases cs with
+    | nil =>
+      have hstep := reorderOne_seat_hoist (tgt := tgt) (i := i) (cur := c) (next := w)
+          (ps := ps) (C := B ++ placed) (D := ([] : List Operand))
+          (by rw [hstk]; simp)
+          (by simp only [List.length_nil] at hidx ⊢; omega)
+          (by simp)
+      simp only [List.length_nil, Nat.zero_add, List.nil_append] at hstep
+      simp only [hstep]
+      have hih := ih (placed ++ [c]) (i + 1)
+        ({ ps with stack := (B ++ placed) ++ c :: [w] } : PlanState)
+        (ops0 ++ [StackOp.SOSwap 1])
+        (by simp)
+        (by simp only [List.length_nil] at hidx ⊢; omega)
+        (by simp)
+      rw [hih]
+      simp only [Prod.mk.injEq]
+      refine ⟨by simp [descSwaps], by simp⟩
+    | cons c2 cs' =>
+      have hstep : reorderOne () tgt i c ps
+          = ([StackOp.SOSwap ((cs' ++ [w]).length + 1)],
+             { ps with stack := (B ++ placed) ++ c :: ((cs' ++ [w]) ++ [c2]) }) := by
+        exact reorderOne_seat_hoist (tgt := tgt) (i := i) (cur := c) (next := c2)
+          (ps := ps) (C := B ++ placed) (D := cs' ++ [w])
+          (by rw [hstk]; simp)
+          (by simp only [List.length_cons, List.length_append, List.length_nil] at hidx ⊢; omega)
+          (by simp only [List.length_cons, List.length_append, List.length_nil] at h16 ⊢; omega)
+      simp only [hstep]
+      have hih := ih (placed ++ [c]) (i + 1)
+        ({ ps with stack := (B ++ placed) ++ c :: ((cs' ++ [w]) ++ [c2]) } : PlanState)
+        (ops0 ++ [StackOp.SOSwap ((cs' ++ [w]).length + 1)])
+        (by simp)
+        (by simp only [List.length_cons, List.length_append, List.length_nil] at hidx ⊢; omega)
+        (by simp only [List.length_cons, List.length_append, List.length_nil] at h16 ⊢; omega)
+      rw [hih]
+      simp only [Prod.mk.injEq]
+      refine ⟨?_, by simp⟩
+      show (ops0 ++ [StackOp.SOSwap ((cs' ++ [w]).length + 1)]) ++ descSwaps (c2 :: cs').length
+          = ops0 ++ descSwaps (c :: c2 :: cs').length
+      rw [List.append_assoc]
+      congr 1
+      show StackOp.SOSwap ((cs' ++ [w]).length + 1) :: descSwaps (c2 :: cs').length
+          = descSwaps (c :: c2 :: cs').length
+      simp only [List.length_append, List.length_cons, List.length_nil, descSwaps]
+
+/-- **The last-operand-spilled N-ary reorder** (`q = 0`): on the one-double emission layout
+    `base ++ pre ++ [v, v]` with target `pre ++ [v]`, `reorderPlan` synthesises exactly the
+    descending run `SWAP N; …; SWAP 1` and lands at the uniformly positioned
+    `base ++ [v] ++ target` — the arbitrary-arity generalization of the proven ternop x-spilled
+    atom (park-and-seat opener + seat-and-hoist chain). -/
+theorem reorderPlan_lastspilled (base : List Operand) (pre : List Operand) (v : Operand)
+    (ps : PlanState)
+    (hstack : ps.stack = base ++ pre ++ [v, v])
+    (hne : pre ≠ [])
+    (h16 : pre.length + 1 ≤ 16)
+    (habs : v ∉ pre) (hnd : pre.Nodup) :
+    reorderPlan (pre ++ [v]) ps
+      = (descSwaps (pre.length + 1), { ps with stack := base ++ v :: (pre ++ [v]) }) := by
+  obtain ⟨p0, pre', rfl⟩ : ∃ p0 pre', pre = p0 :: pre' := by
+    cases pre with
+    | nil => exact absurd rfl hne
+    | cons a l => exact ⟨a, l, rfl⟩
+  simp only [List.length_cons] at h16
+  obtain ⟨hvp0, hvpre'⟩ : v ≠ p0 ∧ v ∉ pre' := by
+    simp only [List.mem_cons] at habs
+    push Not at habs
+    exact habs
+  obtain ⟨hp0pre', hndpre'⟩ := List.nodup_cons.mp hnd
+  unfold reorderPlan
+  show (List.map (fun p => (p.2, p.1)) (((p0 :: pre') ++ [v]).zipIdx 0)).foldl _ ([], ps) = _
+  rw [List.foldl_map]
+  show (((p0 :: pre') ++ [v]).zipIdx 0).foldl
+      (fun acc x => (acc.1 ++ (reorderOne () ((p0 :: pre') ++ [v]) x.2 x.1 acc.2).1,
+        (reorderOne () ((p0 :: pre') ++ [v]) x.2 x.1 acc.2).2)) ([], ps) = _
+  rw [show ((p0 :: pre') ++ [v]) = p0 :: (pre' ++ [v]) from rfl, List.zipIdx_cons,
+      List.foldl_cons]
+  cases pre' with
+  | nil =>
+    have hopener : reorderOne () (p0 :: ([] ++ [v])) 0 p0 ps
+        = ([StackOp.SOSwap 2, StackOp.SOSwap 1],
+           { ps with stack := (base ++ [v]) ++ p0 :: ([] ++ [v]) }) := by
+      have h := reorderOne_park_seat (tgt := p0 :: ([] ++ [v])) (i := 0)
+        (cur := p0) (next := v) (t := v) (ps := ps) (C := base) (D := [])
+        (by rw [hstack]; simp)
+        (by intro hmem
+            simp only [List.mem_cons, List.nil_append, List.not_mem_nil, or_false] at hmem
+            rcases hmem with h | h <;> exact hvp0 h.symm)
+        (by simp)
+        (by simp)
+      rw [h]
+      simp
+    simp only [List.nil_append] at hopener ⊢
+    simp only [hopener, Nat.zero_add]
+    have hchain := reorderFold_chain (p0 :: [v]) (base ++ [v]) v [] [p0] 1
+      ({ ps with stack := (base ++ [v]) ++ p0 :: [v] } : PlanState)
+      [StackOp.SOSwap 2, StackOp.SOSwap 1]
+      (by simp)
+      (by simp)
+      (by simp)
+    simp only [List.nil_append] at hchain
+    rw [hchain]
+    simp only [Prod.mk.injEq]
+    refine ⟨by simp [descSwaps], by simp⟩
+  | cons r pre'' =>
+    have habsent : p0 ∉ r :: ((pre'' ++ [v]) ++ [v]) := by
+      intro hmem
+      simp only [List.mem_cons, List.mem_append, List.not_mem_nil, or_false] at hmem
+      rcases hmem with h | h | h
+      · exact hp0pre' (h ▸ List.mem_cons_self)
+      · rcases h with h | h
+        · exact hp0pre' (List.mem_cons_of_mem r h)
+        · exact hvp0 h.symm
+      · exact hvp0 h.symm
+    have hopener : reorderOne () (p0 :: ((r :: pre'') ++ [v])) 0 p0 ps
+        = ([StackOp.SOSwap (pre''.length + 3), StackOp.SOSwap (pre''.length + 2)],
+           { ps with stack := (base ++ [v]) ++ p0 :: ((pre'' ++ [v]) ++ [r]) }) := by
+      have h := reorderOne_park_seat (tgt := p0 :: ((r :: pre'') ++ [v])) (i := 0)
+        (cur := p0) (next := r) (t := v) (ps := ps) (C := base) (D := pre'' ++ [v])
+        (by rw [hstack]; simp)
+        habsent
+        (by simp only [List.length_append, List.length_cons, List.length_nil]; omega)
+        (by simp only [List.length_append, List.length_cons, List.length_nil] at h16 ⊢; omega)
+      rw [h]
+      simp only [Prod.mk.injEq]
+      constructor
+      · simp only [List.length_append, List.length_cons, List.length_nil]
+      · simp
+    simp only [hopener]
+    have hchain := reorderFold_chain (p0 :: ((r :: pre'') ++ [v])) (base ++ [v]) v
+      (r :: pre'') [p0] 1
+      ({ ps with stack := (base ++ [v]) ++ p0 :: ((pre'' ++ [v]) ++ [r]) } : PlanState)
+      [StackOp.SOSwap (pre''.length + 3), StackOp.SOSwap (pre''.length + 2)]
+      (by simp)
+      (by simp only [List.length_cons, List.length_append, List.length_nil]; omega)
+      (by simp only [List.length_cons, List.length_append, List.length_nil] at h16 ⊢; omega)
+    simp only [Nat.zero_add, List.nil_append]
+    rw [hchain]
+    simp only [Prod.mk.injEq]
+    constructor
+    · show ([StackOp.SOSwap (pre''.length + 3), StackOp.SOSwap (pre''.length + 2)]
+          ++ descSwaps (r :: pre'').length)
+        = descSwaps ((p0 :: r :: pre'').length + 1)
+      simp only [List.length_cons]
+      show [StackOp.SOSwap (pre''.length + 3), StackOp.SOSwap (pre''.length + 2)]
+          ++ descSwaps (pre''.length + 1) = descSwaps (pre''.length + 1 + 1 + 1)
+      rfl
+    · simp
+
+/-- Descending swap run from `lo + len - 1` down to `lo`. -/
+def descRun (lo : Nat) : Nat → List StackOp
+  | 0 => []
+  | len + 1 => StackOp.SOSwap (lo + len) :: descRun lo len
+
+/-- **The seat-and-hoist chain over a fixed tail** `t0 :: T'`: each hoisted element seats in one
+    swap against the head of the shrinking arrangement; when `hs` is exhausted, `t0` sits at the
+    TOS. Emits `descRun (T'.length + 1) hs.length`. The mid-spilled pre-phase; the `q = 0` chain
+    is the `T' = []` shape (plus its seated terminal). -/
+theorem reorderFold_chain_pre (tgt : List Operand) (B : List Operand) (t0 : Operand)
+    (T' : List Operand) :
+    ∀ (hs : List Operand) (placed : List Operand) (i : Nat) (ps : PlanState)
+      (ops0 : List StackOp),
+      (match hs with
+       | [] => ps.stack = B ++ placed ++ (T' ++ [t0])
+       | c :: cs => ps.stack = B ++ placed ++ ((cs ++ (t0 :: T')) ++ [c])) →
+      i + hs.length + T'.length + 1 = tgt.length →
+      hs.length + T'.length + 1 ≤ 16 →
+      (hs.zipIdx i).foldl
+          (fun acc x => (acc.1 ++ (reorderOne () tgt x.2 x.1 acc.2).1,
+            (reorderOne () tgt x.2 x.1 acc.2).2)) (ops0, ps)
+        = (ops0 ++ descRun (T'.length + 1) hs.length,
+           { ps with stack := B ++ (placed ++ hs) ++ (T' ++ [t0]) }) := by
+  intro hs
+  induction hs with
+  | nil =>
+    intro placed i ps ops0 hstk _ _
+    simp only at hstk
+    show ([] : List (Operand × Nat)).foldl _ (ops0, ps) = _
+    simp only [List.foldl_nil, Prod.mk.injEq]
+    refine ⟨by simp [descRun], ?_⟩
+    rw [show B ++ (placed ++ []) ++ (T' ++ [t0]) = B ++ placed ++ (T' ++ [t0]) from by simp,
+        ← hstk]
+  | cons c cs ih =>
+    intro placed i ps ops0 hstk hidx h16
+    simp only at hstk
+    simp only [List.length_cons] at hidx h16
+    show ((c :: cs).zipIdx i).foldl _ (ops0, ps) = _
+    rw [List.zipIdx_cons, List.foldl_cons]
+    cases cs with
+    | nil =>
+      have hstep := reorderOne_seat_hoist (tgt := tgt) (i := i) (cur := c) (next := t0)
+        (ps := ps) (C := B ++ placed) (D := T')
+        (by rw [hstk]; simp)
+        (by simp only [List.length_nil, Nat.zero_add] at hidx ⊢; omega)
+        (by simp only [List.length_nil, Nat.zero_add] at h16 ⊢; omega)
+      simp only [hstep]
+      have hih := ih (placed ++ [c]) (i + 1)
+        ({ ps with stack := (B ++ placed) ++ c :: (T' ++ [t0]) } : PlanState)
+        (ops0 ++ [StackOp.SOSwap (T'.length + 1)])
+        (by simp)
+        (by simp only [List.length_nil, Nat.zero_add] at hidx ⊢; omega)
+        (by simp only [List.length_nil, Nat.zero_add] at h16 ⊢; omega)
+      rw [hih]
+      simp only [Prod.mk.injEq]
+      refine ⟨?_, by simp⟩
+      show (ops0 ++ [StackOp.SOSwap (T'.length + 1)]) ++ descRun (T'.length + 1) [].length
+          = ops0 ++ descRun (T'.length + 1) ([].length + 1)
+      simp only [List.length_nil, descRun, List.append_assoc]
+      rfl
+    | cons c2 cs' =>
+      have hstep := reorderOne_seat_hoist (tgt := tgt) (i := i) (cur := c) (next := c2)
+        (ps := ps) (C := B ++ placed) (D := cs' ++ (t0 :: T'))
+        (by rw [hstk]; simp)
+        (by simp only [List.length_cons, List.length_append, List.length_nil] at hidx ⊢; omega)
+        (by simp only [List.length_cons, List.length_append, List.length_nil] at h16 ⊢; omega)
+      simp only [hstep]
+      have hih := ih (placed ++ [c]) (i + 1)
+        ({ ps with stack := (B ++ placed) ++ c :: ((cs' ++ (t0 :: T')) ++ [c2]) } : PlanState)
+        (ops0 ++ [StackOp.SOSwap ((cs' ++ (t0 :: T')).length + 1)])
+        (by simp)
+        (by simp only [List.length_cons, List.length_append, List.length_nil] at hidx ⊢; omega)
+        (by simp only [List.length_cons, List.length_append, List.length_nil] at h16 ⊢; omega)
+      rw [hih]
+      simp only [Prod.mk.injEq]
+      refine ⟨?_, by simp⟩
+      show (ops0 ++ [StackOp.SOSwap ((cs' ++ (t0 :: T')).length + 1)])
+            ++ descRun (T'.length + 1) (c2 :: cs').length
+          = ops0 ++ descRun (T'.length + 1) ((c2 :: cs').length + 1)
+      have hops : StackOp.SOSwap ((cs' ++ (t0 :: T')).length + 1)
+          = StackOp.SOSwap ((T'.length + 1) + (c2 :: cs').length) := by
+        congr 1
+        simp only [List.length_cons, List.length_append]
+        omega
+      rw [List.append_assoc, hops]
+      rfl
+
+/-- **The return step**: the operand parked at the bottom of the group returns to the TOS in one
+    swap (its final distance is 0), sinking the current TOS to the bottom slot. -/
+theorem reorderOne_return {tgt : List Operand} {i : Nat} {cur t : Operand} {ps : PlanState}
+    {C M : List Operand}
+    (htos : ps.stack = C ++ cur :: (M ++ [t]))
+    (habsent : cur ∉ M ++ [t])
+    (hfin : tgt.length - 1 - i = 0)
+    (h16 : M.length + 1 ≤ 16) (hne : M.length + 1 ≠ 0) :
+    reorderOne () tgt i cur ps
+      = ([StackOp.SOSwap (M.length + 1)], { ps with stack := C ++ t :: (M ++ [cur]) }) := by
+  have hdepth : stackGetDepth cur ps.stack = some (M.length + 1) := by
+    rw [htos]
+    simpa using stackGetDepth_middle (A := C) (op := cur) (B := M ++ [t]) habsent
+  have hswap : doSwap (M.length + 1) ps
+      = ([StackOp.SOSwap (M.length + 1)], { ps with stack := C ++ t :: (M ++ [cur]) }) := by
+    unfold doSwap
+    rw [if_neg hne, if_pos h16, htos, stackSwap_middle]
+  have hds0 : doSwap (tgt.length - 1 - i)
+        ({ ps with stack := C ++ t :: (M ++ [cur]) } : PlanState)
+      = ([], { ps with stack := C ++ t :: (M ++ [cur]) }) := by
+    rw [hfin, doSwap, if_pos rfl]
+  have hne2 : ¬ (M.length + 1 = tgt.length - 1 - i) := by omega
+  unfold reorderOne
+  simp only [hdepth, if_neg hne2, hswap, hds0, List.nil_append, List.append_nil]
+
+/-- **The seated run**: a segment of operands each already at its final depth folds to no ops.
+    (The inner post-operands of the mid-spilled reorder.) -/
+theorem reorderFold_seated_run (tgt : List Operand) (t : Operand) :
+    ∀ (qs : List Operand) (P : List Operand) (i : Nat) (ps : PlanState) (ops0 : List StackOp),
+      ps.stack = P ++ (qs ++ [t]) →
+      (∀ x ∈ qs, x ∉ [t]) →
+      qs.Nodup →
+      i + qs.length + 1 = tgt.length →
+      (qs.zipIdx i).foldl
+          (fun acc x => (acc.1 ++ (reorderOne () tgt x.2 x.1 acc.2).1,
+            (reorderOne () tgt x.2 x.1 acc.2).2)) (ops0, ps)
+        = (ops0, ps) := by
+  intro qs
+  induction qs with
+  | nil => intro P i ps ops0 _ _ _ _; simp
+  | cons a qs' ih =>
+    intro P i ps ops0 hstk habs hnd hidx
+    simp only [List.length_cons] at hidx
+    obtain ⟨hanotqs, hnd'⟩ := List.nodup_cons.mp hnd
+    have hdepth : stackGetDepth a ps.stack = some (qs'.length + 1) := by
+      rw [hstk, show P ++ ((a :: qs') ++ [t]) = (P) ++ a :: (qs' ++ [t]) from by simp]
+      have hnot : a ∉ qs' ++ [t] := by
+        intro h
+        rcases List.mem_append.mp h with h | h
+        · exact hanotqs h
+        · exact habs a List.mem_cons_self h
+      simpa using stackGetDepth_middle (A := P) (op := a) (B := qs' ++ [t]) hnot
+    have hseated : reorderOne () tgt i a ps = ([], ps) := by
+      refine reorderOne_seated hdepth ?_
+      omega
+    rw [List.zipIdx_cons, List.foldl_cons]
+    simp only [hseated, List.append_nil]
+    exact ih (P ++ [a]) (i + 1) ps ops0
+      (by rw [hstk]; simp)
+      (fun x hx => habs x (List.mem_cons_of_mem a hx))
+      hnd'
+      (by omega)
+
+/-- **The mid-operand-spilled N-ary reorder** (`p, q ≥ 1`): on the one-double emission layout
+    `base ++ pre ++ [v, v] ++ post`, `reorderPlan` synthesises exactly
+    `SWAP N; …; SWAP q; SWAP N` and lands at the uniformly positioned `base ++ [v] ++ target` —
+    the arbitrary-arity generalization of the proven ternop mid-spilled atom: park-and-seat
+    opener, seat-and-hoist chain over the fixed `[v] ++ post'` tail, the equal-`v` swap, the
+    seated post-run, and the parked operand's return. -/
+theorem reorderPlan_midspilled (base : List Operand) (pre post : List Operand) (v : Operand)
+    (ps : PlanState)
+    (hstack : ps.stack = base ++ pre ++ [v, v] ++ post)
+    (hpre : pre ≠ []) (hpost : post ≠ [])
+    (h16 : pre.length + post.length + 1 ≤ 16)
+    (hvpre : v ∉ pre) (hvpost : v ∉ post)
+    (hndpre : pre.Nodup) (hndpost : post.Nodup)
+    (hdisj : ∀ x ∈ pre, x ∉ post) :
+    reorderPlan (pre ++ [v] ++ post) ps
+      = ((StackOp.SOSwap (pre.length + post.length + 1)
+            :: StackOp.SOSwap (pre.length + post.length)
+            :: descRun (post.length + 1) (pre.length - 1))
+          ++ [StackOp.SOSwap post.length]
+          ++ [StackOp.SOSwap (pre.length + post.length + 1)],
+         { ps with stack := base ++ v :: (pre ++ [v] ++ post) }) := by
+  obtain ⟨p0, pre', rfl⟩ : ∃ p0 pre', pre = p0 :: pre' := by
+    cases pre with
+    | nil => exact absurd rfl hpre
+    | cons a l => exact ⟨a, l, rfl⟩
+  obtain ⟨post', plast, rfl⟩ : ∃ post' plast, post = post' ++ [plast] := by
+    rcases List.eq_nil_or_concat post with h | ⟨l, a, h⟩
+    · exact absurd h hpost
+    · exact ⟨l, a, by rw [h, List.concat_eq_append]⟩
+  simp only [List.length_cons, List.length_append, List.length_nil] at h16
+  obtain ⟨hvp0, hvpre'⟩ : v ≠ p0 ∧ v ∉ pre' := by
+    simp only [List.mem_cons] at hvpre; push Not at hvpre; exact hvpre
+  obtain ⟨hp0pre', hndpre'⟩ := List.nodup_cons.mp hndpre
+  have hvpost' : v ∉ post' := fun h => hvpost (List.mem_append.mpr (Or.inl h))
+  have hvplast : v ≠ plast := fun h => hvpost (by rw [h]; exact List.mem_append.mpr (Or.inr List.mem_cons_self))
+  have hp0post' : p0 ∉ post' := fun h =>
+    hdisj p0 List.mem_cons_self (List.mem_append.mpr (Or.inl h))
+  have hp0plast : p0 ≠ plast := fun h =>
+    hdisj p0 List.mem_cons_self (by rw [h]; exact List.mem_append.mpr (Or.inr List.mem_cons_self))
+  have hplastpost' : plast ∉ post' := by
+    intro h
+    have h2 := hndpost
+    rw [List.nodup_append] at h2
+    exact h2.2.2 plast h plast (by simp) rfl
+  unfold reorderPlan
+  show (List.map (fun p => (p.2, p.1)) (((p0 :: pre') ++ [v] ++ (post' ++ [plast])).zipIdx 0)).foldl
+      _ ([], ps) = _
+  rw [List.foldl_map]
+  show (((p0 :: pre') ++ [v] ++ (post' ++ [plast])).zipIdx 0).foldl
+      (fun acc x => (acc.1 ++ (reorderOne () ((p0 :: pre') ++ [v] ++ (post' ++ [plast])) x.2 x.1 acc.2).1,
+        (reorderOne () ((p0 :: pre') ++ [v] ++ (post' ++ [plast])) x.2 x.1 acc.2).2)) ([], ps) = _
+  set tgt := (p0 :: pre') ++ [v] ++ (post' ++ [plast]) with htgt
+  have htgtlen : tgt.length = pre'.length + post'.length + 3 := by
+    rw [htgt]; simp; omega
+  -- split the enum walk: p0 ; pre' ; v ; post' ; plast (keeping `tgt` abstract in the fold)
+  have hz0 : tgt.zipIdx 0
+      = (p0, 0) :: (pre'.zipIdx 1
+          ++ ([v] ++ (post' ++ [plast])).zipIdx (1 + pre'.length)) := by
+    rw [htgt]
+    rw [show (p0 :: pre') ++ [v] ++ (post' ++ [plast])
+          = p0 :: (pre' ++ ([v] ++ (post' ++ [plast]))) from by simp,
+        List.zipIdx_cons, List.zipIdx_append]
+  rw [hz0, List.foldl_cons, List.foldl_append]
+  -- the opener: park plast, seat p0, hoist the seam element
+  have hopener : reorderOne () tgt 0 p0 ps
+      = ([StackOp.SOSwap (pre'.length + post'.length + 3),
+          StackOp.SOSwap (pre'.length + post'.length + 2)],
+         { ps with stack := (base ++ [plast]) ++ p0 ::
+             ((pre' ++ (v :: v :: post')).tail ++ [(pre' ++ (v :: v :: post')).head (by cases pre' <;> simp)]) }) := by
+    cases pre' with
+    | nil =>
+      have h := reorderOne_park_seat (tgt := tgt) (i := 0)
+        (cur := p0) (next := v) (t := plast) (ps := ps) (C := base) (D := v :: post')
+        (by rw [hstack]; simp)
+        (by intro hmem
+            simp only [List.mem_cons, List.mem_append, List.not_mem_nil, or_false] at hmem
+            have l1 : ¬ p0 = v := fun h => hvp0 h.symm
+            have l2 : ¬ p0 = plast := hp0plast
+            have l3 : ¬ p0 ∈ post' := hp0post'
+            tauto)
+        (by rw [htgtlen]; simp only [List.length_cons, List.length_nil]; omega)
+        (by simp only [List.length_cons, List.length_nil] at h16 ⊢; omega)
+      rw [h]
+      simp only [Prod.mk.injEq]
+      constructor
+      · simp only [List.length_cons, List.length_nil]
+        have h1 : post'.length + 1 + 2 = 0 + post'.length + 3 := by omega
+        have h2 : post'.length + 1 + 1 = 0 + post'.length + 2 := by omega
+        rw [h1, h2]
+      · simp
+    | cons r pre'' =>
+      have h := reorderOne_park_seat (tgt := tgt) (i := 0)
+        (cur := p0) (next := r) (t := plast) (ps := ps)
+        (C := base) (D := pre'' ++ (v :: v :: post'))
+        (by rw [hstack]; simp)
+        (by intro hmem
+            simp only [List.mem_cons, List.mem_append, List.not_mem_nil, or_false] at hmem
+            have l1 : ¬ p0 = v := fun h => hvp0 h.symm
+            have l2 : ¬ p0 = plast := hp0plast
+            have l3 : ¬ p0 ∈ post' := hp0post'
+            have l4 : ¬ p0 = r := fun h => hp0pre' (h ▸ List.mem_cons_self)
+            have l5 : ¬ p0 ∈ pre'' := fun h => hp0pre' (List.mem_cons_of_mem r h)
+            tauto)
+        (by rw [htgtlen]
+            simp only [List.length_append, List.length_cons, List.length_nil]
+            omega)
+        (by simp only [List.length_append, List.length_cons, List.length_nil] at h16 ⊢; omega)
+      rw [h]
+      simp only [Prod.mk.injEq]
+      constructor
+      · simp only [List.length_cons, List.length_append, List.length_nil]
+        have h1 : pre''.length + (post'.length + 1 + 1) + 2
+            = pre''.length + 1 + post'.length + 3 := by omega
+        have h2 : pre''.length + (post'.length + 1 + 1) + 1
+            = pre''.length + 1 + post'.length + 2 := by omega
+        rw [h1, h2]
+      · simp
+  simp only [hopener, List.nil_append]
+  have hchain := reorderFold_chain_pre tgt (base ++ [plast]) v (v :: post') pre' [p0] 1
+    ({ ps with stack := (base ++ [plast]) ++ p0 ::
+        ((pre' ++ (v :: v :: post')).tail ++ [(pre' ++ (v :: v :: post')).head (by cases pre' <;> simp)]) } : PlanState)
+    [StackOp.SOSwap (pre'.length + post'.length + 3),
+     StackOp.SOSwap (pre'.length + post'.length + 2)]
+    (by cases pre' <;> simp)
+    (by rw [htgtlen]; simp only [List.length_cons, List.length_nil]; omega)
+    (by simp only [List.length_cons, List.length_nil] at h16 ⊢; omega)
+  rw [hchain]
+  -- the v-step (equal-v swap, stack unchanged)
+  have hz1 : ([v] ++ (post' ++ [plast])).zipIdx (1 + pre'.length)
+      = (v, 1 + pre'.length) :: (post'.zipIdx (1 + pre'.length + 1)
+          ++ [(plast, 1 + pre'.length + 1 + post'.length)]) := by
+    rw [show ([v] ++ (post' ++ [plast])) = v :: (post' ++ [plast]) from by simp,
+        List.zipIdx_cons, List.zipIdx_append]
+    simp [Nat.add_comm]
+  rw [hz1, List.foldl_cons]
+  have hvstep : reorderOne () tgt (1 + pre'.length) v
+      ({ ps with stack := (base ++ [plast]) ++ ([p0] ++ pre') ++ ((v :: post') ++ [v]) } : PlanState)
+      = ([StackOp.SOSwap (post'.length + 1)],
+         { ps with stack := ((base ++ [plast]) ++ ([p0] ++ pre')) ++ v :: (post' ++ [v]) }) := by
+    exact reorderOne_seat_hoist (tgt := tgt) (i := 1 + pre'.length) (cur := v) (next := v)
+      (C := (base ++ [plast]) ++ ([p0] ++ pre')) (D := post')
+      (by simp)
+      (by rw [htgtlen]; omega)
+      (by omega)
+  simp only [hvstep]
+  -- the seated post-run
+  rw [List.foldl_append]
+  have hrun := reorderFold_seated_run tgt v post'
+    (((base ++ [plast]) ++ ([p0] ++ pre')) ++ [v]) (1 + pre'.length + 1)
+    ({ ps with stack := ((base ++ [plast]) ++ ([p0] ++ pre')) ++ v :: (post' ++ [v]) } : PlanState)
+    (([StackOp.SOSwap (pre'.length + post'.length + 3),
+        StackOp.SOSwap (pre'.length + post'.length + 2)]
+      ++ descRun ((v :: post').length + 1) pre'.length)
+      ++ [StackOp.SOSwap (post'.length + 1)])
+    (by simp)
+    (by intro x hx hmem
+        simp only [List.mem_cons, List.not_mem_nil, or_false] at hmem
+        exact hvpost' (hmem ▸ hx))
+    ((List.nodup_append.mp hndpost).1)
+    (by rw [htgtlen]; omega)
+  rw [hrun]
+  -- the return: the parked plast comes home, v sinks to the bottom slot
+  rw [List.foldl_cons, List.foldl_nil]
+  have hplastpre : plast ∉ p0 :: pre' := fun h =>
+    hdisj plast h (List.mem_append.mpr (Or.inr List.mem_cons_self))
+  have hreturn : reorderOne () tgt (1 + pre'.length + 1 + post'.length) plast
+      ({ ps with stack := ((base ++ [plast]) ++ ([p0] ++ pre')) ++ v :: (post' ++ [v]) } : PlanState)
+      = ([StackOp.SOSwap (((p0 :: pre') ++ [v] ++ post').length + 1)],
+         { ps with stack := base ++ v :: (((p0 :: pre') ++ [v] ++ post') ++ [plast]) }) := by
+    exact reorderOne_return (tgt := tgt) (i := 1 + pre'.length + 1 + post'.length)
+      (cur := plast) (t := v) (C := base) (M := (p0 :: pre') ++ [v] ++ post')
+      (by show ((base ++ [plast]) ++ ([p0] ++ pre')) ++ v :: (post' ++ [v])
+            = base ++ plast :: (((p0 :: pre') ++ [v] ++ post') ++ [v])
+          simp)
+      (by intro hmem
+          simp only [List.mem_append, List.mem_cons, List.not_mem_nil, or_false] at hmem
+          have l1 : ¬ plast = p0 := fun h => hplastpre (h ▸ List.mem_cons_self)
+          have l2 : ¬ plast ∈ pre' := fun h => hplastpre (List.mem_cons_of_mem p0 h)
+          have l3 : ¬ plast = v := fun h => hvplast h.symm
+          have l4 : ¬ plast ∈ post' := hplastpost'
+          tauto)
+      (by rw [htgtlen]; omega)
+      (by simp only [List.length_append, List.length_cons, List.length_nil] at h16 ⊢; omega)
+      (by simp only [List.length_append, List.length_cons, List.length_nil]; omega)
+  simp only [hreturn]
+  -- assemble
+  simp only [Prod.mk.injEq]
+  constructor
+  · show ((([StackOp.SOSwap (pre'.length + post'.length + 3),
+        StackOp.SOSwap (pre'.length + post'.length + 2)]
+        ++ descRun ((v :: post').length + 1) pre'.length)
+        ++ [StackOp.SOSwap (post'.length + 1)]))
+        ++ [StackOp.SOSwap (((p0 :: pre') ++ [v] ++ post').length + 1)]
+      = _
+    simp only [List.append_nil, List.append_assoc, List.length_append, List.length_cons,
+      List.length_nil, Nat.zero_add]
+    rw [show pre'.length + 1 + (post'.length + 1) + 1 = pre'.length + post'.length + 3 from by
+          omega,
+        show pre'.length + 1 + (post'.length + 1) = pre'.length + post'.length + 2 from by
+          omega,
+        show pre'.length + 1 - 1 = pre'.length from by omega,
+        show pre'.length + 1 + (1 + post'.length) + 1 = pre'.length + post'.length + 3 from by
+          omega]
+    rfl
+  · rw [htgt]
+    simp
 /-- On a `Nodup` list, `stackFind (· == x)` returns exactly the index where `x` sits (no earlier
     match, since nodup forbids duplicates). -/
 theorem stackFind_eq_some_of_nodup : ∀ {L : List Operand} {j : Nat} {x : Operand},
@@ -3076,6 +4379,32 @@ theorem genJmp_executePlan_eq
         curBbLabel ps).1
       = [AsmInst.AsmPushLabel target, AsmInst.AsmOp "JUMP"] := by
   rw [generateRegularInstPlan_jmp_eq hjmp hops houts htgt hstack hnodup]; rfl
+
+/-- **JMP-terminator plan decomposition, genuine-reorder case.** Unlike `generateRegularInstPlan_jmp_eq`
+    (which assumes the body already produced the target layout, so the join reorder is a no-op), this
+    keeps the join reorder explicit: for a JMP to `target`, the plan is
+    `(reorderPlan targetStack ps).1 ++ [SOPushLabel target, SOEmit "JUMP"]` — the join reorder that aligns
+    the predecessor's stack to the target block's entry layout, then the label push + JUMP. This is the
+    plan whose asm side `reorderPlan_join_sim` + `resolved_jump_sim` (packaged as `hasm_jmp_reorder`)
+    discharge for a genuine (non-identity) join. -/
+theorem generateRegularInstPlan_jmp_reorder_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis}
+    {fn : IrFunction} {inst : Instruction} {nextLiveness : List String}
+    {nextIsTerminator : Bool} {curBbLabel : String} {ps : PlanState}
+    {target : String} {targetBb : BasicBlock}
+    (hjmp : inst.opcode = Opcode.JMP)
+    (hops : inst.operands = [Operand.Label target])
+    (houts : inst.outputs = [])
+    (htgt : fn.blocks.find? (·.label == target) = some targetBb) :
+    (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator curBbLabel ps).1
+      = (reorderPlan ((inputVarsFrom curBbLabel targetBb.instructions
+          (liveVarsAt liveness target 0)).map Operand.Var) ps).1
+        ++ [StackOp.SOPushLabel target, StackOp.SOEmit "JUMP"] := by
+  unfold generateRegularInstPlan
+  simp only [computeOperands_jmp hjmp hops, emitInputPlan_nil, hjmp, hops, htgt,
+    generateEmitOps_jmp hjmp hops, houts, reorderPlan_empty, stackPop_zero,
+    isCommutative, List.length_nil, List.foldl_nil, List.isEmpty_nil, List.append_nil,
+    List.nil_append, if_true, if_false, Bool.false_eq_true, Bool.false_and]
 
 /-- `stackFind` succeeds (with an in-range index) whenever some element satisfies the predicate.
     The membership counterpart of `stackFind_some`. -/
@@ -3357,6 +4686,109 @@ theorem venomAsmRel_asmStack_top2_var {lo ps vs as} {base : List Operand} {x y :
   conv_lhs => rw [list_eq_get2 as.stack hge]
   rw [h0, h1]
 
+/-- **Asm stack top = the plan-top operands' values.** If the plan stack is `base ++ ops` and each of
+    `ops` evaluates (in order) to `vals`, then the asm stack's top `ops.length` entries are `vals`
+    reversed (plan LAST = asm TOS), the rest untouched. The N-operand generalisation of
+    `venomAsmRel_asmStack_top2_var` — the connector between an N-input emit and an N-ary op's step
+    (e.g. the 7 operands of a `CALL`). -/
+theorem venomAsmRel_asmStack_topOps {lo : AssocList String Nat} {ps : PlanState} {vs : VenomState}
+    {as : AsmState} {base ops : List Operand} {vals : List bytes32}
+    (hrel : venomAsmRel lo ps vs as)
+    (hstack : ps.stack = base ++ ops)
+    (hvals : List.map (operandVal vs lo) ops = List.map some vals) :
+    as.stack = vals.reverse ++ as.stack.drop ops.length := by
+  obtain ⟨hStk, _⟩ := hrel
+  have hlenpv : ops.length = vals.length := by
+    have := congrArg List.length hvals; simpa using this
+  have hlenas : ps.stack.length = as.stack.length := hStk.1
+  have hge : ops.length ≤ as.stack.length := by
+    rw [← hlenas, hstack, List.length_append]; omega
+  have htake : as.stack.take ops.length = vals.reverse := by
+    apply List.ext_getElem
+    · rw [List.length_take, List.length_reverse]; omega
+    · intro i hi1 hi2
+      have hi : i < ops.length := by rw [List.length_take] at hi1; omega
+      have hivals : i < vals.length := by omega
+      have hjops : ops.length - 1 - i < ops.length := by omega
+      have hjvals : ops.length - 1 - i < vals.length := by omega
+      have hps_i : i < ps.stack.length := by rw [hstack, List.length_append]; omega
+      have hrel_i := hStk.2 i hps_i
+      have hrevidx : ps.stack.reverse[i]! = ops[ops.length - 1 - i]'hjops := by
+        rw [hstack, List.reverse_append,
+            getElem!_pos _ i (by rw [List.length_append, List.length_reverse]; omega),
+            List.getElem_append_left (by rw [List.length_reverse]; omega), List.getElem_reverse]
+      rw [hrevidx] at hrel_i
+      have hmapj : operandVal vs lo (ops[ops.length - 1 - i]'hjops) = some (vals[ops.length - 1 - i]'hjvals) := by
+        have h : (List.map (operandVal vs lo) ops)[ops.length - 1 - i]? = (List.map some vals)[ops.length - 1 - i]? := by
+          rw [hvals]
+        rw [List.getElem?_map, List.getElem?_map,
+            List.getElem?_eq_getElem hjops, List.getElem?_eq_getElem hjvals] at h
+        simpa using h
+      rw [hmapj] at hrel_i
+      have hasi : as.stack[i]'(by omega) = vals[ops.length - 1 - i]'hjvals := by
+        rw [← getElem!_pos as.stack i (by omega)]
+        exact (Option.some.inj hrel_i).symm
+      rw [List.getElem_take, hasi, List.getElem_reverse]
+      congr 1
+      omega
+  calc as.stack = as.stack.take ops.length ++ as.stack.drop ops.length := (List.take_append_drop _ _).symm
+    _ = vals.reverse ++ as.stack.drop ops.length := by rw [htake]
+
+/-- **CALL step in block context.** Wraps `call_step_stateAgree` + `asmStep_call_ok` into a runnable
+    one-step block: given the 7 operand values on the asm stack top and the shared fields agreeing,
+    running the `SOEmit "CALL"` op (`runAsm 1`) reaches a state agreeing with the Venom
+    `stepExternalCall` writeback on all shared `venomAsmRel` fields, advancing the pc by 1. The asm-
+    execution half of a CALL block sim (the emission half is `emitInputPlan_allVars_sim` +
+    `venomAsmRel_asmStack_topOps`). -/
+theorem call_asmStep_block_sim {vs : VenomState} {as : AsmState}
+    {prog : List AsmInst} {offsetToPc : AssocList Nat Nat} {inst : Instruction}
+    {out : String} {gas addr value aOff aSz rOff rSz : bytes32} {stk : List bytes32}
+    {success : bytes32} {newAccs : Accounts} {ret : List byte}
+    (hopc : inst.opcode = Opcode.CALL)
+    (heval : evalOperands inst.operands vs = some [gas, addr, value, aOff, aSz, rOff, rSz])
+    (hout : inst.outputs = [out])
+    (hstk : as.stack = gas :: addr :: value :: aOff :: aSz :: rOff :: rSz :: stk)
+    (hacc : vs.accounts = as.accounts) (hmem : vs.memory = as.memory)
+    (hcc : vs.callCtx = as.callCtx) (htx : vs.txCtx = as.txCtx)
+    (htr : vs.transient = as.transient)
+    (hlg : vs.logs = as.logs) (hbc : vs.blockCtx = as.blockCtx)
+    (hcode : vs.code = as.code) (hph : vs.prevHashes = as.prevHashes)
+    (hcall : evmCall subEvmFuel as.accounts as.callCtx.contract as.txCtx.origin
+      (AccountAddress.ofUInt256 addr) (AccountAddress.ofUInt256 addr) gas value value
+      (as.memory.readWithPadding aOff.toNat aSz.toNat).toList as.txCtx.gasprice 0 (!as.callCtx.static)
+      = (success, newAccs, ret))
+    (hblock : asmBlockAt prog as.pc (executePlan [StackOp.SOEmit "CALL"])) :
+    ∃ s'', runAsm (executePlan [StackOp.SOEmit "CALL"]).length offsetToPc prog as = AsmResult.AsmOK s''
+      ∧ stepExternalCall subEvmFuel inst vs
+          = some (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs)
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).accounts = s''.accounts
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).memory = s''.memory
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).returndata = s''.returndata
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).transient = s''.transient
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).logs = s''.logs
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).callCtx = s''.callCtx
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).txCtx = s''.txCtx
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).blockCtx = s''.blockCtx
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).code = s''.code
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).prevHashes = s''.prevHashes
+      ∧ lookupVar out (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs) = some success
+      ∧ s''.stack = success :: stk ∧ s''.pc = as.pc + 1 := by
+  obtain ⟨hpc, hget⟩ := asmBlockAt_one hblock
+  obtain ⟨s'', hstep, hasmOK, hacc', hmem', hrd', htr', hlg', hcc', htx', hbc', hcode', hph', hout', hstk'⟩ :=
+    call_step_stateAgree hopc heval hout hstk hacc hmem hcc htx htr hlg hbc hcode hph hcall
+  have hstepeq : asmStep offsetToPc prog as = AsmResult.AsmOK s'' := by
+    rw [asmStep_call_ok hpc hget]; exact hasmOK
+  have hpcadv : s''.pc = as.pc + 1 := by
+    have hcalleq : asmCall as = AsmResult.AsmOK s'' := hasmOK
+    unfold asmCall at hcalleq
+    rw [hstk] at hcalleq
+    simp only [asmCallWriteback] at hcalleq
+    injection hcalleq with hc
+    rw [← hc]; rfl
+  refine ⟨s'', ?_, hstep, hacc', hmem', hrd', htr', hlg', hcc', htx', hbc', hcode', hph', hout', hstk', hpcadv⟩
+  show runAsm 1 offsetToPc prog as = AsmResult.AsmOK s''
+  rw [runAsm_succ_ok hpc hstepeq]; rfl
+
 /-! ## Per-instruction execution sim (commutative all-literal binop)
 
 The capstone of this file: running the generated plan for a commutative binop with two
@@ -3482,6 +4914,45 @@ theorem emitInputPlan_pair_var_sim {opc nl x y ps lo vs as prog d_y d_x'}
       (doDup_runAsm_mem hsmall_y hlenas_y hb1 hrun1)⟩
   · rw [List.length_append]; exact runAsm_compose hrun1 hrun2
   · rw [List.length_append, hpc2, hpc1]; omega
+
+/-- **Duping a var puts it at depth 0.** After `stackDup d` (which appends the peeked element to the
+    top), if that peek was `Var x` (`d` = `x`'s depth) then `Var x` is now the top (depth 0). The
+    same-var analogue of `stackGetDepth_append_ne` — the fact that lets the (distinctness-agnostic)
+    `emitInputPlan_pair_var_sim` also cover a *repeated* operand `[Var x, Var x]`. -/
+theorem stackGetDepth_stackDup_self {x : String} (stk : List Operand) (d : Nat)
+    (hd : stackGetDepth (Operand.Var x) stk = some d) :
+    stackGetDepth (Operand.Var x) (stackDup d stk) = some 0 := by
+  have hpeek : stackPeek d stk = Operand.Var x := stackGetDepth_peek hd
+  unfold stackGetDepth stackDup
+  rw [hpeek]
+  simp only [List.reverse_append, List.reverse_cons, List.reverse_nil, List.nil_append,
+    List.singleton_append, stackFind, beq_self_eq_true, if_true]
+
+/-- **Input-emission sim for a *repeated* var operand `[Var x, Var x]`.** The `x = y` case the
+    distinctness assumption `x ≠ y` (in the store/binop classifiers) excluded: the codegen dups `x`
+    from its slot, then dups it again from the top (depth `0`). Reuses the distinctness-agnostic
+    `emitInputPlan_pair_var_sim` at `d_x' = 0` (via `stackGetDepth_stackDup_self`), so a same-var
+    2-input op's operand-emission plan-sim needs no new distinct-depth reasoning — closing the
+    operand-emission half of the `x = y` coverage gap. -/
+theorem emitInputPlan_pair_var_same_sim {opc nl x ps lo vs as prog offsetToPc d_x}
+    (hnospill : alookup' ps.spilled (Operand.Var x) = none)
+    (hlive : nl.contains x = true)
+    (hdepth : stackGetDepth (Operand.Var x) ps.stack = some d_x)
+    (hsmall : d_x ≤ 15) (hlen : d_x < ps.stack.length)
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (emitInputPlan opc [Operand.Var x, Operand.Var x] nl ps).1)) :
+    ∃ as', runAsm (executePlan (emitInputPlan opc [Operand.Var x, Operand.Var x] nl ps).1).length
+             offsetToPc prog as = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (emitInputPlan opc [Operand.Var x, Operand.Var x] nl ps).2 vs as' ∧
+           as'.pc = as.pc
+             + (executePlan (emitInputPlan opc [Operand.Var x, Operand.Var x] nl ps).1).length ∧
+           as'.memory = as.memory := by
+  have hd0 : stackGetDepth (Operand.Var x) (stackDup d_x ps.stack) = some 0 :=
+    stackGetDepth_stackDup_self ps.stack d_x hdepth
+  have hlen0 : 0 < (stackDup d_x ps.stack).length := by unfold stackDup; simp
+  exact emitInputPlan_pair_var_sim (offsetToPc := offsetToPc)
+    hnospill hlive hdepth hsmall hlen hnospill hlive hd0 (by omega) hlen0 hrel hblock
 
 /-- Growing-stack depth chain for N-input emission: emitting `vs` (all live vars) from a base stack
     DUPs each `v_i` at depth `d_i` computed on the stack grown by the prior DUPs. The structured
@@ -3631,6 +5102,377 @@ theorem emitInputPlan_allVars_sim (opc : Opcode) (nl : List String) :
       · rw [List.length_append, hpc', hpc1]; omega
       · rw [hmem', hmem1]
 
+/-- **CALL block core sim: emit operands, then run CALL.** The end-to-end asm ↔ Venom correspondence
+    for the `emit(operands) ++ [SOEmit "CALL"]` core of a compiled CALL block. The N-input emit
+    (`emitInputPlan_allVars_sim`) places the operand values on the asm stack top (`venomAsmRel_asmStack_topOps`),
+    and the CALL step (`call_asmStep_block_sim`) runs the shared sub-EVM. Result: running the whole
+    segment reaches a state agreeing with the Venom `stepExternalCall` writeback on the shared observable
+    `venomAsmRel` fields (accounts / memory / returndata) with the output var reading back `success`.
+    Memory-agreement `vs.memory = as.memory` is an explicit hypothesis (as the store disjuncts carry
+    `hmemsafe`); the residual for the full generated-plan block is the reorder + output-handling tail of
+    `generateRegularInstPlan` and re-establishing `memoryRel`/`planSpillRel` from region write-safety. -/
+theorem call_block_emit_sim {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    {prog : List AsmInst} {offsetToPc : AssocList Nat Nat} {inst : Instruction}
+    {out : String} {ovars : List String} {dists : List Nat} {nl : List String}
+    {gas addr value aOff aSz rOff rSz : bytes32} {vals : List bytes32}
+    {success : bytes32} {newAccs : Accounts} {ret : List byte} {ps : PlanState}
+    (hopc : inst.opcode = Opcode.CALL)
+    (heval : evalOperands inst.operands vs = some [gas, addr, value, aOff, aSz, rOff, rSz])
+    (hout : inst.outputs = [out])
+    (hnospill : ∀ v ∈ ovars, alookup' ps.spilled (Operand.Var v) = none)
+    (hdepths : emitDepthsOk nl ovars dists ps.stack)
+    (hvals : List.map (operandVal vs lo) (ovars.map Operand.Var) = List.map some vals)
+    (hvalrev : vals.reverse = [gas, addr, value, aOff, aSz, rOff, rSz])
+    (hmem : vs.memory = as.memory)
+    (hcall : evmCall subEvmFuel vs.accounts vs.callCtx.contract vs.txCtx.origin
+      (AccountAddress.ofUInt256 addr) (AccountAddress.ofUInt256 addr) gas value value
+      (vs.memory.readWithPadding aOff.toNat aSz.toNat).toList vs.txCtx.gasprice 0 (!vs.callCtx.static)
+      = (success, newAccs, ret))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan ((emitInputPlan Opcode.CALL (ovars.map Operand.Var) nl ps).1 ++ [StackOp.SOEmit "CALL"]))) :
+    ∃ s'', runAsm (executePlan ((emitInputPlan Opcode.CALL (ovars.map Operand.Var) nl ps).1
+             ++ [StackOp.SOEmit "CALL"])).length offsetToPc prog as = AsmResult.AsmOK s''
+      ∧ stepExternalCall subEvmFuel inst vs
+          = some (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs)
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).accounts = s''.accounts
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).memory = s''.memory
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).returndata = s''.returndata
+      ∧ lookupVar out (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs) = some success := by
+  have hemiteq := emitInputPlan_allVars_eq Opcode.CALL nl ovars dists ps hnospill hdepths
+  rw [executePlan_append] at hblock
+  obtain ⟨hbI, hbCall⟩ := asmBlockAt_append hblock
+  obtain ⟨as1, hrunE, hrelE, hpcE, hmemE⟩ :=
+    emitInputPlan_allVars_sim (offsetToPc := offsetToPc) Opcode.CALL nl ovars dists ps hnospill hdepths hrel hbI
+  have hps'stack : (emitInputPlan Opcode.CALL (ovars.map Operand.Var) nl ps).2.stack
+      = ps.stack ++ ovars.map Operand.Var := by rw [hemiteq]
+  have htop := venomAsmRel_asmStack_topOps (base := ps.stack) (ops := ovars.map Operand.Var) (vals := vals)
+    hrelE hps'stack hvals
+  rw [hvalrev] at htop
+  have hlenops : (ovars.map Operand.Var).length = 7 := by
+    rw [List.length_map]
+    have h1 : ovars.length = vals.length := by
+      have := congrArg List.length hvals; simpa [List.length_map] using this
+    have h2 : vals.length = 7 := by
+      have := congrArg List.length hvalrev; simpa using this
+    omega
+  rw [hlenops] at htop
+  obtain ⟨_, _, _, hacc1, htr1, hrd1, hlg1, hcc1, htx1, hbc1, hcode1, hph1⟩ := hrelE
+  have hmem1 : vs.memory = as1.memory := by rw [hmem, hmemE]
+  have hcall1 : evmCall subEvmFuel as1.accounts as1.callCtx.contract as1.txCtx.origin
+      (AccountAddress.ofUInt256 addr) (AccountAddress.ofUInt256 addr) gas value value
+      (as1.memory.readWithPadding aOff.toNat aSz.toNat).toList as1.txCtx.gasprice 0 (!as1.callCtx.static)
+      = (success, newAccs, ret) := by
+    rw [hacc1, hcc1, htx1, ← hmem1]; exact hcall
+  have hbCall' : asmBlockAt prog as1.pc (executePlan [StackOp.SOEmit "CALL"]) := by rw [hpcE]; exact hbCall
+  obtain ⟨s'', hrunC, hstepV, hacc', hmem', hrd', _, _, _, _, _, _, _, hout', _, _⟩ :=
+    call_asmStep_block_sim hopc heval hout htop hacc1.symm hmem1 hcc1.symm htx1.symm htr1.symm
+      hlg1.symm hbc1.symm hcode1.symm hph1.symm hcall1 hbCall'
+  refine ⟨s'', ?_, hstepV, hacc', hmem', hrd', hout'⟩
+  rw [executePlan_append, List.length_append]
+  exact runAsm_compose hrunE hrunC
+
+
+/-- **`memoryRel` survives writing the same data at the same offset into both memories.** In the
+    write window both sides read the written byte; outside it both frame to the old bytes, which
+    agreed. No region hypothesis needed for the relation itself (the window bytes are EQUAL, not
+    merely unrelated) — only offset coverage for the write primitive's clean behavior. -/
+theorem memoryRel_write_same {alloc : SpillAlloc} {m1 m2 data : ByteArray} {off : Nat}
+    (hmem : memoryRel alloc m1 m2)
+    (h1 : off ≤ m1.size) (h2 : off ≤ m2.size) :
+    memoryRel alloc (data.write 0 m1 off data.size) (data.write 0 m2 off data.size) := by
+  intro i hi
+  by_cases hz : data.size = 0
+  · rw [show data.write 0 m1 off data.size = m1 from by rw [hz]; simp [ByteArray.write],
+        show data.write 0 m2 off data.size = m2 from by rw [hz]; simp [ByteArray.write]]
+    exact hmem i hi
+  · exact readByte_write_congr data m1 m2 off i (Nat.pos_of_ne_zero hz) h1 h2 (hmem i hi)
+
+/-- Bytes at or above `off + data.size` are untouched by the write (the spill-slot frame for a
+    below-`fnEom` writeback). -/
+theorem readByte_write_frame_ge {data m : ByteArray} {off i : Nat}
+    (hoff : off ≤ m.size) (hge : off + data.size ≤ i) :
+    readByte i (data.write 0 m off data.size) = readByte i m := by
+  by_cases hz : data.size = 0
+  · rw [show data.write 0 m off data.size = m from by rw [hz]; simp [ByteArray.write]]
+  · exact readByte_write_disjoint data m off i (Nat.pos_of_ne_zero hz) hoff (Or.inr hge)
+
+/-- **CALL writeback agreement, `memoryRel` form.** For the same `evmCall` result over memories
+    agreeing OUTSIDE the spill region, the two writebacks (same returndata slice, same offset,
+    below the spill region) keep the memories `memoryRel`-related AND leave every asm byte at or
+    above `fnEom` untouched — the spill slots survive, so `planSpillRel` can be re-established.
+    The region-rebuild core the full-equality `callWriteback_asmCallWriteback_agree` could not
+    provide. -/
+theorem callWriteback_asmCallWriteback_agree_rel (alloc : SpillAlloc) (out : String)
+    (rOff rSz : Nat) (success : bytes32) (newAccs : Accounts) (ret : List byte)
+    (stk : List bytes32) (vs : VenomState) (s : AsmState)
+    (hmem : memoryRel alloc vs.memory s.memory)
+    (hro1 : rOff ≤ vs.memory.size) (hro2 : rOff ≤ s.memory.size)
+    (hbelow : rOff + rSz ≤ alloc.fnEom) :
+    ∃ s'', asmCallWriteback rOff rSz success newAccs ret stk s = AsmResult.AsmOK s''
+      ∧ (callWriteback out rOff rSz success newAccs ret vs).accounts = s''.accounts
+      ∧ memoryRel alloc (callWriteback out rOff rSz success newAccs ret vs).memory s''.memory
+      ∧ (∀ i, alloc.fnEom ≤ i → readByte i s''.memory = readByte i s.memory)
+      ∧ (callWriteback out rOff rSz success newAccs ret vs).returndata = s''.returndata
+      ∧ lookupVar out (callWriteback out rOff rSz success newAccs ret vs) = some success
+      ∧ s''.stack = success :: stk := by
+  have hretsz : (⟨(ret.take rSz).toArray⟩ : ByteArray).size ≤ rSz := by
+    show (ret.take rSz).toArray.size ≤ rSz
+    rw [List.size_toArray]
+    exact le_trans (List.length_take_le rSz ret) (Nat.le_refl _)
+  refine ⟨_, rfl, ?_, ?_, ?_, ?_, ?_, rfl⟩
+  · show (callWriteback _ _ _ _ _ _ _).accounts = newAccs
+    simp only [callWriteback, updateVar, writeMemoryWithExpansion]
+  · show memoryRel alloc (callWriteback _ _ _ _ _ _ _).memory _
+    simp only [callWriteback, updateVar, writeMemoryWithExpansion]
+    exact memoryRel_write_same hmem hro1 hro2
+  · intro i hi
+    show readByte i ((⟨(ret.take rSz).toArray⟩ : ByteArray).write 0 s.memory rOff
+        (⟨(ret.take rSz).toArray⟩ : ByteArray).size) = readByte i s.memory
+    exact readByte_write_frame_ge hro2 (by omega)
+  · show (callWriteback _ _ _ _ _ _ _).returndata = ⟨ret.toArray⟩
+    simp only [callWriteback, updateVar, writeMemoryWithExpansion]
+  · simp only [callWriteback, updateVar, writeMemoryWithExpansion, lookupVar, alookup, ainsert,
+      AssocList.insert, AssocList.lookup, beq_self_eq_true, if_true]
+
+/-- **CALL evmCall alignment, `memoryRel` form**: with the calldata window below the spill
+    region, both sides read the SAME calldata (`memoryRel_readWithPadding_slice`) and hence run
+    the same sub-EVM call. -/
+theorem asmCall_stepExternalCall_same_evmCall_rel {alloc : SpillAlloc}
+    {vs : VenomState} {s : AsmState} {inst : Instruction}
+    {out : String} {gas addr value aOff aSz rOff rSz : bytes32} {stk : List bytes32}
+    {success : bytes32} {newAccs : Accounts} {ret : List byte}
+    (hopc : inst.opcode = Opcode.CALL)
+    (heval : evalOperands inst.operands vs = some [gas, addr, value, aOff, aSz, rOff, rSz])
+    (hout : inst.outputs = [out])
+    (hstk : s.stack = gas :: addr :: value :: aOff :: aSz :: rOff :: rSz :: stk)
+    (hacc : vs.accounts = s.accounts)
+    (hmem : memoryRel alloc vs.memory s.memory)
+    (hargs : aOff.toNat + aSz.toNat ≤ alloc.fnEom) (haszlt : aSz.toNat < USize.size)
+    (hcc : vs.callCtx = s.callCtx) (htx : vs.txCtx = s.txCtx)
+    (hcall : evmCall subEvmFuel s.accounts s.callCtx.contract s.txCtx.origin
+      (AccountAddress.ofUInt256 addr) (AccountAddress.ofUInt256 addr) gas value value
+      (s.memory.readWithPadding aOff.toNat aSz.toNat).toList s.txCtx.gasprice 0 (!s.callCtx.static)
+      = (success, newAccs, ret)) :
+    stepExternalCall subEvmFuel inst vs
+        = some (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs)
+      ∧ asmCall s = asmCallWriteback rOff.toNat rSz.toNat success newAccs ret stk s := by
+  have hcd : vs.memory.readWithPadding aOff.toNat aSz.toNat
+      = s.memory.readWithPadding aOff.toNat aSz.toNat :=
+    memoryRel_readWithPadding_slice hmem hargs haszlt
+  have hcallV : evmCall subEvmFuel vs.accounts vs.callCtx.contract vs.txCtx.origin
+      (AccountAddress.ofUInt256 addr) (AccountAddress.ofUInt256 addr) gas value value
+      (readMemory aOff.toNat aSz.toNat vs).toList vs.txCtx.gasprice 0 (!vs.callCtx.static)
+      = (success, newAccs, ret) := by
+    rw [hacc, hcc, htx, readMemory, hcd]; exact hcall
+  refine ⟨?_, ?_⟩
+  · unfold stepExternalCall; rw [heval]; simp only [bind, Option.bind, hopc, hout, hcallV]
+  · unfold asmCall; rw [hstk]; simp only [hcall]
+
+/-- **CALL step, full `memoryRel` correspondence.** The region-rebuild replacement for
+    `call_step_stateAgree`: instead of full memory equality, the memories are `memoryRel`-related
+    with the calldata and returndata windows below the spill region — the step preserves the
+    relation AND every asm spill byte, closing the documented residual for the full generated-plan
+    CALL producer. -/
+theorem call_step_stateAgree_rel {alloc : SpillAlloc} {vs : VenomState} {as : AsmState}
+    {inst : Instruction} {out : String} {gas addr value aOff aSz rOff rSz : bytes32}
+    {stk : List bytes32} {success : bytes32} {newAccs : Accounts} {ret : List byte}
+    (hopc : inst.opcode = Opcode.CALL)
+    (heval : evalOperands inst.operands vs = some [gas, addr, value, aOff, aSz, rOff, rSz])
+    (hout : inst.outputs = [out])
+    (hstk : as.stack = gas :: addr :: value :: aOff :: aSz :: rOff :: rSz :: stk)
+    (hacc : vs.accounts = as.accounts)
+    (hmem : memoryRel alloc vs.memory as.memory)
+    (hargs : aOff.toNat + aSz.toNat ≤ alloc.fnEom) (haszlt : aSz.toNat < USize.size)
+    (hro1 : rOff.toNat ≤ vs.memory.size) (hro2 : rOff.toNat ≤ as.memory.size)
+    (hretbelow : rOff.toNat + rSz.toNat ≤ alloc.fnEom)
+    (hcc : vs.callCtx = as.callCtx) (htx : vs.txCtx = as.txCtx)
+    (htr : vs.transient = as.transient)
+    (hlg : vs.logs = as.logs) (hbc : vs.blockCtx = as.blockCtx)
+    (hcode : vs.code = as.code) (hph : vs.prevHashes = as.prevHashes)
+    (hcall : evmCall subEvmFuel as.accounts as.callCtx.contract as.txCtx.origin
+      (AccountAddress.ofUInt256 addr) (AccountAddress.ofUInt256 addr) gas value value
+      (as.memory.readWithPadding aOff.toNat aSz.toNat).toList as.txCtx.gasprice 0 (!as.callCtx.static)
+      = (success, newAccs, ret)) :
+    ∃ s'',
+      stepExternalCall subEvmFuel inst vs
+        = some (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs)
+      ∧ asmCall as = AsmResult.AsmOK s''
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).accounts = s''.accounts
+      ∧ memoryRel alloc (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).memory s''.memory
+      ∧ (∀ i, alloc.fnEom ≤ i → readByte i s''.memory = readByte i as.memory)
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).returndata = s''.returndata
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).transient = s''.transient
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).logs = s''.logs
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).callCtx = s''.callCtx
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).txCtx = s''.txCtx
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).blockCtx = s''.blockCtx
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).code = s''.code
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).prevHashes = s''.prevHashes
+      ∧ lookupVar out (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs) = some success
+      ∧ s''.stack = success :: stk := by
+  obtain ⟨hstep, hasmeq⟩ :=
+    asmCall_stepExternalCall_same_evmCall_rel hopc heval hout hstk hacc hmem hargs haszlt
+      hcc htx hcall
+  obtain ⟨s'', hs''eq, hacc', hmem', hframe', hrd', hout', hstk'⟩ :=
+    callWriteback_asmCallWriteback_agree_rel alloc out rOff.toNat rSz.toNat success newAccs ret
+      stk vs as hmem hro1 hro2 hretbelow
+  have hconcrete := hs''eq
+  simp only [asmCallWriteback] at hconcrete
+  injection hconcrete with hc
+  refine ⟨s'', hstep, by rw [hasmeq]; exact hs''eq, hacc', hmem', hframe', hrd',
+    ?_, ?_, ?_, ?_, ?_, ?_, ?_, hout', hstk'⟩
+  · show (callWriteback _ _ _ _ _ _ _).transient = s''.transient
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact htr
+  · show (callWriteback _ _ _ _ _ _ _).logs = s''.logs
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact hlg
+  · show (callWriteback _ _ _ _ _ _ _).callCtx = s''.callCtx
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact hcc
+  · show (callWriteback _ _ _ _ _ _ _).txCtx = s''.txCtx
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact htx
+  · show (callWriteback _ _ _ _ _ _ _).blockCtx = s''.blockCtx
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact hbc
+  · show (callWriteback _ _ _ _ _ _ _).code = s''.code
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact hcode
+  · show (callWriteback _ _ _ _ _ _ _).prevHashes = s''.prevHashes
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact hph
+
+/-- **CALL block core sim, `memoryRel` form** — the region-rebuild producer core. Emits the 7
+    operands and runs CALL under the honest `venomAsmRel` memory conjunct (`memoryRel`, memories
+    agree OUTSIDE the spill region) instead of full equality: the calldata/returndata windows lie
+    below `fnEom`, so both sides run the same sub-EVM call, the writebacks keep the memories
+    related, and every asm spill byte survives (`planSpillRel` re-establishable). Replaces
+    `call_block_emit_sim`'s `vs.memory = as.memory` hypothesis — the documented residual. -/
+theorem call_block_emit_sim_rel {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    {prog : List AsmInst} {offsetToPc : AssocList Nat Nat} {inst : Instruction}
+    {out : String} {ovars : List String} {dists : List Nat} {nl : List String}
+    {gas addr value aOff aSz rOff rSz : bytes32} {vals : List bytes32}
+    {success : bytes32} {newAccs : Accounts} {ret : List byte} {ps : PlanState}
+    (hopc : inst.opcode = Opcode.CALL)
+    (heval : evalOperands inst.operands vs = some [gas, addr, value, aOff, aSz, rOff, rSz])
+    (hout : inst.outputs = [out])
+    (hnospill : ∀ v ∈ ovars, alookup' ps.spilled (Operand.Var v) = none)
+    (hdepths : emitDepthsOk nl ovars dists ps.stack)
+    (hvals : List.map (operandVal vs lo) (ovars.map Operand.Var) = List.map some vals)
+    (hvalrev : vals.reverse = [gas, addr, value, aOff, aSz, rOff, rSz])
+    (hargs : aOff.toNat + aSz.toNat ≤ ps.alloc.fnEom) (haszlt : aSz.toNat < USize.size)
+    (hro1 : rOff.toNat ≤ vs.memory.size)
+    (hretbelow : rOff.toNat + rSz.toNat ≤ ps.alloc.fnEom)
+    (hfnEom : ps.alloc.fnEom ≤ as.memory.size)
+    (hcall : evmCall subEvmFuel vs.accounts vs.callCtx.contract vs.txCtx.origin
+      (AccountAddress.ofUInt256 addr) (AccountAddress.ofUInt256 addr) gas value value
+      (vs.memory.readWithPadding aOff.toNat aSz.toNat).toList vs.txCtx.gasprice 0 (!vs.callCtx.static)
+      = (success, newAccs, ret))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan ((emitInputPlan Opcode.CALL (ovars.map Operand.Var) nl ps).1 ++ [StackOp.SOEmit "CALL"]))) :
+    ∃ s'', runAsm (executePlan ((emitInputPlan Opcode.CALL (ovars.map Operand.Var) nl ps).1
+             ++ [StackOp.SOEmit "CALL"])).length offsetToPc prog as = AsmResult.AsmOK s''
+      ∧ stepExternalCall subEvmFuel inst vs
+          = some (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs)
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).accounts = s''.accounts
+      ∧ memoryRel ps.alloc
+          (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).memory s''.memory
+      ∧ (∀ i, ps.alloc.fnEom ≤ i → readByte i s''.memory = readByte i as.memory)
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).returndata = s''.returndata
+      ∧ lookupVar out (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs) = some success := by
+  have hemiteq := emitInputPlan_allVars_eq Opcode.CALL nl ovars dists ps hnospill hdepths
+  rw [executePlan_append] at hblock
+  obtain ⟨hbI, hbCall⟩ := asmBlockAt_append hblock
+  obtain ⟨as1, hrunE, hrelE, hpcE, hmemE⟩ :=
+    emitInputPlan_allVars_sim (offsetToPc := offsetToPc) Opcode.CALL nl ovars dists ps hnospill hdepths hrel hbI
+  have hps'stack : (emitInputPlan Opcode.CALL (ovars.map Operand.Var) nl ps).2.stack
+      = ps.stack ++ ovars.map Operand.Var := by rw [hemiteq]
+  have htop := venomAsmRel_asmStack_topOps (base := ps.stack) (ops := ovars.map Operand.Var) (vals := vals)
+    hrelE hps'stack hvals
+  rw [hvalrev] at htop
+  have hlenops : (ovars.map Operand.Var).length = 7 := by
+    rw [List.length_map]
+    have h1 : ovars.length = vals.length := by
+      have := congrArg List.length hvals; simpa [List.length_map] using this
+    have h2 : vals.length = 7 := by
+      have := congrArg List.length hvalrev; simpa using this
+    omega
+  rw [hlenops] at htop
+  obtain ⟨_, _, hmemrel1, hacc1, htr1, hrd1, hlg1, hcc1, htx1, hbc1, hcode1, hph1⟩ := hrelE
+  have hps'alloc : (emitInputPlan Opcode.CALL (ovars.map Operand.Var) nl ps).2.alloc = ps.alloc := by
+    rw [hemiteq]
+  rw [hps'alloc] at hmemrel1
+  have hmemrel1' : memoryRel ps.alloc vs.memory as1.memory := hmemrel1
+  have hro2 : rOff.toNat ≤ as1.memory.size := by
+    rw [hmemE]
+    omega
+  have hcall1 : evmCall subEvmFuel as1.accounts as1.callCtx.contract as1.txCtx.origin
+      (AccountAddress.ofUInt256 addr) (AccountAddress.ofUInt256 addr) gas value value
+      (as1.memory.readWithPadding aOff.toNat aSz.toNat).toList as1.txCtx.gasprice 0 (!as1.callCtx.static)
+      = (success, newAccs, ret) := by
+    rw [hacc1, hcc1, htx1,
+        ← memoryRel_readWithPadding_slice hmemrel1' hargs haszlt]
+    exact hcall
+  obtain ⟨hpcC, hgetC⟩ := asmBlockAt_one (by rw [← hpcE] at hbCall; exact hbCall)
+  obtain ⟨s'', hstepV, hasmOK, hacc', hmemrel', hframe', hrd', _, _, _, _, _, _, _, hout', hstk'⟩ :=
+    call_step_stateAgree_rel (alloc := ps.alloc) (as := as1) hopc heval hout htop
+      hacc1.symm hmemrel1' hargs haszlt hro1 hro2 hretbelow hcc1.symm htx1.symm htr1.symm
+      hlg1.symm hbc1.symm hcode1.symm hph1.symm hcall1
+  have hstepeq : asmStep offsetToPc prog as1 = AsmResult.AsmOK s'' := by
+    rw [asmStep_call_ok hpcC hgetC]; exact hasmOK
+  have hrunC : runAsm (executePlan [StackOp.SOEmit "CALL"]).length offsetToPc prog as1
+      = AsmResult.AsmOK s'' := by
+    show runAsm 1 offsetToPc prog as1 = AsmResult.AsmOK s''
+    rw [runAsm_succ_ok hpcC hstepeq]; rfl
+  refine ⟨s'', ?_, hstepV, hacc', hmemrel', ?_, hrd', hout'⟩
+  · rw [executePlan_append, List.length_append]
+    exact runAsm_compose hrunE hrunC
+  · intro i hi
+    rw [hframe' i hi, hmemE]
+
+/-- **CALL plan reduction** (all-live 7 distinct var operands): emit the operands (already
+    positioned — `reorderPlan_allVars_nil`), `CALL` pops them and pushes the success flag bound
+    to `out` — intermediate stack `base ++ [Var out]`. The named-1-output N-ary analogue of
+    `genRegularInstPlan_log_eq`. -/
+theorem genRegularInstPlan_call_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {ovars : List String} {dists : List Nat} {out : String} {base : List Operand}
+    (hopc : inst.opcode = Opcode.CALL)
+    (hcompute : computeOperands inst = ovars.map Operand.Var)
+    (houts : inst.outputs = [out])
+    (hstack0 : ps.stack = base)
+    (hnd : ovars.Nodup)
+    (hnospill : ∀ v ∈ ovars, alookup' ps.spilled (Operand.Var v) = none)
+    (hdepths : emitDepthsOk nextLiveness ovars dists ps.stack)
+    (hlive : nextLiveness.contains out = true) :
+    generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator
+        curBbLabel ps
+      = (((emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).1
+            ++ [StackOp.SOEmit "CALL"]
+            ++ (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+                  { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+                    stack := base ++ [Operand.Var out] }).1),
+         releaseDeadSpills nextLiveness
+           (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+             { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+               stack := base ++ [Operand.Var out] }).2) := by
+  have hname : opcodeToEvmName inst.opcode = some "CALL" := by rw [hopc]; rfl
+  have hncomm : isCommutative inst.opcode = false := by rw [hopc]; rfl
+  have hnjmp : ¬ (inst.opcode = Opcode.JMP) := by rw [hopc]; decide
+  have hpvar := emitInputPlan_allVars_eq inst.opcode nextLiveness ovars dists ps hnospill hdepths
+  unfold generateRegularInstPlan
+  simp only [hcompute, houts]
+  rcases hemit : emitInputPlan inst.opcode (ovars.map Operand.Var) nextLiveness ps
+    with ⟨inputOps, ps1⟩
+  have h2 : (emitInputPlan inst.opcode (ovars.map Operand.Var) nextLiveness ps).2 = ps1 := by
+    rw [hemit]
+  have hps1' : ps1.stack = base ++ ovars.map Operand.Var := by
+    rw [← h2, hpvar, hstack0]
+  have hreorder := reorderPlan_allVars_nil base ovars ps1 hps1' hnd
+  have hmem : out ∈ nextLiveness := by simpa using hlive
+  have hpop : stackPop ovars.length (base ++ ovars.map Operand.Var) = base := by
+    have h := stackPop_append_top base (ovars.map Operand.Var)
+    rwa [List.length_map] at h
+  simp [generateEmitOps_evmName hname, hreorder, hps1', hpop, stackPush, popmanyPlan_nil, hmem,
+        hncomm, hnjmp]
+
 /-- Closed form of the var-pair input plan: two `DUP`s, leaving the operands `[Var y, Var x]`
     DUP'd onto the original stack. Because `stackDup d s = s ++ [stackPeek d s]` and the depth
     hypotheses pin the peeked operands (via `stackGetDepth_peek`), the resulting stack is
@@ -3728,6 +5570,1761 @@ theorem stepInstBase_binopVar {inst : Instruction} {v : VenomState} {x y out : S
     `venomAsmRel`) feed the Venom-side step (`evalOperand`/`lookupVar`, in `stepInstBase`). -/
 theorem operandVal_var_eq_lookupVar (vs : VenomState) (lo : AssocList String Nat) (x : String) :
     operandVal vs lo (Operand.Var x) = lookupVar x vs := rfl
+
+
+/-- `callWriteback` changes only `out`'s binding among the operand-visible state. -/
+theorem callWriteback_operandVal_ne {lo : AssocList String Nat} {out : String}
+    {rOff rSz : Nat} {success : bytes32} {newAccs : Accounts} {ret : List byte}
+    {vs : VenomState} {op : Operand} (h : op ≠ Operand.Var out) :
+    operandVal (callWriteback out rOff rSz success newAccs ret vs) lo op
+      = operandVal vs lo op := by
+  simp only [callWriteback]
+  rw [operandVal_updateVar_ne _ _ _ _ _ h]
+  cases op with
+  | Var w => rfl
+  | Lit w => rfl
+  | Label l => rfl
+
+/-- `planStackRel` is stable under a Venom-state change that preserves every stack operand's
+    value. -/
+theorem planStackRel_env_congr {lo : AssocList String Nat} {vs vs' : VenomState}
+    {psStack : List Operand} {asmStack : List bytes32}
+    (hcongr : ∀ o ∈ psStack, operandVal vs' lo o = operandVal vs lo o)
+    (h : planStackRel lo vs psStack asmStack) :
+    planStackRel lo vs' psStack asmStack := by
+  refine ⟨h.1, fun i hi => ?_⟩
+  have hi' : i < psStack.reverse.length := by rw [List.length_reverse]; exact hi
+  have hb : psStack.reverse[i]! = psStack.reverse[i] := getElem!_pos psStack.reverse i hi'
+  rw [hb, hcongr _ (List.mem_reverse.mp (List.getElem_mem hi'))]
+  rw [← hb]
+  exact h.2 i hi
+
+/-- `planSpillRel` is stable under a value-preserving env change plus a per-slot memory frame. -/
+theorem planSpillRel_frame_congr {lo : AssocList String Nat} {vs vs' : VenomState}
+    {spl : SpilledMap} {m m' : ByteArray}
+    (h : planSpillRel lo vs spl m)
+    (hcongr : ∀ op off, AssocList.lookup Operand Nat spl op = some off →
+        operandVal vs' lo op = operandVal vs lo op)
+    (hframe : ∀ op off, AssocList.lookup Operand Nat spl op = some off →
+        m'.readWithPadding off 32 = m.readWithPadding off 32) :
+    planSpillRel lo vs' spl m' := by
+  intro op off hlook
+  obtain ⟨v, hov, hword⟩ := h op off hlook
+  exact ⟨v, by rw [hcongr op off hlook]; exact hov,
+    by rw [hframe op off hlook]; exact hword⟩
+
+set_option maxHeartbeats 800000 in
+/-- **Full-relation CALL block core**: emit the 7 live operands and run CALL under the honest
+    `memoryRel` memory conjunct — concluding the COMPLETE `venomAsmRel` at the popped-and-pushed
+    plan state and the writeback Venom state. `planStackRel` rebuilds by pop-7/push-out over the
+    `callWriteback`-stable operand values; `planSpillRel` rebuilds from the spill-slot byte frame
+    (the returndata window lies below the spill region). The producer-grade replacement for
+    `call_block_emit_sim`. -/
+theorem call_block_emit_rel_full {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    {prog : List AsmInst} {offsetToPc : AssocList Nat Nat} {inst : Instruction}
+    {out : String} {ovars : List String} {dists : List Nat} {nl : List String}
+    {gas addr value aOff aSz rOff rSz : bytes32} {vals : List bytes32}
+    {success : bytes32} {newAccs : Accounts} {ret : List byte} {ps : PlanState}
+    (hopc : inst.opcode = Opcode.CALL)
+    (heval : evalOperands inst.operands vs = some [gas, addr, value, aOff, aSz, rOff, rSz])
+    (hout : inst.outputs = [out])
+    (hnospill : ∀ v ∈ ovars, alookup' ps.spilled (Operand.Var v) = none)
+    (hdepths : emitDepthsOk nl ovars dists ps.stack)
+    (hvals : List.map (operandVal vs lo) (ovars.map Operand.Var) = List.map some vals)
+    (hvalrev : vals.reverse = [gas, addr, value, aOff, aSz, rOff, rSz])
+    (hargs : aOff.toNat + aSz.toNat ≤ ps.alloc.fnEom) (haszlt : aSz.toNat < USize.size)
+    (hro1 : rOff.toNat ≤ vs.memory.size)
+    (hretbelow : rOff.toNat + rSz.toNat ≤ ps.alloc.fnEom)
+    (hfnEom : ps.alloc.fnEom ≤ as.memory.size)
+    (hfreshS : ¬ Operand.Var out ∈ ps.stack) (houtov : out ∉ ovars)
+    (hspill_out : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none)
+    (hspillReg : ∀ op off, AssocList.lookup Operand Nat ps.spilled op = some off →
+        ps.alloc.fnEom ≤ off)
+    (hcall : evmCall subEvmFuel vs.accounts vs.callCtx.contract vs.txCtx.origin
+      (AccountAddress.ofUInt256 addr) (AccountAddress.ofUInt256 addr) gas value value
+      (vs.memory.readWithPadding aOff.toNat aSz.toNat).toList vs.txCtx.gasprice 0 (!vs.callCtx.static)
+      = (success, newAccs, ret))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan ((emitInputPlan Opcode.CALL (ovars.map Operand.Var) nl ps).1 ++ [StackOp.SOEmit "CALL"]))) :
+    ∃ s'', runAsm (executePlan ((emitInputPlan Opcode.CALL (ovars.map Operand.Var) nl ps).1
+             ++ [StackOp.SOEmit "CALL"])).length offsetToPc prog as = AsmResult.AsmOK s''
+      ∧ stepExternalCall subEvmFuel inst vs
+          = some (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs)
+      ∧ venomAsmRel lo
+          { (emitInputPlan Opcode.CALL (ovars.map Operand.Var) nl ps).2 with
+            stack := ps.stack ++ [Operand.Var out] }
+          (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs) s''
+      ∧ s''.pc = as.pc + (executePlan ((emitInputPlan Opcode.CALL (ovars.map Operand.Var) nl ps).1
+          ++ [StackOp.SOEmit "CALL"])).length := by
+  have hemiteq := emitInputPlan_allVars_eq Opcode.CALL nl ovars dists ps hnospill hdepths
+  rw [executePlan_append] at hblock
+  obtain ⟨hbI, hbCall⟩ := asmBlockAt_append hblock
+  obtain ⟨as1, hrunE, hrelE, hpcE, hmemE⟩ :=
+    emitInputPlan_allVars_sim (offsetToPc := offsetToPc) Opcode.CALL nl ovars dists ps hnospill hdepths hrel hbI
+  have hps'stack : (emitInputPlan Opcode.CALL (ovars.map Operand.Var) nl ps).2.stack
+      = ps.stack ++ ovars.map Operand.Var := by rw [hemiteq]
+  have hps'spill : (emitInputPlan Opcode.CALL (ovars.map Operand.Var) nl ps).2.spilled
+      = ps.spilled := by rw [hemiteq]
+  have hps'alloc : (emitInputPlan Opcode.CALL (ovars.map Operand.Var) nl ps).2.alloc = ps.alloc := by
+    rw [hemiteq]
+  have htop := venomAsmRel_asmStack_topOps (base := ps.stack) (ops := ovars.map Operand.Var) (vals := vals)
+    hrelE hps'stack hvals
+  rw [hvalrev] at htop
+  have hlenops : (ovars.map Operand.Var).length = 7 := by
+    rw [List.length_map]
+    have h1 : ovars.length = vals.length := by
+      have := congrArg List.length hvals; simpa [List.length_map] using this
+    have h2 : vals.length = 7 := by
+      have := congrArg List.length hvalrev; simpa using this
+    omega
+  rw [hlenops] at htop
+  obtain ⟨hStk1, hSpill1, hmemrel1, hacc1, htr1, hrd1, hlg1, hcc1, htx1, hbc1, hcode1, hph1⟩ := hrelE
+  rw [hps'alloc] at hmemrel1
+  have hro2 : rOff.toNat ≤ as1.memory.size := by
+    rw [hmemE]
+    omega
+  have hcall1 : evmCall subEvmFuel as1.accounts as1.callCtx.contract as1.txCtx.origin
+      (AccountAddress.ofUInt256 addr) (AccountAddress.ofUInt256 addr) gas value value
+      (as1.memory.readWithPadding aOff.toNat aSz.toNat).toList as1.txCtx.gasprice 0 (!as1.callCtx.static)
+      = (success, newAccs, ret) := by
+    rw [hacc1, hcc1, htx1,
+        ← memoryRel_readWithPadding_slice hmemrel1 hargs haszlt]
+    exact hcall
+  obtain ⟨hpcC, hgetC⟩ := asmBlockAt_one (by rw [← hpcE] at hbCall; exact hbCall)
+  obtain ⟨s'', hstepV, hasmOK, hacc', hmemrel', hframe', hrd', htr', hlg', hcc', htx', hbc',
+    hcode', hph', hout', hstk'⟩ :=
+    call_step_stateAgree_rel (alloc := ps.alloc) (as := as1) hopc heval hout htop
+      hacc1.symm hmemrel1 hargs haszlt hro1 hro2 hretbelow hcc1.symm htx1.symm htr1.symm
+      hlg1.symm hbc1.symm hcode1.symm hph1.symm hcall1
+  -- pc: the CALL writeback advances by one
+  have hpcadv : s''.pc = as1.pc + 1 := by
+    have hcalleq : asmCall as1 = AsmResult.AsmOK s'' := hasmOK
+    unfold asmCall at hcalleq
+    rw [htop] at hcalleq
+    simp only [asmCallWriteback] at hcalleq
+    injection hcalleq with hc
+    rw [← hc]; rfl
+  have hstepeq : asmStep offsetToPc prog as1 = AsmResult.AsmOK s'' := by
+    rw [asmStep_call_ok hpcC hgetC]; exact hasmOK
+  have hrunC : runAsm (executePlan [StackOp.SOEmit "CALL"]).length offsetToPc prog as1
+      = AsmResult.AsmOK s'' := by
+    show runAsm 1 offsetToPc prog as1 = AsmResult.AsmOK s''
+    rw [runAsm_succ_ok hpcC hstepeq]; rfl
+  set cb := callWriteback out rOff.toNat rSz.toNat success newAccs ret vs with hcbdef
+  -- operand values are callWriteback-stable away from `out`
+  have hcongrStack : ∀ o ∈ (emitInputPlan Opcode.CALL (ovars.map Operand.Var) nl ps).2.stack,
+      operandVal cb lo o = operandVal vs lo o := by
+    intro o ho
+    rw [hps'stack] at ho
+    refine callWriteback_operandVal_ne ?_
+    rcases List.mem_append.mp ho with h | h
+    · intro hc; rw [hc] at h; exact hfreshS h
+    · intro hc
+      obtain ⟨w, hw, hwe⟩ := List.mem_map.mp h
+      rw [hc] at hwe
+      injection hwe with hwe'
+      exact houtov (hwe' ▸ hw)
+  -- planStackRel: env-congr, pop 7, push out
+  have hStkCb : planStackRel lo cb
+      (emitInputPlan Opcode.CALL (ovars.map Operand.Var) nl ps).2.stack as1.stack :=
+    planStackRel_env_congr hcongrStack hStk1
+  have hlen7 : 7 ≤ (emitInputPlan Opcode.CALL (ovars.map Operand.Var) nl ps).2.stack.length := by
+    rw [hps'stack, List.length_append]
+    have := hlenops
+    rw [List.length_map] at this
+    omega
+  have houtval : operandVal cb lo (Operand.Var out) = some success := by
+    rw [operandVal_var_eq_lookupVar]; exact hout'
+  have hStkFinal := planStackRel_push (planStackRel_popN hStkCb hlen7) houtval
+  have hpop7 : stackPop 7 (emitInputPlan Opcode.CALL (ovars.map Operand.Var) nl ps).2.stack
+      = ps.stack := by
+    rw [hps'stack, ← hlenops]
+    exact stackPop_append_top ps.stack (ovars.map Operand.Var)
+  rw [hpop7] at hStkFinal
+  have hdrop7 : as1.stack.drop 7 = as1.stack.drop 7 := rfl
+  -- planSpillRel: env-congr + per-slot byte frame
+  have hSpillFinal : planSpillRel lo cb
+      (emitInputPlan Opcode.CALL (ovars.map Operand.Var) nl ps).2.spilled s''.memory := by
+    rw [hps'spill]
+    rw [hps'spill] at hSpill1
+    refine planSpillRel_frame_congr hSpill1 ?_ ?_
+    · intro op off hlook
+      refine callWriteback_operandVal_ne ?_
+      intro hc
+      rw [hc, hspill_out] at hlook
+      simp at hlook
+    · intro op off hlook
+      have hge : ps.alloc.fnEom ≤ off := hspillReg op off hlook
+      have h32 : (32 : Nat) < USize.size :=
+        Nat.lt_of_lt_of_le (by norm_num) USize.le_size
+      apply ByteArray.readWithPadding_congr _ _ off 32 h32
+      intro k hk
+      have := hframe' (off + k) (by omega)
+      rw [readByte_eq_getElem?_getD, readByte_eq_getElem?_getD] at this
+      exact this
+  refine ⟨s'', ?_, hstepV, ?_, ?_⟩
+  · rw [executePlan_append, List.length_append]
+    exact runAsm_compose hrunE hrunC
+  · refine ⟨?_, hSpillFinal, ?_, hacc'.symm, htr'.symm, hrd'.symm, hlg'.symm, hcc'.symm,
+      htx'.symm, hbc'.symm, hcode'.symm, hph'.symm⟩
+    · show planStackRel lo cb (ps.stack ++ [Operand.Var out]) s''.stack
+      rw [hstk']
+      show planStackRel lo cb (ps.stack ++ [Operand.Var out]) (success :: as1.stack.drop 7)
+      have hpush : stackPush (Operand.Var out) ps.stack = ps.stack ++ [Operand.Var out] := rfl
+      rw [← hpush]
+      exact hStkFinal
+    · show memoryRel (emitInputPlan Opcode.CALL (ovars.map Operand.Var) nl ps).2.alloc
+        cb.memory s''.memory
+      rw [hps'alloc]
+      exact hmemrel'
+  · rw [executePlan_append, List.length_append, hpcadv, hpcE]
+    rfl
+
+/-- **The full generated-plan CALL producer sim** — the deep item closed: running the ENTIRE
+    `generateRegularInstPlan` output for a CALL (7 live operands, positioned; the sub-EVM runs on
+    calldata below the spill region; the writeback lands below it too) preserves the complete
+    `venomAsmRel` against the Venom `stepExternalCall` writeback. Composes the plan reduction
+    (`genRegularInstPlan_call_eq`), the full-relation core (`call_block_emit_rel_full`), and
+    `releaseDeadSpills_sim`. -/
+theorem genRegularInstPlan_call_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {offsetToPc : AssocList Nat Nat} {ovars : List String} {dists : List Nat} {out : String}
+    {base : List Operand} {gas addr value aOff aSz rOff rSz : bytes32} {vals : List bytes32}
+    {success : bytes32} {newAccs : Accounts} {ret : List byte}
+    (hopc : inst.opcode = Opcode.CALL)
+    (hcompute : computeOperands inst = ovars.map Operand.Var)
+    (houts : inst.outputs = [out])
+    (hstack0 : ps.stack = base)
+    (hnd : ovars.Nodup)
+    (hnospill : ∀ v ∈ ovars, alookup' ps.spilled (Operand.Var v) = none)
+    (hdepths : emitDepthsOk nextLiveness ovars dists ps.stack)
+    (hlive : nextLiveness.contains out = true)
+    (heval : evalOperands inst.operands vs = some [gas, addr, value, aOff, aSz, rOff, rSz])
+    (hvals : List.map (operandVal vs lo) (ovars.map Operand.Var) = List.map some vals)
+    (hvalrev : vals.reverse = [gas, addr, value, aOff, aSz, rOff, rSz])
+    (hargs : aOff.toNat + aSz.toNat ≤ ps.alloc.fnEom) (haszlt : aSz.toNat < USize.size)
+    (hro1 : rOff.toNat ≤ vs.memory.size)
+    (hretbelow : rOff.toNat + rSz.toNat ≤ ps.alloc.fnEom)
+    (hfnEom : ps.alloc.fnEom ≤ as.memory.size)
+    (hfreshS : ¬ Operand.Var out ∈ ps.stack) (houtov : out ∉ ovars)
+    (hspill_out : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none)
+    (hspillReg : ∀ op off, AssocList.lookup Operand Nat ps.spilled op = some off →
+        ps.alloc.fnEom ≤ off)
+    (hcall : evmCall subEvmFuel vs.accounts vs.callCtx.contract vs.txCtx.origin
+      (AccountAddress.ofUInt256 addr) (AccountAddress.ofUInt256 addr) gas value value
+      (vs.memory.readWithPadding aOff.toNat aSz.toNat).toList vs.txCtx.gasprice 0 (!vs.callCtx.static)
+      = (success, newAccs, ret))
+    (hoptnoop : optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+        { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+          stack := base ++ [Operand.Var out] }
+      = ([], { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+              stack := base ++ [Operand.Var out] }))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+           stepExternalCall subEvmFuel inst vs
+             = some (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs) ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2
+             (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  rw [genRegularInstPlan_call_eq hopc hcompute houts hstack0 hnd hnospill hdepths hlive,
+      hoptnoop] at hblock ⊢
+  simp only [List.append_nil] at hblock ⊢
+  rw [hcompute, hopc] at hblock ⊢
+  rw [← hstack0]
+  obtain ⟨s'', hrun, hstepV, hrelF, hpcF⟩ :=
+    call_block_emit_rel_full (offsetToPc := offsetToPc) hopc heval houts hnospill hdepths hvals
+      hvalrev hargs haszlt hro1 hretbelow hfnEom hfreshS houtov hspill_out hspillReg hcall
+      hrel hblock
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrelF
+  exact ⟨s'', hrun, hstepV, hrelR, hpcF⟩
+/-- **STATICCALL correspondence core: both interpreters run the identical sub-EVM** — the
+    6-operand, zero-value, non-permissioned sibling of `asmCall_stepExternalCall_same_evmCall_rel`. -/
+theorem asmStaticCall_stepExternalCall_same_evmCall_rel {alloc : SpillAlloc}
+    {vs : VenomState} {s : AsmState} {inst : Instruction}
+    {out : String} {gas addr aOff aSz rOff rSz : bytes32} {stk : List bytes32}
+    {success : bytes32} {newAccs : Accounts} {ret : List byte}
+    (hopc : inst.opcode = Opcode.STATICCALL)
+    (heval : evalOperands inst.operands vs = some [gas, addr, aOff, aSz, rOff, rSz])
+    (hout : inst.outputs = [out])
+    (hstk : s.stack = gas :: addr :: aOff :: aSz :: rOff :: rSz :: stk)
+    (hacc : vs.accounts = s.accounts)
+    (hmem : memoryRel alloc vs.memory s.memory)
+    (hargs : aOff.toNat + aSz.toNat ≤ alloc.fnEom) (haszlt : aSz.toNat < USize.size)
+    (hcc : vs.callCtx = s.callCtx) (htx : vs.txCtx = s.txCtx)
+    (hcall : evmCall subEvmFuel s.accounts s.callCtx.contract s.txCtx.origin
+      (AccountAddress.ofUInt256 addr) (AccountAddress.ofUInt256 addr) gas ⟨0⟩ ⟨0⟩
+      (s.memory.readWithPadding aOff.toNat aSz.toNat).toList s.txCtx.gasprice 0 false
+      = (success, newAccs, ret)) :
+    stepExternalCall subEvmFuel inst vs
+        = some (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs)
+      ∧ asmStaticCall s = asmCallWriteback rOff.toNat rSz.toNat success newAccs ret stk s := by
+  have hcd : vs.memory.readWithPadding aOff.toNat aSz.toNat
+      = s.memory.readWithPadding aOff.toNat aSz.toNat :=
+    memoryRel_readWithPadding_slice hmem hargs haszlt
+  have hcallV : evmCall subEvmFuel vs.accounts vs.callCtx.contract vs.txCtx.origin
+      (AccountAddress.ofUInt256 addr) (AccountAddress.ofUInt256 addr) gas ⟨0⟩ ⟨0⟩
+      (readMemory aOff.toNat aSz.toNat vs).toList vs.txCtx.gasprice 0 false
+      = (success, newAccs, ret) := by
+    rw [hacc, hcc, htx, readMemory, hcd]; exact hcall
+  refine ⟨?_, ?_⟩
+  · unfold stepExternalCall; rw [heval]; simp only [bind, Option.bind, hopc, hout, hcallV]
+  · unfold asmStaticCall; rw [hstk]; simp only [hcall]
+
+/-- **STATICCALL step, full `memoryRel` correspondence** — the 6-operand mirror of
+    `call_step_stateAgree_rel`: same shared `callWriteback`/`asmCallWriteback` agree core, the
+    sub-EVM runs with zero value and `perm = false`. -/
+theorem staticcall_step_stateAgree_rel {alloc : SpillAlloc} {vs : VenomState} {as : AsmState}
+    {inst : Instruction} {out : String} {gas addr aOff aSz rOff rSz : bytes32}
+    {stk : List bytes32} {success : bytes32} {newAccs : Accounts} {ret : List byte}
+    (hopc : inst.opcode = Opcode.STATICCALL)
+    (heval : evalOperands inst.operands vs = some [gas, addr, aOff, aSz, rOff, rSz])
+    (hout : inst.outputs = [out])
+    (hstk : as.stack = gas :: addr :: aOff :: aSz :: rOff :: rSz :: stk)
+    (hacc : vs.accounts = as.accounts)
+    (hmem : memoryRel alloc vs.memory as.memory)
+    (hargs : aOff.toNat + aSz.toNat ≤ alloc.fnEom) (haszlt : aSz.toNat < USize.size)
+    (hro1 : rOff.toNat ≤ vs.memory.size) (hro2 : rOff.toNat ≤ as.memory.size)
+    (hretbelow : rOff.toNat + rSz.toNat ≤ alloc.fnEom)
+    (hcc : vs.callCtx = as.callCtx) (htx : vs.txCtx = as.txCtx)
+    (htr : vs.transient = as.transient)
+    (hlg : vs.logs = as.logs) (hbc : vs.blockCtx = as.blockCtx)
+    (hcode : vs.code = as.code) (hph : vs.prevHashes = as.prevHashes)
+    (hcall : evmCall subEvmFuel as.accounts as.callCtx.contract as.txCtx.origin
+      (AccountAddress.ofUInt256 addr) (AccountAddress.ofUInt256 addr) gas ⟨0⟩ ⟨0⟩
+      (as.memory.readWithPadding aOff.toNat aSz.toNat).toList as.txCtx.gasprice 0 false
+      = (success, newAccs, ret)) :
+    ∃ s'',
+      stepExternalCall subEvmFuel inst vs
+        = some (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs)
+      ∧ asmStaticCall as = AsmResult.AsmOK s''
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).accounts = s''.accounts
+      ∧ memoryRel alloc (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).memory s''.memory
+      ∧ (∀ i, alloc.fnEom ≤ i → readByte i s''.memory = readByte i as.memory)
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).returndata = s''.returndata
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).transient = s''.transient
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).logs = s''.logs
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).callCtx = s''.callCtx
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).txCtx = s''.txCtx
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).blockCtx = s''.blockCtx
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).code = s''.code
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).prevHashes = s''.prevHashes
+      ∧ lookupVar out (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs) = some success
+      ∧ s''.stack = success :: stk := by
+  obtain ⟨hstep, hasmeq⟩ :=
+    asmStaticCall_stepExternalCall_same_evmCall_rel hopc heval hout hstk hacc hmem hargs haszlt
+      hcc htx hcall
+  obtain ⟨s'', hs''eq, hacc', hmem', hframe', hrd', hout', hstk'⟩ :=
+    callWriteback_asmCallWriteback_agree_rel alloc out rOff.toNat rSz.toNat success newAccs ret
+      stk vs as hmem hro1 hro2 hretbelow
+  have hconcrete := hs''eq
+  simp only [asmCallWriteback] at hconcrete
+  injection hconcrete with hc
+  refine ⟨s'', hstep, by rw [hasmeq]; exact hs''eq, hacc', hmem', hframe', hrd',
+    ?_, ?_, ?_, ?_, ?_, ?_, ?_, hout', hstk'⟩
+  · show (callWriteback _ _ _ _ _ _ _).transient = s''.transient
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact htr
+  · show (callWriteback _ _ _ _ _ _ _).logs = s''.logs
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact hlg
+  · show (callWriteback _ _ _ _ _ _ _).callCtx = s''.callCtx
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact hcc
+  · show (callWriteback _ _ _ _ _ _ _).txCtx = s''.txCtx
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact htx
+  · show (callWriteback _ _ _ _ _ _ _).blockCtx = s''.blockCtx
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact hbc
+  · show (callWriteback _ _ _ _ _ _ _).code = s''.code
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact hcode
+  · show (callWriteback _ _ _ _ _ _ _).prevHashes = s''.prevHashes
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact hph
+
+/-- **Full-relation STATICCALL block core** — the 6-operand mirror of `call_block_emit_rel_full`:
+    emit the operands and run STATICCALL, concluding the COMPLETE `venomAsmRel` at net +1 and the
+    writeback state. -/
+theorem staticcall_block_emit_rel_full {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    {prog : List AsmInst} {offsetToPc : AssocList Nat Nat} {inst : Instruction}
+    {out : String} {ovars : List String} {dists : List Nat} {nl : List String}
+    {gas addr aOff aSz rOff rSz : bytes32} {vals : List bytes32}
+    {success : bytes32} {newAccs : Accounts} {ret : List byte} {ps : PlanState}
+    (hopc : inst.opcode = Opcode.STATICCALL)
+    (heval : evalOperands inst.operands vs = some [gas, addr, aOff, aSz, rOff, rSz])
+    (hout : inst.outputs = [out])
+    (hnospill : ∀ v ∈ ovars, alookup' ps.spilled (Operand.Var v) = none)
+    (hdepths : emitDepthsOk nl ovars dists ps.stack)
+    (hvals : List.map (operandVal vs lo) (ovars.map Operand.Var) = List.map some vals)
+    (hvalrev : vals.reverse = [gas, addr, aOff, aSz, rOff, rSz])
+    (hargs : aOff.toNat + aSz.toNat ≤ ps.alloc.fnEom) (haszlt : aSz.toNat < USize.size)
+    (hro1 : rOff.toNat ≤ vs.memory.size)
+    (hretbelow : rOff.toNat + rSz.toNat ≤ ps.alloc.fnEom)
+    (hfnEom : ps.alloc.fnEom ≤ as.memory.size)
+    (hfreshS : ¬ Operand.Var out ∈ ps.stack) (houtov : out ∉ ovars)
+    (hspill_out : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none)
+    (hspillReg : ∀ op off, AssocList.lookup Operand Nat ps.spilled op = some off →
+        ps.alloc.fnEom ≤ off)
+    (hcall : evmCall subEvmFuel vs.accounts vs.callCtx.contract vs.txCtx.origin
+      (AccountAddress.ofUInt256 addr) (AccountAddress.ofUInt256 addr) gas ⟨0⟩ ⟨0⟩
+      (vs.memory.readWithPadding aOff.toNat aSz.toNat).toList vs.txCtx.gasprice 0 false
+      = (success, newAccs, ret))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan ((emitInputPlan Opcode.STATICCALL (ovars.map Operand.Var) nl ps).1 ++ [StackOp.SOEmit "STATICCALL"]))) :
+    ∃ s'', runAsm (executePlan ((emitInputPlan Opcode.STATICCALL (ovars.map Operand.Var) nl ps).1
+             ++ [StackOp.SOEmit "STATICCALL"])).length offsetToPc prog as = AsmResult.AsmOK s''
+      ∧ stepExternalCall subEvmFuel inst vs
+          = some (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs)
+      ∧ venomAsmRel lo
+          { (emitInputPlan Opcode.STATICCALL (ovars.map Operand.Var) nl ps).2 with
+            stack := ps.stack ++ [Operand.Var out] }
+          (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs) s''
+      ∧ s''.pc = as.pc + (executePlan ((emitInputPlan Opcode.STATICCALL (ovars.map Operand.Var) nl ps).1
+          ++ [StackOp.SOEmit "STATICCALL"])).length := by
+  have hemiteq := emitInputPlan_allVars_eq Opcode.STATICCALL nl ovars dists ps hnospill hdepths
+  rw [executePlan_append] at hblock
+  obtain ⟨hbI, hbCall⟩ := asmBlockAt_append hblock
+  obtain ⟨as1, hrunE, hrelE, hpcE, hmemE⟩ :=
+    emitInputPlan_allVars_sim (offsetToPc := offsetToPc) Opcode.STATICCALL nl ovars dists ps hnospill hdepths hrel hbI
+  have hps'stack : (emitInputPlan Opcode.STATICCALL (ovars.map Operand.Var) nl ps).2.stack
+      = ps.stack ++ ovars.map Operand.Var := by rw [hemiteq]
+  have hps'spill : (emitInputPlan Opcode.STATICCALL (ovars.map Operand.Var) nl ps).2.spilled
+      = ps.spilled := by rw [hemiteq]
+  have hps'alloc : (emitInputPlan Opcode.STATICCALL (ovars.map Operand.Var) nl ps).2.alloc = ps.alloc := by
+    rw [hemiteq]
+  have htop := venomAsmRel_asmStack_topOps (base := ps.stack) (ops := ovars.map Operand.Var) (vals := vals)
+    hrelE hps'stack hvals
+  rw [hvalrev] at htop
+  have hlenops : (ovars.map Operand.Var).length = 6 := by
+    rw [List.length_map]
+    have h1 : ovars.length = vals.length := by
+      have := congrArg List.length hvals; simpa [List.length_map] using this
+    have h2 : vals.length = 6 := by
+      have := congrArg List.length hvalrev; simpa using this
+    omega
+  rw [hlenops] at htop
+  obtain ⟨hStk1, hSpill1, hmemrel1, hacc1, htr1, hrd1, hlg1, hcc1, htx1, hbc1, hcode1, hph1⟩ := hrelE
+  rw [hps'alloc] at hmemrel1
+  have hro2 : rOff.toNat ≤ as1.memory.size := by
+    rw [hmemE]
+    omega
+  have hcall1 : evmCall subEvmFuel as1.accounts as1.callCtx.contract as1.txCtx.origin
+      (AccountAddress.ofUInt256 addr) (AccountAddress.ofUInt256 addr) gas ⟨0⟩ ⟨0⟩
+      (as1.memory.readWithPadding aOff.toNat aSz.toNat).toList as1.txCtx.gasprice 0 false
+      = (success, newAccs, ret) := by
+    rw [hacc1, hcc1, htx1,
+        ← memoryRel_readWithPadding_slice hmemrel1 hargs haszlt]
+    exact hcall
+  obtain ⟨hpcC, hgetC⟩ := asmBlockAt_one (by rw [← hpcE] at hbCall; exact hbCall)
+  obtain ⟨s'', hstepV, hasmOK, hacc', hmemrel', hframe', hrd', htr', hlg', hcc', htx', hbc',
+    hcode', hph', hout', hstk'⟩ :=
+    staticcall_step_stateAgree_rel (alloc := ps.alloc) (as := as1) hopc heval hout htop
+      hacc1.symm hmemrel1 hargs haszlt hro1 hro2 hretbelow hcc1.symm htx1.symm htr1.symm
+      hlg1.symm hbc1.symm hcode1.symm hph1.symm hcall1
+  -- pc: the CALL writeback advances by one
+  have hpcadv : s''.pc = as1.pc + 1 := by
+    have hcalleq : asmStaticCall as1 = AsmResult.AsmOK s'' := hasmOK
+    unfold asmStaticCall at hcalleq
+    rw [htop] at hcalleq
+    simp only [asmCallWriteback] at hcalleq
+    injection hcalleq with hc
+    rw [← hc]; rfl
+  have hstepeq : asmStep offsetToPc prog as1 = AsmResult.AsmOK s'' := by
+    rw [asmStep_staticcall_ok hpcC hgetC]; exact hasmOK
+  have hrunC : runAsm (executePlan [StackOp.SOEmit "STATICCALL"]).length offsetToPc prog as1
+      = AsmResult.AsmOK s'' := by
+    show runAsm 1 offsetToPc prog as1 = AsmResult.AsmOK s''
+    rw [runAsm_succ_ok hpcC hstepeq]; rfl
+  set cb := callWriteback out rOff.toNat rSz.toNat success newAccs ret vs with hcbdef
+  -- operand values are callWriteback-stable away from `out`
+  have hcongrStack : ∀ o ∈ (emitInputPlan Opcode.STATICCALL (ovars.map Operand.Var) nl ps).2.stack,
+      operandVal cb lo o = operandVal vs lo o := by
+    intro o ho
+    rw [hps'stack] at ho
+    refine callWriteback_operandVal_ne ?_
+    rcases List.mem_append.mp ho with h | h
+    · intro hc; rw [hc] at h; exact hfreshS h
+    · intro hc
+      obtain ⟨w, hw, hwe⟩ := List.mem_map.mp h
+      rw [hc] at hwe
+      injection hwe with hwe'
+      exact houtov (hwe' ▸ hw)
+  -- planStackRel: env-congr, pop 7, push out
+  have hStkCb : planStackRel lo cb
+      (emitInputPlan Opcode.STATICCALL (ovars.map Operand.Var) nl ps).2.stack as1.stack :=
+    planStackRel_env_congr hcongrStack hStk1
+  have hlen7 : 6 ≤ (emitInputPlan Opcode.STATICCALL (ovars.map Operand.Var) nl ps).2.stack.length := by
+    rw [hps'stack, List.length_append]
+    have := hlenops
+    rw [List.length_map] at this
+    omega
+  have houtval : operandVal cb lo (Operand.Var out) = some success := by
+    rw [operandVal_var_eq_lookupVar]; exact hout'
+  have hStkFinal := planStackRel_push (planStackRel_popN hStkCb hlen7) houtval
+  have hpop7 : stackPop 6 (emitInputPlan Opcode.STATICCALL (ovars.map Operand.Var) nl ps).2.stack
+      = ps.stack := by
+    rw [hps'stack, ← hlenops]
+    exact stackPop_append_top ps.stack (ovars.map Operand.Var)
+  rw [hpop7] at hStkFinal
+  have hdrop7 : as1.stack.drop 6 = as1.stack.drop 6 := rfl
+  -- planSpillRel: env-congr + per-slot byte frame
+  have hSpillFinal : planSpillRel lo cb
+      (emitInputPlan Opcode.STATICCALL (ovars.map Operand.Var) nl ps).2.spilled s''.memory := by
+    rw [hps'spill]
+    rw [hps'spill] at hSpill1
+    refine planSpillRel_frame_congr hSpill1 ?_ ?_
+    · intro op off hlook
+      refine callWriteback_operandVal_ne ?_
+      intro hc
+      rw [hc, hspill_out] at hlook
+      simp at hlook
+    · intro op off hlook
+      have hge : ps.alloc.fnEom ≤ off := hspillReg op off hlook
+      have h32 : (32 : Nat) < USize.size :=
+        Nat.lt_of_lt_of_le (by norm_num) USize.le_size
+      apply ByteArray.readWithPadding_congr _ _ off 32 h32
+      intro k hk
+      have := hframe' (off + k) (by omega)
+      rw [readByte_eq_getElem?_getD, readByte_eq_getElem?_getD] at this
+      exact this
+  refine ⟨s'', ?_, hstepV, ?_, ?_⟩
+  · rw [executePlan_append, List.length_append]
+    exact runAsm_compose hrunE hrunC
+  · refine ⟨?_, hSpillFinal, ?_, hacc'.symm, htr'.symm, hrd'.symm, hlg'.symm, hcc'.symm,
+      htx'.symm, hbc'.symm, hcode'.symm, hph'.symm⟩
+    · show planStackRel lo cb (ps.stack ++ [Operand.Var out]) s''.stack
+      rw [hstk']
+      show planStackRel lo cb (ps.stack ++ [Operand.Var out]) (success :: as1.stack.drop 6)
+      have hpush : stackPush (Operand.Var out) ps.stack = ps.stack ++ [Operand.Var out] := rfl
+      rw [← hpush]
+      exact hStkFinal
+    · show memoryRel (emitInputPlan Opcode.STATICCALL (ovars.map Operand.Var) nl ps).2.alloc
+        cb.memory s''.memory
+      rw [hps'alloc]
+      exact hmemrel'
+  · rw [executePlan_append, List.length_append, hpcadv, hpcE]
+    rfl
+
+/-- **STATICCALL plan reduction** (all-live 6 distinct var operands): the 6-operand mirror of
+    `genRegularInstPlan_call_eq`. -/
+theorem genRegularInstPlan_staticcall_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {ovars : List String} {dists : List Nat} {out : String} {base : List Operand}
+    (hopc : inst.opcode = Opcode.STATICCALL)
+    (hcompute : computeOperands inst = ovars.map Operand.Var)
+    (houts : inst.outputs = [out])
+    (hstack0 : ps.stack = base)
+    (hnd : ovars.Nodup)
+    (hnospill : ∀ v ∈ ovars, alookup' ps.spilled (Operand.Var v) = none)
+    (hdepths : emitDepthsOk nextLiveness ovars dists ps.stack)
+    (hlive : nextLiveness.contains out = true) :
+    generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator
+        curBbLabel ps
+      = (((emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).1
+            ++ [StackOp.SOEmit "STATICCALL"]
+            ++ (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+                  { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+                    stack := base ++ [Operand.Var out] }).1),
+         releaseDeadSpills nextLiveness
+           (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+             { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+               stack := base ++ [Operand.Var out] }).2) := by
+  have hname : opcodeToEvmName inst.opcode = some "STATICCALL" := by rw [hopc]; rfl
+  have hncomm : isCommutative inst.opcode = false := by rw [hopc]; rfl
+  have hnjmp : ¬ (inst.opcode = Opcode.JMP) := by rw [hopc]; decide
+  have hpvar := emitInputPlan_allVars_eq inst.opcode nextLiveness ovars dists ps hnospill hdepths
+  unfold generateRegularInstPlan
+  simp only [hcompute, houts]
+  rcases hemit : emitInputPlan inst.opcode (ovars.map Operand.Var) nextLiveness ps
+    with ⟨inputOps, ps1⟩
+  have h2 : (emitInputPlan inst.opcode (ovars.map Operand.Var) nextLiveness ps).2 = ps1 := by
+    rw [hemit]
+  have hps1' : ps1.stack = base ++ ovars.map Operand.Var := by
+    rw [← h2, hpvar, hstack0]
+  have hreorder := reorderPlan_allVars_nil base ovars ps1 hps1' hnd
+  have hmem : out ∈ nextLiveness := by simpa using hlive
+  have hpop : stackPop ovars.length (base ++ ovars.map Operand.Var) = base := by
+    have h := stackPop_append_top base (ovars.map Operand.Var)
+    rwa [List.length_map] at h
+  simp [generateEmitOps_evmName hname, hreorder, hps1', hpop, stackPush, popmanyPlan_nil, hmem,
+        hncomm, hnjmp]
+
+/-- **The full generated-plan STATICCALL producer sim** — running the ENTIRE
+    `generateRegularInstPlan` output for a STATICCALL (6 live operands, positioned) preserves the
+    complete `venomAsmRel` against the Venom `stepExternalCall` writeback. The first non-CALL
+    external-call producer, mirrored off the CALL chain. -/
+theorem genRegularInstPlan_staticcall_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {offsetToPc : AssocList Nat Nat} {ovars : List String} {dists : List Nat} {out : String}
+    {base : List Operand} {gas addr aOff aSz rOff rSz : bytes32} {vals : List bytes32}
+    {success : bytes32} {newAccs : Accounts} {ret : List byte}
+    (hopc : inst.opcode = Opcode.STATICCALL)
+    (hcompute : computeOperands inst = ovars.map Operand.Var)
+    (houts : inst.outputs = [out])
+    (hstack0 : ps.stack = base)
+    (hnd : ovars.Nodup)
+    (hnospill : ∀ v ∈ ovars, alookup' ps.spilled (Operand.Var v) = none)
+    (hdepths : emitDepthsOk nextLiveness ovars dists ps.stack)
+    (hlive : nextLiveness.contains out = true)
+    (heval : evalOperands inst.operands vs = some [gas, addr, aOff, aSz, rOff, rSz])
+    (hvals : List.map (operandVal vs lo) (ovars.map Operand.Var) = List.map some vals)
+    (hvalrev : vals.reverse = [gas, addr, aOff, aSz, rOff, rSz])
+    (hargs : aOff.toNat + aSz.toNat ≤ ps.alloc.fnEom) (haszlt : aSz.toNat < USize.size)
+    (hro1 : rOff.toNat ≤ vs.memory.size)
+    (hretbelow : rOff.toNat + rSz.toNat ≤ ps.alloc.fnEom)
+    (hfnEom : ps.alloc.fnEom ≤ as.memory.size)
+    (hfreshS : ¬ Operand.Var out ∈ ps.stack) (houtov : out ∉ ovars)
+    (hspill_out : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none)
+    (hspillReg : ∀ op off, AssocList.lookup Operand Nat ps.spilled op = some off →
+        ps.alloc.fnEom ≤ off)
+    (hcall : evmCall subEvmFuel vs.accounts vs.callCtx.contract vs.txCtx.origin
+      (AccountAddress.ofUInt256 addr) (AccountAddress.ofUInt256 addr) gas ⟨0⟩ ⟨0⟩
+      (vs.memory.readWithPadding aOff.toNat aSz.toNat).toList vs.txCtx.gasprice 0 false
+      = (success, newAccs, ret))
+    (hoptnoop : optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+        { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+          stack := base ++ [Operand.Var out] }
+      = ([], { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+              stack := base ++ [Operand.Var out] }))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+           stepExternalCall subEvmFuel inst vs
+             = some (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs) ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2
+             (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  rw [genRegularInstPlan_staticcall_eq hopc hcompute houts hstack0 hnd hnospill hdepths hlive,
+      hoptnoop] at hblock ⊢
+  simp only [List.append_nil] at hblock ⊢
+  rw [hcompute, hopc] at hblock ⊢
+  rw [← hstack0]
+  obtain ⟨s'', hrun, hstepV, hrelF, hpcF⟩ :=
+    staticcall_block_emit_rel_full (offsetToPc := offsetToPc) hopc heval houts hnospill hdepths hvals
+      hvalrev hargs haszlt hro1 hretbelow hfnEom hfreshS houtov hspill_out hspillReg hcall
+      hrel hblock
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrelF
+  exact ⟨s'', hrun, hstepV, hrelR, hpcF⟩
+
+/-- **DELEGATECALL correspondence core: both interpreters run the identical sub-EVM** — the
+    6-operand caller-context sibling (recipient = self, code = addr, apparent value = own callvalue) of `asmCall_stepExternalCall_same_evmCall_rel`. -/
+theorem asmDelegateCall_stepExternalCall_same_evmCall_rel {alloc : SpillAlloc}
+    {vs : VenomState} {s : AsmState} {inst : Instruction}
+    {out : String} {gas addr aOff aSz rOff rSz : bytes32} {stk : List bytes32}
+    {success : bytes32} {newAccs : Accounts} {ret : List byte}
+    (hopc : inst.opcode = Opcode.DELEGATECALL)
+    (heval : evalOperands inst.operands vs = some [gas, addr, aOff, aSz, rOff, rSz])
+    (hout : inst.outputs = [out])
+    (hstk : s.stack = gas :: addr :: aOff :: aSz :: rOff :: rSz :: stk)
+    (hacc : vs.accounts = s.accounts)
+    (hmem : memoryRel alloc vs.memory s.memory)
+    (hargs : aOff.toNat + aSz.toNat ≤ alloc.fnEom) (haszlt : aSz.toNat < USize.size)
+    (hcc : vs.callCtx = s.callCtx) (htx : vs.txCtx = s.txCtx)
+    (hcall : evmCall subEvmFuel s.accounts s.callCtx.caller s.txCtx.origin
+      s.callCtx.contract (AccountAddress.ofUInt256 addr) gas ⟨0⟩ s.callCtx.callvalue
+      (s.memory.readWithPadding aOff.toNat aSz.toNat).toList s.txCtx.gasprice 0 (!s.callCtx.static)
+      = (success, newAccs, ret)) :
+    stepExternalCall subEvmFuel inst vs
+        = some (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs)
+      ∧ asmDelegateCall s = asmCallWriteback rOff.toNat rSz.toNat success newAccs ret stk s := by
+  have hcd : vs.memory.readWithPadding aOff.toNat aSz.toNat
+      = s.memory.readWithPadding aOff.toNat aSz.toNat :=
+    memoryRel_readWithPadding_slice hmem hargs haszlt
+  have hcallV : evmCall subEvmFuel vs.accounts vs.callCtx.caller vs.txCtx.origin
+      vs.callCtx.contract (AccountAddress.ofUInt256 addr) gas ⟨0⟩ vs.callCtx.callvalue
+      (readMemory aOff.toNat aSz.toNat vs).toList vs.txCtx.gasprice 0 (!vs.callCtx.static)
+      = (success, newAccs, ret) := by
+    rw [hacc, hcc, htx, readMemory, hcd]; exact hcall
+  refine ⟨?_, ?_⟩
+  · unfold stepExternalCall; rw [heval]; simp only [bind, Option.bind, hopc, hout, hcallV]
+  · unfold asmDelegateCall; rw [hstk]; simp only [hcall]
+
+/-- **DELEGATECALL step, full `memoryRel` correspondence** — the 6-operand mirror of
+    `call_step_stateAgree_rel`: same shared `callWriteback`/`asmCallWriteback` agree core, the
+    sub-EVM runs `addr`'s code in the caller's own context. -/
+theorem delegatecall_step_stateAgree_rel {alloc : SpillAlloc} {vs : VenomState} {as : AsmState}
+    {inst : Instruction} {out : String} {gas addr aOff aSz rOff rSz : bytes32}
+    {stk : List bytes32} {success : bytes32} {newAccs : Accounts} {ret : List byte}
+    (hopc : inst.opcode = Opcode.DELEGATECALL)
+    (heval : evalOperands inst.operands vs = some [gas, addr, aOff, aSz, rOff, rSz])
+    (hout : inst.outputs = [out])
+    (hstk : as.stack = gas :: addr :: aOff :: aSz :: rOff :: rSz :: stk)
+    (hacc : vs.accounts = as.accounts)
+    (hmem : memoryRel alloc vs.memory as.memory)
+    (hargs : aOff.toNat + aSz.toNat ≤ alloc.fnEom) (haszlt : aSz.toNat < USize.size)
+    (hro1 : rOff.toNat ≤ vs.memory.size) (hro2 : rOff.toNat ≤ as.memory.size)
+    (hretbelow : rOff.toNat + rSz.toNat ≤ alloc.fnEom)
+    (hcc : vs.callCtx = as.callCtx) (htx : vs.txCtx = as.txCtx)
+    (htr : vs.transient = as.transient)
+    (hlg : vs.logs = as.logs) (hbc : vs.blockCtx = as.blockCtx)
+    (hcode : vs.code = as.code) (hph : vs.prevHashes = as.prevHashes)
+    (hcall : evmCall subEvmFuel as.accounts as.callCtx.caller as.txCtx.origin
+      as.callCtx.contract (AccountAddress.ofUInt256 addr) gas ⟨0⟩ as.callCtx.callvalue
+      (as.memory.readWithPadding aOff.toNat aSz.toNat).toList as.txCtx.gasprice 0 (!as.callCtx.static)
+      = (success, newAccs, ret)) :
+    ∃ s'',
+      stepExternalCall subEvmFuel inst vs
+        = some (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs)
+      ∧ asmDelegateCall as = AsmResult.AsmOK s''
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).accounts = s''.accounts
+      ∧ memoryRel alloc (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).memory s''.memory
+      ∧ (∀ i, alloc.fnEom ≤ i → readByte i s''.memory = readByte i as.memory)
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).returndata = s''.returndata
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).transient = s''.transient
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).logs = s''.logs
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).callCtx = s''.callCtx
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).txCtx = s''.txCtx
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).blockCtx = s''.blockCtx
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).code = s''.code
+      ∧ (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs).prevHashes = s''.prevHashes
+      ∧ lookupVar out (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs) = some success
+      ∧ s''.stack = success :: stk := by
+  obtain ⟨hstep, hasmeq⟩ :=
+    asmDelegateCall_stepExternalCall_same_evmCall_rel hopc heval hout hstk hacc hmem hargs haszlt
+      hcc htx hcall
+  obtain ⟨s'', hs''eq, hacc', hmem', hframe', hrd', hout', hstk'⟩ :=
+    callWriteback_asmCallWriteback_agree_rel alloc out rOff.toNat rSz.toNat success newAccs ret
+      stk vs as hmem hro1 hro2 hretbelow
+  have hconcrete := hs''eq
+  simp only [asmCallWriteback] at hconcrete
+  injection hconcrete with hc
+  refine ⟨s'', hstep, by rw [hasmeq]; exact hs''eq, hacc', hmem', hframe', hrd',
+    ?_, ?_, ?_, ?_, ?_, ?_, ?_, hout', hstk'⟩
+  · show (callWriteback _ _ _ _ _ _ _).transient = s''.transient
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact htr
+  · show (callWriteback _ _ _ _ _ _ _).logs = s''.logs
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact hlg
+  · show (callWriteback _ _ _ _ _ _ _).callCtx = s''.callCtx
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact hcc
+  · show (callWriteback _ _ _ _ _ _ _).txCtx = s''.txCtx
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact htx
+  · show (callWriteback _ _ _ _ _ _ _).blockCtx = s''.blockCtx
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact hbc
+  · show (callWriteback _ _ _ _ _ _ _).code = s''.code
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact hcode
+  · show (callWriteback _ _ _ _ _ _ _).prevHashes = s''.prevHashes
+    rw [← hc]; simp only [callWriteback, updateVar, writeMemoryWithExpansion, asmNext]; exact hph
+
+/-- **Full-relation DELEGATECALL block core** — the 6-operand mirror of `call_block_emit_rel_full`:
+    emit the operands and run DELEGATECALL, concluding the COMPLETE `venomAsmRel` at net +1 and the
+    writeback state. -/
+theorem delegatecall_block_emit_rel_full {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    {prog : List AsmInst} {offsetToPc : AssocList Nat Nat} {inst : Instruction}
+    {out : String} {ovars : List String} {dists : List Nat} {nl : List String}
+    {gas addr aOff aSz rOff rSz : bytes32} {vals : List bytes32}
+    {success : bytes32} {newAccs : Accounts} {ret : List byte} {ps : PlanState}
+    (hopc : inst.opcode = Opcode.DELEGATECALL)
+    (heval : evalOperands inst.operands vs = some [gas, addr, aOff, aSz, rOff, rSz])
+    (hout : inst.outputs = [out])
+    (hnospill : ∀ v ∈ ovars, alookup' ps.spilled (Operand.Var v) = none)
+    (hdepths : emitDepthsOk nl ovars dists ps.stack)
+    (hvals : List.map (operandVal vs lo) (ovars.map Operand.Var) = List.map some vals)
+    (hvalrev : vals.reverse = [gas, addr, aOff, aSz, rOff, rSz])
+    (hargs : aOff.toNat + aSz.toNat ≤ ps.alloc.fnEom) (haszlt : aSz.toNat < USize.size)
+    (hro1 : rOff.toNat ≤ vs.memory.size)
+    (hretbelow : rOff.toNat + rSz.toNat ≤ ps.alloc.fnEom)
+    (hfnEom : ps.alloc.fnEom ≤ as.memory.size)
+    (hfreshS : ¬ Operand.Var out ∈ ps.stack) (houtov : out ∉ ovars)
+    (hspill_out : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none)
+    (hspillReg : ∀ op off, AssocList.lookup Operand Nat ps.spilled op = some off →
+        ps.alloc.fnEom ≤ off)
+    (hcall : evmCall subEvmFuel vs.accounts vs.callCtx.caller vs.txCtx.origin
+      vs.callCtx.contract (AccountAddress.ofUInt256 addr) gas ⟨0⟩ vs.callCtx.callvalue
+      (vs.memory.readWithPadding aOff.toNat aSz.toNat).toList vs.txCtx.gasprice 0 (!vs.callCtx.static)
+      = (success, newAccs, ret))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan ((emitInputPlan Opcode.DELEGATECALL (ovars.map Operand.Var) nl ps).1 ++ [StackOp.SOEmit "DELEGATECALL"]))) :
+    ∃ s'', runAsm (executePlan ((emitInputPlan Opcode.DELEGATECALL (ovars.map Operand.Var) nl ps).1
+             ++ [StackOp.SOEmit "DELEGATECALL"])).length offsetToPc prog as = AsmResult.AsmOK s''
+      ∧ stepExternalCall subEvmFuel inst vs
+          = some (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs)
+      ∧ venomAsmRel lo
+          { (emitInputPlan Opcode.DELEGATECALL (ovars.map Operand.Var) nl ps).2 with
+            stack := ps.stack ++ [Operand.Var out] }
+          (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs) s''
+      ∧ s''.pc = as.pc + (executePlan ((emitInputPlan Opcode.DELEGATECALL (ovars.map Operand.Var) nl ps).1
+          ++ [StackOp.SOEmit "DELEGATECALL"])).length := by
+  have hemiteq := emitInputPlan_allVars_eq Opcode.DELEGATECALL nl ovars dists ps hnospill hdepths
+  rw [executePlan_append] at hblock
+  obtain ⟨hbI, hbCall⟩ := asmBlockAt_append hblock
+  obtain ⟨as1, hrunE, hrelE, hpcE, hmemE⟩ :=
+    emitInputPlan_allVars_sim (offsetToPc := offsetToPc) Opcode.DELEGATECALL nl ovars dists ps hnospill hdepths hrel hbI
+  have hps'stack : (emitInputPlan Opcode.DELEGATECALL (ovars.map Operand.Var) nl ps).2.stack
+      = ps.stack ++ ovars.map Operand.Var := by rw [hemiteq]
+  have hps'spill : (emitInputPlan Opcode.DELEGATECALL (ovars.map Operand.Var) nl ps).2.spilled
+      = ps.spilled := by rw [hemiteq]
+  have hps'alloc : (emitInputPlan Opcode.DELEGATECALL (ovars.map Operand.Var) nl ps).2.alloc = ps.alloc := by
+    rw [hemiteq]
+  have htop := venomAsmRel_asmStack_topOps (base := ps.stack) (ops := ovars.map Operand.Var) (vals := vals)
+    hrelE hps'stack hvals
+  rw [hvalrev] at htop
+  have hlenops : (ovars.map Operand.Var).length = 6 := by
+    rw [List.length_map]
+    have h1 : ovars.length = vals.length := by
+      have := congrArg List.length hvals; simpa [List.length_map] using this
+    have h2 : vals.length = 6 := by
+      have := congrArg List.length hvalrev; simpa using this
+    omega
+  rw [hlenops] at htop
+  obtain ⟨hStk1, hSpill1, hmemrel1, hacc1, htr1, hrd1, hlg1, hcc1, htx1, hbc1, hcode1, hph1⟩ := hrelE
+  rw [hps'alloc] at hmemrel1
+  have hro2 : rOff.toNat ≤ as1.memory.size := by
+    rw [hmemE]
+    omega
+  have hcall1 : evmCall subEvmFuel as1.accounts as1.callCtx.caller as1.txCtx.origin
+      as1.callCtx.contract (AccountAddress.ofUInt256 addr) gas ⟨0⟩ as1.callCtx.callvalue
+      (as1.memory.readWithPadding aOff.toNat aSz.toNat).toList as1.txCtx.gasprice 0 (!as1.callCtx.static)
+      = (success, newAccs, ret) := by
+    rw [hacc1, hcc1, htx1,
+        ← memoryRel_readWithPadding_slice hmemrel1 hargs haszlt]
+    exact hcall
+  obtain ⟨hpcC, hgetC⟩ := asmBlockAt_one (by rw [← hpcE] at hbCall; exact hbCall)
+  obtain ⟨s'', hstepV, hasmOK, hacc', hmemrel', hframe', hrd', htr', hlg', hcc', htx', hbc',
+    hcode', hph', hout', hstk'⟩ :=
+    delegatecall_step_stateAgree_rel (alloc := ps.alloc) (as := as1) hopc heval hout htop
+      hacc1.symm hmemrel1 hargs haszlt hro1 hro2 hretbelow hcc1.symm htx1.symm htr1.symm
+      hlg1.symm hbc1.symm hcode1.symm hph1.symm hcall1
+  -- pc: the CALL writeback advances by one
+  have hpcadv : s''.pc = as1.pc + 1 := by
+    have hcalleq : asmDelegateCall as1 = AsmResult.AsmOK s'' := hasmOK
+    unfold asmDelegateCall at hcalleq
+    rw [htop] at hcalleq
+    simp only [asmCallWriteback] at hcalleq
+    injection hcalleq with hc
+    rw [← hc]; rfl
+  have hstepeq : asmStep offsetToPc prog as1 = AsmResult.AsmOK s'' := by
+    rw [asmStep_delegatecall_ok hpcC hgetC]; exact hasmOK
+  have hrunC : runAsm (executePlan [StackOp.SOEmit "DELEGATECALL"]).length offsetToPc prog as1
+      = AsmResult.AsmOK s'' := by
+    show runAsm 1 offsetToPc prog as1 = AsmResult.AsmOK s''
+    rw [runAsm_succ_ok hpcC hstepeq]; rfl
+  set cb := callWriteback out rOff.toNat rSz.toNat success newAccs ret vs with hcbdef
+  -- operand values are callWriteback-stable away from `out`
+  have hcongrStack : ∀ o ∈ (emitInputPlan Opcode.DELEGATECALL (ovars.map Operand.Var) nl ps).2.stack,
+      operandVal cb lo o = operandVal vs lo o := by
+    intro o ho
+    rw [hps'stack] at ho
+    refine callWriteback_operandVal_ne ?_
+    rcases List.mem_append.mp ho with h | h
+    · intro hc; rw [hc] at h; exact hfreshS h
+    · intro hc
+      obtain ⟨w, hw, hwe⟩ := List.mem_map.mp h
+      rw [hc] at hwe
+      injection hwe with hwe'
+      exact houtov (hwe' ▸ hw)
+  -- planStackRel: env-congr, pop 7, push out
+  have hStkCb : planStackRel lo cb
+      (emitInputPlan Opcode.DELEGATECALL (ovars.map Operand.Var) nl ps).2.stack as1.stack :=
+    planStackRel_env_congr hcongrStack hStk1
+  have hlen7 : 6 ≤ (emitInputPlan Opcode.DELEGATECALL (ovars.map Operand.Var) nl ps).2.stack.length := by
+    rw [hps'stack, List.length_append]
+    have := hlenops
+    rw [List.length_map] at this
+    omega
+  have houtval : operandVal cb lo (Operand.Var out) = some success := by
+    rw [operandVal_var_eq_lookupVar]; exact hout'
+  have hStkFinal := planStackRel_push (planStackRel_popN hStkCb hlen7) houtval
+  have hpop7 : stackPop 6 (emitInputPlan Opcode.DELEGATECALL (ovars.map Operand.Var) nl ps).2.stack
+      = ps.stack := by
+    rw [hps'stack, ← hlenops]
+    exact stackPop_append_top ps.stack (ovars.map Operand.Var)
+  rw [hpop7] at hStkFinal
+  have hdrop7 : as1.stack.drop 6 = as1.stack.drop 6 := rfl
+  -- planSpillRel: env-congr + per-slot byte frame
+  have hSpillFinal : planSpillRel lo cb
+      (emitInputPlan Opcode.DELEGATECALL (ovars.map Operand.Var) nl ps).2.spilled s''.memory := by
+    rw [hps'spill]
+    rw [hps'spill] at hSpill1
+    refine planSpillRel_frame_congr hSpill1 ?_ ?_
+    · intro op off hlook
+      refine callWriteback_operandVal_ne ?_
+      intro hc
+      rw [hc, hspill_out] at hlook
+      simp at hlook
+    · intro op off hlook
+      have hge : ps.alloc.fnEom ≤ off := hspillReg op off hlook
+      have h32 : (32 : Nat) < USize.size :=
+        Nat.lt_of_lt_of_le (by norm_num) USize.le_size
+      apply ByteArray.readWithPadding_congr _ _ off 32 h32
+      intro k hk
+      have := hframe' (off + k) (by omega)
+      rw [readByte_eq_getElem?_getD, readByte_eq_getElem?_getD] at this
+      exact this
+  refine ⟨s'', ?_, hstepV, ?_, ?_⟩
+  · rw [executePlan_append, List.length_append]
+    exact runAsm_compose hrunE hrunC
+  · refine ⟨?_, hSpillFinal, ?_, hacc'.symm, htr'.symm, hrd'.symm, hlg'.symm, hcc'.symm,
+      htx'.symm, hbc'.symm, hcode'.symm, hph'.symm⟩
+    · show planStackRel lo cb (ps.stack ++ [Operand.Var out]) s''.stack
+      rw [hstk']
+      show planStackRel lo cb (ps.stack ++ [Operand.Var out]) (success :: as1.stack.drop 6)
+      have hpush : stackPush (Operand.Var out) ps.stack = ps.stack ++ [Operand.Var out] := rfl
+      rw [← hpush]
+      exact hStkFinal
+    · show memoryRel (emitInputPlan Opcode.DELEGATECALL (ovars.map Operand.Var) nl ps).2.alloc
+        cb.memory s''.memory
+      rw [hps'alloc]
+      exact hmemrel'
+  · rw [executePlan_append, List.length_append, hpcadv, hpcE]
+    rfl
+
+/-- **DELEGATECALL plan reduction** (all-live 6 distinct var operands): the 6-operand mirror of
+    `genRegularInstPlan_call_eq`. -/
+theorem genRegularInstPlan_delegatecall_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {ovars : List String} {dists : List Nat} {out : String} {base : List Operand}
+    (hopc : inst.opcode = Opcode.DELEGATECALL)
+    (hcompute : computeOperands inst = ovars.map Operand.Var)
+    (houts : inst.outputs = [out])
+    (hstack0 : ps.stack = base)
+    (hnd : ovars.Nodup)
+    (hnospill : ∀ v ∈ ovars, alookup' ps.spilled (Operand.Var v) = none)
+    (hdepths : emitDepthsOk nextLiveness ovars dists ps.stack)
+    (hlive : nextLiveness.contains out = true) :
+    generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator
+        curBbLabel ps
+      = (((emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).1
+            ++ [StackOp.SOEmit "DELEGATECALL"]
+            ++ (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+                  { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+                    stack := base ++ [Operand.Var out] }).1),
+         releaseDeadSpills nextLiveness
+           (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+             { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+               stack := base ++ [Operand.Var out] }).2) := by
+  have hname : opcodeToEvmName inst.opcode = some "DELEGATECALL" := by rw [hopc]; rfl
+  have hncomm : isCommutative inst.opcode = false := by rw [hopc]; rfl
+  have hnjmp : ¬ (inst.opcode = Opcode.JMP) := by rw [hopc]; decide
+  have hpvar := emitInputPlan_allVars_eq inst.opcode nextLiveness ovars dists ps hnospill hdepths
+  unfold generateRegularInstPlan
+  simp only [hcompute, houts]
+  rcases hemit : emitInputPlan inst.opcode (ovars.map Operand.Var) nextLiveness ps
+    with ⟨inputOps, ps1⟩
+  have h2 : (emitInputPlan inst.opcode (ovars.map Operand.Var) nextLiveness ps).2 = ps1 := by
+    rw [hemit]
+  have hps1' : ps1.stack = base ++ ovars.map Operand.Var := by
+    rw [← h2, hpvar, hstack0]
+  have hreorder := reorderPlan_allVars_nil base ovars ps1 hps1' hnd
+  have hmem : out ∈ nextLiveness := by simpa using hlive
+  have hpop : stackPop ovars.length (base ++ ovars.map Operand.Var) = base := by
+    have h := stackPop_append_top base (ovars.map Operand.Var)
+    rwa [List.length_map] at h
+  simp [generateEmitOps_evmName hname, hreorder, hps1', hpop, stackPush, popmanyPlan_nil, hmem,
+        hncomm, hnjmp]
+
+/-- **The full generated-plan DELEGATECALL producer sim** — running the ENTIRE
+    `generateRegularInstPlan` output for a DELEGATECALL (6 live operands, positioned) preserves the
+    complete `venomAsmRel` against the Venom `stepExternalCall` writeback. Runs `addr`'s code in the
+    caller's own context; mirrored off the STATICCALL chain. -/
+theorem genRegularInstPlan_delegatecall_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {offsetToPc : AssocList Nat Nat} {ovars : List String} {dists : List Nat} {out : String}
+    {base : List Operand} {gas addr aOff aSz rOff rSz : bytes32} {vals : List bytes32}
+    {success : bytes32} {newAccs : Accounts} {ret : List byte}
+    (hopc : inst.opcode = Opcode.DELEGATECALL)
+    (hcompute : computeOperands inst = ovars.map Operand.Var)
+    (houts : inst.outputs = [out])
+    (hstack0 : ps.stack = base)
+    (hnd : ovars.Nodup)
+    (hnospill : ∀ v ∈ ovars, alookup' ps.spilled (Operand.Var v) = none)
+    (hdepths : emitDepthsOk nextLiveness ovars dists ps.stack)
+    (hlive : nextLiveness.contains out = true)
+    (heval : evalOperands inst.operands vs = some [gas, addr, aOff, aSz, rOff, rSz])
+    (hvals : List.map (operandVal vs lo) (ovars.map Operand.Var) = List.map some vals)
+    (hvalrev : vals.reverse = [gas, addr, aOff, aSz, rOff, rSz])
+    (hargs : aOff.toNat + aSz.toNat ≤ ps.alloc.fnEom) (haszlt : aSz.toNat < USize.size)
+    (hro1 : rOff.toNat ≤ vs.memory.size)
+    (hretbelow : rOff.toNat + rSz.toNat ≤ ps.alloc.fnEom)
+    (hfnEom : ps.alloc.fnEom ≤ as.memory.size)
+    (hfreshS : ¬ Operand.Var out ∈ ps.stack) (houtov : out ∉ ovars)
+    (hspill_out : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none)
+    (hspillReg : ∀ op off, AssocList.lookup Operand Nat ps.spilled op = some off →
+        ps.alloc.fnEom ≤ off)
+    (hcall : evmCall subEvmFuel vs.accounts vs.callCtx.caller vs.txCtx.origin
+      vs.callCtx.contract (AccountAddress.ofUInt256 addr) gas ⟨0⟩ vs.callCtx.callvalue
+      (vs.memory.readWithPadding aOff.toNat aSz.toNat).toList vs.txCtx.gasprice 0 (!vs.callCtx.static)
+      = (success, newAccs, ret))
+    (hoptnoop : optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+        { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+          stack := base ++ [Operand.Var out] }
+      = ([], { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+              stack := base ++ [Operand.Var out] }))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+           stepExternalCall subEvmFuel inst vs
+             = some (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs) ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2
+             (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  rw [genRegularInstPlan_delegatecall_eq hopc hcompute houts hstack0 hnd hnospill hdepths hlive,
+      hoptnoop] at hblock ⊢
+  simp only [List.append_nil] at hblock ⊢
+  rw [hcompute, hopc] at hblock ⊢
+  rw [← hstack0]
+  obtain ⟨s'', hrun, hstepV, hrelF, hpcF⟩ :=
+    delegatecall_block_emit_rel_full (offsetToPc := offsetToPc) hopc heval houts hnospill hdepths hvals
+      hvalrev hargs haszlt hro1 hretbelow hfnEom hfreshS houtov hspill_out hspillReg hcall
+      hrel hblock
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrelF
+  exact ⟨s'', hrun, hstepV, hrelR, hpcF⟩
+
+/-- **CREATE correspondence core: both interpreters run the identical sub-EVM creation.** The
+    init code is read below the spill region, so the `memoryRel` slice agreement makes both
+    sides run the same `evmCreate`; the writebacks are variable-bind + accounts only (no memory
+    write, no returndata). -/
+theorem asmCreate_stepExternalCall_same_evmCreate_rel {alloc : SpillAlloc}
+    {vs : VenomState} {s : AsmState} {inst : Instruction}
+    {out : String} {value off size : bytes32} {stk : List bytes32}
+    {addrOrZero : bytes32} {newAccs : Accounts} {ret : List byte}
+    (hopc : inst.opcode = Opcode.CREATE)
+    (heval : evalOperands inst.operands vs = some [value, off, size])
+    (hout : inst.outputs = [out])
+    (hstk : s.stack = value :: off :: size :: stk)
+    (hacc : vs.accounts = s.accounts)
+    (hmem : memoryRel alloc vs.memory s.memory)
+    (hargs : off.toNat + size.toNat ≤ alloc.fnEom) (hszlt : size.toNat < USize.size)
+    (hcc : vs.callCtx = s.callCtx) (htx : vs.txCtx = s.txCtx)
+    (hcreate : evmCreate subEvmFuel s.accounts s.callCtx.contract s.txCtx.origin
+      value (s.memory.readWithPadding off.toNat size.toNat).toList s.txCtx.gasprice 0 none
+      = (addrOrZero, newAccs, ret)) :
+    stepExternalCall subEvmFuel inst vs
+        = some (updateVar out addrOrZero { vs with accounts := newAccs })
+      ∧ asmCreate s
+        = AsmResult.AsmOK { asmNext s with stack := addrOrZero :: stk, accounts := newAccs } := by
+  have hcd : vs.memory.readWithPadding off.toNat size.toNat
+      = s.memory.readWithPadding off.toNat size.toNat :=
+    memoryRel_readWithPadding_slice hmem hargs hszlt
+  have hcreateV : evmCreate subEvmFuel vs.accounts vs.callCtx.contract vs.txCtx.origin
+      value (readMemory off.toNat size.toNat vs).toList vs.txCtx.gasprice 0 none
+      = (addrOrZero, newAccs, ret) := by
+    rw [hacc, hcc, htx, readMemory, hcd]; exact hcreate
+  refine ⟨?_, ?_⟩
+  · unfold stepExternalCall; rw [heval]; simp only [bind, Option.bind, hopc, hout, hcreateV]
+  · unfold asmCreate; rw [hstk]; simp only [hcreate]
+
+/-- **CREATE step, full `memoryRel` correspondence.** Both writebacks leave memory untouched, so
+    the relation and every asm byte carry over trivially; accounts update to the creation result
+    and the new address (or zero) binds to `out` / pushes onto the stack. -/
+theorem create_step_stateAgree_rel {alloc : SpillAlloc} {vs : VenomState} {as : AsmState}
+    {inst : Instruction} {out : String} {value off size : bytes32}
+    {stk : List bytes32} {addrOrZero : bytes32} {newAccs : Accounts} {ret : List byte}
+    (hopc : inst.opcode = Opcode.CREATE)
+    (heval : evalOperands inst.operands vs = some [value, off, size])
+    (hout : inst.outputs = [out])
+    (hstk : as.stack = value :: off :: size :: stk)
+    (hacc : vs.accounts = as.accounts)
+    (hmem : memoryRel alloc vs.memory as.memory)
+    (hargs : off.toNat + size.toNat ≤ alloc.fnEom) (hszlt : size.toNat < USize.size)
+    (hcc : vs.callCtx = as.callCtx) (htx : vs.txCtx = as.txCtx)
+    (htr : vs.transient = as.transient)
+    (hrd : vs.returndata = as.returndata)
+    (hlg : vs.logs = as.logs) (hbc : vs.blockCtx = as.blockCtx)
+    (hcode : vs.code = as.code) (hph : vs.prevHashes = as.prevHashes)
+    (hcreate : evmCreate subEvmFuel as.accounts as.callCtx.contract as.txCtx.origin
+      value (as.memory.readWithPadding off.toNat size.toNat).toList as.txCtx.gasprice 0 none
+      = (addrOrZero, newAccs, ret)) :
+    ∃ s'',
+      stepExternalCall subEvmFuel inst vs
+        = some (updateVar out addrOrZero { vs with accounts := newAccs })
+      ∧ asmCreate as = AsmResult.AsmOK s''
+      ∧ (updateVar out addrOrZero { vs with accounts := newAccs }).accounts = s''.accounts
+      ∧ memoryRel alloc (updateVar out addrOrZero { vs with accounts := newAccs }).memory s''.memory
+      ∧ (∀ i, alloc.fnEom ≤ i → readByte i s''.memory = readByte i as.memory)
+      ∧ (updateVar out addrOrZero { vs with accounts := newAccs }).returndata = s''.returndata
+      ∧ (updateVar out addrOrZero { vs with accounts := newAccs }).transient = s''.transient
+      ∧ (updateVar out addrOrZero { vs with accounts := newAccs }).logs = s''.logs
+      ∧ (updateVar out addrOrZero { vs with accounts := newAccs }).callCtx = s''.callCtx
+      ∧ (updateVar out addrOrZero { vs with accounts := newAccs }).txCtx = s''.txCtx
+      ∧ (updateVar out addrOrZero { vs with accounts := newAccs }).blockCtx = s''.blockCtx
+      ∧ (updateVar out addrOrZero { vs with accounts := newAccs }).code = s''.code
+      ∧ (updateVar out addrOrZero { vs with accounts := newAccs }).prevHashes = s''.prevHashes
+      ∧ lookupVar out (updateVar out addrOrZero { vs with accounts := newAccs }) = some addrOrZero
+      ∧ s''.stack = addrOrZero :: stk
+      ∧ s''.pc = as.pc + 1 := by
+  obtain ⟨hstep, hasmeq⟩ :=
+    asmCreate_stepExternalCall_same_evmCreate_rel hopc heval hout hstk hacc hmem hargs hszlt
+      hcc htx hcreate
+  refine ⟨{ asmNext as with stack := addrOrZero :: stk, accounts := newAccs },
+    hstep, hasmeq, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_,
+    lookupVar_updateVar_self _ _ _, rfl, rfl⟩
+  · show (updateVar out addrOrZero { vs with accounts := newAccs }).accounts = newAccs
+    simp only [updateVar]
+  · show memoryRel alloc (updateVar out addrOrZero { vs with accounts := newAccs }).memory as.memory
+    simp only [updateVar]
+    exact hmem
+  · intro i _
+    rfl
+  · show (updateVar out addrOrZero { vs with accounts := newAccs }).returndata = as.returndata
+    simp only [updateVar]
+    exact hrd
+  · show (updateVar out addrOrZero { vs with accounts := newAccs }).transient = as.transient
+    simp only [updateVar]
+    exact htr
+  · show (updateVar out addrOrZero { vs with accounts := newAccs }).logs = as.logs
+    simp only [updateVar]
+    exact hlg
+  · show (updateVar out addrOrZero { vs with accounts := newAccs }).callCtx = as.callCtx
+    simp only [updateVar]
+    exact hcc
+  · show (updateVar out addrOrZero { vs with accounts := newAccs }).txCtx = as.txCtx
+    simp only [updateVar]
+    exact htx
+  · show (updateVar out addrOrZero { vs with accounts := newAccs }).blockCtx = as.blockCtx
+    simp only [updateVar]
+    exact hbc
+  · show (updateVar out addrOrZero { vs with accounts := newAccs }).code = as.code
+    simp only [updateVar]
+    exact hcode
+  · show (updateVar out addrOrZero { vs with accounts := newAccs }).prevHashes = as.prevHashes
+    simp only [updateVar]
+    exact hph
+
+set_option maxHeartbeats 800000 in
+/-- **Full-relation CREATE block core**: emit the 3 operands and run CREATE — concluding the
+    COMPLETE `venomAsmRel` at net +1 (the created address binds to `out`) and the writeback
+    state. Memories are untouched, so the memory/spill conjuncts carry over directly. -/
+theorem create_block_emit_rel_full {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    {prog : List AsmInst} {offsetToPc : AssocList Nat Nat} {inst : Instruction}
+    {out : String} {ovars : List String} {dists : List Nat} {nl : List String}
+    {value off size : bytes32} {vals : List bytes32}
+    {addrOrZero : bytes32} {newAccs : Accounts} {ret : List byte} {ps : PlanState}
+    (hopc : inst.opcode = Opcode.CREATE)
+    (heval : evalOperands inst.operands vs = some [value, off, size])
+    (hout : inst.outputs = [out])
+    (hnospill : ∀ v ∈ ovars, alookup' ps.spilled (Operand.Var v) = none)
+    (hdepths : emitDepthsOk nl ovars dists ps.stack)
+    (hvals : List.map (operandVal vs lo) (ovars.map Operand.Var) = List.map some vals)
+    (hvalrev : vals.reverse = [value, off, size])
+    (hargs : off.toNat + size.toNat ≤ ps.alloc.fnEom) (hszlt : size.toNat < USize.size)
+    (hfreshS : ¬ Operand.Var out ∈ ps.stack) (houtov : out ∉ ovars)
+    (hspill_out : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none)
+    (hspillReg : ∀ op off', AssocList.lookup Operand Nat ps.spilled op = some off' →
+        ps.alloc.fnEom ≤ off')
+    (hcreate : evmCreate subEvmFuel vs.accounts vs.callCtx.contract vs.txCtx.origin
+      value (vs.memory.readWithPadding off.toNat size.toNat).toList vs.txCtx.gasprice 0 none
+      = (addrOrZero, newAccs, ret))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan ((emitInputPlan Opcode.CREATE (ovars.map Operand.Var) nl ps).1 ++ [StackOp.SOEmit "CREATE"]))) :
+    ∃ s'', runAsm (executePlan ((emitInputPlan Opcode.CREATE (ovars.map Operand.Var) nl ps).1
+             ++ [StackOp.SOEmit "CREATE"])).length offsetToPc prog as = AsmResult.AsmOK s''
+      ∧ stepExternalCall subEvmFuel inst vs
+          = some (updateVar out addrOrZero { vs with accounts := newAccs })
+      ∧ venomAsmRel lo
+          { (emitInputPlan Opcode.CREATE (ovars.map Operand.Var) nl ps).2 with
+            stack := ps.stack ++ [Operand.Var out] }
+          (updateVar out addrOrZero { vs with accounts := newAccs }) s''
+      ∧ s''.pc = as.pc + (executePlan ((emitInputPlan Opcode.CREATE (ovars.map Operand.Var) nl ps).1
+          ++ [StackOp.SOEmit "CREATE"])).length := by
+  have hemiteq := emitInputPlan_allVars_eq Opcode.CREATE nl ovars dists ps hnospill hdepths
+  rw [executePlan_append] at hblock
+  obtain ⟨hbI, hbCall⟩ := asmBlockAt_append hblock
+  obtain ⟨as1, hrunE, hrelE, hpcE, hmemE⟩ :=
+    emitInputPlan_allVars_sim (offsetToPc := offsetToPc) Opcode.CREATE nl ovars dists ps hnospill hdepths hrel hbI
+  have hps'stack : (emitInputPlan Opcode.CREATE (ovars.map Operand.Var) nl ps).2.stack
+      = ps.stack ++ ovars.map Operand.Var := by rw [hemiteq]
+  have hps'spill : (emitInputPlan Opcode.CREATE (ovars.map Operand.Var) nl ps).2.spilled
+      = ps.spilled := by rw [hemiteq]
+  have hps'alloc : (emitInputPlan Opcode.CREATE (ovars.map Operand.Var) nl ps).2.alloc = ps.alloc := by
+    rw [hemiteq]
+  have htop := venomAsmRel_asmStack_topOps (base := ps.stack) (ops := ovars.map Operand.Var) (vals := vals)
+    hrelE hps'stack hvals
+  rw [hvalrev] at htop
+  have hlenops : (ovars.map Operand.Var).length = 3 := by
+    rw [List.length_map]
+    have h1 : ovars.length = vals.length := by
+      have := congrArg List.length hvals; simpa [List.length_map] using this
+    have h2 : vals.length = 3 := by
+      have := congrArg List.length hvalrev; simpa using this
+    omega
+  rw [hlenops] at htop
+  obtain ⟨hStk1, hSpill1, hmemrel1, hacc1, htr1, hrd1, hlg1, hcc1, htx1, hbc1, hcode1, hph1⟩ := hrelE
+  rw [hps'alloc] at hmemrel1
+  have hcreate1 : evmCreate subEvmFuel as1.accounts as1.callCtx.contract as1.txCtx.origin
+      value (as1.memory.readWithPadding off.toNat size.toNat).toList as1.txCtx.gasprice 0 none
+      = (addrOrZero, newAccs, ret) := by
+    rw [hacc1, hcc1, htx1,
+        ← memoryRel_readWithPadding_slice hmemrel1 hargs hszlt]
+    exact hcreate
+  obtain ⟨hpcC, hgetC⟩ := asmBlockAt_one (by rw [← hpcE] at hbCall; exact hbCall)
+  obtain ⟨s'', hstepV, hasmOK, hacc', hmemrel', hframe', hrd', htr', hlg', hcc', htx', hbc',
+    hcode', hph', hout', hstk', hpcadv0⟩ :=
+    create_step_stateAgree_rel (alloc := ps.alloc) (as := as1) hopc heval hout htop
+      hacc1.symm hmemrel1 hargs hszlt hcc1.symm htx1.symm htr1.symm hrd1.symm
+      hlg1.symm hbc1.symm hcode1.symm hph1.symm hcreate1
+  have hstepeq : asmStep offsetToPc prog as1 = AsmResult.AsmOK s'' := by
+    rw [asmStep_create_ok hpcC hgetC]; exact hasmOK
+  have hrunC : runAsm (executePlan [StackOp.SOEmit "CREATE"]).length offsetToPc prog as1
+      = AsmResult.AsmOK s'' := by
+    show runAsm 1 offsetToPc prog as1 = AsmResult.AsmOK s''
+    rw [runAsm_succ_ok hpcC hstepeq]; rfl
+  set cb := updateVar out addrOrZero { vs with accounts := newAccs } with hcbdef
+  have hstable : ∀ (o : Operand), o ≠ Operand.Var out → operandVal cb lo o = operandVal vs lo o := by
+    intro o ho
+    rw [hcbdef, operandVal_updateVar_ne _ _ _ _ _ ho]
+    cases o with
+    | Var w => rfl
+    | Lit w => rfl
+    | Label l => rfl
+  have hcongrStack : ∀ o ∈ (emitInputPlan Opcode.CREATE (ovars.map Operand.Var) nl ps).2.stack,
+      operandVal cb lo o = operandVal vs lo o := by
+    intro o ho
+    rw [hps'stack] at ho
+    refine hstable o ?_
+    rcases List.mem_append.mp ho with h | h
+    · intro hc; rw [hc] at h; exact hfreshS h
+    · intro hc
+      obtain ⟨w, hw, hwe⟩ := List.mem_map.mp h
+      rw [hc] at hwe
+      injection hwe with hwe'
+      exact houtov (hwe' ▸ hw)
+  have hStkCb : planStackRel lo cb
+      (emitInputPlan Opcode.CREATE (ovars.map Operand.Var) nl ps).2.stack as1.stack :=
+    planStackRel_env_congr hcongrStack hStk1
+  have hlen3 : 3 ≤ (emitInputPlan Opcode.CREATE (ovars.map Operand.Var) nl ps).2.stack.length := by
+    rw [hps'stack, List.length_append]
+    have := hlenops
+    rw [List.length_map] at this
+    omega
+  have houtval : operandVal cb lo (Operand.Var out) = some addrOrZero := by
+    rw [operandVal_var_eq_lookupVar]; exact hout'
+  have hStkFinal := planStackRel_push (planStackRel_popN hStkCb hlen3) houtval
+  have hpop3 : stackPop 3 (emitInputPlan Opcode.CREATE (ovars.map Operand.Var) nl ps).2.stack
+      = ps.stack := by
+    rw [hps'stack, ← hlenops]
+    exact stackPop_append_top ps.stack (ovars.map Operand.Var)
+  rw [hpop3] at hStkFinal
+  have hSpillFinal : planSpillRel lo cb
+      (emitInputPlan Opcode.CREATE (ovars.map Operand.Var) nl ps).2.spilled s''.memory := by
+    rw [hps'spill]
+    rw [hps'spill] at hSpill1
+    refine planSpillRel_frame_congr hSpill1 ?_ ?_
+    · intro op off' hlook
+      refine hstable op ?_
+      intro hc
+      rw [hc, hspill_out] at hlook
+      simp at hlook
+    · intro op off' hlook
+      have hge : ps.alloc.fnEom ≤ off' := hspillReg op off' hlook
+      have h32 : (32 : Nat) < USize.size :=
+        Nat.lt_of_lt_of_le (by norm_num) USize.le_size
+      apply ByteArray.readWithPadding_congr _ _ off' 32 h32
+      intro k hk
+      have := hframe' (off' + k) (by omega)
+      rw [readByte_eq_getElem?_getD, readByte_eq_getElem?_getD] at this
+      exact this
+  refine ⟨s'', ?_, hstepV, ?_, ?_⟩
+  · rw [executePlan_append, List.length_append]
+    exact runAsm_compose hrunE hrunC
+  · refine ⟨?_, hSpillFinal, ?_, hacc'.symm, htr'.symm, hrd'.symm, hlg'.symm, hcc'.symm,
+      htx'.symm, hbc'.symm, hcode'.symm, hph'.symm⟩
+    · show planStackRel lo cb (ps.stack ++ [Operand.Var out]) s''.stack
+      rw [hstk']
+      show planStackRel lo cb (ps.stack ++ [Operand.Var out]) (addrOrZero :: as1.stack.drop 3)
+      have hpush : stackPush (Operand.Var out) ps.stack = ps.stack ++ [Operand.Var out] := rfl
+      rw [← hpush]
+      exact hStkFinal
+    · show memoryRel (emitInputPlan Opcode.CREATE (ovars.map Operand.Var) nl ps).2.alloc
+        cb.memory s''.memory
+      rw [hps'alloc]
+      exact hmemrel'
+  · rw [executePlan_append, List.length_append, hpcadv0, hpcE]
+    rfl
+
+/-- **CREATE plan reduction** (all-live 3 distinct var operands): emit the operands (already
+    positioned — `reorderPlan_allVars_nil`), `CREATE` pops them and pushes the new address bound
+    to `out` — net `+1`. -/
+theorem genRegularInstPlan_create_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {ovars : List String} {dists : List Nat} {out : String} {base : List Operand}
+    (hopc : inst.opcode = Opcode.CREATE)
+    (hcompute : computeOperands inst = ovars.map Operand.Var)
+    (houts : inst.outputs = [out])
+    (hstack0 : ps.stack = base)
+    (hnd : ovars.Nodup)
+    (hnospill : ∀ v ∈ ovars, alookup' ps.spilled (Operand.Var v) = none)
+    (hdepths : emitDepthsOk nextLiveness ovars dists ps.stack)
+    (hlive : nextLiveness.contains out = true) :
+    generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator
+        curBbLabel ps
+      = (((emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).1
+            ++ [StackOp.SOEmit "CREATE"]
+            ++ (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+                  { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+                    stack := base ++ [Operand.Var out] }).1),
+         releaseDeadSpills nextLiveness
+           (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+             { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+               stack := base ++ [Operand.Var out] }).2) := by
+  have hname : opcodeToEvmName inst.opcode = some "CREATE" := by rw [hopc]; rfl
+  have hncomm : isCommutative inst.opcode = false := by rw [hopc]; rfl
+  have hnjmp : ¬ (inst.opcode = Opcode.JMP) := by rw [hopc]; decide
+  have hpvar := emitInputPlan_allVars_eq inst.opcode nextLiveness ovars dists ps hnospill hdepths
+  unfold generateRegularInstPlan
+  simp only [hcompute, houts]
+  rcases hemit : emitInputPlan inst.opcode (ovars.map Operand.Var) nextLiveness ps
+    with ⟨inputOps, ps1⟩
+  have h2 : (emitInputPlan inst.opcode (ovars.map Operand.Var) nextLiveness ps).2 = ps1 := by
+    rw [hemit]
+  have hps1' : ps1.stack = base ++ ovars.map Operand.Var := by
+    rw [← h2, hpvar, hstack0]
+  have hreorder := reorderPlan_allVars_nil base ovars ps1 hps1' hnd
+  have hmem : out ∈ nextLiveness := by simpa using hlive
+  have hpop : stackPop ovars.length (base ++ ovars.map Operand.Var) = base := by
+    have h := stackPop_append_top base (ovars.map Operand.Var)
+    rwa [List.length_map] at h
+  simp [generateEmitOps_evmName hname, hreorder, hps1', hpop, stackPush, popmanyPlan_nil, hmem,
+        hncomm, hnjmp]
+
+/-- **The full generated-plan CREATE producer sim** — running the ENTIRE
+    `generateRegularInstPlan` output for a CREATE (3 live operands, positioned; init code below
+    the spill region) preserves the complete `venomAsmRel` against the Venom `stepExternalCall`
+    writeback. The creation sibling of `genRegularInstPlan_call_sim`. -/
+theorem genRegularInstPlan_create_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {offsetToPc : AssocList Nat Nat} {ovars : List String} {dists : List Nat} {out : String}
+    {base : List Operand} {value off size : bytes32} {vals : List bytes32}
+    {addrOrZero : bytes32} {newAccs : Accounts} {ret : List byte}
+    (hopc : inst.opcode = Opcode.CREATE)
+    (hcompute : computeOperands inst = ovars.map Operand.Var)
+    (houts : inst.outputs = [out])
+    (hstack0 : ps.stack = base)
+    (hnd : ovars.Nodup)
+    (hnospill : ∀ v ∈ ovars, alookup' ps.spilled (Operand.Var v) = none)
+    (hdepths : emitDepthsOk nextLiveness ovars dists ps.stack)
+    (hlive : nextLiveness.contains out = true)
+    (heval : evalOperands inst.operands vs = some [value, off, size])
+    (hvals : List.map (operandVal vs lo) (ovars.map Operand.Var) = List.map some vals)
+    (hvalrev : vals.reverse = [value, off, size])
+    (hargs : off.toNat + size.toNat ≤ ps.alloc.fnEom) (hszlt : size.toNat < USize.size)
+    (hfreshS : ¬ Operand.Var out ∈ ps.stack) (houtov : out ∉ ovars)
+    (hspill_out : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none)
+    (hspillReg : ∀ op off', AssocList.lookup Operand Nat ps.spilled op = some off' →
+        ps.alloc.fnEom ≤ off')
+    (hcreate : evmCreate subEvmFuel vs.accounts vs.callCtx.contract vs.txCtx.origin
+      value (vs.memory.readWithPadding off.toNat size.toNat).toList vs.txCtx.gasprice 0 none
+      = (addrOrZero, newAccs, ret))
+    (hoptnoop : optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+        { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+          stack := base ++ [Operand.Var out] }
+      = ([], { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+              stack := base ++ [Operand.Var out] }))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+           stepExternalCall subEvmFuel inst vs
+             = some (updateVar out addrOrZero { vs with accounts := newAccs }) ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2
+             (updateVar out addrOrZero { vs with accounts := newAccs }) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  rw [genRegularInstPlan_create_eq hopc hcompute houts hstack0 hnd hnospill hdepths hlive,
+      hoptnoop] at hblock ⊢
+  simp only [List.append_nil] at hblock ⊢
+  rw [hcompute, hopc] at hblock ⊢
+  rw [← hstack0]
+  obtain ⟨s'', hrun, hstepV, hrelF, hpcF⟩ :=
+    create_block_emit_rel_full (offsetToPc := offsetToPc) hopc heval houts hnospill hdepths hvals
+      hvalrev hargs hszlt hfreshS houtov hspill_out hspillReg hcreate hrel hblock
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrelF
+  exact ⟨s'', hrun, hstepV, hrelR, hpcF⟩
+
+/-- **CREATE2 correspondence core: both interpreters run the identical sub-EVM creation.** The
+    init code is read below the spill region, so the `memoryRel` slice agreement makes both
+    sides run the same `evmCreate`; the writebacks are variable-bind + accounts only (no memory
+    write, no returndata). -/
+theorem asmCreate2_stepExternalCall_same_evmCreate_rel {alloc : SpillAlloc}
+    {vs : VenomState} {s : AsmState} {inst : Instruction}
+    {out : String} {value off size salt : bytes32} {stk : List bytes32}
+    {addrOrZero : bytes32} {newAccs : Accounts} {ret : List byte}
+    (hopc : inst.opcode = Opcode.CREATE2)
+    (heval : evalOperands inst.operands vs = some [value, off, size, salt])
+    (hout : inst.outputs = [out])
+    (hstk : s.stack = value :: off :: size :: salt :: stk)
+    (hacc : vs.accounts = s.accounts)
+    (hmem : memoryRel alloc vs.memory s.memory)
+    (hargs : off.toNat + size.toNat ≤ alloc.fnEom) (hszlt : size.toNat < USize.size)
+    (hcc : vs.callCtx = s.callCtx) (htx : vs.txCtx = s.txCtx)
+    (hcreate : evmCreate subEvmFuel s.accounts s.callCtx.contract s.txCtx.origin
+      value (s.memory.readWithPadding off.toNat size.toNat).toList s.txCtx.gasprice 0 (some (wordToBytes salt).toList)
+      = (addrOrZero, newAccs, ret)) :
+    stepExternalCall subEvmFuel inst vs
+        = some (updateVar out addrOrZero { vs with accounts := newAccs })
+      ∧ asmCreate2 s
+        = AsmResult.AsmOK { asmNext s with stack := addrOrZero :: stk, accounts := newAccs } := by
+  have hcd : vs.memory.readWithPadding off.toNat size.toNat
+      = s.memory.readWithPadding off.toNat size.toNat :=
+    memoryRel_readWithPadding_slice hmem hargs hszlt
+  have hcreateV : evmCreate subEvmFuel vs.accounts vs.callCtx.contract vs.txCtx.origin
+      value (readMemory off.toNat size.toNat vs).toList vs.txCtx.gasprice 0 (some (wordToBytes salt).toList)
+      = (addrOrZero, newAccs, ret) := by
+    rw [hacc, hcc, htx, readMemory, hcd]; exact hcreate
+  refine ⟨?_, ?_⟩
+  · unfold stepExternalCall; rw [heval]; simp only [bind, Option.bind, hopc, hout, hcreateV]
+  · unfold asmCreate2; rw [hstk]; simp only [hcreate]
+
+/-- **CREATE2 step, full `memoryRel` correspondence.** Both writebacks leave memory untouched, so
+    the relation and every asm byte carry over trivially; accounts update to the creation result
+    and the new address (or zero) binds to `out` / pushes onto the stack. -/
+theorem create2_step_stateAgree_rel {alloc : SpillAlloc} {vs : VenomState} {as : AsmState}
+    {inst : Instruction} {out : String} {value off size salt : bytes32}
+    {stk : List bytes32} {addrOrZero : bytes32} {newAccs : Accounts} {ret : List byte}
+    (hopc : inst.opcode = Opcode.CREATE2)
+    (heval : evalOperands inst.operands vs = some [value, off, size, salt])
+    (hout : inst.outputs = [out])
+    (hstk : as.stack = value :: off :: size :: salt :: stk)
+    (hacc : vs.accounts = as.accounts)
+    (hmem : memoryRel alloc vs.memory as.memory)
+    (hargs : off.toNat + size.toNat ≤ alloc.fnEom) (hszlt : size.toNat < USize.size)
+    (hcc : vs.callCtx = as.callCtx) (htx : vs.txCtx = as.txCtx)
+    (htr : vs.transient = as.transient)
+    (hrd : vs.returndata = as.returndata)
+    (hlg : vs.logs = as.logs) (hbc : vs.blockCtx = as.blockCtx)
+    (hcode : vs.code = as.code) (hph : vs.prevHashes = as.prevHashes)
+    (hcreate : evmCreate subEvmFuel as.accounts as.callCtx.contract as.txCtx.origin
+      value (as.memory.readWithPadding off.toNat size.toNat).toList as.txCtx.gasprice 0 (some (wordToBytes salt).toList)
+      = (addrOrZero, newAccs, ret)) :
+    ∃ s'',
+      stepExternalCall subEvmFuel inst vs
+        = some (updateVar out addrOrZero { vs with accounts := newAccs })
+      ∧ asmCreate2 as = AsmResult.AsmOK s''
+      ∧ (updateVar out addrOrZero { vs with accounts := newAccs }).accounts = s''.accounts
+      ∧ memoryRel alloc (updateVar out addrOrZero { vs with accounts := newAccs }).memory s''.memory
+      ∧ (∀ i, alloc.fnEom ≤ i → readByte i s''.memory = readByte i as.memory)
+      ∧ (updateVar out addrOrZero { vs with accounts := newAccs }).returndata = s''.returndata
+      ∧ (updateVar out addrOrZero { vs with accounts := newAccs }).transient = s''.transient
+      ∧ (updateVar out addrOrZero { vs with accounts := newAccs }).logs = s''.logs
+      ∧ (updateVar out addrOrZero { vs with accounts := newAccs }).callCtx = s''.callCtx
+      ∧ (updateVar out addrOrZero { vs with accounts := newAccs }).txCtx = s''.txCtx
+      ∧ (updateVar out addrOrZero { vs with accounts := newAccs }).blockCtx = s''.blockCtx
+      ∧ (updateVar out addrOrZero { vs with accounts := newAccs }).code = s''.code
+      ∧ (updateVar out addrOrZero { vs with accounts := newAccs }).prevHashes = s''.prevHashes
+      ∧ lookupVar out (updateVar out addrOrZero { vs with accounts := newAccs }) = some addrOrZero
+      ∧ s''.stack = addrOrZero :: stk
+      ∧ s''.pc = as.pc + 1 := by
+  obtain ⟨hstep, hasmeq⟩ :=
+    asmCreate2_stepExternalCall_same_evmCreate_rel hopc heval hout hstk hacc hmem hargs hszlt
+      hcc htx hcreate
+  refine ⟨{ asmNext as with stack := addrOrZero :: stk, accounts := newAccs },
+    hstep, hasmeq, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_,
+    lookupVar_updateVar_self _ _ _, rfl, rfl⟩
+  · show (updateVar out addrOrZero { vs with accounts := newAccs }).accounts = newAccs
+    simp only [updateVar]
+  · show memoryRel alloc (updateVar out addrOrZero { vs with accounts := newAccs }).memory as.memory
+    simp only [updateVar]
+    exact hmem
+  · intro i _
+    rfl
+  · show (updateVar out addrOrZero { vs with accounts := newAccs }).returndata = as.returndata
+    simp only [updateVar]
+    exact hrd
+  · show (updateVar out addrOrZero { vs with accounts := newAccs }).transient = as.transient
+    simp only [updateVar]
+    exact htr
+  · show (updateVar out addrOrZero { vs with accounts := newAccs }).logs = as.logs
+    simp only [updateVar]
+    exact hlg
+  · show (updateVar out addrOrZero { vs with accounts := newAccs }).callCtx = as.callCtx
+    simp only [updateVar]
+    exact hcc
+  · show (updateVar out addrOrZero { vs with accounts := newAccs }).txCtx = as.txCtx
+    simp only [updateVar]
+    exact htx
+  · show (updateVar out addrOrZero { vs with accounts := newAccs }).blockCtx = as.blockCtx
+    simp only [updateVar]
+    exact hbc
+  · show (updateVar out addrOrZero { vs with accounts := newAccs }).code = as.code
+    simp only [updateVar]
+    exact hcode
+  · show (updateVar out addrOrZero { vs with accounts := newAccs }).prevHashes = as.prevHashes
+    simp only [updateVar]
+    exact hph
+
+set_option maxHeartbeats 800000 in
+/-- **Full-relation CREATE2 block core**: emit the 4 operands and run CREATE2 — concluding the
+    COMPLETE `venomAsmRel` at net +1 (the created address binds to `out`) and the writeback
+    state. Memories are untouched, so the memory/spill conjuncts carry over directly. -/
+theorem create2_block_emit_rel_full {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    {prog : List AsmInst} {offsetToPc : AssocList Nat Nat} {inst : Instruction}
+    {out : String} {ovars : List String} {dists : List Nat} {nl : List String}
+    {value off size salt : bytes32} {vals : List bytes32}
+    {addrOrZero : bytes32} {newAccs : Accounts} {ret : List byte} {ps : PlanState}
+    (hopc : inst.opcode = Opcode.CREATE2)
+    (heval : evalOperands inst.operands vs = some [value, off, size, salt])
+    (hout : inst.outputs = [out])
+    (hnospill : ∀ v ∈ ovars, alookup' ps.spilled (Operand.Var v) = none)
+    (hdepths : emitDepthsOk nl ovars dists ps.stack)
+    (hvals : List.map (operandVal vs lo) (ovars.map Operand.Var) = List.map some vals)
+    (hvalrev : vals.reverse = [value, off, size, salt])
+    (hargs : off.toNat + size.toNat ≤ ps.alloc.fnEom) (hszlt : size.toNat < USize.size)
+    (hfreshS : ¬ Operand.Var out ∈ ps.stack) (houtov : out ∉ ovars)
+    (hspill_out : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none)
+    (hspillReg : ∀ op off', AssocList.lookup Operand Nat ps.spilled op = some off' →
+        ps.alloc.fnEom ≤ off')
+    (hcreate : evmCreate subEvmFuel vs.accounts vs.callCtx.contract vs.txCtx.origin
+      value (vs.memory.readWithPadding off.toNat size.toNat).toList vs.txCtx.gasprice 0 (some (wordToBytes salt).toList)
+      = (addrOrZero, newAccs, ret))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan ((emitInputPlan Opcode.CREATE2 (ovars.map Operand.Var) nl ps).1 ++ [StackOp.SOEmit "CREATE2"]))) :
+    ∃ s'', runAsm (executePlan ((emitInputPlan Opcode.CREATE2 (ovars.map Operand.Var) nl ps).1
+             ++ [StackOp.SOEmit "CREATE2"])).length offsetToPc prog as = AsmResult.AsmOK s''
+      ∧ stepExternalCall subEvmFuel inst vs
+          = some (updateVar out addrOrZero { vs with accounts := newAccs })
+      ∧ venomAsmRel lo
+          { (emitInputPlan Opcode.CREATE2 (ovars.map Operand.Var) nl ps).2 with
+            stack := ps.stack ++ [Operand.Var out] }
+          (updateVar out addrOrZero { vs with accounts := newAccs }) s''
+      ∧ s''.pc = as.pc + (executePlan ((emitInputPlan Opcode.CREATE2 (ovars.map Operand.Var) nl ps).1
+          ++ [StackOp.SOEmit "CREATE2"])).length := by
+  have hemiteq := emitInputPlan_allVars_eq Opcode.CREATE2 nl ovars dists ps hnospill hdepths
+  rw [executePlan_append] at hblock
+  obtain ⟨hbI, hbCall⟩ := asmBlockAt_append hblock
+  obtain ⟨as1, hrunE, hrelE, hpcE, hmemE⟩ :=
+    emitInputPlan_allVars_sim (offsetToPc := offsetToPc) Opcode.CREATE2 nl ovars dists ps hnospill hdepths hrel hbI
+  have hps'stack : (emitInputPlan Opcode.CREATE2 (ovars.map Operand.Var) nl ps).2.stack
+      = ps.stack ++ ovars.map Operand.Var := by rw [hemiteq]
+  have hps'spill : (emitInputPlan Opcode.CREATE2 (ovars.map Operand.Var) nl ps).2.spilled
+      = ps.spilled := by rw [hemiteq]
+  have hps'alloc : (emitInputPlan Opcode.CREATE2 (ovars.map Operand.Var) nl ps).2.alloc = ps.alloc := by
+    rw [hemiteq]
+  have htop := venomAsmRel_asmStack_topOps (base := ps.stack) (ops := ovars.map Operand.Var) (vals := vals)
+    hrelE hps'stack hvals
+  rw [hvalrev] at htop
+  have hlenops : (ovars.map Operand.Var).length = 4 := by
+    rw [List.length_map]
+    have h1 : ovars.length = vals.length := by
+      have := congrArg List.length hvals; simpa [List.length_map] using this
+    have h2 : vals.length = 4 := by
+      have := congrArg List.length hvalrev; simpa using this
+    omega
+  rw [hlenops] at htop
+  obtain ⟨hStk1, hSpill1, hmemrel1, hacc1, htr1, hrd1, hlg1, hcc1, htx1, hbc1, hcode1, hph1⟩ := hrelE
+  rw [hps'alloc] at hmemrel1
+  have hcreate1 : evmCreate subEvmFuel as1.accounts as1.callCtx.contract as1.txCtx.origin
+      value (as1.memory.readWithPadding off.toNat size.toNat).toList as1.txCtx.gasprice 0 (some (wordToBytes salt).toList)
+      = (addrOrZero, newAccs, ret) := by
+    rw [hacc1, hcc1, htx1,
+        ← memoryRel_readWithPadding_slice hmemrel1 hargs hszlt]
+    exact hcreate
+  obtain ⟨hpcC, hgetC⟩ := asmBlockAt_one (by rw [← hpcE] at hbCall; exact hbCall)
+  obtain ⟨s'', hstepV, hasmOK, hacc', hmemrel', hframe', hrd', htr', hlg', hcc', htx', hbc',
+    hcode', hph', hout', hstk', hpcadv0⟩ :=
+    create2_step_stateAgree_rel (alloc := ps.alloc) (as := as1) hopc heval hout htop
+      hacc1.symm hmemrel1 hargs hszlt hcc1.symm htx1.symm htr1.symm hrd1.symm
+      hlg1.symm hbc1.symm hcode1.symm hph1.symm hcreate1
+  have hstepeq : asmStep offsetToPc prog as1 = AsmResult.AsmOK s'' := by
+    rw [asmStep_create2_ok hpcC hgetC]; exact hasmOK
+  have hrunC : runAsm (executePlan [StackOp.SOEmit "CREATE2"]).length offsetToPc prog as1
+      = AsmResult.AsmOK s'' := by
+    show runAsm 1 offsetToPc prog as1 = AsmResult.AsmOK s''
+    rw [runAsm_succ_ok hpcC hstepeq]; rfl
+  set cb := updateVar out addrOrZero { vs with accounts := newAccs } with hcbdef
+  have hstable : ∀ (o : Operand), o ≠ Operand.Var out → operandVal cb lo o = operandVal vs lo o := by
+    intro o ho
+    rw [hcbdef, operandVal_updateVar_ne _ _ _ _ _ ho]
+    cases o with
+    | Var w => rfl
+    | Lit w => rfl
+    | Label l => rfl
+  have hcongrStack : ∀ o ∈ (emitInputPlan Opcode.CREATE2 (ovars.map Operand.Var) nl ps).2.stack,
+      operandVal cb lo o = operandVal vs lo o := by
+    intro o ho
+    rw [hps'stack] at ho
+    refine hstable o ?_
+    rcases List.mem_append.mp ho with h | h
+    · intro hc; rw [hc] at h; exact hfreshS h
+    · intro hc
+      obtain ⟨w, hw, hwe⟩ := List.mem_map.mp h
+      rw [hc] at hwe
+      injection hwe with hwe'
+      exact houtov (hwe' ▸ hw)
+  have hStkCb : planStackRel lo cb
+      (emitInputPlan Opcode.CREATE2 (ovars.map Operand.Var) nl ps).2.stack as1.stack :=
+    planStackRel_env_congr hcongrStack hStk1
+  have hlen4 : 4 ≤ (emitInputPlan Opcode.CREATE2 (ovars.map Operand.Var) nl ps).2.stack.length := by
+    rw [hps'stack, List.length_append]
+    have := hlenops
+    rw [List.length_map] at this
+    omega
+  have houtval : operandVal cb lo (Operand.Var out) = some addrOrZero := by
+    rw [operandVal_var_eq_lookupVar]; exact hout'
+  have hStkFinal := planStackRel_push (planStackRel_popN hStkCb hlen4) houtval
+  have hpop4 : stackPop 4 (emitInputPlan Opcode.CREATE2 (ovars.map Operand.Var) nl ps).2.stack
+      = ps.stack := by
+    rw [hps'stack, ← hlenops]
+    exact stackPop_append_top ps.stack (ovars.map Operand.Var)
+  rw [hpop4] at hStkFinal
+  have hSpillFinal : planSpillRel lo cb
+      (emitInputPlan Opcode.CREATE2 (ovars.map Operand.Var) nl ps).2.spilled s''.memory := by
+    rw [hps'spill]
+    rw [hps'spill] at hSpill1
+    refine planSpillRel_frame_congr hSpill1 ?_ ?_
+    · intro op off' hlook
+      refine hstable op ?_
+      intro hc
+      rw [hc, hspill_out] at hlook
+      simp at hlook
+    · intro op off' hlook
+      have hge : ps.alloc.fnEom ≤ off' := hspillReg op off' hlook
+      have h32 : (32 : Nat) < USize.size :=
+        Nat.lt_of_lt_of_le (by norm_num) USize.le_size
+      apply ByteArray.readWithPadding_congr _ _ off' 32 h32
+      intro k hk
+      have := hframe' (off' + k) (by omega)
+      rw [readByte_eq_getElem?_getD, readByte_eq_getElem?_getD] at this
+      exact this
+  refine ⟨s'', ?_, hstepV, ?_, ?_⟩
+  · rw [executePlan_append, List.length_append]
+    exact runAsm_compose hrunE hrunC
+  · refine ⟨?_, hSpillFinal, ?_, hacc'.symm, htr'.symm, hrd'.symm, hlg'.symm, hcc'.symm,
+      htx'.symm, hbc'.symm, hcode'.symm, hph'.symm⟩
+    · show planStackRel lo cb (ps.stack ++ [Operand.Var out]) s''.stack
+      rw [hstk']
+      show planStackRel lo cb (ps.stack ++ [Operand.Var out]) (addrOrZero :: as1.stack.drop 4)
+      have hpush : stackPush (Operand.Var out) ps.stack = ps.stack ++ [Operand.Var out] := rfl
+      rw [← hpush]
+      exact hStkFinal
+    · show memoryRel (emitInputPlan Opcode.CREATE2 (ovars.map Operand.Var) nl ps).2.alloc
+        cb.memory s''.memory
+      rw [hps'alloc]
+      exact hmemrel'
+  · rw [executePlan_append, List.length_append, hpcadv0, hpcE]
+    rfl
+
+/-- **CREATE2 plan reduction** (all-live 4 distinct var operands): emit the operands (already
+    positioned — `reorderPlan_allVars_nil`), `CREATE` pops them and pushes the new address bound
+    to `out` — net `+1`. -/
+theorem genRegularInstPlan_create2_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {ovars : List String} {dists : List Nat} {out : String} {base : List Operand}
+    (hopc : inst.opcode = Opcode.CREATE2)
+    (hcompute : computeOperands inst = ovars.map Operand.Var)
+    (houts : inst.outputs = [out])
+    (hstack0 : ps.stack = base)
+    (hnd : ovars.Nodup)
+    (hnospill : ∀ v ∈ ovars, alookup' ps.spilled (Operand.Var v) = none)
+    (hdepths : emitDepthsOk nextLiveness ovars dists ps.stack)
+    (hlive : nextLiveness.contains out = true) :
+    generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator
+        curBbLabel ps
+      = (((emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).1
+            ++ [StackOp.SOEmit "CREATE2"]
+            ++ (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+                  { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+                    stack := base ++ [Operand.Var out] }).1),
+         releaseDeadSpills nextLiveness
+           (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+             { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+               stack := base ++ [Operand.Var out] }).2) := by
+  have hname : opcodeToEvmName inst.opcode = some "CREATE2" := by rw [hopc]; rfl
+  have hncomm : isCommutative inst.opcode = false := by rw [hopc]; rfl
+  have hnjmp : ¬ (inst.opcode = Opcode.JMP) := by rw [hopc]; decide
+  have hpvar := emitInputPlan_allVars_eq inst.opcode nextLiveness ovars dists ps hnospill hdepths
+  unfold generateRegularInstPlan
+  simp only [hcompute, houts]
+  rcases hemit : emitInputPlan inst.opcode (ovars.map Operand.Var) nextLiveness ps
+    with ⟨inputOps, ps1⟩
+  have h2 : (emitInputPlan inst.opcode (ovars.map Operand.Var) nextLiveness ps).2 = ps1 := by
+    rw [hemit]
+  have hps1' : ps1.stack = base ++ ovars.map Operand.Var := by
+    rw [← h2, hpvar, hstack0]
+  have hreorder := reorderPlan_allVars_nil base ovars ps1 hps1' hnd
+  have hmem : out ∈ nextLiveness := by simpa using hlive
+  have hpop : stackPop ovars.length (base ++ ovars.map Operand.Var) = base := by
+    have h := stackPop_append_top base (ovars.map Operand.Var)
+    rwa [List.length_map] at h
+  simp [generateEmitOps_evmName hname, hreorder, hps1', hpop, stackPush, popmanyPlan_nil, hmem,
+        hncomm, hnjmp]
+
+/-- **The full generated-plan CREATE2 producer sim** — running the ENTIRE
+    `generateRegularInstPlan` output for a CREATE2 (4 live operands, positioned; init code below
+    the spill region) preserves the complete `venomAsmRel` against the Venom `stepExternalCall`
+    writeback. The salted sibling of `genRegularInstPlan_create_sim`. -/
+theorem genRegularInstPlan_create2_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {offsetToPc : AssocList Nat Nat} {ovars : List String} {dists : List Nat} {out : String}
+    {base : List Operand} {value off size salt : bytes32} {vals : List bytes32}
+    {addrOrZero : bytes32} {newAccs : Accounts} {ret : List byte}
+    (hopc : inst.opcode = Opcode.CREATE2)
+    (hcompute : computeOperands inst = ovars.map Operand.Var)
+    (houts : inst.outputs = [out])
+    (hstack0 : ps.stack = base)
+    (hnd : ovars.Nodup)
+    (hnospill : ∀ v ∈ ovars, alookup' ps.spilled (Operand.Var v) = none)
+    (hdepths : emitDepthsOk nextLiveness ovars dists ps.stack)
+    (hlive : nextLiveness.contains out = true)
+    (heval : evalOperands inst.operands vs = some [value, off, size, salt])
+    (hvals : List.map (operandVal vs lo) (ovars.map Operand.Var) = List.map some vals)
+    (hvalrev : vals.reverse = [value, off, size, salt])
+    (hargs : off.toNat + size.toNat ≤ ps.alloc.fnEom) (hszlt : size.toNat < USize.size)
+    (hfreshS : ¬ Operand.Var out ∈ ps.stack) (houtov : out ∉ ovars)
+    (hspill_out : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none)
+    (hspillReg : ∀ op off', AssocList.lookup Operand Nat ps.spilled op = some off' →
+        ps.alloc.fnEom ≤ off')
+    (hcreate : evmCreate subEvmFuel vs.accounts vs.callCtx.contract vs.txCtx.origin
+      value (vs.memory.readWithPadding off.toNat size.toNat).toList vs.txCtx.gasprice 0 (some (wordToBytes salt).toList)
+      = (addrOrZero, newAccs, ret))
+    (hoptnoop : optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+        { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+          stack := base ++ [Operand.Var out] }
+      = ([], { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+              stack := base ++ [Operand.Var out] }))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+           stepExternalCall subEvmFuel inst vs
+             = some (updateVar out addrOrZero { vs with accounts := newAccs }) ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2
+             (updateVar out addrOrZero { vs with accounts := newAccs }) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  rw [genRegularInstPlan_create2_eq hopc hcompute houts hstack0 hnd hnospill hdepths hlive,
+      hoptnoop] at hblock ⊢
+  simp only [List.append_nil] at hblock ⊢
+  rw [hcompute, hopc] at hblock ⊢
+  rw [← hstack0]
+  obtain ⟨s'', hrun, hstepV, hrelF, hpcF⟩ :=
+    create2_block_emit_rel_full (offsetToPc := offsetToPc) hopc heval houts hnospill hdepths hvals
+      hvalrev hargs hszlt hfreshS houtov hspill_out hspillReg hcreate hrel hblock
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrelF
+  exact ⟨s'', hrun, hstepV, hrelR, hpcF⟩
 
 /-- The Venom step of a unary op with a variable operand is `updateVar out (f w)`. The unary
     counterpart of `stepInstBase_binopVar` (`execPure1` instead of `execPure2`). -/
@@ -4356,6 +7953,948 @@ theorem list_eq_get3 {α} [Inhabited α] (l : List α) (h : 3 ≤ l.length) :
   | [c0] => simp at h
   | [c0, c1] => simp at h
 
+/-! ### Genuine multi-swap join reconciliation (`perm_reaches`, 3-element case)
+
+The identity join (`reorderPlan_vars_nil`) and the transposition join (`reorderPlan_swapped_pair_var`)
+are handled. The next step of the general `perm_reaches` — where `reorderPlan` synthesises the target
+layout with *two* swaps and must not disturb an already-placed element — is the 3-cycle. These are the
+triple `stackSwap` helpers and the concrete 3-cycle reconciliation. -/
+
+/-- `stackSwap 2` on `base ++ [x, y, z]` (z = TOS) swaps TOS with the depth-2 element. -/
+theorem stackSwap_2_append_triple (base : List Operand) (x y z : Operand) :
+    stackSwap 2 (base ++ [x, y, z]) = base ++ [z, y, x] := by
+  have hlen : (base ++ [x, y, z]).length = base.length + 3 := by simp
+  have htop : (base ++ [x, y, z])[base.length + 2]! = z := getbang_append_triple_2 base x y z
+  have htgt : (base ++ [x, y, z])[base.length]! = x := getbang_append_triple_0 base x y z
+  have hset1 : (base ++ [x, y, z]).set (base.length + 2) x = base ++ [x, y, x] := by
+    rw [List.set_append_right (base.length + 2) x (by omega)]; simp
+  have hset2 : (base ++ [x, y, x]).set base.length z = base ++ [z, y, x] := by
+    rw [List.set_append_right base.length z (by omega)]; simp
+  unfold stackSwap
+  simp only [hlen, show base.length + 3 - 1 = base.length + 2 from by omega,
+    show base.length + 2 - 2 = base.length from by omega, htop, htgt, hset1, hset2]
+
+/-- `stackSwap 1` on `base ++ [x, y, z]` (z = TOS) swaps the top two, keeping the depth-2 element. -/
+theorem stackSwap_1_append_triple (base : List Operand) (x y z : Operand) :
+    stackSwap 1 (base ++ [x, y, z]) = base ++ [x, z, y] := by
+  have hlen : (base ++ [x, y, z]).length = base.length + 3 := by simp
+  have htop : (base ++ [x, y, z])[base.length + 2]! = z := getbang_append_triple_2 base x y z
+  have htgt : (base ++ [x, y, z])[base.length + 1]! = y := getbang_append_triple_1 base x y z
+  have hset1 : (base ++ [x, y, z]).set (base.length + 2) y = base ++ [x, y, y] := by
+    rw [List.set_append_right (base.length + 2) y (by omega)]; simp
+  have hset2 : (base ++ [x, y, y]).set (base.length + 1) z = base ++ [x, z, y] := by
+    rw [List.set_append_right (base.length + 1) z (by omega)]; simp
+  unfold stackSwap
+  simp only [hlen, show base.length + 3 - 1 = base.length + 2 from by omega,
+    show base.length + 2 - 1 = base.length + 1 from by omega, htop, htgt, hset1, hset2]
+
+/-- TOS of a triple `base ++ [x, y, z]` sits at depth 0. -/
+theorem stackGetDepth_triple_tos (base : List Operand) (x y z : Operand) :
+    stackGetDepth z (base ++ [x, y, z]) = some 0 := by
+  simp [stackGetDepth, stackFind, List.reverse_append]
+
+/-- `doSwap 2` is a single `SWAP2`. -/
+theorem doSwap_two (ps : PlanState) :
+    doSwap 2 ps = ([StackOp.SOSwap 2], { ps with stack := stackSwap 2 ps.stack }) := by
+  unfold doSwap; simp
+
+/-- **A genuine 3-cycle join reconciliation.** For the target entry layout `[a, b, c]` and a predecessor
+    that leaves the 3-cycle permutation `[b, c, a]` on top of the stack (`a` = TOS), `reorderPlan`
+    synthesises the target layout with two swaps (`SWAP2 ; SWAP1`). This is the smallest genuine
+    `perm_reaches` case beyond the transposition `reorderPlan_swapped_pair_var`: step 0 places `a` at the
+    deepest target slot (depth 2), and step 1's `SWAP1` — over the top two — does **not** disturb that
+    placed `a` (the "doesn't disturb already-placed" property that distinguishes the general reorder from
+    a single transposition). The stack result needs no distinctness hypothesis — each reorder step's
+    operand is threaded through the TOS, so it is located unconditionally. -/
+theorem reorderPlan_3cycle_var (base : List Operand) (a b c : String) (ps : PlanState)
+    (hstack : ps.stack = base ++ [Operand.Var b, Operand.Var c, Operand.Var a]) :
+    (reorderPlan [Operand.Var a, Operand.Var b, Operand.Var c] ps).2.stack
+      = base ++ [Operand.Var a, Operand.Var b, Operand.Var c] := by
+  -- step 0: op `a` (at TOS) → depth 2 via SWAP2, leaving `base ++ [a, c, b]`
+  have hstep0 : reorderOne () [Operand.Var a, Operand.Var b, Operand.Var c] 0 (Operand.Var a) ps
+      = ([StackOp.SOSwap 2], { ps with stack := base ++ [Operand.Var a, Operand.Var c, Operand.Var b] }) := by
+    have hd : stackGetDepth (Operand.Var a) ps.stack = some 0 := by
+      rw [hstack]; exact stackGetDepth_triple_tos base (Operand.Var b) (Operand.Var c) (Operand.Var a)
+    have hsw : stackSwap 2 ps.stack = base ++ [Operand.Var a, Operand.Var c, Operand.Var b] := by
+      rw [hstack]; exact stackSwap_2_append_triple base (Operand.Var b) (Operand.Var c) (Operand.Var a)
+    unfold reorderOne
+    simp [hd, doSwap_zero, doSwap_two, hsw]
+  -- step 1: op `b` (now at TOS) → depth 1 via SWAP1, leaving `base ++ [a, b, c]`; `a` at depth 2 untouched
+  have hstep1 : reorderOne () [Operand.Var a, Operand.Var b, Operand.Var c] 1 (Operand.Var b)
+      { ps with stack := base ++ [Operand.Var a, Operand.Var c, Operand.Var b] }
+      = ([StackOp.SOSwap 1], { ps with stack := base ++ [Operand.Var a, Operand.Var b, Operand.Var c] }) := by
+    have hd : stackGetDepth (Operand.Var b) (base ++ [Operand.Var a, Operand.Var c, Operand.Var b]) = some 0 :=
+      stackGetDepth_triple_tos base (Operand.Var a) (Operand.Var c) (Operand.Var b)
+    have hsw : stackSwap 1 (base ++ [Operand.Var a, Operand.Var c, Operand.Var b])
+        = base ++ [Operand.Var a, Operand.Var b, Operand.Var c] :=
+      stackSwap_1_append_triple base (Operand.Var a) (Operand.Var c) (Operand.Var b)
+    unfold reorderOne
+    simp [hd, doSwap_zero, doSwap_one, hsw]
+  -- step 2: op `c` (now at TOS) is already at its target depth 0 → no-op
+  have hstep2 : reorderOne () [Operand.Var a, Operand.Var b, Operand.Var c] 2 (Operand.Var c)
+      { ps with stack := base ++ [Operand.Var a, Operand.Var b, Operand.Var c] }
+      = ([], { ps with stack := base ++ [Operand.Var a, Operand.Var b, Operand.Var c] }) := by
+    apply reorderOne_nil_of_positioned
+    show stackGetDepth (Operand.Var c) (base ++ [Operand.Var a, Operand.Var b, Operand.Var c]) = some 0
+    exact stackGetDepth_triple_tos base (Operand.Var a) (Operand.Var b) (Operand.Var c)
+  unfold reorderPlan
+  have henum : ([Operand.Var a, Operand.Var b, Operand.Var c]).enum
+      = [(0, Operand.Var a), (1, Operand.Var b), (2, Operand.Var c)] := rfl
+  rw [henum]
+  simp only [List.foldl_cons, List.foldl_nil, hstep0, hstep1, hstep2,
+    List.append_nil, List.nil_append]
+
+/-- **Full-plan 3-cycle reorder.** `reorderPlan_3cycle_var` exposes only the resulting stack; this
+    exposes the whole `(ops, state)` pair — `reorderPlan [a,b,c]` on `base ++ [b, c, a]` synthesises
+    `SWAP2 ; SWAP1` (rotate `a` from TOS down to depth 2, `b` from TOS down to depth 1, `c` already at
+    TOS) leaving `base ++ [a, b, c]`. The 3-deep reorder atom for a ternop reorder sim. -/
+theorem reorderPlan_3cycle_var_full (base : List Operand) (a b c : String) (ps : PlanState)
+    (hstack : ps.stack = base ++ [Operand.Var b, Operand.Var c, Operand.Var a]) :
+    reorderPlan [Operand.Var a, Operand.Var b, Operand.Var c] ps
+      = ([StackOp.SOSwap 2, StackOp.SOSwap 1],
+         { ps with stack := base ++ [Operand.Var a, Operand.Var b, Operand.Var c] }) := by
+  have hstep0 : reorderOne () [Operand.Var a, Operand.Var b, Operand.Var c] 0 (Operand.Var a) ps
+      = ([StackOp.SOSwap 2], { ps with stack := base ++ [Operand.Var a, Operand.Var c, Operand.Var b] }) := by
+    have hd : stackGetDepth (Operand.Var a) ps.stack = some 0 := by
+      rw [hstack]; exact stackGetDepth_triple_tos base (Operand.Var b) (Operand.Var c) (Operand.Var a)
+    have hsw : stackSwap 2 ps.stack = base ++ [Operand.Var a, Operand.Var c, Operand.Var b] := by
+      rw [hstack]; exact stackSwap_2_append_triple base (Operand.Var b) (Operand.Var c) (Operand.Var a)
+    unfold reorderOne
+    simp [hd, doSwap_zero, doSwap_two, hsw]
+  have hstep1 : reorderOne () [Operand.Var a, Operand.Var b, Operand.Var c] 1 (Operand.Var b)
+      { ps with stack := base ++ [Operand.Var a, Operand.Var c, Operand.Var b] }
+      = ([StackOp.SOSwap 1], { ps with stack := base ++ [Operand.Var a, Operand.Var b, Operand.Var c] }) := by
+    have hd : stackGetDepth (Operand.Var b) (base ++ [Operand.Var a, Operand.Var c, Operand.Var b]) = some 0 :=
+      stackGetDepth_triple_tos base (Operand.Var a) (Operand.Var c) (Operand.Var b)
+    have hsw : stackSwap 1 (base ++ [Operand.Var a, Operand.Var c, Operand.Var b])
+        = base ++ [Operand.Var a, Operand.Var b, Operand.Var c] :=
+      stackSwap_1_append_triple base (Operand.Var a) (Operand.Var c) (Operand.Var b)
+    unfold reorderOne
+    simp [hd, doSwap_zero, doSwap_one, hsw]
+  have hstep2 : reorderOne () [Operand.Var a, Operand.Var b, Operand.Var c] 2 (Operand.Var c)
+      { ps with stack := base ++ [Operand.Var a, Operand.Var b, Operand.Var c] }
+      = ([], { ps with stack := base ++ [Operand.Var a, Operand.Var b, Operand.Var c] }) := by
+    apply reorderOne_nil_of_positioned
+    show stackGetDepth (Operand.Var c) (base ++ [Operand.Var a, Operand.Var b, Operand.Var c]) = some 0
+    exact stackGetDepth_triple_tos base (Operand.Var a) (Operand.Var b) (Operand.Var c)
+  unfold reorderPlan
+  have henum : ([Operand.Var a, Operand.Var b, Operand.Var c]).enum
+      = [(0, Operand.Var a), (1, Operand.Var b), (2, Operand.Var c)] := rfl
+  rw [henum]
+  simp [List.foldl_cons, List.foldl_nil, hstep0, hstep1, hstep2]
+
+/-! ### 4-input (quad) stack helpers — the 3→4 ports for EXTCODECOPY's 4-input plan. -/
+
+theorem getbang_append_quad_0 (base : List Operand) (a b c d : Operand) :
+    (base ++ [a, b, c, d])[base.length]! = a := by
+  rw [List.getElem!_eq_getElem?_getD, List.getElem?_append_right (by omega)]; simp
+
+theorem getbang_append_quad_1 (base : List Operand) (a b c d : Operand) :
+    (base ++ [a, b, c, d])[base.length + 1]! = b := by
+  rw [List.getElem!_eq_getElem?_getD, List.getElem?_append_right (by omega)]; simp
+
+theorem getbang_append_quad_2 (base : List Operand) (a b c d : Operand) :
+    (base ++ [a, b, c, d])[base.length + 2]! = c := by
+  rw [List.getElem!_eq_getElem?_getD, List.getElem?_append_right (by omega)]; simp
+
+theorem getbang_append_quad_3 (base : List Operand) (a b c d : Operand) :
+    (base ++ [a, b, c, d])[base.length + 3]! = d := by
+  rw [List.getElem!_eq_getElem?_getD, List.getElem?_append_right (by omega)]; simp
+
+/-- `stackPeek` at depths 0/1/2/3 of `base ++ [a, b, c, d]` (TOS = `d`). -/
+theorem stackPeek_0_append_quad (base : List Operand) (a b c d : Operand) :
+    stackPeek 0 (base ++ [a, b, c, d]) = d := by
+  unfold stackPeek
+  rw [show (base ++ [a, b, c, d]).length - 1 - 0 = base.length + 3 from by simp]
+  exact getbang_append_quad_3 base a b c d
+
+theorem stackPeek_1_append_quad (base : List Operand) (a b c d : Operand) :
+    stackPeek 1 (base ++ [a, b, c, d]) = c := by
+  unfold stackPeek
+  rw [show (base ++ [a, b, c, d]).length - 1 - 1 = base.length + 2 from by simp]
+  exact getbang_append_quad_2 base a b c d
+
+theorem stackPeek_2_append_quad (base : List Operand) (a b c d : Operand) :
+    stackPeek 2 (base ++ [a, b, c, d]) = b := by
+  unfold stackPeek
+  rw [show (base ++ [a, b, c, d]).length - 1 - 2 = base.length + 1 from by simp]
+  exact getbang_append_quad_1 base a b c d
+
+theorem stackPeek_3_append_quad (base : List Operand) (a b c d : Operand) :
+    stackPeek 3 (base ++ [a, b, c, d]) = a := by
+  unfold stackPeek
+  rw [show (base ++ [a, b, c, d]).length - 1 - 3 = base.length from by simp]
+  exact getbang_append_quad_0 base a b c d
+
+/-- `stackPop 4 (base ++ [a, b, c, d]) = base`. -/
+theorem stackPop_4_append_quad (base : List Operand) (a b c d : Operand) :
+    stackPop 4 (base ++ [a, b, c, d]) = base := by
+  unfold stackPop; simp
+
+/-- A list of length ≥ 4 is `get!0 :: get!1 :: get!2 :: get!3 :: drop 4`. -/
+theorem list_eq_get4 {α} [Inhabited α] (l : List α) (h : 4 ≤ l.length) :
+    l = l[0]! :: l[1]! :: l[2]! :: l[3]! :: l.drop 4 := by
+  match l with
+  | c0 :: c1 :: c2 :: c3 :: rest => rfl
+  | [] => simp at h
+  | [c0] => simp at h
+  | [c0, c1] => simp at h
+  | [c0, c1, c2] => simp at h
+
+/-! ### Genuine multi-swap join reconciliation (`perm_reaches`, 4-element rotation)
+
+The 4-element continuation of `reorderPlan_3cycle_var`: the single left-rotation, exercising the
+"doesn't disturb **two** already-placed elements" case (after steps 0–1 both `a` at depth 3 and `b` at
+depth 2 must survive step 2's shallow `SWAP1`). Triple `stackSwap` had `stackSwap_{1,2}_append_triple`;
+here the quad `stackSwap_{1,2,3}_append_quad` ports (over the existing `getbang_append_quad_*`). -/
+
+/-- `stackSwap 3` on `base ++ [w, x, y, z]` (z = TOS) swaps TOS with the depth-3 element. -/
+theorem stackSwap_3_append_quad (base : List Operand) (w x y z : Operand) :
+    stackSwap 3 (base ++ [w, x, y, z]) = base ++ [z, x, y, w] := by
+  have hlen : (base ++ [w, x, y, z]).length = base.length + 4 := by simp
+  have htop : (base ++ [w, x, y, z])[base.length + 3]! = z := getbang_append_quad_3 base w x y z
+  have htgt : (base ++ [w, x, y, z])[base.length]! = w := getbang_append_quad_0 base w x y z
+  have hset1 : (base ++ [w, x, y, z]).set (base.length + 3) w = base ++ [w, x, y, w] := by
+    rw [List.set_append_right (base.length + 3) w (by omega)]; simp
+  have hset2 : (base ++ [w, x, y, w]).set base.length z = base ++ [z, x, y, w] := by
+    rw [List.set_append_right base.length z (by omega)]; simp
+  unfold stackSwap
+  simp only [hlen, show base.length + 4 - 1 = base.length + 3 from by omega,
+    show base.length + 3 - 3 = base.length from by omega, htop, htgt, hset1, hset2]
+
+/-- `stackSwap 2` on `base ++ [w, x, y, z]` (z = TOS) swaps TOS with the depth-2 element. -/
+theorem stackSwap_2_append_quad (base : List Operand) (w x y z : Operand) :
+    stackSwap 2 (base ++ [w, x, y, z]) = base ++ [w, z, y, x] := by
+  have hlen : (base ++ [w, x, y, z]).length = base.length + 4 := by simp
+  have htop : (base ++ [w, x, y, z])[base.length + 3]! = z := getbang_append_quad_3 base w x y z
+  have htgt : (base ++ [w, x, y, z])[base.length + 1]! = x := getbang_append_quad_1 base w x y z
+  have hset1 : (base ++ [w, x, y, z]).set (base.length + 3) x = base ++ [w, x, y, x] := by
+    rw [List.set_append_right (base.length + 3) x (by omega)]; simp
+  have hset2 : (base ++ [w, x, y, x]).set (base.length + 1) z = base ++ [w, z, y, x] := by
+    rw [List.set_append_right (base.length + 1) z (by omega)]; simp
+  unfold stackSwap
+  simp only [hlen, show base.length + 4 - 1 = base.length + 3 from by omega,
+    show base.length + 3 - 2 = base.length + 1 from by omega, htop, htgt, hset1, hset2]
+
+/-- `stackSwap 1` on `base ++ [w, x, y, z]` (z = TOS) swaps the top two. -/
+theorem stackSwap_1_append_quad (base : List Operand) (w x y z : Operand) :
+    stackSwap 1 (base ++ [w, x, y, z]) = base ++ [w, x, z, y] := by
+  have hlen : (base ++ [w, x, y, z]).length = base.length + 4 := by simp
+  have htop : (base ++ [w, x, y, z])[base.length + 3]! = z := getbang_append_quad_3 base w x y z
+  have htgt : (base ++ [w, x, y, z])[base.length + 2]! = y := getbang_append_quad_2 base w x y z
+  have hset1 : (base ++ [w, x, y, z]).set (base.length + 3) y = base ++ [w, x, y, y] := by
+    rw [List.set_append_right (base.length + 3) y (by omega)]; simp
+  have hset2 : (base ++ [w, x, y, y]).set (base.length + 2) z = base ++ [w, x, z, y] := by
+    rw [List.set_append_right (base.length + 2) z (by omega)]; simp
+  unfold stackSwap
+  simp only [hlen, show base.length + 4 - 1 = base.length + 3 from by omega,
+    show base.length + 3 - 1 = base.length + 2 from by omega, htop, htgt, hset1, hset2]
+
+/-- TOS of a quad `base ++ [w, x, y, z]` sits at depth 0. -/
+theorem stackGetDepth_quad_tos (base : List Operand) (w x y z : Operand) :
+    stackGetDepth z (base ++ [w, x, y, z]) = some 0 := by
+  simp [stackGetDepth, stackFind, List.reverse_append]
+
+/-- `doSwap 3` is a single `SWAP3`. -/
+theorem doSwap_three (ps : PlanState) :
+    doSwap 3 ps = ([StackOp.SOSwap 3], { ps with stack := stackSwap 3 ps.stack }) := by
+  unfold doSwap; simp
+
+/-- **A genuine 4-element rotation join reconciliation.** For the target entry layout `[a, b, c, d]` and
+    a predecessor leaving the single left-rotation `[b, c, d, a]` on top (`a` = TOS), `reorderPlan`
+    synthesises the target with three swaps (`SWAP3 ; SWAP2 ; SWAP1`). Extends the 3-cycle
+    (`reorderPlan_3cycle_var`) to the "doesn't disturb **two** already-placed elements" case: after steps
+    0–1, `a` sits at depth 3 and `b` at depth 2, and step 2's `SWAP1` (over the top two) leaves both
+    untouched. The stack result is unconditional (each step threads its operand through the TOS). -/
+theorem reorderPlan_4rotate_var (base : List Operand) (a b c d : String) (ps : PlanState)
+    (hstack : ps.stack = base ++ [Operand.Var b, Operand.Var c, Operand.Var d, Operand.Var a]) :
+    (reorderPlan [Operand.Var a, Operand.Var b, Operand.Var c, Operand.Var d] ps).2.stack
+      = base ++ [Operand.Var a, Operand.Var b, Operand.Var c, Operand.Var d] := by
+  -- step 0: `a` (TOS) → depth 3 via SWAP3, leaving `base ++ [a, c, d, b]`
+  have hstep0 : reorderOne () [Operand.Var a, Operand.Var b, Operand.Var c, Operand.Var d] 0 (Operand.Var a) ps
+      = ([StackOp.SOSwap 3], { ps with stack := base ++ [Operand.Var a, Operand.Var c, Operand.Var d, Operand.Var b] }) := by
+    have hd : stackGetDepth (Operand.Var a) ps.stack = some 0 := by
+      rw [hstack]; exact stackGetDepth_quad_tos base (Operand.Var b) (Operand.Var c) (Operand.Var d) (Operand.Var a)
+    have hsw : stackSwap 3 ps.stack = base ++ [Operand.Var a, Operand.Var c, Operand.Var d, Operand.Var b] := by
+      rw [hstack]; exact stackSwap_3_append_quad base (Operand.Var b) (Operand.Var c) (Operand.Var d) (Operand.Var a)
+    unfold reorderOne
+    simp [hd, doSwap_zero, doSwap_three, hsw]
+  -- step 1: `b` (TOS) → depth 2 via SWAP2, leaving `base ++ [a, b, d, c]`; `a` at depth 3 untouched
+  have hstep1 : reorderOne () [Operand.Var a, Operand.Var b, Operand.Var c, Operand.Var d] 1 (Operand.Var b)
+      { ps with stack := base ++ [Operand.Var a, Operand.Var c, Operand.Var d, Operand.Var b] }
+      = ([StackOp.SOSwap 2], { ps with stack := base ++ [Operand.Var a, Operand.Var b, Operand.Var d, Operand.Var c] }) := by
+    have hd : stackGetDepth (Operand.Var b) (base ++ [Operand.Var a, Operand.Var c, Operand.Var d, Operand.Var b]) = some 0 :=
+      stackGetDepth_quad_tos base (Operand.Var a) (Operand.Var c) (Operand.Var d) (Operand.Var b)
+    have hsw : stackSwap 2 (base ++ [Operand.Var a, Operand.Var c, Operand.Var d, Operand.Var b])
+        = base ++ [Operand.Var a, Operand.Var b, Operand.Var d, Operand.Var c] :=
+      stackSwap_2_append_quad base (Operand.Var a) (Operand.Var c) (Operand.Var d) (Operand.Var b)
+    unfold reorderOne
+    simp [hd, doSwap_zero, doSwap_two, hsw]
+  -- step 2: `c` (TOS) → depth 1 via SWAP1, leaving `base ++ [a, b, c, d]`; `a`(3), `b`(2) untouched
+  have hstep2 : reorderOne () [Operand.Var a, Operand.Var b, Operand.Var c, Operand.Var d] 2 (Operand.Var c)
+      { ps with stack := base ++ [Operand.Var a, Operand.Var b, Operand.Var d, Operand.Var c] }
+      = ([StackOp.SOSwap 1], { ps with stack := base ++ [Operand.Var a, Operand.Var b, Operand.Var c, Operand.Var d] }) := by
+    have hd : stackGetDepth (Operand.Var c) (base ++ [Operand.Var a, Operand.Var b, Operand.Var d, Operand.Var c]) = some 0 :=
+      stackGetDepth_quad_tos base (Operand.Var a) (Operand.Var b) (Operand.Var d) (Operand.Var c)
+    have hsw : stackSwap 1 (base ++ [Operand.Var a, Operand.Var b, Operand.Var d, Operand.Var c])
+        = base ++ [Operand.Var a, Operand.Var b, Operand.Var c, Operand.Var d] :=
+      stackSwap_1_append_quad base (Operand.Var a) (Operand.Var b) (Operand.Var d) (Operand.Var c)
+    unfold reorderOne
+    simp [hd, doSwap_zero, doSwap_one, hsw]
+  -- step 3: `d` (TOS) already at target depth 0 → no-op
+  have hstep3 : reorderOne () [Operand.Var a, Operand.Var b, Operand.Var c, Operand.Var d] 3 (Operand.Var d)
+      { ps with stack := base ++ [Operand.Var a, Operand.Var b, Operand.Var c, Operand.Var d] }
+      = ([], { ps with stack := base ++ [Operand.Var a, Operand.Var b, Operand.Var c, Operand.Var d] }) := by
+    apply reorderOne_nil_of_positioned
+    show stackGetDepth (Operand.Var d) (base ++ [Operand.Var a, Operand.Var b, Operand.Var c, Operand.Var d]) = some 0
+    exact stackGetDepth_quad_tos base (Operand.Var a) (Operand.Var b) (Operand.Var c) (Operand.Var d)
+  unfold reorderPlan
+  have henum : ([Operand.Var a, Operand.Var b, Operand.Var c, Operand.Var d]).enum
+      = [(0, Operand.Var a), (1, Operand.Var b), (2, Operand.Var c), (3, Operand.Var d)] := rfl
+  rw [henum]
+  simp only [List.foldl_cons, List.foldl_nil, hstep0, hstep1, hstep2, hstep3,
+    List.append_nil, List.nil_append]
+
+/-! ### General single-rotation join reconciliation (`perm_reaches`, any length)
+
+The concrete 3-cycle / 4-rotation above are the `n = 3, 4` instances of the general single left-rotation,
+which `reorderPlan_rotate` proves for **any** length. The two general building blocks: `stackSwap`
+localises to the top (active) segment (`stackSwap_append_right`) and a swap to the deepest slot exchanges
+a segment's endpoints (`stackSwap_endpoints`). The rotation keeps the operand to place at the TOS at
+every step, so `reorderOne` locates it unconditionally (`reorderOne_tos_stack`) — no nodup needed. -/
+
+/-- One left-rotation of a stack segment: the deepest element moves to the TOS. -/
+def rotate1 : List Operand → List Operand
+  | [] => []
+  | a :: l => l ++ [a]
+
+/-- **`stackSwap` localises to the top segment.** When the swap distance `d` stays within the top part
+    `high` of a stack `low ++ high` (`d < high.length`), the swap touches only `high`:
+    `stackSwap d (low ++ high) = low ++ stackSwap d high`. The base of the stack (`low`) is untouched —
+    the reusable core of the general `perm_reaches` induction (a reorder step over the active region
+    leaves the already-placed prefix intact). -/
+theorem stackSwap_append_right (low high : List Operand) (d : Nat) (hd : d < high.length) :
+    stackSwap d (low ++ high) = low ++ stackSwap d high := by
+  unfold stackSwap
+  simp only [List.length_append]
+  have h1 : low.length + high.length - 1 = low.length + (high.length - 1) := by omega
+  rw [h1]
+  have h2 : low.length + (high.length - 1) - d = low.length + (high.length - 1 - d) := by omega
+  rw [h2]
+  have g1 : (low ++ high)[low.length + (high.length - 1)]! = high[high.length - 1]! := by
+    rw [List.getElem!_eq_getElem?_getD, List.getElem?_append_right (Nat.le_add_right _ _),
+        Nat.add_sub_cancel_left, ← List.getElem!_eq_getElem?_getD]
+  have g2 : (low ++ high)[low.length + (high.length - 1 - d)]! = high[high.length - 1 - d]! := by
+    rw [List.getElem!_eq_getElem?_getD, List.getElem?_append_right (Nat.le_add_right _ _),
+        Nat.add_sub_cancel_left, ← List.getElem!_eq_getElem?_getD]
+  rw [g1, g2, List.set_append_right _ _ (Nat.le_add_right _ _),
+      List.set_append_right _ _ (Nat.le_add_right _ _)]
+  simp only [Nat.add_sub_cancel_left]
+
+/-- **Swapping to the deepest slot swaps a segment's endpoints.** `stackSwap (mid.length + 1)` on
+    `a :: mid ++ [z]` (TOS = `z`, deepest = `a`) exchanges top and bottom, keeping the middle — the shape
+    a `reorderPlan` rotation step produces. Companion to `stackSwap_append_right`. -/
+theorem stackSwap_endpoints (a z : Operand) (mid : List Operand) :
+    stackSwap (mid.length + 1) (a :: mid ++ [z]) = z :: mid ++ [a] := by
+  have hl : (a :: mid ++ [z]).length = mid.length + 2 := by simp
+  have htop : (a :: mid ++ [z])[mid.length + 1]! = z := by
+    rw [List.getElem!_eq_getElem?_getD]
+    show ((a :: (mid ++ [z]))[mid.length + 1]?).getD default = z
+    rw [List.getElem?_cons_succ, List.getElem?_append_right (le_refl _)]
+    simp
+  have htgt : (a :: mid ++ [z])[0]! = a := by simp
+  have hset1 : (a :: mid ++ [z]).set (mid.length + 1) a = a :: (mid ++ [a]) := by
+    show (a :: (mid ++ [z])).set (mid.length + 1) a = a :: (mid ++ [a])
+    rw [List.set_cons_succ]
+    congr 1
+    rw [List.set_append_right mid.length a (le_refl _)]
+    simp
+  unfold stackSwap
+  rw [hl]
+  simp only [show mid.length + 2 - 1 = mid.length + 1 from by omega,
+    show mid.length + 1 - (mid.length + 1) = 0 from by omega, htop, htgt, hset1]
+  show (a :: (mid ++ [a])).set 0 z = z :: mid ++ [a]
+  rw [List.set_cons_zero, List.cons_append]
+
+/-- `stackSwap 0` is the identity. -/
+theorem stackSwap_zero (stk : List Operand) : stackSwap 0 stk = stk := by
+  unfold stackSwap
+  simp only [Nat.sub_zero, List.set_set]
+  rcases stk with _ | ⟨h, t⟩
+  · rfl
+  · have hpos : (h :: t).length - 1 < (h :: t).length := by simp
+    rw [List.getElem!_eq_getElem?_getD, List.getElem?_eq_getElem hpos, Option.getD_some,
+        List.set_getElem_self]
+
+/-- The TOS of `l ++ [op]` is `op`, at depth 0. -/
+theorem stackGetDepth_snoc_self (op : Operand) (l : List Operand) :
+    stackGetDepth op (l ++ [op]) = some 0 := by
+  simp [stackGetDepth, stackFind, List.reverse_append]
+
+/-- The deepest element of a `[y, x, x]` triple is at depth 2 (`y ≠ x`; the two `x`'s above it are
+    scanned first, and any deeper `y` in `base` is never reached — found at depth 2 unconditionally). -/
+theorem stackGetDepth_triple_deep (base : List Operand) (y x : String) (hyx : y ≠ x) :
+    stackGetDepth (Operand.Var y) (base ++ [Operand.Var y, Operand.Var x, Operand.Var x]) = some 2 := by
+  rw [show base ++ [Operand.Var y, Operand.Var x, Operand.Var x]
+        = ((base ++ [Operand.Var y]) ++ [Operand.Var x]) ++ [Operand.Var x] from by simp,
+      stackGetDepth_append_ne ((base ++ [Operand.Var y]) ++ [Operand.Var x]) hyx,
+      stackGetDepth_append_ne (base ++ [Operand.Var y]) hyx,
+      stackGetDepth_snoc_self]; rfl
+
+/-- **Key-spilled store reorder — the first genuine non-positioned reorder-under-spill.** For target
+    `[Var y, Var x]` and a stack `base ++ [y, x, x]` (the live value `y` DUP'd, then the spilled key `x`
+    restored+DUP'd), `reorderPlan` synthesises two swaps `SWAP2 ; SWAP1`: the deep `y` (depth 2) moves to
+    its target depth 1, then `x` is already at depth 0. Unlike the value-spilled config (reorder `[]`),
+    the restored operand needs real swaps to reach its store position. Adapts the `reorderPlan_3cycle_var`
+    technique with the triple-append swap lemmas. -/
+theorem reorderPlan_keyspilled (base : List Operand) (x y : String) (ps : PlanState) (hxy : x ≠ y)
+    (hstack : ps.stack = base ++ [Operand.Var y, Operand.Var x, Operand.Var x]) :
+    reorderPlan [Operand.Var y, Operand.Var x] ps
+      = ([StackOp.SOSwap 2, StackOp.SOSwap 1], { ps with stack := base ++ [Operand.Var x, Operand.Var y, Operand.Var x] }) := by
+  have hstep0 : reorderOne () [Operand.Var y, Operand.Var x] 0 (Operand.Var y) ps
+      = ([StackOp.SOSwap 2, StackOp.SOSwap 1], { ps with stack := base ++ [Operand.Var x, Operand.Var y, Operand.Var x] }) := by
+    have hd : stackGetDepth (Operand.Var y) ps.stack = some 2 := by
+      rw [hstack]; exact stackGetDepth_triple_deep base y x (Ne.symm hxy)
+    have hsw2 : stackSwap 2 ps.stack = base ++ [Operand.Var x, Operand.Var x, Operand.Var y] := by
+      rw [hstack]; exact stackSwap_2_append_triple base (Operand.Var y) (Operand.Var x) (Operand.Var x)
+    have hsw1 : stackSwap 1 (base ++ [Operand.Var x, Operand.Var x, Operand.Var y])
+        = base ++ [Operand.Var x, Operand.Var y, Operand.Var x] :=
+      stackSwap_1_append_triple base (Operand.Var x) (Operand.Var x) (Operand.Var y)
+    unfold reorderOne
+    simp [hd, doSwap_two, doSwap_one, hsw2, hsw1]
+  have hstep1 : reorderOne () [Operand.Var y, Operand.Var x] 1 (Operand.Var x)
+      { ps with stack := base ++ [Operand.Var x, Operand.Var y, Operand.Var x] }
+      = ([], { ps with stack := base ++ [Operand.Var x, Operand.Var y, Operand.Var x] }) := by
+    apply reorderOne_nil_of_positioned
+    show stackGetDepth (Operand.Var x) (base ++ [Operand.Var x, Operand.Var y, Operand.Var x]) = some 0
+    exact stackGetDepth_triple_tos base (Operand.Var x) (Operand.Var y) (Operand.Var x)
+  unfold reorderPlan
+  have henum : ([Operand.Var y, Operand.Var x]).enum = [(0, Operand.Var y), (1, Operand.Var x)] := rfl
+  rw [henum]
+  simp only [List.foldl_cons, List.foldl_nil, hstep0, hstep1, List.append_nil, List.nil_append]
+
+/-- Deepest `y` in a both-spilled emit stack `base ++ [y, y, x, x]` is at depth 2 (the two `x`'s above
+    are scanned first; the nearer `y` sits at the snoc boundary). The quad analogue of
+    `stackGetDepth_triple_deep`. -/
+theorem stackGetDepth_quad_deep (base : List Operand) (y x : String) (hyx : y ≠ x) :
+    stackGetDepth (Operand.Var y)
+      (base ++ [Operand.Var y, Operand.Var y, Operand.Var x, Operand.Var x]) = some 2 := by
+  rw [show base ++ [Operand.Var y, Operand.Var y, Operand.Var x, Operand.Var x]
+        = ((base ++ [Operand.Var y, Operand.Var y]) ++ [Operand.Var x]) ++ [Operand.Var x] from by simp,
+      stackGetDepth_append_ne ((base ++ [Operand.Var y, Operand.Var y]) ++ [Operand.Var x]) hyx,
+      stackGetDepth_append_ne (base ++ [Operand.Var y, Operand.Var y]) hyx,
+      show base ++ [Operand.Var y, Operand.Var y] = (base ++ [Operand.Var y]) ++ [Operand.Var y] from by simp,
+      stackGetDepth_snoc_self]; rfl
+
+/-- **Both-spilled store reorder.** For target `[Var y, Var x]` on `base ++ [y, y, x, x]` (both operands
+    restored+DUP'd, two copies each), `reorderPlan` synthesises the same `SWAP2 ; SWAP1` as the
+    key-spilled case: the deep `y` (depth 2) moves to its target depth 1, `x` is already at TOS —
+    leaving `base ++ [y, x, y, x]`. -/
+theorem reorderPlan_bothspilled (base : List Operand) (x y : String) (ps : PlanState) (hxy : x ≠ y)
+    (hstack : ps.stack = base ++ [Operand.Var y, Operand.Var y, Operand.Var x, Operand.Var x]) :
+    reorderPlan [Operand.Var y, Operand.Var x] ps
+      = ([StackOp.SOSwap 2, StackOp.SOSwap 1],
+         { ps with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var y, Operand.Var x] }) := by
+  have hstep0 : reorderOne () [Operand.Var y, Operand.Var x] 0 (Operand.Var y) ps
+      = ([StackOp.SOSwap 2, StackOp.SOSwap 1],
+         { ps with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var y, Operand.Var x] }) := by
+    have hd : stackGetDepth (Operand.Var y) ps.stack = some 2 := by
+      rw [hstack]; exact stackGetDepth_quad_deep base y x (Ne.symm hxy)
+    have hsw2 : stackSwap 2 ps.stack
+        = base ++ [Operand.Var y, Operand.Var x, Operand.Var x, Operand.Var y] := by
+      rw [hstack, show base ++ [Operand.Var y, Operand.Var y, Operand.Var x, Operand.Var x]
+            = (base ++ [Operand.Var y]) ++ [Operand.Var y, Operand.Var x, Operand.Var x] from by simp,
+          stackSwap_2_append_triple (base ++ [Operand.Var y]) (Operand.Var y) (Operand.Var x) (Operand.Var x)]
+      simp
+    have hsw1 : stackSwap 1 (base ++ [Operand.Var y, Operand.Var x, Operand.Var x, Operand.Var y])
+        = base ++ [Operand.Var y, Operand.Var x, Operand.Var y, Operand.Var x] := by
+      rw [show base ++ [Operand.Var y, Operand.Var x, Operand.Var x, Operand.Var y]
+            = (base ++ [Operand.Var y]) ++ [Operand.Var x, Operand.Var x, Operand.Var y] from by simp,
+          stackSwap_1_append_triple (base ++ [Operand.Var y]) (Operand.Var x) (Operand.Var x) (Operand.Var y)]
+      simp
+    unfold reorderOne
+    simp [hd, doSwap_two, doSwap_one, hsw2, hsw1]
+  have hstep1 : reorderOne () [Operand.Var y, Operand.Var x] 1 (Operand.Var x)
+      { ps with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var y, Operand.Var x] }
+      = ([], { ps with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var y, Operand.Var x] }) := by
+    apply reorderOne_nil_of_positioned
+    show stackGetDepth (Operand.Var x)
+      (base ++ [Operand.Var y, Operand.Var x, Operand.Var y, Operand.Var x]) = some 0
+    rw [show base ++ [Operand.Var y, Operand.Var x, Operand.Var y, Operand.Var x]
+          = (base ++ [Operand.Var y, Operand.Var x, Operand.Var y]) ++ [Operand.Var x] from by simp]
+    exact stackGetDepth_snoc_self (Operand.Var x) (base ++ [Operand.Var y, Operand.Var x, Operand.Var y])
+  unfold reorderPlan
+  have henum : ([Operand.Var y, Operand.Var x]).enum = [(0, Operand.Var y), (1, Operand.Var x)] := rfl
+  rw [henum]
+  simp only [List.foldl_cons, List.foldl_nil, hstep0, hstep1, List.append_nil, List.nil_append]
+
+-- LS emit .2 (y live, x spilled): stack base ++ [y, x, x], x's slot freed.
+/-- Deepest `z` in a first-spilled ternop emit stack `base ++ [z, y, x, x]` is at depth 3. -/
+theorem stackGetDepth_quad_deepest (base : List Operand) (z y x : String)
+    (hzy : z ≠ y) (hzx : z ≠ x) :
+    stackGetDepth (Operand.Var z)
+      (base ++ [Operand.Var z, Operand.Var y, Operand.Var x, Operand.Var x]) = some 3 := by
+  rw [show base ++ [Operand.Var z, Operand.Var y, Operand.Var x, Operand.Var x]
+        = (((base ++ [Operand.Var z]) ++ [Operand.Var y]) ++ [Operand.Var x]) ++ [Operand.Var x]
+        from by simp,
+      stackGetDepth_append_ne (((base ++ [Operand.Var z]) ++ [Operand.Var y]) ++ [Operand.Var x]) hzx,
+      stackGetDepth_append_ne ((base ++ [Operand.Var z]) ++ [Operand.Var y]) hzx,
+      stackGetDepth_append_ne (base ++ [Operand.Var z]) hzy,
+      stackGetDepth_snoc_self]; rfl
+
+/-- **First-spilled ternop reorder.** For target `[Var z, Var y, Var x]` on `base ++ [z, y, x, x]`
+    (the spilled `x` restored+DUP'd, `z`/`y` live-DUP'd below), `reorderPlan` synthesises
+    `SWAP3 ; SWAP2 ; SWAP1`: the deep `z` (depth 3) moves to its target depth 2 (two swaps), `y`
+    lands at TOS and one `SWAP1` sends it home — leaving `base ++ [x, z, y, x]`, the operands
+    positioned over the kept restored copy. -/
+theorem reorderPlan_ternop_firstspilled (base : List Operand) (x y z : String) (ps : PlanState)
+    (hxz : x ≠ z) (hyz : y ≠ z)
+    (hstack : ps.stack = base ++ [Operand.Var z, Operand.Var y, Operand.Var x, Operand.Var x]) :
+    reorderPlan [Operand.Var z, Operand.Var y, Operand.Var x] ps
+      = ([StackOp.SOSwap 3, StackOp.SOSwap 2, StackOp.SOSwap 1],
+         { ps with stack := base ++ [Operand.Var x, Operand.Var z, Operand.Var y, Operand.Var x] }) := by
+  have hstep0 : reorderOne () [Operand.Var z, Operand.Var y, Operand.Var x] 0 (Operand.Var z) ps
+      = ([StackOp.SOSwap 3, StackOp.SOSwap 2],
+         { ps with stack := base ++ [Operand.Var x, Operand.Var z, Operand.Var x, Operand.Var y] }) := by
+    have hd : stackGetDepth (Operand.Var z) ps.stack = some 3 := by
+      rw [hstack]; exact stackGetDepth_quad_deepest base z y x (Ne.symm hyz) (Ne.symm hxz)
+    have hsw3 : stackSwap 3 ps.stack
+        = base ++ [Operand.Var x, Operand.Var y, Operand.Var x, Operand.Var z] := by
+      rw [hstack]
+      exact stackSwap_3_append_quad base (Operand.Var z) (Operand.Var y) (Operand.Var x) (Operand.Var x)
+    have hsw2 : stackSwap 2 (base ++ [Operand.Var x, Operand.Var y, Operand.Var x, Operand.Var z])
+        = base ++ [Operand.Var x, Operand.Var z, Operand.Var x, Operand.Var y] :=
+      stackSwap_2_append_quad base (Operand.Var x) (Operand.Var y) (Operand.Var x) (Operand.Var z)
+    unfold reorderOne
+    simp [hd, doSwap_three, doSwap_two, hsw3, hsw2]
+  have hstep1 : reorderOne () [Operand.Var z, Operand.Var y, Operand.Var x] 1 (Operand.Var y)
+      { ps with stack := base ++ [Operand.Var x, Operand.Var z, Operand.Var x, Operand.Var y] }
+      = ([StackOp.SOSwap 1],
+         { ps with stack := base ++ [Operand.Var x, Operand.Var z, Operand.Var y, Operand.Var x] }) := by
+    have h := reorderOne_dist0 (targetOps := [Operand.Var z, Operand.Var y, Operand.Var x])
+      (idx := 1) (op := Operand.Var y)
+      (ps := { ps with stack := base ++ [Operand.Var x, Operand.Var z, Operand.Var x, Operand.Var y] })
+      (f := 1) rfl
+      (stackGetDepth_quad_tos base (Operand.Var x) (Operand.Var z) (Operand.Var x) (Operand.Var y))
+      (by decide) (by decide)
+    rw [h]
+    rw [show stackSwap 1 (base ++ [Operand.Var x, Operand.Var z, Operand.Var x, Operand.Var y])
+          = base ++ [Operand.Var x, Operand.Var z, Operand.Var y, Operand.Var x] from
+        stackSwap_1_append_quad base (Operand.Var x) (Operand.Var z) (Operand.Var x) (Operand.Var y)]
+  have hstep2 : reorderOne () [Operand.Var z, Operand.Var y, Operand.Var x] 2 (Operand.Var x)
+      { ps with stack := base ++ [Operand.Var x, Operand.Var z, Operand.Var y, Operand.Var x] }
+      = ([], { ps with stack := base ++ [Operand.Var x, Operand.Var z, Operand.Var y, Operand.Var x] }) := by
+    apply reorderOne_nil_of_positioned
+    show stackGetDepth (Operand.Var x)
+        (base ++ [Operand.Var x, Operand.Var z, Operand.Var y, Operand.Var x]) = some 0
+    exact stackGetDepth_quad_tos base (Operand.Var x) (Operand.Var z) (Operand.Var y) (Operand.Var x)
+  unfold reorderPlan
+  have henum : ([Operand.Var z, Operand.Var y, Operand.Var x]).enum
+      = [(0, Operand.Var z), (1, Operand.Var y), (2, Operand.Var x)] := rfl
+  rw [henum]
+  simp only [List.foldl_cons, List.foldl_nil, hstep0, hstep1, hstep2, List.append_nil,
+    List.nil_append]
+  rfl
+
+/-- Deepest `x` in the mid-spilled intermediate `base ++ [x, z, y, y]` is at depth 3. -/
+theorem stackGetDepth_quad_deepest' (base : List Operand) (x z y : String)
+    (hxz : x ≠ z) (hxy : x ≠ y) :
+    stackGetDepth (Operand.Var x)
+      (base ++ [Operand.Var x, Operand.Var z, Operand.Var y, Operand.Var y]) = some 3 := by
+  rw [show base ++ [Operand.Var x, Operand.Var z, Operand.Var y, Operand.Var y]
+        = (((base ++ [Operand.Var x]) ++ [Operand.Var z]) ++ [Operand.Var y]) ++ [Operand.Var y]
+        from by simp,
+      stackGetDepth_append_ne (((base ++ [Operand.Var x]) ++ [Operand.Var z]) ++ [Operand.Var y]) hxy,
+      stackGetDepth_append_ne ((base ++ [Operand.Var x]) ++ [Operand.Var z]) hxy,
+      stackGetDepth_append_ne (base ++ [Operand.Var x]) hxz,
+      stackGetDepth_snoc_self]; rfl
+
+/-- Deepest `z` in a mid-spilled ternop emit stack `base ++ [z, y, y, x]` is at depth 3. -/
+theorem stackGetDepth_quad_deepest'' (base : List Operand) (z y x : String)
+    (hzy : z ≠ y) (hzx : z ≠ x) :
+    stackGetDepth (Operand.Var z)
+      (base ++ [Operand.Var z, Operand.Var y, Operand.Var y, Operand.Var x]) = some 3 := by
+  rw [show base ++ [Operand.Var z, Operand.Var y, Operand.Var y, Operand.Var x]
+        = (((base ++ [Operand.Var z]) ++ [Operand.Var y]) ++ [Operand.Var y]) ++ [Operand.Var x]
+        from by simp,
+      stackGetDepth_append_ne (((base ++ [Operand.Var z]) ++ [Operand.Var y]) ++ [Operand.Var y]) hzx,
+      stackGetDepth_append_ne ((base ++ [Operand.Var z]) ++ [Operand.Var y]) hzy,
+      stackGetDepth_append_ne (base ++ [Operand.Var z]) hzy,
+      stackGetDepth_snoc_self]; rfl
+
+/-- **Mid-spilled ternop reorder.** For target `[Var z, Var y, Var x]` on `base ++ [z, y, y, x]`
+    (the spilled `y` restored+DUP'd between the live DUPs), `reorderPlan` synthesises
+    `SWAP3 ; SWAP2 ; SWAP1 ; SWAP3`: the deep `z` moves to its target (two swaps), the `SWAP1`
+    exchanges the two equal `y` copies (a stack no-op), and the final `SWAP3` lifts `x` from the
+    bottom of the working region to TOS — leaving `base ++ [y, z, y, x]`, positioned over the kept
+    `y`. -/
+theorem reorderPlan_ternop_midspilled (base : List Operand) (x y z : String) (ps : PlanState)
+    (hxy : x ≠ y) (hxz : x ≠ z) (hyz : y ≠ z)
+    (hstack : ps.stack = base ++ [Operand.Var z, Operand.Var y, Operand.Var y, Operand.Var x]) :
+    reorderPlan [Operand.Var z, Operand.Var y, Operand.Var x] ps
+      = ([StackOp.SOSwap 3, StackOp.SOSwap 2, StackOp.SOSwap 1, StackOp.SOSwap 3],
+         { ps with stack := base ++ [Operand.Var y, Operand.Var z, Operand.Var y, Operand.Var x] }) := by
+  have hstep0 : reorderOne () [Operand.Var z, Operand.Var y, Operand.Var x] 0 (Operand.Var z) ps
+      = ([StackOp.SOSwap 3, StackOp.SOSwap 2],
+         { ps with stack := base ++ [Operand.Var x, Operand.Var z, Operand.Var y, Operand.Var y] }) := by
+    have hd : stackGetDepth (Operand.Var z) ps.stack = some 3 := by
+      rw [hstack]; exact stackGetDepth_quad_deepest'' base z y x (Ne.symm hyz) (Ne.symm hxz)
+    have hsw3 : stackSwap 3 ps.stack
+        = base ++ [Operand.Var x, Operand.Var y, Operand.Var y, Operand.Var z] := by
+      rw [hstack]
+      exact stackSwap_3_append_quad base (Operand.Var z) (Operand.Var y) (Operand.Var y) (Operand.Var x)
+    have hsw2 : stackSwap 2 (base ++ [Operand.Var x, Operand.Var y, Operand.Var y, Operand.Var z])
+        = base ++ [Operand.Var x, Operand.Var z, Operand.Var y, Operand.Var y] :=
+      stackSwap_2_append_quad base (Operand.Var x) (Operand.Var y) (Operand.Var y) (Operand.Var z)
+    unfold reorderOne
+    simp [hd, doSwap_three, doSwap_two, hsw3, hsw2]
+  have hstep1 : reorderOne () [Operand.Var z, Operand.Var y, Operand.Var x] 1 (Operand.Var y)
+      { ps with stack := base ++ [Operand.Var x, Operand.Var z, Operand.Var y, Operand.Var y] }
+      = ([StackOp.SOSwap 1],
+         { ps with stack := base ++ [Operand.Var x, Operand.Var z, Operand.Var y, Operand.Var y] }) := by
+    have h := reorderOne_dist0 (targetOps := [Operand.Var z, Operand.Var y, Operand.Var x])
+      (idx := 1) (op := Operand.Var y)
+      (ps := { ps with stack := base ++ [Operand.Var x, Operand.Var z, Operand.Var y, Operand.Var y] })
+      (f := 1) rfl
+      (stackGetDepth_quad_tos base (Operand.Var x) (Operand.Var z) (Operand.Var y) (Operand.Var y))
+      (by decide) (by decide)
+    rw [h]
+    rw [show stackSwap 1 (base ++ [Operand.Var x, Operand.Var z, Operand.Var y, Operand.Var y])
+          = base ++ [Operand.Var x, Operand.Var z, Operand.Var y, Operand.Var y] from
+        stackSwap_1_append_quad base (Operand.Var x) (Operand.Var z) (Operand.Var y) (Operand.Var y)]
+  have hstep2 : reorderOne () [Operand.Var z, Operand.Var y, Operand.Var x] 2 (Operand.Var x)
+      { ps with stack := base ++ [Operand.Var x, Operand.Var z, Operand.Var y, Operand.Var y] }
+      = ([StackOp.SOSwap 3],
+         { ps with stack := base ++ [Operand.Var y, Operand.Var z, Operand.Var y, Operand.Var x] }) := by
+    have hd : stackGetDepth (Operand.Var x)
+        (base ++ [Operand.Var x, Operand.Var z, Operand.Var y, Operand.Var y]) = some 3 :=
+      stackGetDepth_quad_deepest' base x z y hxz hxy
+    have hsw3 : stackSwap 3 (base ++ [Operand.Var x, Operand.Var z, Operand.Var y, Operand.Var y])
+        = base ++ [Operand.Var y, Operand.Var z, Operand.Var y, Operand.Var x] :=
+      stackSwap_3_append_quad base (Operand.Var x) (Operand.Var z) (Operand.Var y) (Operand.Var y)
+    have hds0 : doSwap 0 ({ ps with stack := base ++ [Operand.Var y, Operand.Var z, Operand.Var y,
+        Operand.Var x] } : PlanState) = ([], { ps with stack := base ++ [Operand.Var y,
+        Operand.Var z, Operand.Var y, Operand.Var x] }) := by
+      rw [doSwap, if_pos rfl]
+    unfold reorderOne
+    simp [hd, doSwap_three, hsw3, hds0]
+  unfold reorderPlan
+  have henum : ([Operand.Var z, Operand.Var y, Operand.Var x]).enum
+      = [(0, Operand.Var z), (1, Operand.Var y), (2, Operand.Var x)] := rfl
+  rw [henum]
+  simp only [List.foldl_cons, List.foldl_nil, hstep0, hstep1, hstep2, List.nil_append]
+  rfl
+
+/-- **Both-spilled binop reorder — swapped (commutative) order.** For target `[Var x, Var y]`
+    (picked on the `reorderCost` tie) and emit stack `base ++ [y, y, x, x]`, `reorderPlan`
+    synthesises `SWAP1 ; SWAP2` (SWAP1 transposes the two equal `x`'s, a stack no-op; SWAP2
+    rotates a deep `y` to TOS) leaving `base ++ [y, x, x, y]`. -/
+theorem reorderPlan_bothspilled_swapped (base : List Operand) (x y : String) (ps : PlanState) (hxy : x ≠ y)
+    (hstack : ps.stack = base ++ [Operand.Var y, Operand.Var y, Operand.Var x, Operand.Var x]) :
+    reorderPlan [Operand.Var x, Operand.Var y] ps
+      = ([StackOp.SOSwap 1, StackOp.SOSwap 2],
+         { ps with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var x, Operand.Var y] }) := by
+  have hstep0 : reorderOne () [Operand.Var x, Operand.Var y] 0 (Operand.Var x) ps
+      = ([StackOp.SOSwap 1], { ps with stack := base ++ [Operand.Var y, Operand.Var y, Operand.Var x, Operand.Var x] }) := by
+    have hd : stackGetDepth (Operand.Var x) ps.stack = some 0 := by
+      rw [hstack, show base ++ [Operand.Var y, Operand.Var y, Operand.Var x, Operand.Var x]
+            = (base ++ [Operand.Var y, Operand.Var y, Operand.Var x]) ++ [Operand.Var x] from by simp,
+          stackGetDepth_snoc_self]
+    have hsw1 : stackSwap 1 ps.stack = base ++ [Operand.Var y, Operand.Var y, Operand.Var x, Operand.Var x] := by
+      rw [hstack, show base ++ [Operand.Var y, Operand.Var y, Operand.Var x, Operand.Var x]
+            = (base ++ [Operand.Var y]) ++ [Operand.Var y, Operand.Var x, Operand.Var x] from by simp,
+          stackSwap_1_append_triple (base ++ [Operand.Var y]) (Operand.Var y) (Operand.Var x) (Operand.Var x)]
+    unfold reorderOne
+    simp [hd, doSwap_zero, doSwap_one, hsw1]
+  have hstep1 : reorderOne () [Operand.Var x, Operand.Var y] 1 (Operand.Var y)
+      { ps with stack := base ++ [Operand.Var y, Operand.Var y, Operand.Var x, Operand.Var x] }
+      = ([StackOp.SOSwap 2], { ps with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var x, Operand.Var y] }) := by
+    have hd : stackGetDepth (Operand.Var y)
+        (base ++ [Operand.Var y, Operand.Var y, Operand.Var x, Operand.Var x]) = some 2 :=
+      stackGetDepth_quad_deep base y x (Ne.symm hxy)
+    have hsw2 : stackSwap 2 (base ++ [Operand.Var y, Operand.Var y, Operand.Var x, Operand.Var x])
+        = base ++ [Operand.Var y, Operand.Var x, Operand.Var x, Operand.Var y] := by
+      rw [show base ++ [Operand.Var y, Operand.Var y, Operand.Var x, Operand.Var x]
+            = (base ++ [Operand.Var y]) ++ [Operand.Var y, Operand.Var x, Operand.Var x] from by simp,
+          stackSwap_2_append_triple (base ++ [Operand.Var y]) (Operand.Var y) (Operand.Var x) (Operand.Var x)]
+      simp
+    unfold reorderOne
+    simp [hd, doSwap_zero, doSwap_two, hsw2]
+  unfold reorderPlan
+  have henum : ([Operand.Var x, Operand.Var y]).enum = [(0, Operand.Var x), (1, Operand.Var y)] := rfl
+  rw [henum]
+  simp [List.foldl_cons, List.foldl_nil, hstep0, hstep1]
+
+
+theorem emit2_keyspilled {opc nl x y ps base offx d_y}
+    (hstack0 : ps.stack = base)
+    (hnospill_y : alookup' ps.spilled (Operand.Var y) = none) (hlivey : nl.contains y = true)
+    (hdepth_y : stackGetDepth (Operand.Var y) ps.stack = some d_y) (hsmall_y : d_y ≤ 15)
+    (hspill_x : alookup' ps.spilled (Operand.Var x) = some offx) (hlivex : nl.contains x = true) :
+    (emitInputPlan opc [Operand.Var y, Operand.Var x] nl ps).2
+      = { ps with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var x],
+                  spilled := aremove ps.spilled (Operand.Var x), alloc := freeSpillSlot offx ps.alloc } := by
+  have hpeeky : stackPeek d_y ps.stack = Operand.Var y := stackGetDepth_peek hdepth_y
+  have hdupy : stackDup d_y ps.stack = ps.stack ++ [Operand.Var y] := by unfold stackDup; rw [hpeeky]
+  set ps1 : PlanState := { ps with stack := stackDup d_y ps.stack } with hps1def
+  have hdd : doDup d_y ps = ([StackOp.SODup (d_y + 1)], ps1) := by rw [hps1def]; unfold doDup; rw [if_pos hsmall_y]
+  have hhead : emitOneInput opc nl (Operand.Var y) ps = ([StackOp.SODup (d_y + 1)], ps1) := by
+    unfold emitOneInput
+    simp only [isVarOperand, hnospill_y, Option.isSome_none, Bool.and_false, Bool.false_eq_true,
+      if_false, hlivey, if_true, hdepth_y, hdd, List.nil_append]
+  have hps1stack : ps1.stack = ps.stack ++ [Operand.Var y] := by rw [hps1def, hdupy]
+  have hspillx1 : alookup' ps1.spilled (Operand.Var x) = some offx := by rw [hps1def]; exact hspill_x
+  have htail : emitOneInput opc nl (Operand.Var x) ps1
+      = ([StackOp.SORestore offx, StackOp.SODup 1],
+         { ps1 with stack := ps1.stack ++ [Operand.Var x, Operand.Var x],
+                    spilled := aremove ps1.spilled (Operand.Var x), alloc := freeSpillSlot offx ps1.alloc }) :=
+    emitOneInput_var_spilled_eq hspillx1 hlivex
+  have hemit2 : (emitInputPlan opc [Operand.Var y, Operand.Var x] nl ps).2
+      = { ps1 with stack := ps1.stack ++ [Operand.Var x, Operand.Var x],
+                   spilled := aremove ps1.spilled (Operand.Var x), alloc := freeSpillSlot offx ps1.alloc } := by
+    unfold emitInputPlan; simp only [List.foldl_cons, List.foldl_nil, hhead, htail, List.nil_append]
+  rw [hemit2, hps1stack, hstack0, hps1def]; simp
+
+/-- **Key-spilled store plan reduction.** `SSTORE x y`, key `x` spilled, value `y` live: emit leaves
+    `base ++ [y, x, x]`, the reorder is the non-trivial `SWAP2 ; SWAP1` (`reorderPlan_keyspilled`)
+    giving `base ++ [x, y, x]`, `stackPop 2` leaves `base ++ [x]` (the kept restored key). -/
+theorem genRegularInstPlan_sstore_keyspilled_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {x y : String} {base : List Operand} {name : String} {offx d_y : Nat}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x, Operand.Var y])
+    (houts : inst.outputs = [])
+    (hxy : x ≠ y)
+    (hstack0 : ps.stack = base)
+    (hnospill_y : alookup' ps.spilled (Operand.Var y) = none)
+    (hlivey : nextLiveness.contains y = true)
+    (hdepth_y : stackGetDepth (Operand.Var y) ps.stack = some d_y)
+    (hsmall_y : d_y ≤ 15)
+    (hspill_x : alookup' ps.spilled (Operand.Var x) = some offx)
+    (hlivex : nextLiveness.contains x = true) :
+    generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator curBbLabel ps
+      = ((emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).1
+           ++ [StackOp.SOSwap 2, StackOp.SOSwap 1, StackOp.SOEmit name],
+         releaseDeadSpills nextLiveness
+           { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+             stack := base ++ [Operand.Var x] }) := by
+  have hrev : inst.operands.reverse = [Operand.Var y, Operand.Var x] := by rw [hops]; rfl
+  have hemit2 := emit2_keyspilled (opc := inst.opcode) (nl := nextLiveness) hstack0 hnospill_y hlivey hdepth_y hsmall_y hspill_x hlivex
+  unfold generateRegularInstPlan
+  simp only [hcompute, hrev, houts]
+  rcases hemit : emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps with ⟨inputOps, ps1⟩
+  have h2 : (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).2 = ps1 := by rw [hemit]
+  have hps1stack : ps1.stack = base ++ [Operand.Var y, Operand.Var x, Operand.Var x] := by
+    rw [← h2, hemit2]
+  have hreorder : reorderPlan [Operand.Var y, Operand.Var x] ps1
+      = ([StackOp.SOSwap 2, StackOp.SOSwap 1], { ps1 with stack := base ++ [Operand.Var x, Operand.Var y, Operand.Var x] }) :=
+    reorderPlan_keyspilled base x y ps1 hxy hps1stack
+  have hpop2 : stackPop 2 (base ++ [Operand.Var x, Operand.Var y, Operand.Var x]) = base ++ [Operand.Var x] := by
+    rw [show base ++ [Operand.Var x, Operand.Var y, Operand.Var x] = (base ++ [Operand.Var x]) ++ [Operand.Var y, Operand.Var x] from by simp,
+        stackPop_2_append_pair]
+  simp [generateEmitOps_evmName hname, hreorder, hpop2, hncomm, hnjmp]
+
+/-- **`reorderOne` on a TOS operand: its plan-stack effect is `stackSwap finalDist`.** When `op` is the
+    TOS (`stackGetDepth op = some 0`) and the final depth is in range, `reorderOne` leaves
+    `stackSwap (targetOps.length - 1 - idx) ps.stack` — uniformly (the `finalDist = 0` case is
+    `stackSwap 0 = id`). No distinctness needed. -/
+theorem reorderOne_tos_stack {targetOps : List Operand} {idx : Nat} {op : Operand} {ps : PlanState}
+    (hd : stackGetDepth op ps.stack = some 0)
+    (hfd : targetOps.length - 1 - idx < ps.stack.length) :
+    (reorderOne () targetOps idx op ps).2.stack
+      = stackSwap (targetOps.length - 1 - idx) ps.stack := by
+  unfold reorderOne
+  simp only [hd]
+  by_cases hf0 : targetOps.length - 1 - idx = 0
+  · rw [if_pos hf0.symm, hf0, stackSwap_zero]
+  · rw [if_neg (fun h => hf0 h.symm)]
+    show (doSwap (targetOps.length - 1 - idx) (doSwap 0 ps).2).2.stack = _
+    rw [doSwap_zero]
+    exact doSwap_stack_ne0 hf0 hfd
+
+/-- **The fold invariant for the general rotation.** Processing the tail of the `reorderPlan` fold
+    (`zipIdx`-entries `(op, idx)` of `suf.zipIdx pre.length`) from a stack `base ++ pre ++ rotate1 suf`
+    yields `base ++ pre ++ suf = base ++ T`. Each step's operand is the TOS of the active segment
+    (`rotate1` puts it there), so `reorderOne` swaps it to the segment's deepest slot
+    (`stackSwap_endpoints`) without touching `base ++ pre` (`stackSwap_append_right`), extending the
+    placed prefix by one. No nodup needed. -/
+theorem reorderPlan_rotate_aux (T base : List Operand) :
+    ∀ (suf pre : List Operand) (acc : List StackOp) (ps : PlanState),
+    T = pre ++ suf →
+    ps.stack = base ++ pre ++ rotate1 suf →
+    (List.foldl (fun (a : List StackOp × PlanState) (p : Operand × Nat) =>
+       (a.1 ++ (reorderOne () T p.2 p.1 a.2).1, (reorderOne () T p.2 p.1 a.2).2))
+       (acc, ps) (suf.zipIdx pre.length)).2.stack = base ++ T := by
+  intro suf
+  induction suf with
+  | nil =>
+    intro pre acc ps hT hstk
+    simp only [List.zipIdx_nil, List.foldl_nil]
+    rw [hstk]; simp only [rotate1, List.append_nil]
+    rw [hT]; simp
+  | cons op rest ih =>
+    intro pre acc ps hT hstk
+    rw [show (op :: rest).zipIdx pre.length = (op, pre.length) :: rest.zipIdx (pre.length + 1) from rfl,
+        List.foldl_cons]
+    have hstk_snoc : ps.stack = base ++ pre ++ rest ++ [op] := by
+      rw [hstk]; simp only [rotate1]; rw [← List.append_assoc]
+    have hstk_split : ps.stack = (base ++ pre) ++ (rest ++ [op]) := by
+      rw [hstk]; simp only [rotate1]
+    have hlen : T.length - 1 - pre.length = rest.length := by
+      have hTl : T.length = pre.length + (rest.length + 1) := by
+        rw [hT]; simp only [List.length_append, List.length_cons]
+      omega
+    have hdep : stackGetDepth op ps.stack = some 0 := by
+      rw [hstk_snoc]; exact stackGetDepth_snoc_self op (base ++ pre ++ rest)
+    have hfd : T.length - 1 - pre.length < ps.stack.length := by
+      rw [hlen, hstk_snoc]; simp only [List.length_append, List.length_cons, List.length_nil]; omega
+    have hps'stk : (reorderOne () T pre.length op ps).2.stack
+        = base ++ (pre ++ [op]) ++ rotate1 rest := by
+      rw [reorderOne_tos_stack hdep hfd, hlen, hstk_split]
+      rw [stackSwap_append_right (base ++ pre) (rest ++ [op]) rest.length (by simp)]
+      cases rest with
+      | nil =>
+        simp only [rotate1, List.length_nil, List.nil_append]
+        rw [stackSwap_zero]; simp [List.append_assoc]
+      | cons r rs =>
+        have hsw : stackSwap (r :: rs).length ((r :: rs) ++ [op]) = op :: (rs ++ [r]) := by
+          show stackSwap (rs.length + 1) (r :: (rs ++ [op])) = op :: (rs ++ [r])
+          exact stackSwap_endpoints r op rs
+        rw [hsw]
+        simp [rotate1, List.append_assoc]
+    have hrec := ih (pre ++ [op]) (acc ++ (reorderOne () T pre.length op ps).1)
+      (reorderOne () T pre.length op ps).2 (by rw [hT]; simp) hps'stk
+    rw [show pre.length + 1 = (pre ++ [op]).length from by simp]
+    exact hrec
+
+/-- **General single-rotation join reconciliation (`perm_reaches`, any length).** For any target entry
+    layout `T` and a predecessor that leaves the single left-rotation `rotate1 T` on top of the stack
+    (`base ++ rotate1 T`), `reorderPlan T` synthesises `base ++ T`. Generalises `reorderPlan_3cycle_var`
+    (`T = [a,b,c]`, `rotate1 = [b,c,a]`) and `reorderPlan_4rotate_var` (`T = [a,b,c,d]`) to arbitrary
+    length. Needs **no distinctness / nodup** — the rotation keeps the operand to place at the TOS at
+    every step, so each `reorderOne` locates it unconditionally. -/
+theorem reorderPlan_rotate (T base : List Operand) (ps : PlanState)
+    (hstk : ps.stack = base ++ rotate1 T) :
+    (reorderPlan T ps).2.stack = base ++ T := by
+  unfold reorderPlan
+  rw [show T.enum = (T.zipIdx 0).map (fun p => (p.2, p.1)) from rfl, List.foldl_map]
+  exact reorderPlan_rotate_aux T base T [] [] ps (by simp) (by simpa using hstk)
+
+/-- The asm stack holds the four top plan vars' values (`base ++ [Var z, Var y, Var x, Var w]`, `w`=TOS).
+    The 4-input twin of `venomAsmRel_asmStack_top3_var`. -/
+theorem venomAsmRel_asmStack_top4_var {lo ps vs as} {base : List Operand} {w x y z : String}
+    {ww wx wy wz : bytes32}
+    (hrel : venomAsmRel lo ps vs as)
+    (hstack : ps.stack = base ++ [Operand.Var z, Operand.Var y, Operand.Var x, Operand.Var w])
+    (hvw : operandVal vs lo (Operand.Var w) = some ww)
+    (hvx : operandVal vs lo (Operand.Var x) = some wx)
+    (hvy : operandVal vs lo (Operand.Var y) = some wy)
+    (hvz : operandVal vs lo (Operand.Var z) = some wz) :
+    as.stack = ww :: wx :: wy :: wz :: as.stack.drop 4 := by
+  obtain ⟨hStk, _⟩ := hrel
+  have hlen : ps.stack.length = as.stack.length := hStk.1
+  have hge : 4 ≤ as.stack.length := by rw [← hlen, hstack]; simp
+  have h0 : as.stack[0]! = ww := by
+    have hp := planStackRel_peek hStk (dist := 0) (by rw [hstack]; simp)
+    rw [hstack, stackPeek_0_append_quad, hvw] at hp
+    exact (Option.some.inj hp).symm
+  have h1 : as.stack[1]! = wx := by
+    have hp := planStackRel_peek hStk (dist := 1) (by rw [hstack]; simp)
+    rw [hstack, stackPeek_1_append_quad, hvx] at hp
+    exact (Option.some.inj hp).symm
+  have h2 : as.stack[2]! = wy := by
+    have hp := planStackRel_peek hStk (dist := 2) (by rw [hstack]; simp)
+    rw [hstack, stackPeek_2_append_quad, hvy] at hp
+    exact (Option.some.inj hp).symm
+  have h3 : as.stack[3]! = wz := by
+    have hp := planStackRel_peek hStk (dist := 3) (by rw [hstack]; simp)
+    rw [hstack, stackPeek_3_append_quad, hvz] at hp
+    exact (Option.some.inj hp).symm
+  conv_lhs => rw [list_eq_get4 as.stack hge]
+  rw [h0, h1, h2, h3]
+
+/-- The N-input emitter specialised to four vars — the quad twin of `emitInputPlan_triple_var_eq`. -/
+theorem emitInputPlan_quad_var_eq {opc nl w z y x ps d_w d_z d_y d_x}
+    (hnospill_w : alookup' ps.spilled (Operand.Var w) = none)
+    (hlivew : nl.contains w = true)
+    (hdepth_w : stackGetDepth (Operand.Var w) ps.stack = some d_w)
+    (hsmall_w : d_w ≤ 15)
+    (hnospill_z : alookup' ps.spilled (Operand.Var z) = none)
+    (hlivez : nl.contains z = true)
+    (hdepth_z : stackGetDepth (Operand.Var z) (stackDup d_w ps.stack) = some d_z)
+    (hsmall_z : d_z ≤ 15)
+    (hnospill_y : alookup' ps.spilled (Operand.Var y) = none)
+    (hlivey : nl.contains y = true)
+    (hdepth_y : stackGetDepth (Operand.Var y) (stackDup d_z (stackDup d_w ps.stack)) = some d_y)
+    (hsmall_y : d_y ≤ 15)
+    (hnospill_x : alookup' ps.spilled (Operand.Var x) = none)
+    (hlivex : nl.contains x = true)
+    (hdepth_x : stackGetDepth (Operand.Var x) (stackDup d_y (stackDup d_z (stackDup d_w ps.stack))) = some d_x)
+    (hsmall_x : d_x ≤ 15) :
+    emitInputPlan opc [Operand.Var w, Operand.Var z, Operand.Var y, Operand.Var x] nl ps
+      = ([StackOp.SODup (d_w + 1), StackOp.SODup (d_z + 1), StackOp.SODup (d_y + 1), StackOp.SODup (d_x + 1)],
+         { ps with stack := ps.stack ++ [Operand.Var w, Operand.Var z, Operand.Var y, Operand.Var x] }) := by
+  have hdupW : stackDup d_w ps.stack = ps.stack ++ [Operand.Var w] := by
+    unfold stackDup; rw [stackGetDepth_peek hdepth_w]
+  have hdz : stackGetDepth (Operand.Var z) (ps.stack ++ [Operand.Var w]) = some d_z := hdupW ▸ hdepth_z
+  have hdupZ : stackDup d_z (ps.stack ++ [Operand.Var w]) = (ps.stack ++ [Operand.Var w]) ++ [Operand.Var z] := by
+    unfold stackDup; rw [stackGetDepth_peek hdz]
+  have hdy : stackGetDepth (Operand.Var y) ((ps.stack ++ [Operand.Var w]) ++ [Operand.Var z]) = some d_y := by
+    rw [← hdupZ, ← hdupW]; exact hdepth_y
+  have hdupY : stackDup d_y ((ps.stack ++ [Operand.Var w]) ++ [Operand.Var z])
+      = ((ps.stack ++ [Operand.Var w]) ++ [Operand.Var z]) ++ [Operand.Var y] := by
+    unfold stackDup; rw [stackGetDepth_peek hdy]
+  have hdx : stackGetDepth (Operand.Var x) (((ps.stack ++ [Operand.Var w]) ++ [Operand.Var z]) ++ [Operand.Var y]) = some d_x := by
+    rw [← hdupY, ← hdupZ, ← hdupW]; exact hdepth_x
+  have h := emitInputPlan_allVars_eq opc nl [w, z, y, x] [d_w, d_z, d_y, d_x] ps
+    (by intro v hv; simp only [List.mem_cons, List.not_mem_nil, or_false] at hv
+        rcases hv with rfl | rfl | rfl | rfl; exacts [hnospill_w, hnospill_z, hnospill_y, hnospill_x])
+    ⟨hlivew, hdepth_w, hsmall_w, hlivez, hdz, hsmall_z, hlivey, hdy, hsmall_y, hlivex, hdx, hsmall_x, trivial⟩
+  simpa using h
+
+/-- `reorderPlan [Var a, Var b, Var c, Var d]` is a no-op when the quad is already positioned. The
+    4-input twin of `reorderPlan_triple_var_nil`. -/
+theorem reorderPlan_quad_var_nil (base : List Operand) (a b c d : String) (ps : PlanState)
+    (hstack : ps.stack = base ++ [Operand.Var a, Operand.Var b, Operand.Var c, Operand.Var d])
+    (hab : a ≠ b) (hac : a ≠ c) (had : a ≠ d) (hbc : b ≠ c) (hbd : b ≠ d) (hcd : c ≠ d) :
+    reorderPlan [Operand.Var a, Operand.Var b, Operand.Var c, Operand.Var d] ps = ([], ps) := by
+  have hba : (Operand.Var b == Operand.Var a) = false := by
+    simp only [beq_eq_false_iff_ne, ne_eq]; intro h; exact hab (Operand.Var.inj h).symm
+  have hca : (Operand.Var c == Operand.Var a) = false := by
+    simp only [beq_eq_false_iff_ne, ne_eq]; intro h; exact hac (Operand.Var.inj h).symm
+  have hda : (Operand.Var d == Operand.Var a) = false := by
+    simp only [beq_eq_false_iff_ne, ne_eq]; intro h; exact had (Operand.Var.inj h).symm
+  have hcb : (Operand.Var c == Operand.Var b) = false := by
+    simp only [beq_eq_false_iff_ne, ne_eq]; intro h; exact hbc (Operand.Var.inj h).symm
+  have hdb : (Operand.Var d == Operand.Var b) = false := by
+    simp only [beq_eq_false_iff_ne, ne_eq]; intro h; exact hbd (Operand.Var.inj h).symm
+  have hdc : (Operand.Var d == Operand.Var c) = false := by
+    simp only [beq_eq_false_iff_ne, ne_eq]; intro h; exact hcd (Operand.Var.inj h).symm
+  apply reorderPlan_nil_of_allPositioned
+  intro p hp
+  have henum : ([Operand.Var a, Operand.Var b, Operand.Var c, Operand.Var d]).enum
+      = [(0, Operand.Var a), (1, Operand.Var b), (2, Operand.Var c), (3, Operand.Var d)] := rfl
+  rw [henum] at hp
+  rw [hstack]
+  simp only [List.mem_cons, List.not_mem_nil, or_false] at hp
+  rcases hp with rfl | rfl | rfl | rfl
+  · show stackGetDepth (Operand.Var a)
+      (base ++ [Operand.Var a, Operand.Var b, Operand.Var c, Operand.Var d]) = some 3
+    simp [stackGetDepth, stackFind, List.reverse_append, hba, hca, hda]
+  · show stackGetDepth (Operand.Var b)
+      (base ++ [Operand.Var a, Operand.Var b, Operand.Var c, Operand.Var d]) = some 2
+    simp [stackGetDepth, stackFind, List.reverse_append, hcb, hdb]
+  · show stackGetDepth (Operand.Var c)
+      (base ++ [Operand.Var a, Operand.Var b, Operand.Var c, Operand.Var d]) = some 1
+    simp [stackGetDepth, stackFind, List.reverse_append, hdc]
+  · show stackGetDepth (Operand.Var d)
+      (base ++ [Operand.Var a, Operand.Var b, Operand.Var c, Operand.Var d]) = some 0
+    simp [stackGetDepth, stackFind, List.reverse_append]
+
 /-- `reorderPlan [Var a, Var b, Var c]` is a no-op when that triple is already positioned (`Var a`
     at depth 2, `Var b` at depth 1, `Var c` at depth 0). The 3-input counterpart of
     `reorderPlan_pair_var_nil`. -/
@@ -4548,6 +9087,55 @@ theorem emitInputPlan_triple_var_sim_mem {opc nl x y z ps lo vs as prog d_z d_y'
     ⟨hlivez, hdepth_z, hsmall_z, hlivey, hdy, hsmall_y, hlivex, hdx, hsmall_x, trivial⟩ hrel hblock
   simpa using h
 
+/-- The quad twin of `emitInputPlan_triple_var_sim_mem` — the 4-var input emission runs OK, preserves
+    `venomAsmRel`, and leaves memory unchanged (four DUPs). -/
+theorem emitInputPlan_quad_var_sim_mem {opc nl w z y x ps lo vs as prog d_w d_z d_y d_x}
+    (hnospill_w : alookup' ps.spilled (Operand.Var w) = none)
+    (hlivew : nl.contains w = true)
+    (hdepth_w : stackGetDepth (Operand.Var w) ps.stack = some d_w)
+    (hsmall_w : d_w ≤ 15)
+    (_hlenw : d_w < ps.stack.length)
+    (hnospill_z : alookup' ps.spilled (Operand.Var z) = none)
+    (hlivez : nl.contains z = true)
+    (hdepth_z : stackGetDepth (Operand.Var z) (stackDup d_w ps.stack) = some d_z)
+    (hsmall_z : d_z ≤ 15)
+    (_hlenz : d_z < (stackDup d_w ps.stack).length)
+    (hnospill_y : alookup' ps.spilled (Operand.Var y) = none)
+    (hlivey : nl.contains y = true)
+    (hdepth_y : stackGetDepth (Operand.Var y) (stackDup d_z (stackDup d_w ps.stack)) = some d_y)
+    (hsmall_y : d_y ≤ 15)
+    (_hleny : d_y < (stackDup d_z (stackDup d_w ps.stack)).length)
+    (hnospill_x : alookup' ps.spilled (Operand.Var x) = none)
+    (hlivex : nl.contains x = true)
+    (hdepth_x : stackGetDepth (Operand.Var x) (stackDup d_y (stackDup d_z (stackDup d_w ps.stack))) = some d_x)
+    (hsmall_x : d_x ≤ 15)
+    (_hlenx : d_x < (stackDup d_y (stackDup d_z (stackDup d_w ps.stack))).length)
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (emitInputPlan opc [Operand.Var w, Operand.Var z, Operand.Var y, Operand.Var x] nl ps).1)) :
+    ∃ as', runAsm (executePlan (emitInputPlan opc [Operand.Var w, Operand.Var z, Operand.Var y, Operand.Var x] nl ps).1).length
+             offsetToPc prog as = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (emitInputPlan opc [Operand.Var w, Operand.Var z, Operand.Var y, Operand.Var x] nl ps).2 vs as' ∧
+           as'.pc = as.pc + (executePlan (emitInputPlan opc [Operand.Var w, Operand.Var z, Operand.Var y, Operand.Var x] nl ps).1).length ∧
+           as'.memory = as.memory := by
+  have hdupW : stackDup d_w ps.stack = ps.stack ++ [Operand.Var w] := by
+    unfold stackDup; rw [stackGetDepth_peek hdepth_w]
+  have hdz : stackGetDepth (Operand.Var z) (ps.stack ++ [Operand.Var w]) = some d_z := hdupW ▸ hdepth_z
+  have hdupZ : stackDup d_z (ps.stack ++ [Operand.Var w]) = (ps.stack ++ [Operand.Var w]) ++ [Operand.Var z] := by
+    unfold stackDup; rw [stackGetDepth_peek hdz]
+  have hdy : stackGetDepth (Operand.Var y) ((ps.stack ++ [Operand.Var w]) ++ [Operand.Var z]) = some d_y := by
+    rw [← hdupZ, ← hdupW]; exact hdepth_y
+  have hdupY : stackDup d_y ((ps.stack ++ [Operand.Var w]) ++ [Operand.Var z])
+      = ((ps.stack ++ [Operand.Var w]) ++ [Operand.Var z]) ++ [Operand.Var y] := by
+    unfold stackDup; rw [stackGetDepth_peek hdy]
+  have hdx : stackGetDepth (Operand.Var x) (((ps.stack ++ [Operand.Var w]) ++ [Operand.Var z]) ++ [Operand.Var y]) = some d_x := by
+    rw [← hdupY, ← hdupZ, ← hdupW]; exact hdepth_x
+  have h := emitInputPlan_allVars_sim (offsetToPc := offsetToPc) opc nl [w, z, y, x] [d_w, d_z, d_y, d_x] ps
+    (by intro v hv; simp only [List.mem_cons, List.not_mem_nil, or_false] at hv
+        rcases hv with rfl | rfl | rfl | rfl; exacts [hnospill_w, hnospill_z, hnospill_y, hnospill_x])
+    ⟨hlivew, hdepth_w, hsmall_w, hlivez, hdz, hsmall_z, hlivey, hdy, hsmall_y, hlivex, hdx, hsmall_x, trivial⟩ hrel hblock
+  simpa using h
+
 /-- Plan reduction for a no-output 3-var op (the copies): `3 DUPs ++ [SOEmit name]`, plan state popped
     back to `base` then `releaseDeadSpills`. The 3-input analog of `genRegularInstPlan_sstore_eq`. -/
 theorem genRegularInstPlan_copy_eq
@@ -4594,6 +9182,53 @@ theorem genRegularInstPlan_copy_eq
   simp [generateEmitOps_evmName hname,
         reorderPlan_triple_var_nil base c b a ps1 hps1' (Ne.symm hbc) (Ne.symm hab) (Ne.symm hac),
         hps1', stackPop_3_append_triple, hncomm, hnjmp]
+
+/-- **Structural decomposition of `generateRegularInstPlan` for a 4-input, no-output op** (EXTCODECOPY).
+    The 4-input twin of `genRegularInstPlan_copy_eq`: emit four DUPs (`emitInputPlan_quad_var_eq`) + the
+    op, no reorder (`reorderPlan_quad_var_nil`), pop 4 (`stackPop_4_append_quad`). -/
+theorem genRegularInstPlan_noOutput4Var_ops_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {a b c d : String} {base : List Operand} {name : String}
+    {d_d d_c d_b d_a : Nat}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var a, Operand.Var b, Operand.Var c, Operand.Var d])
+    (houts : inst.outputs = [])
+    (hab : a ≠ b) (hac : a ≠ c) (had : a ≠ d) (hbc : b ≠ c) (hbd : b ≠ d) (hcd : c ≠ d)
+    (hstack0 : ps.stack = base)
+    (hnospill_d : alookup' ps.spilled (Operand.Var d) = none) (hlive_d : nextLiveness.contains d = true)
+    (hdepth_d : stackGetDepth (Operand.Var d) ps.stack = some d_d) (hsmall_d : d_d ≤ 15)
+    (hnospill_c : alookup' ps.spilled (Operand.Var c) = none) (hlive_c : nextLiveness.contains c = true)
+    (hdepth_c : stackGetDepth (Operand.Var c) (stackDup d_d ps.stack) = some d_c) (hsmall_c : d_c ≤ 15)
+    (hnospill_b : alookup' ps.spilled (Operand.Var b) = none) (hlive_b : nextLiveness.contains b = true)
+    (hdepth_b : stackGetDepth (Operand.Var b) (stackDup d_c (stackDup d_d ps.stack)) = some d_b) (hsmall_b : d_b ≤ 15)
+    (hnospill_a : alookup' ps.spilled (Operand.Var a) = none) (hlive_a : nextLiveness.contains a = true)
+    (hdepth_a : stackGetDepth (Operand.Var a) (stackDup d_b (stackDup d_c (stackDup d_d ps.stack))) = some d_a) (hsmall_a : d_a ≤ 15) :
+    generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator curBbLabel ps
+      = ((emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).1 ++ [StackOp.SOEmit name],
+         releaseDeadSpills nextLiveness
+           { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with stack := base }) := by
+  have hrev : inst.operands.reverse = [Operand.Var d, Operand.Var c, Operand.Var b, Operand.Var a] := by rw [hops]; rfl
+  have hpvar := emitInputPlan_quad_var_eq (opc := inst.opcode) (nl := nextLiveness)
+    hnospill_d hlive_d hdepth_d hsmall_d hnospill_c hlive_c hdepth_c hsmall_c
+    hnospill_b hlive_b hdepth_b hsmall_b hnospill_a hlive_a hdepth_a hsmall_a
+  have hps1 : (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2.stack
+      = base ++ [Operand.Var d, Operand.Var c, Operand.Var b, Operand.Var a] := by rw [hrev, hpvar, hstack0]
+  unfold generateRegularInstPlan
+  simp only [hcompute, hrev, houts]
+  rcases hemit : emitInputPlan inst.opcode [Operand.Var d, Operand.Var c, Operand.Var b, Operand.Var a] nextLiveness ps
+    with ⟨inputOps, ps1⟩
+  have hps1' : ps1.stack = base ++ [Operand.Var d, Operand.Var c, Operand.Var b, Operand.Var a] := by
+    have h2 : (emitInputPlan inst.opcode [Operand.Var d, Operand.Var c, Operand.Var b, Operand.Var a] nextLiveness ps).2 = ps1 := by
+      rw [hemit]
+    rw [hrev] at hps1; rw [← h2]; exact hps1
+  simp [generateEmitOps_evmName hname,
+        reorderPlan_quad_var_nil base d c b a ps1 hps1'
+          (Ne.symm hcd) (Ne.symm hbd) (Ne.symm had) (Ne.symm hbc) (Ne.symm hac) (Ne.symm hab),
+        hps1', stackPop_4_append_quad, hncomm, hnjmp]
 
 /-- **Structural decomposition of `generateRegularInstPlan` for a LOG** with all-variable operands.
     LOG drops its `Lit` topic-count head then reverses the rest to stack order (offset on top, via
@@ -4852,6 +9487,86 @@ theorem genRegularInstPlan_codecopy_sim
       (by rw [hps1alloc]; exact hsafe) hpos hsize (by rw [hps1spill, hps1alloc]; exact hspillReg) hbE'
   have hps5 : ({ ps1 with stack := stackPop 3 ps1.stack } : PlanState) = { ps1 with stack := base } := by
     rw [hps1stack, stackPop_3_append_triple]
+  rw [hps5] at hrelE
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrelE
+  refine ⟨as2, ?_, hrelR, ?_⟩
+  · rw [executePlan_append, List.length_append]; exact runAsm_compose hrunI hrunE
+  · rw [executePlan_append, List.length_append, hpcE, hpcI]; omega
+
+/-- **EXTCODECOPY instruction sim** — the 4-input account-code → memory copy over the real codegen plan.
+    The 4-input twin of `genRegularInstPlan_codecopy_sim`: the quad plan-eq/emit-sim
+    (`genRegularInstPlan_noOutput4Var_ops_eq` / `emitInputPlan_quad_var_sim_mem`), the four top values
+    via `venomAsmRel_asmStack_top4_var`, then `emit_extcodecopy_sim` (memory coverage threaded through
+    `hmemI`/`hps1alloc`, exactly as the copy sims do). -/
+theorem genRegularInstPlan_extcodecopy_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {a b c d : String} {wa wb wc wd : bytes32} {base : List Operand} {d_d d_c d_b d_a : Nat}
+    (hname : opcodeToEvmName inst.opcode = some "EXTCODECOPY")
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var a, Operand.Var b, Operand.Var c, Operand.Var d])
+    (houts : inst.outputs = [])
+    (hab : a ≠ b) (hac : a ≠ c) (had : a ≠ d) (hbc : b ≠ c) (hbd : b ≠ d) (hcd : c ≠ d)
+    (hstack0 : ps.stack = base)
+    (hnospill_d : alookup' ps.spilled (Operand.Var d) = none) (hlive_d : nextLiveness.contains d = true)
+    (hdepth_d : stackGetDepth (Operand.Var d) ps.stack = some d_d) (hsmall_d : d_d ≤ 15) (hlend : d_d < ps.stack.length)
+    (hnospill_c : alookup' ps.spilled (Operand.Var c) = none) (hlive_c : nextLiveness.contains c = true)
+    (hdepth_c : stackGetDepth (Operand.Var c) (stackDup d_d ps.stack) = some d_c) (hsmall_c : d_c ≤ 15) (hlenc : d_c < (stackDup d_d ps.stack).length)
+    (hnospill_b : alookup' ps.spilled (Operand.Var b) = none) (hlive_b : nextLiveness.contains b = true)
+    (hdepth_b : stackGetDepth (Operand.Var b) (stackDup d_c (stackDup d_d ps.stack)) = some d_b) (hsmall_b : d_b ≤ 15) (hlenb : d_b < (stackDup d_c (stackDup d_d ps.stack)).length)
+    (hnospill_a : alookup' ps.spilled (Operand.Var a) = none) (hlive_a : nextLiveness.contains a = true)
+    (hdepth_a : stackGetDepth (Operand.Var a) (stackDup d_b (stackDup d_c (stackDup d_d ps.stack))) = some d_a) (hsmall_a : d_a ≤ 15) (hlena : d_a < (stackDup d_b (stackDup d_c (stackDup d_d ps.stack))).length)
+    (hva : operandVal vs lo (Operand.Var a) = some wa) (hvb : operandVal vs lo (Operand.Var b) = some wb)
+    (hvc : operandVal vs lo (Operand.Var c) = some wc) (hvd : operandVal vs lo (Operand.Var d) = some wd)
+    (hcovV : wb.toNat ≤ vs.memory.size)
+    (hcovA : ((wb.toNat + wd.toNat + 31) / 32) * 32 ≤ as.memory.size)
+    (hsafe : wb.toNat + wd.toNat ≤ ps.alloc.fnEom)
+    (hpos : 0 < wd.toNat) (hsize : wd.toNat < USize.size)
+    (hspillReg : ∀ op off', AssocList.lookup Operand Nat ps.spilled op = some off' → ps.alloc.fnEom ≤ off')
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as
+             = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2
+             (writeMemoryWithExpansion wb.toNat
+               ((⟨(lookupAccount (AccountAddress.ofUInt256 wa) vs.accounts).code.toArray⟩ : ByteArray).readWithPadding wc.toNat wd.toNat) vs) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  have hrev : inst.operands.reverse = [Operand.Var d, Operand.Var c, Operand.Var b, Operand.Var a] := by rw [hops]; rfl
+  rw [genRegularInstPlan_noOutput4Var_ops_eq hname hncomm hnjmp hcompute hops houts hab hac had hbc hbd hcd
+      hstack0 hnospill_d hlive_d hdepth_d hsmall_d hnospill_c hlive_c hdepth_c hsmall_c hnospill_b hlive_b
+      hdepth_b hsmall_b hnospill_a hlive_a hdepth_a hsmall_a, hrev] at hblock ⊢
+  set ps1 := (emitInputPlan inst.opcode [Operand.Var d, Operand.Var c, Operand.Var b, Operand.Var a] nextLiveness ps).2 with hps1def
+  have hpvar : (emitInputPlan inst.opcode [Operand.Var d, Operand.Var c, Operand.Var b, Operand.Var a] nextLiveness ps)
+      = ([StackOp.SODup (d_d + 1), StackOp.SODup (d_c + 1), StackOp.SODup (d_b + 1), StackOp.SODup (d_a + 1)],
+         { ps with stack := ps.stack ++ [Operand.Var d, Operand.Var c, Operand.Var b, Operand.Var a] }) :=
+    emitInputPlan_quad_var_eq hnospill_d hlive_d hdepth_d hsmall_d hnospill_c hlive_c hdepth_c hsmall_c
+      hnospill_b hlive_b hdepth_b hsmall_b hnospill_a hlive_a hdepth_a hsmall_a
+  have hps1stack : ps1.stack = base ++ [Operand.Var d, Operand.Var c, Operand.Var b, Operand.Var a] := by
+    rw [hps1def, hpvar, hstack0]
+  have hps1alloc : ps1.alloc = ps.alloc := by rw [hps1def, hpvar]
+  have hps1spill : ps1.spilled = ps.spilled := by rw [hps1def, hpvar]
+  rw [executePlan_append] at hblock
+  obtain ⟨hbI, hbE⟩ := asmBlockAt_append hblock
+  obtain ⟨as1, hrunI, hrelI, hpcI, hmemI⟩ := emitInputPlan_quad_var_sim_mem hnospill_d hlive_d hdepth_d
+    hsmall_d hlend hnospill_c hlive_c hdepth_c hsmall_c hlenc hnospill_b hlive_b hdepth_b hsmall_b hlenb
+    hnospill_a hlive_a hdepth_a hsmall_a hlena hrel hbI
+  have hstacktop : as1.stack = wa :: wb :: wc :: wd :: as1.stack.drop 4 :=
+    venomAsmRel_asmStack_top4_var hrelI hps1stack hva hvb hvc hvd
+  have hbE' : asmBlockAt prog as1.pc (executePlan [StackOp.SOEmit "EXTCODECOPY"]) := by
+    rw [hpcI]; exact hbE
+  obtain ⟨as2, hrunE, hrelE, hpcE⟩ :=
+    emit_extcodecopy_sim hrelI hstacktop hcovV (by rw [hmemI]; exact hcovA)
+      (by rw [hps1alloc]; exact hsafe) hpos hsize (by rw [hps1spill, hps1alloc]; exact hspillReg) hbE'
+  have hps5 : ({ ps1 with stack := stackPop 4 ps1.stack } : PlanState) = { ps1 with stack := base } := by
+    rw [hps1stack, stackPop_4_append_quad]
   rw [hps5] at hrelE
   have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrelE
   refine ⟨as2, ?_, hrelR, ?_⟩
@@ -5175,6 +9890,103 @@ theorem genRegularInstPlan_nonCommBinopVar_sim
   · rw [executePlan_append, List.length_append]; exact runAsm_compose hrunI hrunE
   · rw [executePlan_append, List.length_append, hpcE, hpcI]; omega
 
+/-- **SHA3 instruction sim** — the 2-input memory-hash over the real codegen plan. Same non-commutative
+    2-var plan scaffolding as `genRegularInstPlan_nonCommBinopVar_sim`, but the emit is `emit_sha3_sim`
+    (reading memory + keccak) rather than a stack binop; the memory-coverage conditions are threaded
+    through the input-emission (`hmemI` / `hps1alloc`), exactly as the copy/LOG sims do. -/
+theorem genRegularInstPlan_sha3_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis}
+    {fn : IrFunction} {inst : Instruction} {nextLiveness : List String}
+    {nextIsTerminator : Bool} {curBbLabel : String} {ps : PlanState} {lo : AssocList String Nat}
+    {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {x y : String} {wx wy : bytes32} {out : String} {base : List Operand}
+    {d_y d_x' : Nat}
+    (hname : opcodeToEvmName inst.opcode = some "SHA3")
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x, Operand.Var y])
+    (houts : inst.outputs = [out])
+    (hxy : x ≠ y)
+    (hox : out ≠ x)
+    (hoy : out ≠ y)
+    (hstack0 : ps.stack = base)
+    (hlive : nextLiveness.contains out = true)
+    (hfresh : ¬ (Operand.Var out) ∈ base)
+    (hspill : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none)
+    (hnospill_y : alookup' ps.spilled (Operand.Var y) = none)
+    (hlivey : nextLiveness.contains y = true)
+    (hdepth_y : stackGetDepth (Operand.Var y) ps.stack = some d_y)
+    (hsmall_y : d_y ≤ 15)
+    (hleny : d_y < ps.stack.length)
+    (hnospill_x : alookup' ps.spilled (Operand.Var x) = none)
+    (hlivex : nextLiveness.contains x = true)
+    (hdepth_x' : stackGetDepth (Operand.Var x) (stackDup d_y ps.stack) = some d_x')
+    (hsmall_x' : d_x' ≤ 15)
+    (hlenx' : d_x' < (stackDup d_y ps.stack).length)
+    (hvx : operandVal vs lo (Operand.Var x) = some wx)
+    (hvy : operandVal vs lo (Operand.Var y) = some wy)
+    (hcov : ((wx.toNat + wy.toNat + 31) / 32) * 32 ≤ as.memory.size)
+    (hbelow : wx.toNat + wy.toNat ≤ ps.alloc.fnEom)
+    (hsize : wy.toNat < USize.size)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp "SHA3" →
+        asmStep offsetToPc prog s = asmSha3 s)
+    (hoptnoop : optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+        { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+          stack := base ++ [Operand.Var out] }
+      = ([], { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+              stack := base ++ [Operand.Var out] }))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as
+             = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2
+             (updateVar out (keccak256 (readMemory wx.toNat wy.toNat vs)) vs) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  have hrev : inst.operands.reverse = [Operand.Var y, Operand.Var x] := by rw [hops]; rfl
+  rw [genRegularInstPlan_nonCommBinopVar_eq hname hncomm hnjmp hcompute hops houts hxy hstack0 hlive
+        hnospill_y hlivey hdepth_y hsmall_y hnospill_x hlivex hdepth_x' hsmall_x',
+      hoptnoop, hrev] at hblock ⊢
+  simp only [List.append_nil] at hblock ⊢
+  set ps1 := (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).2 with hps1def
+  have hpvar : (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps)
+      = ([StackOp.SODup (d_y + 1), StackOp.SODup (d_x' + 1)],
+         { ps with stack := ps.stack ++ [Operand.Var y, Operand.Var x] }) :=
+    emitInputPlan_pair_var_eq hnospill_y hlivey hdepth_y hsmall_y hnospill_x hlivex hdepth_x' hsmall_x'
+  have hps1stack : ps1.stack = base ++ [Operand.Var y, Operand.Var x] := by
+    rw [hps1def, hpvar, hstack0]
+  have hps1alloc : ps1.alloc = ps.alloc := by rw [hps1def, hpvar]
+  have hps1spill : AssocList.lookup Operand Nat ps1.spilled (Operand.Var out) = none := by
+    rw [hps1def, hpvar]; exact hspill
+  rw [executePlan_append] at hblock
+  obtain ⟨hbI, hbE⟩ := asmBlockAt_append hblock
+  obtain ⟨as1, hrunI, hrelI, hpcI, hmemI⟩ := emitInputPlan_pair_var_sim hnospill_y hlivey hdepth_y
+    hsmall_y hleny hnospill_x hlivex hdepth_x' hsmall_x' hlenx' hrel hbI
+  have hstacktop : as1.stack = wx :: wy :: as1.stack.drop 2 :=
+    venomAsmRel_asmStack_top2_var hrelI hps1stack hvx hvy
+  have hfresh1 : ¬ (Operand.Var out) ∈ ps1.stack := by
+    rw [hps1stack]; simp only [List.mem_append, List.mem_cons, List.not_mem_nil, or_false]
+    rintro (h | h | h) <;> simp_all
+  have hbE' : asmBlockAt prog as1.pc (executePlan [StackOp.SOEmit "SHA3"]) := by
+    rw [hpcI]; exact hbE
+  obtain ⟨as2, hrunE, hrelE, hpcE⟩ :=
+    emit_sha3_sim hrelI hstacktop (by rw [hmemI]; exact hcov) (by rw [hps1alloc]; exact hbelow) hsize
+      hfresh1 hps1spill hbE' (fun h hg => hdisp as1 h hg)
+  have hps6 : ({ ps1 with stack := stackPush (Operand.Var out) (stackPop 2 ps1.stack) } : PlanState)
+      = { ps1 with stack := base ++ [Operand.Var out] } := by
+    rw [hps1stack, stackPop_2_append_pair]; rfl
+  rw [hps6] at hrelE
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrelE
+  refine ⟨as2, ?_, hrelR, ?_⟩
+  · rw [executePlan_append, List.length_append]; exact runAsm_compose hrunI hrunE
+  · rw [executePlan_append, List.length_append, hpcE, hpcI]; omega
+
 /-! ## Consume-operand binop: the dead-operand (no-DUP) body atom
 
 The DUP-based `step_S` atoms require both operands to be *live* (DUP'd, kept on the stack). The dual
@@ -5469,6 +10281,146 @@ theorem genRegularInstPlan_sstore_sim
   refine ⟨as2, ?_, hrelR, ?_⟩
   · rw [executePlan_append, List.length_append]; exact runAsm_compose hrunI hrunE
   · rw [executePlan_append, List.length_append, hpcE, hpcI]; omega
+
+/-! ### Same-var store (`x = y`) — the operand-distinctness edge case
+
+`genRegularInstPlan_sstore_eq/_sim` assume `x ≠ y` (the reorder is `[]` via `reorderPlan_pair_var_nil`).
+When a store repeats a single var (`SSTORE x x`), the final reorder is one **no-op `SWAP1`**
+(`reorderPlan_pair_var_same` — the two copies are equal, so the swap changes neither the plan stack nor
+the asm value stack), and both key and value read the same word `wx`. These twins close the `x = y`
+coverage gap for the store class (whose `RegularStepG` disjunct is stated only for `x ≠ y`). -/
+
+/-- Plan reduction for a no-output *same-var* 2-input store `[Var x, Var x]`: `2 DUPs ++ [SWAP1, op]`.
+    The `x = y` twin of `genRegularInstPlan_sstore_eq`, whose final reorder is one (no-op) `SWAP1`
+    (`reorderPlan_pair_var_same`) rather than `[]`. -/
+theorem genRegularInstPlan_sstore_same_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {x : String} {base : List Operand} {name : String} {d_x : Nat}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x, Operand.Var x])
+    (houts : inst.outputs = [])
+    (hstack0 : ps.stack = base)
+    (hnospill_x : alookup' ps.spilled (Operand.Var x) = none)
+    (hlivex : nextLiveness.contains x = true)
+    (hdepth_x : stackGetDepth (Operand.Var x) ps.stack = some d_x)
+    (hsmall_x : d_x ≤ 15) :
+    generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator curBbLabel ps
+      = ((emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).1
+           ++ [StackOp.SOSwap 1, StackOp.SOEmit name],
+         releaseDeadSpills nextLiveness
+           { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with stack := base }) := by
+  have hrev : inst.operands.reverse = [Operand.Var x, Operand.Var x] := by rw [hops]; rfl
+  have hd0 : stackGetDepth (Operand.Var x) (stackDup d_x ps.stack) = some 0 :=
+    stackGetDepth_stackDup_self ps.stack d_x hdepth_x
+  have hpvar := emitInputPlan_pair_var_eq (opc := inst.opcode) (nl := nextLiveness)
+    hnospill_x hlivex hdepth_x hsmall_x hnospill_x hlivex hd0 (by omega)
+  have hps1 : (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2.stack
+      = base ++ [Operand.Var x, Operand.Var x] := by rw [hrev, hpvar, hstack0]
+  unfold generateRegularInstPlan
+  simp only [hcompute, hrev, houts]
+  rcases hemit : emitInputPlan inst.opcode [Operand.Var x, Operand.Var x] nextLiveness ps
+    with ⟨inputOps, ps1⟩
+  have hps1' : ps1.stack = base ++ [Operand.Var x, Operand.Var x] := by
+    have h2 : (emitInputPlan inst.opcode [Operand.Var x, Operand.Var x] nextLiveness ps).2 = ps1 := by
+      rw [hemit]
+    rw [hrev] at hps1; rw [← h2]; exact hps1
+  simp [generateEmitOps_evmName hname,
+        reorderPlan_pair_var_same base x ps1 hps1',
+        hps1', stackPop_2_append_pair, hncomm, hnjmp]
+
+/-- Runnable sim for a same-var SSTORE `SSTORE x x` through the generator: `2 DUPs`, a no-op `SWAP1`
+    (the two copies are equal), then `SSTORE`, applying `sstore wx wx`. The `x = y` twin of
+    `genRegularInstPlan_sstore_sim`; the store reads the same word `wx` for both key and value. -/
+theorem genRegularInstPlan_sstore_same_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {x : String} {wx : bytes32} {base : List Operand} {d_x : Nat}
+    (hname : opcodeToEvmName inst.opcode = some "SSTORE")
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x, Operand.Var x])
+    (houts : inst.outputs = [])
+    (hstack0 : ps.stack = base)
+    (hnospill_x : alookup' ps.spilled (Operand.Var x) = none)
+    (hlivex : nextLiveness.contains x = true)
+    (hdepth_x : stackGetDepth (Operand.Var x) ps.stack = some d_x)
+    (hsmall_x : d_x ≤ 15)
+    (hlenx : d_x < ps.stack.length)
+    (hvx : operandVal vs lo (Operand.Var x) = some wx)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp "SSTORE" → asmStep offsetToPc prog s = asmSstore s)
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as
+             = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2 (sstore wx wx vs) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  have hrev : inst.operands.reverse = [Operand.Var x, Operand.Var x] := by rw [hops]; rfl
+  rw [genRegularInstPlan_sstore_same_eq hname hncomm hnjmp hcompute hops houts hstack0 hnospill_x hlivex
+      hdepth_x hsmall_x, hrev] at hblock ⊢
+  set ps1 := (emitInputPlan inst.opcode [Operand.Var x, Operand.Var x] nextLiveness ps).2 with hps1def
+  have hd0 : stackGetDepth (Operand.Var x) (stackDup d_x ps.stack) = some 0 :=
+    stackGetDepth_stackDup_self ps.stack d_x hdepth_x
+  have hps1stack : ps1.stack = base ++ [Operand.Var x, Operand.Var x] := by
+    rw [hps1def, emitInputPlan_pair_var_eq hnospill_x hlivex hdepth_x hsmall_x hnospill_x hlivex
+      hd0 (by omega), hstack0]
+  -- split the block: emit ++ [SWAP1] ++ [SSTORE]
+  rw [executePlan_append] at hblock
+  obtain ⟨hbI, hbRest⟩ := asmBlockAt_append hblock
+  -- run emit
+  obtain ⟨as1, hrunI, hrelI, hpcI, _⟩ := emitInputPlan_pair_var_same_sim (offsetToPc := offsetToPc)
+    hnospill_x hlivex hdepth_x hsmall_x hlenx hrel hbI
+  -- further split [SWAP1, SSTORE] = [SWAP1] ++ [SSTORE]
+  have hbRest2 : asmBlockAt prog
+      (as.pc + (executePlan (emitInputPlan inst.opcode [Operand.Var x, Operand.Var x] nextLiveness ps).1).length)
+      (executePlan ([StackOp.SOSwap 1] ++ [StackOp.SOEmit "SSTORE"])) := hbRest
+  rw [executePlan_append] at hbRest2
+  obtain ⟨hbSwap0, hbStore0⟩ := asmBlockAt_append hbRest2
+  -- run SWAP1 (a no-op on equal values)
+  have hswapstack : stackSwap 1 ps1.stack = ps1.stack := by rw [hps1stack, stackSwap_1_append_pair]
+  have hdoSwap : doSwap 1 ps1 = ([StackOp.SOSwap 1], ps1) := by
+    unfold doSwap
+    rw [if_neg (by decide : ¬ (1 = 0)), if_pos (by decide : 1 ≤ 16)]
+    congr 1
+    rw [hswapstack]
+  have hlen1 : (1 : Nat) < ps1.stack.length := by rw [hps1stack]; simp
+  have hbSwap : asmBlockAt prog as1.pc (executePlan [StackOp.SOSwap 1]) := by rw [hpcI]; exact hbSwap0
+  obtain ⟨as2, hrunSwap, hrelSwap, hpcSwap⟩ :=
+    doSwap_sim (offsetToPc := offsetToPc) hdoSwap hrelI hlen1 hbSwap (by intro h; omega)
+  -- as2 still has wx :: wx on top
+  have hstacktop2 : as2.stack = wx :: wx :: as2.stack.drop 2 :=
+    venomAsmRel_asmStack_top2_var hrelSwap hps1stack hvx hvx
+  -- run SSTORE
+  have hbStore : asmBlockAt prog as2.pc (executePlan [StackOp.SOEmit "SSTORE"]) := by
+    rw [hpcSwap, hpcI]; exact hbStore0
+  obtain ⟨as3, hrunStore, hrelStore, hpcStore⟩ :=
+    emit_sstore_sim hrelSwap hstacktop2 hbStore (fun h hg => hdisp as2 h hg)
+  -- assemble
+  have hps5 : ({ ps1 with stack := stackPop 2 ps1.stack } : PlanState) = { ps1 with stack := base } := by
+    rw [hps1stack, stackPop_2_append_pair]
+  rw [hps5] at hrelStore
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrelStore
+  have hlenEq : (executePlan ((emitInputPlan inst.opcode [Operand.Var x, Operand.Var x] nextLiveness ps).1
+        ++ [StackOp.SOSwap 1, StackOp.SOEmit "SSTORE"])).length
+      = (executePlan (emitInputPlan inst.opcode [Operand.Var x, Operand.Var x] nextLiveness ps).1).length
+        + ((executePlan [StackOp.SOSwap 1]).length + (executePlan [StackOp.SOEmit "SSTORE"]).length) := by
+    rw [show ([StackOp.SOSwap 1, StackOp.SOEmit "SSTORE"] : List StackOp)
+          = [StackOp.SOSwap 1] ++ [StackOp.SOEmit "SSTORE"] from rfl,
+       executePlan_append, executePlan_append, List.length_append, List.length_append]
+  refine ⟨as3, ?_, hrelR, ?_⟩
+  · rw [hlenEq]; exact runAsm_compose hrunI (runAsm_compose hrunSwap hrunStore)
+  · rw [hlenEq, hpcStore, hpcSwap, hpcI]; omega
 
 /-- Runnable sim for TSTORE through the generator — the transient-store twin of
     `genRegularInstPlan_sstore_sim` (reuses the generic `genRegularInstPlan_sstore_eq`; `emit_tstore_sim`
@@ -6446,6 +11398,719 @@ theorem emitInputPlan_single_var_sim {opc nl x ps lo vs as prog dist}
   rw [hemit] at hblock ⊢
   exact doDup_sim rfl hsmall hrel hlen hblock
 
+/-- **`emitInputPlan` sim for a single SPILLED live var** — fold-level lift of the spilling connective.
+    A one-operand `emitInputPlan` is `emitOneInput`, so this threads `emitOneInput_sim_var_spilled`
+    through the real fold, demonstrating spilling composes at the `emitInputPlan` layer. -/
+theorem emitInputPlan_single_var_sim_spilled {opc nl v ps lo vs as prog off}
+    (hspill : alookup' ps.spilled (Operand.Var v) = some off)
+    (hlive : nl.contains v = true)
+    (hrel : venomAsmRel lo ps vs as)
+    (hspillWf : ∀ o off, alookup' ps.spilled o = some off →
+        32 ∣ off ∧ off + 32 ≤ as.memory.size ∧ off < 2 ^ 256)
+    (hblock : asmBlockAt prog as.pc (executePlan (emitInputPlan opc [Operand.Var v] nl ps).1)) :
+    ∃ as', runAsm (executePlan (emitInputPlan opc [Operand.Var v] nl ps).1).length offsetToPc prog as
+             = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (emitInputPlan opc [Operand.Var v] nl ps).2 vs as' ∧
+           as'.pc = as.pc + (executePlan (emitInputPlan opc [Operand.Var v] nl ps).1).length := by
+  have hemit : emitInputPlan opc [Operand.Var v] nl ps = emitOneInput opc nl (Operand.Var v) ps := by
+    unfold emitInputPlan
+    simp only [List.foldl_cons, List.foldl_nil, List.nil_append, Prod.mk.eta]
+  rw [hemit] at hblock ⊢
+  exact emitOneInput_sim_var_spilled (opc := opc) (offsetToPc := offsetToPc) hspill hlive rfl hrel hspillWf hblock
+
+/-- `aremove` preserves a `none` lookup at any key (removing a key can't create an entry). -/
+theorem aremove_lookup_none {β} (m : AssocList Operand β) (k o : Operand)
+    (h : AssocList.lookup Operand β m o = none) :
+    AssocList.lookup Operand β (aremove m k) o = none := by
+  rcases hr : AssocList.lookup Operand β (aremove m k) o with _ | v
+  · rfl
+  · rw [aremove_lookup_some m k o v hr] at h; exact absurd h (by simp)
+
+/-- **`emitInputPlan` sim for a mixed pair `[spilled v, live w]`** — the fold genuinely composes the
+    spilled-restore path (`emitOneInput_sim_var_spilled`) for the head with the ordinary DUP path
+    (inlined) for the tail. After the head, `v` sits atop (`ps.stack ++ [v, v]`) and its spill entry is
+    gone, so `w`'s depth shifts by 2 and `w` stays unspilled. Concrete demonstration that spilling
+    threads through `emitInputPlan` alongside a normal operand. -/
+theorem emitInputPlan_pair_spill_first_sim {opc nl v w ps lo vs as prog off d}
+    (hvw : v ≠ w)
+    (hspill : alookup' ps.spilled (Operand.Var v) = some off)
+    (hlivev : nl.contains v = true) (hlivew : nl.contains w = true)
+    (hnospillw : alookup' ps.spilled (Operand.Var w) = none)
+    (hdepthw : stackGetDepth (Operand.Var w) ps.stack = some d) (hsmall : d + 2 ≤ 15)
+    (hlenw : d < ps.stack.length)
+    (hrel : venomAsmRel lo ps vs as)
+    (hspillWf : ∀ o off, alookup' ps.spilled o = some off →
+        32 ∣ off ∧ off + 32 ≤ as.memory.size ∧ off < 2 ^ 256)
+    (hblock : asmBlockAt prog as.pc (executePlan (emitInputPlan opc [Operand.Var v, Operand.Var w] nl ps).1)) :
+    ∃ as', runAsm (executePlan (emitInputPlan opc [Operand.Var v, Operand.Var w] nl ps).1).length offsetToPc prog as
+             = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (emitInputPlan opc [Operand.Var v, Operand.Var w] nl ps).2 vs as' ∧
+           as'.pc = as.pc + (executePlan (emitInputPlan opc [Operand.Var v, Operand.Var w] nl ps).1).length := by
+  set ps1 : PlanState := { ps with stack := ps.stack ++ [Operand.Var v, Operand.Var v],
+                                    spilled := aremove ps.spilled (Operand.Var v),
+                                    alloc := freeSpillSlot off ps.alloc } with hps1def
+  have hhead : emitOneInput opc nl (Operand.Var v) ps = ([StackOp.SORestore off, StackOp.SODup 1], ps1) :=
+    emitOneInput_var_spilled_eq hspill hlivev
+  have hps1stack : ps1.stack = ps.stack ++ [Operand.Var v, Operand.Var v] := by rw [hps1def]
+  have hdepthw1 : stackGetDepth (Operand.Var w) ps1.stack = some (d + 2) := by
+    rw [hps1stack,
+        show ps.stack ++ [Operand.Var v, Operand.Var v]
+          = (ps.stack ++ [Operand.Var v]) ++ [Operand.Var v] from by simp,
+        stackGetDepth_append_ne (ps.stack ++ [Operand.Var v]) (Ne.symm hvw),
+        stackGetDepth_append_ne ps.stack (Ne.symm hvw), hdepthw]; rfl
+  have hnospillw1 : alookup' ps1.spilled (Operand.Var w) = none := by
+    rw [hps1def]; exact aremove_lookup_none ps.spilled (Operand.Var v) (Operand.Var w) hnospillw
+  have hlenw1 : d + 2 < ps1.stack.length := by
+    rw [hps1stack]; simp only [List.length_append, List.length_cons, List.length_nil]; omega
+  have hddred : doDup (d + 2) ps1
+      = ([StackOp.SODup (d + 2 + 1)], { ps1 with stack := stackDup (d + 2) ps1.stack }) := by
+    unfold doDup; rw [if_pos hsmall]
+  have htail : emitOneInput opc nl (Operand.Var w) ps1
+      = ([StackOp.SODup (d + 2 + 1)], { ps1 with stack := stackDup (d + 2) ps1.stack }) := by
+    unfold emitOneInput
+    simp only [isVarOperand, hnospillw1, Option.isSome_none, Bool.and_false, Bool.false_eq_true,
+      if_false, hlivew, if_true, hdepthw1, hddred, List.nil_append]
+  have hfold : emitInputPlan opc [Operand.Var v, Operand.Var w] nl ps
+      = ([StackOp.SORestore off, StackOp.SODup 1] ++ [StackOp.SODup (d + 2 + 1)],
+         { ps1 with stack := stackDup (d + 2) ps1.stack }) := by
+    unfold emitInputPlan
+    simp only [List.foldl_cons, List.foldl_nil, hhead, htail, List.nil_append]
+  rw [hfold] at hblock ⊢
+  rw [executePlan_append] at hblock
+  obtain ⟨hbHead, hbTail⟩ := asmBlockAt_append hblock
+  obtain ⟨as1, hrunHead, hrelHead, hpcHead⟩ :=
+    emitOneInput_sim_var_spilled (offsetToPc := offsetToPc) hspill hlivev hhead hrel hspillWf hbHead
+  have hbTail' : asmBlockAt prog as1.pc (executePlan [StackOp.SODup (d + 2 + 1)]) := by
+    rw [hpcHead]; exact hbTail
+  obtain ⟨as2, hrunTail, hrelTail, hpcTail⟩ :=
+    doDup_sim (offsetToPc := offsetToPc) hddred hsmall hrelHead hlenw1 hbTail'
+  have hlen : (executePlan ([StackOp.SORestore off, StackOp.SODup 1] ++ [StackOp.SODup (d + 2 + 1)])).length
+      = (executePlan [StackOp.SORestore off, StackOp.SODup 1]).length
+        + (executePlan [StackOp.SODup (d + 2 + 1)]).length := by
+    rw [executePlan_append, List.length_append]
+  refine ⟨as2, ?_, hrelTail, ?_⟩
+  · rw [hlen]; exact runAsm_compose hrunHead hrunTail
+  · rw [hlen, hpcTail, hpcHead]; omega
+
+/-! ### Spilled-value store — the first 2-operand spill-aware producer (Gap C)
+
+The `x ≠ y` store with the **value** operand `y` spilled and the **key** `x` live. The emit restores+dups
+`y` and dups `x`, leaving `base ++ [y, y, x]`; crucially, the store's operands `[Var y, Var x]` are
+**still positioned** on top (`(base ++ [y]) ++ [y, x]`), so the reorder is `[]` — the case where the
+2-operand reorder-under-spill is trivial. `stackPop 2` leaves `base ++ [y]` (the kept restored `y`). -/
+
+/-- **Spilled-value plan reduction for a no-output 2-var store** — the value-spilled reroute of
+    `genRegularInstPlan_sstore_eq`. -/
+theorem genRegularInstPlan_sstore_spilled_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {x y : String} {base : List Operand} {name : String} {offy d_x : Nat}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x, Operand.Var y])
+    (houts : inst.outputs = [])
+    (hxy : x ≠ y)
+    (hstack0 : ps.stack = base)
+    (hspill_y : alookup' ps.spilled (Operand.Var y) = some offy)
+    (hlivey : nextLiveness.contains y = true)
+    (hnospill_x : alookup' ps.spilled (Operand.Var x) = none)
+    (hlivex : nextLiveness.contains x = true)
+    (hdepth_x : stackGetDepth (Operand.Var x) ps.stack = some d_x)
+    (hsmall_x : d_x + 2 ≤ 15) :
+    generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator curBbLabel ps
+      = ((emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).1 ++ [StackOp.SOEmit name],
+         releaseDeadSpills nextLiveness
+           { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+             stack := base ++ [Operand.Var y] }) := by
+  have hrev : inst.operands.reverse = [Operand.Var y, Operand.Var x] := by rw [hops]; rfl
+  set psY : PlanState := { ps with stack := ps.stack ++ [Operand.Var y, Operand.Var y], spilled := aremove ps.spilled (Operand.Var y), alloc := freeSpillSlot offy ps.alloc } with hpsYdef
+  have hhead : emitOneInput inst.opcode nextLiveness (Operand.Var y) ps
+      = ([StackOp.SORestore offy, StackOp.SODup 1], psY) := emitOneInput_var_spilled_eq hspill_y hlivey
+  have hpsYstack : psY.stack = ps.stack ++ [Operand.Var y, Operand.Var y] := by rw [hpsYdef]
+  have hdepthx1 : stackGetDepth (Operand.Var x) psY.stack = some (d_x + 2) := by
+    rw [hpsYstack,
+        show ps.stack ++ [Operand.Var y, Operand.Var y]
+          = (ps.stack ++ [Operand.Var y]) ++ [Operand.Var y] from by simp,
+        stackGetDepth_append_ne (ps.stack ++ [Operand.Var y]) hxy,
+        stackGetDepth_append_ne ps.stack hxy, hdepth_x]; rfl
+  have hnospillx1 : alookup' psY.spilled (Operand.Var x) = none := by
+    rw [hpsYdef]; exact aremove_lookup_none ps.spilled (Operand.Var y) (Operand.Var x) hnospill_x
+  have hpeekx : stackPeek (d_x + 2) psY.stack = Operand.Var x := stackGetDepth_peek hdepthx1
+  have hddred : doDup (d_x + 2) psY
+      = ([StackOp.SODup (d_x + 2 + 1)], { psY with stack := stackDup (d_x + 2) psY.stack }) := by
+    unfold doDup; rw [if_pos hsmall_x]
+  have htail : emitOneInput inst.opcode nextLiveness (Operand.Var x) psY
+      = ([StackOp.SODup (d_x + 2 + 1)], { psY with stack := stackDup (d_x + 2) psY.stack }) := by
+    unfold emitOneInput
+    simp only [isVarOperand, hnospillx1, Option.isSome_none, Bool.and_false, Bool.false_eq_true,
+      if_false, hlivex, if_true, hdepthx1, hddred, List.nil_append]
+  have hemit2 : (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).2
+      = { psY with stack := stackDup (d_x + 2) psY.stack } := by
+    unfold emitInputPlan
+    simp only [List.foldl_cons, List.foldl_nil, hhead, htail, List.nil_append]
+  have hdupx : stackDup (d_x + 2) psY.stack = base ++ [Operand.Var y, Operand.Var y, Operand.Var x] := by
+    unfold stackDup; rw [hpeekx, hpsYstack, hstack0]; simp
+  have hemitstack : (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2.stack
+      = base ++ [Operand.Var y, Operand.Var y, Operand.Var x] := by
+    rw [hrev, hemit2]; exact hdupx
+  unfold generateRegularInstPlan
+  simp only [hcompute, hrev, houts]
+  rcases hemit : emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps
+    with ⟨inputOps, ps1⟩
+  have h2 : (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).2 = ps1 := by rw [hemit]
+  have hps1flat : ps1.stack = base ++ [Operand.Var y, Operand.Var y, Operand.Var x] := by
+    rw [hrev] at hemitstack; rw [← h2]; exact hemitstack
+  have hps1 : ps1.stack = (base ++ [Operand.Var y]) ++ [Operand.Var y, Operand.Var x] := by
+    rw [hps1flat]; simp
+  have hpop2 : stackPop 2 ps1.stack = base ++ [Operand.Var y] := by
+    rw [hps1, stackPop_2_append_pair]
+  simp [generateEmitOps_evmName hname,
+        reorderPlan_pair_var_nil (base ++ [Operand.Var y]) y x ps1 hps1 (Ne.symm hxy),
+        hpop2, hncomm, hnjmp]
+
+/-- **Spilled-value SSTORE sim.** The value-operand-spilled reroute of `genRegularInstPlan_sstore_sim`:
+    restore the value `y`, DUP the key `x`, run SSTORE — the whole plan preserves `venomAsmRel` across
+    `sstore wx wy`. The first *2-operand* spill-aware producer (the reorder is `[]` because the emit
+    leaves the operands positioned). -/
+theorem genRegularInstPlan_sstore_spilled_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {x y : String} {wx wy : bytes32} {base : List Operand} {offy d_x : Nat}
+    (hname : opcodeToEvmName inst.opcode = some "SSTORE")
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x, Operand.Var y])
+    (houts : inst.outputs = [])
+    (hxy : x ≠ y)
+    (hstack0 : ps.stack = base)
+    (hspill_y : alookup' ps.spilled (Operand.Var y) = some offy)
+    (hlivey : nextLiveness.contains y = true)
+    (hnospill_x : alookup' ps.spilled (Operand.Var x) = none)
+    (hlivex : nextLiveness.contains x = true)
+    (hdepth_x : stackGetDepth (Operand.Var x) ps.stack = some d_x)
+    (hsmall_x : d_x + 2 ≤ 15)
+    (hvx : operandVal vs lo (Operand.Var x) = some wx)
+    (hvy : operandVal vs lo (Operand.Var y) = some wy)
+    (hspillWf : ∀ o off, alookup' ps.spilled o = some off →
+        32 ∣ off ∧ off + 32 ≤ as.memory.size ∧ off < 2 ^ 256)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp "SSTORE" → asmStep offsetToPc prog s = asmSstore s)
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2 (sstore wx wy vs) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  have hrev : inst.operands.reverse = [Operand.Var y, Operand.Var x] := by rw [hops]; rfl
+  have hlenx : d_x < ps.stack.length := stackGetDepth_lt_length hdepth_x
+  rw [genRegularInstPlan_sstore_spilled_eq hname hncomm hnjmp hcompute hops houts hxy hstack0 hspill_y
+      hlivey hnospill_x hlivex hdepth_x hsmall_x, hrev] at hblock ⊢
+  set ps1 := (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).2 with hps1def
+  have hps1stack : ps1.stack = (base ++ [Operand.Var y]) ++ [Operand.Var y, Operand.Var x] := by
+    have hemit2 : (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).2.stack
+        = base ++ [Operand.Var y, Operand.Var y, Operand.Var x] := by
+      have hhead : emitOneInput inst.opcode nextLiveness (Operand.Var y) ps
+          = ([StackOp.SORestore offy, StackOp.SODup 1],
+             { ps with stack := ps.stack ++ [Operand.Var y, Operand.Var y],
+                       spilled := aremove ps.spilled (Operand.Var y), alloc := freeSpillSlot offy ps.alloc }) :=
+        emitOneInput_var_spilled_eq hspill_y hlivey
+      set psY : PlanState := { ps with stack := ps.stack ++ [Operand.Var y, Operand.Var y], spilled := aremove ps.spilled (Operand.Var y), alloc := freeSpillSlot offy ps.alloc } with hpsYdef
+      have hpsYstack : psY.stack = ps.stack ++ [Operand.Var y, Operand.Var y] := by rw [hpsYdef]
+      have hdepthx1 : stackGetDepth (Operand.Var x) psY.stack = some (d_x + 2) := by
+        rw [hpsYstack, show ps.stack ++ [Operand.Var y, Operand.Var y] = (ps.stack ++ [Operand.Var y]) ++ [Operand.Var y] from by simp,
+            stackGetDepth_append_ne (ps.stack ++ [Operand.Var y]) hxy, stackGetDepth_append_ne ps.stack hxy, hdepth_x]; rfl
+      have hnospillx1 : alookup' psY.spilled (Operand.Var x) = none := by
+        rw [hpsYdef]; exact aremove_lookup_none ps.spilled (Operand.Var y) (Operand.Var x) hnospill_x
+      have hpeekx : stackPeek (d_x + 2) psY.stack = Operand.Var x := stackGetDepth_peek hdepthx1
+      have hddred : doDup (d_x + 2) psY = ([StackOp.SODup (d_x + 2 + 1)], { psY with stack := stackDup (d_x + 2) psY.stack }) := by
+        unfold doDup; rw [if_pos hsmall_x]
+      have htail : emitOneInput inst.opcode nextLiveness (Operand.Var x) psY
+          = ([StackOp.SODup (d_x + 2 + 1)], { psY with stack := stackDup (d_x + 2) psY.stack }) := by
+        unfold emitOneInput
+        simp only [isVarOperand, hnospillx1, Option.isSome_none, Bool.and_false, Bool.false_eq_true,
+          if_false, hlivex, if_true, hdepthx1, hddred, List.nil_append]
+      have hemit2' : (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).2
+          = { psY with stack := stackDup (d_x + 2) psY.stack } := by
+        unfold emitInputPlan; simp only [List.foldl_cons, List.foldl_nil, hhead, htail, List.nil_append]
+      rw [hemit2']; show stackDup (d_x + 2) psY.stack = _
+      unfold stackDup; rw [hpeekx, hpsYstack, hstack0]; simp
+    rw [hps1def, hemit2]; simp
+  rw [executePlan_append] at hblock
+  obtain ⟨hbI, hbE⟩ := asmBlockAt_append hblock
+  obtain ⟨as1, hrunI, hrelI, hpcI⟩ :=
+    emitInputPlan_pair_spill_first_sim (offsetToPc := offsetToPc) (Ne.symm hxy) hspill_y hlivey hlivex
+      hnospill_x hdepth_x hsmall_x hlenx hrel hspillWf hbI
+  have hstacktop : as1.stack = wx :: wy :: as1.stack.drop 2 :=
+    venomAsmRel_asmStack_top2_var hrelI hps1stack hvx hvy
+  have hbE' : asmBlockAt prog as1.pc (executePlan [StackOp.SOEmit "SSTORE"]) := by rw [hpcI]; exact hbE
+  obtain ⟨as2, hrunE, hrelE, hpcE⟩ :=
+    emit_sstore_sim hrelI hstacktop hbE' (fun h hg => hdisp as1 h hg)
+  have hps5 : ({ ps1 with stack := stackPop 2 ps1.stack } : PlanState) = { ps1 with stack := base ++ [Operand.Var y] } := by
+    rw [hps1stack, stackPop_2_append_pair]
+  rw [hps5] at hrelE
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrelE
+  refine ⟨as2, ?_, hrelR, ?_⟩
+  · rw [executePlan_append, List.length_append]; exact runAsm_compose hrunI hrunE
+  · rw [executePlan_append, List.length_append, hpcE, hpcI]; omega
+
+/-! ### Spilled-value binop — the 1-output 2-operand spill-aware producer (Gap C) -/
+
+-- shared: full emit .2 for value-spilled 2-var op (y spilled, x live): stack base ++ [y, y, x],
+-- y's slot freed. (Public: also consumed by the value-spilled store fold-producer preservation.)
+theorem emit2_valspilled {opc nl x y ps base offy d_x}
+    (hstack0 : ps.stack = base)
+    (hspill_y : alookup' ps.spilled (Operand.Var y) = some offy) (hlivey : nl.contains y = true)
+    (hnospill_x : alookup' ps.spilled (Operand.Var x) = none) (hlivex : nl.contains x = true)
+    (hxy : x ≠ y)
+    (hdepth_x : stackGetDepth (Operand.Var x) ps.stack = some d_x) (hsmall_x : d_x + 2 ≤ 15) :
+    (emitInputPlan opc [Operand.Var y, Operand.Var x] nl ps).2
+      = { ps with stack := base ++ [Operand.Var y, Operand.Var y, Operand.Var x],
+                  spilled := aremove ps.spilled (Operand.Var y), alloc := freeSpillSlot offy ps.alloc } := by
+  have hhead : emitOneInput opc nl (Operand.Var y) ps
+      = ([StackOp.SORestore offy, StackOp.SODup 1],
+         { ps with stack := ps.stack ++ [Operand.Var y, Operand.Var y],
+                   spilled := aremove ps.spilled (Operand.Var y), alloc := freeSpillSlot offy ps.alloc }) :=
+    emitOneInput_var_spilled_eq hspill_y hlivey
+  set psY : PlanState := { ps with stack := ps.stack ++ [Operand.Var y, Operand.Var y], spilled := aremove ps.spilled (Operand.Var y), alloc := freeSpillSlot offy ps.alloc } with hpsYdef
+  have hpsYstack : psY.stack = ps.stack ++ [Operand.Var y, Operand.Var y] := by rw [hpsYdef]
+  have hdepthx1 : stackGetDepth (Operand.Var x) psY.stack = some (d_x + 2) := by
+    rw [hpsYstack, show ps.stack ++ [Operand.Var y, Operand.Var y] = (ps.stack ++ [Operand.Var y]) ++ [Operand.Var y] from by simp,
+        stackGetDepth_append_ne (ps.stack ++ [Operand.Var y]) hxy, stackGetDepth_append_ne ps.stack hxy, hdepth_x]; rfl
+  have hnospillx1 : alookup' psY.spilled (Operand.Var x) = none := by
+    rw [hpsYdef]; exact aremove_lookup_none ps.spilled (Operand.Var y) (Operand.Var x) hnospill_x
+  have hpeekx : stackPeek (d_x + 2) psY.stack = Operand.Var x := stackGetDepth_peek hdepthx1
+  have hddred : doDup (d_x + 2) psY = ([StackOp.SODup (d_x + 2 + 1)], { psY with stack := stackDup (d_x + 2) psY.stack }) := by
+    unfold doDup; rw [if_pos hsmall_x]
+  have htail : emitOneInput opc nl (Operand.Var x) psY
+      = ([StackOp.SODup (d_x + 2 + 1)], { psY with stack := stackDup (d_x + 2) psY.stack }) := by
+    unfold emitOneInput
+    simp only [isVarOperand, hnospillx1, Option.isSome_none, Bool.and_false, Bool.false_eq_true,
+      if_false, hlivex, if_true, hdepthx1, hddred, List.nil_append]
+  have hemit2 : (emitInputPlan opc [Operand.Var y, Operand.Var x] nl ps).2
+      = { psY with stack := stackDup (d_x + 2) psY.stack } := by
+    unfold emitInputPlan; simp only [List.foldl_cons, List.foldl_nil, hhead, htail, List.nil_append]
+  have hdupx : stackDup (d_x + 2) psY.stack = base ++ [Operand.Var y, Operand.Var y, Operand.Var x] := by
+    unfold stackDup; rw [hpeekx, hpsYstack, hstack0]; simp
+  rw [hemit2, hdupx]
+
+private theorem emitstack_valspilled {opc nl x y ps base offy d_x}
+    (hstack0 : ps.stack = base)
+    (hspill_y : alookup' ps.spilled (Operand.Var y) = some offy) (hlivey : nl.contains y = true)
+    (hnospill_x : alookup' ps.spilled (Operand.Var x) = none) (hlivex : nl.contains x = true)
+    (hxy : x ≠ y)
+    (hdepth_x : stackGetDepth (Operand.Var x) ps.stack = some d_x) (hsmall_x : d_x + 2 ≤ 15) :
+    (emitInputPlan opc [Operand.Var y, Operand.Var x] nl ps).2.stack
+      = base ++ [Operand.Var y, Operand.Var y, Operand.Var x] := by
+  rw [emit2_valspilled hstack0 hspill_y hlivey hnospill_x hlivex hxy hdepth_x hsmall_x]
+
+/-- **Spilled-value plan reduction for a 1-output 2-var op** (non-commutative binop). Value operand `y`
+    spilled, first operand `x` live: emit leaves `base ++ [y, y, x]`, operands positioned (reorder `[]`),
+    `stackPop 2` then push `out` gives the optSwap intermediate `base ++ [Var y, Var out]`. -/
+theorem genRegularInstPlan_nonCommBinopVar_spilled_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {x y out : String} {base : List Operand} {name : String} {offy d_x : Nat}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x, Operand.Var y])
+    (houts : inst.outputs = [out])
+    (hxy : x ≠ y)
+    (hstack0 : ps.stack = base)
+    (hlive : nextLiveness.contains out = true)
+    (hspill_y : alookup' ps.spilled (Operand.Var y) = some offy)
+    (hlivey : nextLiveness.contains y = true)
+    (hnospill_x : alookup' ps.spilled (Operand.Var x) = none)
+    (hlivex : nextLiveness.contains x = true)
+    (hdepth_x : stackGetDepth (Operand.Var x) ps.stack = some d_x)
+    (hsmall_x : d_x + 2 ≤ 15) :
+    generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator curBbLabel ps
+      = (((emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).1 ++ [StackOp.SOEmit name]
+            ++ (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+                  { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+                    stack := base ++ [Operand.Var y, Operand.Var out] }).1),
+         releaseDeadSpills nextLiveness
+           (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+             { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+               stack := base ++ [Operand.Var y, Operand.Var out] }).2) := by
+  have hrev : inst.operands.reverse = [Operand.Var y, Operand.Var x] := by rw [hops]; rfl
+  have hemitstack : (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2.stack
+      = base ++ [Operand.Var y, Operand.Var y, Operand.Var x] := by
+    rw [hrev]; exact emitstack_valspilled hstack0 hspill_y hlivey hnospill_x hlivex hxy hdepth_x hsmall_x
+  unfold generateRegularInstPlan
+  simp only [hcompute, hrev, houts]
+  rcases hemit : emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps with ⟨inputOps, ps1⟩
+  have h2 : (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).2 = ps1 := by rw [hemit]
+  have hps1flat : ps1.stack = base ++ [Operand.Var y, Operand.Var y, Operand.Var x] := by
+    rw [hrev] at hemitstack; rw [← h2]; exact hemitstack
+  have hps1 : ps1.stack = (base ++ [Operand.Var y]) ++ [Operand.Var y, Operand.Var x] := by
+    rw [hps1flat]; simp
+  have hmem : out ∈ nextLiveness := by simpa using hlive
+  have hpush : stackPop 2 ps1.stack ++ [Operand.Var out] = base ++ [Operand.Var y, Operand.Var out] := by
+    rw [hps1, stackPop_2_append_pair]; simp [List.append_assoc]
+  simp [generateEmitOps_evmName hname,
+        reorderPlan_pair_var_nil (base ++ [Operand.Var y]) y x ps1 hps1 (Ne.symm hxy),
+        hpush, stackPush, popmanyPlan_nil, hmem, hncomm, hnjmp]
+
+/-- **Spilled-value non-commutative binop sim.** Value operand `y` spilled, first `x` live: restore `y`,
+    DUP `x`, run the binop, push `out` — whole plan preserves `venomAsmRel` across `out := f wx wy`. The
+    binop-class instance of the Gap-C reroute (2-operand-positioned config + output-handling under spill). -/
+theorem genRegularInstPlan_nonCommBinopVar_spilled_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {offsetToPc : AssocList Nat Nat} {x y out : String} {wx wy : bytes32} {base : List Operand}
+    {name : String} {offy d_x : Nat} {f : bytes32 → bytes32 → bytes32}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x, Operand.Var y])
+    (houts : inst.outputs = [out])
+    (hxy : x ≠ y) (hox : out ≠ x) (hoy : out ≠ y)
+    (hstack0 : ps.stack = base)
+    (hlive : nextLiveness.contains out = true)
+    (hfresh : ¬ (Operand.Var out) ∈ base)
+    (hspill_out : alookup' ps.spilled (Operand.Var out) = none)
+    (hspill_y : alookup' ps.spilled (Operand.Var y) = some offy)
+    (hlivey : nextLiveness.contains y = true)
+    (hnospill_x : alookup' ps.spilled (Operand.Var x) = none)
+    (hlivex : nextLiveness.contains x = true)
+    (hdepth_x : stackGetDepth (Operand.Var x) ps.stack = some d_x)
+    (hsmall_x : d_x + 2 ≤ 15)
+    (hvx : operandVal vs lo (Operand.Var x) = some wx)
+    (hvy : operandVal vs lo (Operand.Var y) = some wy)
+    (hspillWf : ∀ o off, alookup' ps.spilled o = some off →
+        32 ∣ off ∧ off + 32 ≤ as.memory.size ∧ off < 2 ^ 256)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp name → asmStep offsetToPc prog s = asmBinop f s)
+    (hoptnoop : optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+        { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+          stack := base ++ [Operand.Var y, Operand.Var out] }
+      = ([], { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+              stack := base ++ [Operand.Var y, Operand.Var out] }))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2 (updateVar out (f wx wy) vs) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  have hrev : inst.operands.reverse = [Operand.Var y, Operand.Var x] := by rw [hops]; rfl
+  have hlenx : d_x < ps.stack.length := stackGetDepth_lt_length hdepth_x
+  rw [genRegularInstPlan_nonCommBinopVar_spilled_eq hname hncomm hnjmp hcompute hops houts hxy hstack0
+      hlive hspill_y hlivey hnospill_x hlivex hdepth_x hsmall_x, hoptnoop, hrev] at hblock ⊢
+  simp only [List.append_nil] at hblock ⊢
+  set ps1 := (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).2 with hps1def
+  have hemit2 := emit2_valspilled (opc := inst.opcode) (nl := nextLiveness) hstack0 hspill_y hlivey hnospill_x hlivex hxy hdepth_x hsmall_x
+  have hps1stack : ps1.stack = (base ++ [Operand.Var y]) ++ [Operand.Var y, Operand.Var x] := by
+    rw [hps1def, hemit2]; simp
+  have hps1spill : alookup' ps1.spilled (Operand.Var out) = none := by
+    rw [hps1def, hemit2]
+    show alookup' (aremove ps.spilled (Operand.Var y)) (Operand.Var out) = none
+    exact aremove_lookup_none ps.spilled (Operand.Var y) (Operand.Var out) hspill_out
+  rw [executePlan_append] at hblock
+  obtain ⟨hbI, hbE⟩ := asmBlockAt_append hblock
+  obtain ⟨as1, hrunI, hrelI, hpcI⟩ :=
+    emitInputPlan_pair_spill_first_sim (offsetToPc := offsetToPc) (Ne.symm hxy) hspill_y hlivey hlivex
+      hnospill_x hdepth_x hsmall_x hlenx hrel hspillWf hbI
+  have hstacktop : as1.stack = wx :: wy :: as1.stack.drop 2 :=
+    venomAsmRel_asmStack_top2_var hrelI hps1stack hvx hvy
+  have hfresh1 : ¬ (Operand.Var out) ∈ ps1.stack := by
+    rw [hps1stack]; simp only [List.mem_append, List.mem_cons, List.not_mem_nil, or_false]
+    rintro ((h | h) | h | h) <;> simp_all
+  have hbE' : asmBlockAt prog as1.pc (executePlan [StackOp.SOEmit name]) := by rw [hpcI]; exact hbE
+  obtain ⟨as2, hrunE, hrelE, hpcE⟩ :=
+    emit_binop_sim hrelI hstacktop hfresh1 hps1spill hbE' (fun h hg => hdisp as1 h hg)
+  have hps6 : ({ ps1 with stack := stackPush (Operand.Var out) (stackPop 2 ps1.stack) } : PlanState)
+      = { ps1 with stack := base ++ [Operand.Var y, Operand.Var out] } := by
+    rw [hps1stack, stackPop_2_append_pair]; simp [stackPush, List.append_assoc]
+  rw [hps6] at hrelE
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrelE
+  refine ⟨as2, ?_, hrelR, ?_⟩
+  · rw [executePlan_append, List.length_append]; exact runAsm_compose hrunI hrunE
+  · rw [executePlan_append, List.length_append, hpcE, hpcI]; omega
+
+/-- **Value-spilled commutative binop plan reduction.** Value `y` spilled, `x` live. The
+    commutative dispatch resolves to the positioned order (opsA cost 0 < opsB cost 1), so the plan
+    matches the non-commutative value-spilled binop (intermediate `base ++ [y, out]`); `f`'s
+    symmetry makes the order irrelevant to the result. -/
+theorem genRegularInstPlan_commBinopVar_valspilled_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {x y out : String} {base : List Operand} {name : String} {offy d_x : Nat}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hcomm : isCommutative inst.opcode = true)
+    (hops : inst.operands = [Operand.Var x, Operand.Var y])
+    (houts : inst.outputs = [out])
+    (hxy : x ≠ y)
+    (hstack0 : ps.stack = base)
+    (hlive : nextLiveness.contains out = true)
+    (hspill_y : alookup' ps.spilled (Operand.Var y) = some offy)
+    (hlivey : nextLiveness.contains y = true)
+    (hnospill_x : alookup' ps.spilled (Operand.Var x) = none)
+    (hlivex : nextLiveness.contains x = true)
+    (hdepth_x : stackGetDepth (Operand.Var x) ps.stack = some d_x)
+    (hsmall_x : d_x + 2 ≤ 15) :
+    generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator curBbLabel ps
+      = (((emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).1 ++ [StackOp.SOEmit name]
+            ++ (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+                  { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+                    stack := base ++ [Operand.Var y, Operand.Var out] }).1),
+         releaseDeadSpills nextLiveness
+           (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+             { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+               stack := base ++ [Operand.Var y, Operand.Var out] }).2) := by
+  have hco := computeOperands_of_commutative inst hcomm
+  have hjmp := commutative_ne_jmp hcomm
+  have hrev : inst.operands.reverse = [Operand.Var y, Operand.Var x] := by rw [hops]; rfl
+  have hemit2 := emit2_valspilled (opc := inst.opcode) (nl := nextLiveness) hstack0 hspill_y hlivey hnospill_x hlivex hxy hdepth_x hsmall_x
+  unfold generateRegularInstPlan
+  simp only [hco, hrev, houts]
+  rcases hemit : emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps with ⟨inputOps, ps1⟩
+  have h2 : (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).2 = ps1 := by rw [hemit]
+  have hps1flat : ps1.stack = base ++ [Operand.Var y, Operand.Var y, Operand.Var x] := by rw [← h2, hemit2]
+  have hps1'' : ps1.stack = (base ++ [Operand.Var y]) ++ [Operand.Var y, Operand.Var x] := by rw [hps1flat]; simp
+  have hmem : out ∈ nextLiveness := by simpa using hlive
+  have hpush : stackPop 2 ps1.stack ++ [Operand.Var out] = base ++ [Operand.Var y, Operand.Var out] := by
+    rw [hps1'', stackPop_2_append_pair]; simp [List.append_assoc]
+  simp [generateEmitOps_evmName hname,
+        reorderPlan_pair_var_nil (base ++ [Operand.Var y]) y x ps1 hps1'' (Ne.symm hxy),
+        reorderPlan_swapped_pair_var (base ++ [Operand.Var y]) y x ps1 hps1'',
+        hpush, stackPush, popmanyPlan_nil, hmem, reorderCost, hcomm, hjmp]
+
+/-- **Key-spilled store/binop reorder — swapped (commutative) order.** For target `[Var x, Var y]`
+    (the swapped operand order a commutative binop picks on a `reorderCost` tie) and the emit stack
+    `base ++ [y, x, x]`, `reorderPlan` synthesises `SWAP1 ; SWAP2`: the first `SWAP1` transposes the two
+    equal `x`'s (a no-op on the stack, moving `x` toward depth 1), the `SWAP2` rotates the deep `y` to
+    TOS — leaving `base ++ [x, x, y]`. -/
+theorem reorderPlan_keyspilled_swapped (base : List Operand) (x y : String) (ps : PlanState) (hxy : x ≠ y)
+    (hstack : ps.stack = base ++ [Operand.Var y, Operand.Var x, Operand.Var x]) :
+    reorderPlan [Operand.Var x, Operand.Var y] ps
+      = ([StackOp.SOSwap 1, StackOp.SOSwap 2],
+         { ps with stack := base ++ [Operand.Var x, Operand.Var x, Operand.Var y] }) := by
+  -- step 0: op `x` (TOS, depth 0) → target depth 1 via SWAP1; swapping the two equal `x`'s is a stack no-op
+  have hstep0 : reorderOne () [Operand.Var x, Operand.Var y] 0 (Operand.Var x) ps
+      = ([StackOp.SOSwap 1], { ps with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var x] }) := by
+    have hd : stackGetDepth (Operand.Var x) ps.stack = some 0 := by
+      rw [hstack]; exact stackGetDepth_triple_tos base (Operand.Var y) (Operand.Var x) (Operand.Var x)
+    have hsw1 : stackSwap 1 ps.stack = base ++ [Operand.Var y, Operand.Var x, Operand.Var x] := by
+      rw [hstack]; exact stackSwap_1_append_triple base (Operand.Var y) (Operand.Var x) (Operand.Var x)
+    unfold reorderOne
+    simp [hd, doSwap_zero, doSwap_one, hsw1]
+  -- step 1: op `y` (depth 2) → target depth 0 (TOS) via SWAP2, leaving `base ++ [x, x, y]`
+  have hstep1 : reorderOne () [Operand.Var x, Operand.Var y] 1 (Operand.Var y)
+      { ps with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var x] }
+      = ([StackOp.SOSwap 2], { ps with stack := base ++ [Operand.Var x, Operand.Var x, Operand.Var y] }) := by
+    have hd : stackGetDepth (Operand.Var y) (base ++ [Operand.Var y, Operand.Var x, Operand.Var x]) = some 2 :=
+      stackGetDepth_triple_deep base y x (Ne.symm hxy)
+    have hsw2 : stackSwap 2 (base ++ [Operand.Var y, Operand.Var x, Operand.Var x])
+        = base ++ [Operand.Var x, Operand.Var x, Operand.Var y] :=
+      stackSwap_2_append_triple base (Operand.Var y) (Operand.Var x) (Operand.Var x)
+    unfold reorderOne
+    simp [hd, doSwap_zero, doSwap_two, hsw2]
+  unfold reorderPlan
+  have henum : ([Operand.Var x, Operand.Var y]).enum = [(0, Operand.Var x), (1, Operand.Var y)] := rfl
+  rw [henum]
+  simp [List.foldl_cons, List.foldl_nil, hstep0, hstep1]
+
+
+/-- **Key-spilled commutative binop plan reduction.** Key `x` spilled, value `y` live. Emit leaves
+    `base ++ [y, x, x]`; both operand orders reorder at equal cost 2 (SWAP2;SWAP1 vs SWAP1;SWAP2), so the
+    commutative dispatch takes the *swapped* order `[x, y]` (`reorderPlan_keyspilled_swapped` →
+    `SWAP1 ; SWAP2`, `base ++ [x, x, y]`); `stackPop 2` then push `out` gives the optSwap intermediate
+    `base ++ [x, out]`. -/
+theorem genRegularInstPlan_commBinopVar_keyspilled_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {x y out : String} {base : List Operand} {name : String} {offx d_y : Nat}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hcomm : isCommutative inst.opcode = true)
+    (hops : inst.operands = [Operand.Var x, Operand.Var y])
+    (houts : inst.outputs = [out])
+    (hxy : x ≠ y)
+    (hstack0 : ps.stack = base)
+    (hlive : nextLiveness.contains out = true)
+    (hnospill_y : alookup' ps.spilled (Operand.Var y) = none)
+    (hlivey : nextLiveness.contains y = true)
+    (hdepth_y : stackGetDepth (Operand.Var y) ps.stack = some d_y)
+    (hsmall_y : d_y ≤ 15)
+    (hspill_x : alookup' ps.spilled (Operand.Var x) = some offx)
+    (hlivex : nextLiveness.contains x = true) :
+    generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator curBbLabel ps
+      = (((emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).1
+            ++ [StackOp.SOSwap 1, StackOp.SOSwap 2] ++ [StackOp.SOEmit name]
+            ++ (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+                  { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+                    stack := base ++ [Operand.Var x, Operand.Var out] }).1),
+         releaseDeadSpills nextLiveness
+           (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+             { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+               stack := base ++ [Operand.Var x, Operand.Var out] }).2) := by
+  have hco := computeOperands_of_commutative inst hcomm
+  have hjmp := commutative_ne_jmp hcomm
+  have hrev : inst.operands.reverse = [Operand.Var y, Operand.Var x] := by rw [hops]; rfl
+  have hemit2 := emit2_keyspilled (opc := inst.opcode) (nl := nextLiveness) hstack0 hnospill_y hlivey hdepth_y hsmall_y hspill_x hlivex
+  unfold generateRegularInstPlan
+  simp only [hco, hrev, houts]
+  rcases hemit : emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps with ⟨inputOps, ps1⟩
+  have h2 : (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).2 = ps1 := by rw [hemit]
+  have hps1flat : ps1.stack = base ++ [Operand.Var y, Operand.Var x, Operand.Var x] := by rw [← h2, hemit2]
+  have hmem : out ∈ nextLiveness := by simpa using hlive
+  have hpush : stackPop 2 (base ++ [Operand.Var x, Operand.Var x, Operand.Var y]) ++ [Operand.Var out]
+      = base ++ [Operand.Var x, Operand.Var out] := by
+    rw [show base ++ [Operand.Var x, Operand.Var x, Operand.Var y] = (base ++ [Operand.Var x]) ++ [Operand.Var x, Operand.Var y] from by simp,
+        stackPop_2_append_pair]; simp [List.append_assoc]
+  simp [generateEmitOps_evmName hname,
+        reorderPlan_keyspilled base x y ps1 hxy hps1flat,
+        reorderPlan_keyspilled_swapped base x y ps1 hxy hps1flat,
+        hpush, stackPush, popmanyPlan_nil, hmem, reorderCost, hcomm, hjmp]
+
+
+/-- **Value-spilled commutative binop sim.** As the non-commutative value-spilled binop sim but
+    through the commutative branch (same plan/state). Preserves `venomAsmRel` across
+    `out := f wx wy`. -/
+theorem genRegularInstPlan_commBinopVar_valspilled_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {offsetToPc : AssocList Nat Nat} {x y out : String} {wx wy : bytes32} {base : List Operand}
+    {name : String} {offy d_x : Nat} {f : bytes32 → bytes32 → bytes32}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hcomm : isCommutative inst.opcode = true)
+    (hops : inst.operands = [Operand.Var x, Operand.Var y])
+    (houts : inst.outputs = [out])
+    (hxy : x ≠ y) (hox : out ≠ x) (hoy : out ≠ y)
+    (hstack0 : ps.stack = base)
+    (hlive : nextLiveness.contains out = true)
+    (hfresh : ¬ (Operand.Var out) ∈ base)
+    (hspill_out : alookup' ps.spilled (Operand.Var out) = none)
+    (hspill_y : alookup' ps.spilled (Operand.Var y) = some offy)
+    (hlivey : nextLiveness.contains y = true)
+    (hnospill_x : alookup' ps.spilled (Operand.Var x) = none)
+    (hlivex : nextLiveness.contains x = true)
+    (hdepth_x : stackGetDepth (Operand.Var x) ps.stack = some d_x)
+    (hsmall_x : d_x + 2 ≤ 15)
+    (hvx : operandVal vs lo (Operand.Var x) = some wx)
+    (hvy : operandVal vs lo (Operand.Var y) = some wy)
+    (hspillWf : ∀ o off, alookup' ps.spilled o = some off →
+        32 ∣ off ∧ off + 32 ≤ as.memory.size ∧ off < 2 ^ 256)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp name → asmStep offsetToPc prog s = asmBinop f s)
+    (hoptnoop : optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+        { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+          stack := base ++ [Operand.Var y, Operand.Var out] }
+      = ([], { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+              stack := base ++ [Operand.Var y, Operand.Var out] }))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2 (updateVar out (f wx wy) vs) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  have hrev : inst.operands.reverse = [Operand.Var y, Operand.Var x] := by rw [hops]; rfl
+  have hlenx : d_x < ps.stack.length := stackGetDepth_lt_length hdepth_x
+  rw [genRegularInstPlan_commBinopVar_valspilled_eq hname hcomm hops houts hxy hstack0
+      hlive hspill_y hlivey hnospill_x hlivex hdepth_x hsmall_x, hoptnoop, hrev] at hblock ⊢
+  simp only [List.append_nil] at hblock ⊢
+  set ps1 := (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).2 with hps1def
+  have hemit2 := emit2_valspilled (opc := inst.opcode) (nl := nextLiveness) hstack0 hspill_y hlivey hnospill_x hlivex hxy hdepth_x hsmall_x
+  have hps1stack : ps1.stack = (base ++ [Operand.Var y]) ++ [Operand.Var y, Operand.Var x] := by
+    rw [hps1def, hemit2]; simp
+  have hps1spill : alookup' ps1.spilled (Operand.Var out) = none := by
+    rw [hps1def, hemit2]
+    show alookup' (aremove ps.spilled (Operand.Var y)) (Operand.Var out) = none
+    exact aremove_lookup_none ps.spilled (Operand.Var y) (Operand.Var out) hspill_out
+  rw [executePlan_append] at hblock
+  obtain ⟨hbI, hbE⟩ := asmBlockAt_append hblock
+  obtain ⟨as1, hrunI, hrelI, hpcI⟩ :=
+    emitInputPlan_pair_spill_first_sim (offsetToPc := offsetToPc) (Ne.symm hxy) hspill_y hlivey hlivex
+      hnospill_x hdepth_x hsmall_x hlenx hrel hspillWf hbI
+  have hstacktop : as1.stack = wx :: wy :: as1.stack.drop 2 :=
+    venomAsmRel_asmStack_top2_var hrelI hps1stack hvx hvy
+  have hfresh1 : ¬ (Operand.Var out) ∈ ps1.stack := by
+    rw [hps1stack]; simp only [List.mem_append, List.mem_cons, List.not_mem_nil, or_false]
+    rintro ((h | h) | h | h) <;> simp_all
+  have hbE' : asmBlockAt prog as1.pc (executePlan [StackOp.SOEmit name]) := by rw [hpcI]; exact hbE
+  obtain ⟨as2, hrunE, hrelE, hpcE⟩ :=
+    emit_binop_sim hrelI hstacktop hfresh1 hps1spill hbE' (fun h hg => hdisp as1 h hg)
+  have hps6 : ({ ps1 with stack := stackPush (Operand.Var out) (stackPop 2 ps1.stack) } : PlanState)
+      = { ps1 with stack := base ++ [Operand.Var y, Operand.Var out] } := by
+    rw [hps1stack, stackPop_2_append_pair]; simp [stackPush, List.append_assoc]
+  rw [hps6] at hrelE
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrelE
+  refine ⟨as2, ?_, hrelR, ?_⟩
+  · rw [executePlan_append, List.length_append]; exact runAsm_compose hrunI hrunE
+  · rw [executePlan_append, List.length_append, hpcE, hpcI]; omega
+
+/-- **Key-spilled non-commutative binop plan reduction.** Key `x` spilled, value `y` live: emit DUPs
+    `y` and restores+DUPs `x` (`base ++ [y, x, x]`), the reorder is the non-trivial `SWAP2 ; SWAP1`
+    (`reorderPlan_keyspilled`) giving `base ++ [x, y, x]`, then the op pops two and pushes `out`
+    (optSwap intermediate `base ++ [x, out]`). The reorder+output combination — assembles the
+    key-spilled store reorder with the value-spilled binop's output handling. -/
+theorem genRegularInstPlan_nonCommBinopVar_keyspilled_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {x y out : String} {base : List Operand} {name : String} {offx d_y : Nat}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x, Operand.Var y])
+    (houts : inst.outputs = [out])
+    (hxy : x ≠ y)
+    (hstack0 : ps.stack = base)
+    (hlive : nextLiveness.contains out = true)
+    (hnospill_y : alookup' ps.spilled (Operand.Var y) = none)
+    (hlivey : nextLiveness.contains y = true)
+    (hdepth_y : stackGetDepth (Operand.Var y) ps.stack = some d_y)
+    (hsmall_y : d_y ≤ 15)
+    (hspill_x : alookup' ps.spilled (Operand.Var x) = some offx)
+    (hlivex : nextLiveness.contains x = true) :
+    generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator curBbLabel ps
+      = (((emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).1
+            ++ [StackOp.SOSwap 2, StackOp.SOSwap 1] ++ [StackOp.SOEmit name]
+            ++ (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+                  { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+                    stack := base ++ [Operand.Var x, Operand.Var out] }).1),
+         releaseDeadSpills nextLiveness
+           (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+             { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+               stack := base ++ [Operand.Var x, Operand.Var out] }).2) := by
+  have hrev : inst.operands.reverse = [Operand.Var y, Operand.Var x] := by rw [hops]; rfl
+  have hemit2 := emit2_keyspilled (opc := inst.opcode) (nl := nextLiveness) hstack0 hnospill_y hlivey hdepth_y hsmall_y hspill_x hlivex
+  unfold generateRegularInstPlan
+  simp only [hcompute, hrev, houts]
+  rcases hemit : emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps with ⟨inputOps, ps1⟩
+  have h2 : (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).2 = ps1 := by rw [hemit]
+  have hps1stack : ps1.stack = base ++ [Operand.Var y, Operand.Var x, Operand.Var x] := by
+    rw [← h2, hemit2]
+  have hreorder : reorderPlan [Operand.Var y, Operand.Var x] ps1
+      = ([StackOp.SOSwap 2, StackOp.SOSwap 1], { ps1 with stack := base ++ [Operand.Var x, Operand.Var y, Operand.Var x] }) :=
+    reorderPlan_keyspilled base x y ps1 hxy hps1stack
+  have hmem : out ∈ nextLiveness := by simpa using hlive
+  have hpush : stackPop 2 (base ++ [Operand.Var x, Operand.Var y, Operand.Var x]) ++ [Operand.Var out]
+      = base ++ [Operand.Var x, Operand.Var out] := by
+    rw [show base ++ [Operand.Var x, Operand.Var y, Operand.Var x] = (base ++ [Operand.Var x]) ++ [Operand.Var y, Operand.Var x] from by simp,
+        stackPop_2_append_pair]; simp [List.append_assoc]
+  simp [generateEmitOps_evmName hname, hreorder, hpush, stackPush, popmanyPlan_nil, hmem, hncomm, hnjmp]
+
 /-- Input-emission sim for a single literal: run the one `PUSH`. -/
 theorem emitInputPlan_single_lit_sim {opc nl a ps lo vs as prog}
     (hrel : venomAsmRel lo ps vs as)
@@ -6627,6 +12292,56 @@ theorem genRegularInstPlan_unopVar_eq
   have hmem : out ∈ nextLiveness := by simpa using hlive
   simp [generateEmitOps_evmName hname, reorderPlan_single_var_nil base x ps1 hps1',
         hps1', stackPop_1_append_single, stackPush, popmanyPlan_nil, hmem, hnjmp]
+
+/-- **Spilled plan reduction for a single-var unary op.** The `x`-spilled counterpart of
+    `genRegularInstPlan_unopVar_eq`: the emit *restores+dups* the spilled operand (so `x` transitions
+    onto the stack), leaving the pre-op stack `base ++ [Var x]` and the post-op `base ++ [Var x, Var out]`
+    (the no-spill version pops `x` back into `base`, so its intermediate is `base ++ [Var out]`). The
+    plan structure — `emit ++ [op] ++ optSwap ++ releaseDeadSpills` — is the same; only the stack
+    accounting differs. A building block for rerouting the read-class body producer off
+    `StackDiscH.noSpill`. -/
+theorem genRegularInstPlan_unopVar_spilled_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis}
+    {fn : IrFunction} {inst : Instruction} {nextLiveness : List String}
+    {nextIsTerminator : Bool} {curBbLabel : String} {ps : PlanState}
+    {x out : String} {base : List Operand} {name : String} {off : Nat}
+    (hname : opcodeToEvmName inst.opcode = some name) (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x]) (houts : inst.outputs = [out])
+    (hstack0 : ps.stack = base) (hlive : nextLiveness.contains out = true)
+    (hspill : alookup' ps.spilled (Operand.Var x) = some off) (hlivex : nextLiveness.contains x = true) :
+    generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator curBbLabel ps
+      = (((emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).1 ++ [StackOp.SOEmit name]
+            ++ (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+                  { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+                    stack := base ++ [Operand.Var x, Operand.Var out] }).1),
+         releaseDeadSpills nextLiveness
+           (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+             { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+               stack := base ++ [Operand.Var x, Operand.Var out] }).2) := by
+  have hrev : inst.operands.reverse = [Operand.Var x] := by rw [hops]; rfl
+  have hemiteq : emitInputPlan inst.opcode [Operand.Var x] nextLiveness ps
+      = ([StackOp.SORestore off, StackOp.SODup 1],
+         { ps with stack := ps.stack ++ [Operand.Var x, Operand.Var x],
+                   spilled := aremove ps.spilled (Operand.Var x), alloc := freeSpillSlot off ps.alloc }) := by
+    unfold emitInputPlan
+    simp only [List.foldl_cons, List.foldl_nil, List.nil_append, emitOneInput_var_spilled_eq hspill hlivex]
+  have hps1 : (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2.stack
+      = base ++ [Operand.Var x, Operand.Var x] := by rw [hrev, hemiteq, hstack0]
+  unfold generateRegularInstPlan
+  simp only [hcompute, hrev, houts]
+  rcases hemit : emitInputPlan inst.opcode [Operand.Var x] nextLiveness ps with ⟨inputOps, ps1⟩
+  have hps1' : ps1.stack = base ++ [Operand.Var x, Operand.Var x] := by
+    have h2 : (emitInputPlan inst.opcode [Operand.Var x] nextLiveness ps).2 = ps1 := by rw [hemit]
+    rw [hrev] at hps1; rw [← h2]; exact hps1
+  have hps1'' : ps1.stack = (base ++ [Operand.Var x]) ++ [Operand.Var x] := by rw [hps1']; simp
+  have hmem : out ∈ nextLiveness := by simpa using hlive
+  have hpop : stackPop 1 (base ++ [Operand.Var x, Operand.Var x]) ++ [Operand.Var out]
+      = base ++ [Operand.Var x, Operand.Var out] := by
+    rw [show base ++ [Operand.Var x, Operand.Var x] = (base ++ [Operand.Var x]) ++ [Operand.Var x] from by simp,
+        stackPop_1_append_single]; simp
+  simp [generateEmitOps_evmName hname, reorderPlan_single_var_nil (base ++ [Operand.Var x]) x ps1 hps1'',
+        hps1', hpop, stackPush, popmanyPlan_nil, hmem, hnjmp]
 
 /-- The runnable sim for a single-var unary op: the generated plan for `out := OP (Var x)`
     simulates the Venom step `out := f w`, where `w` is `x`'s value. The first var-operand
@@ -6982,6 +12697,361 @@ theorem genRegularInstPlan_sload_sim
   · rw [executePlan_append, List.length_append]; exact runAsm_compose hrunI hrunE
   · rw [executePlan_append, List.length_append, hpcE, hpcI]; omega
 
+/-- **TLOAD instruction sim** — the transient-storage twin of `genRegularInstPlan_sload_sim`. Identical
+    plan/stack scaffolding (the generic `genRegularInstPlan_unopVar_eq` 1-input/1-output shape); only the
+    read semantics differ: `emit_tload_sim` reconciles the `TLOAD` asm read with `tload w vs`. -/
+theorem genRegularInstPlan_tload_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {x out : String} {base : List Operand} {dist : Nat} {w : bytes32}
+    (hname : opcodeToEvmName inst.opcode = some "TLOAD")
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x])
+    (houts : inst.outputs = [out])
+    (hstack0 : ps.stack = base)
+    (hlive : nextLiveness.contains out = true)
+    (hnospill : alookup' ps.spilled (Operand.Var x) = none)
+    (hlivex : nextLiveness.contains x = true)
+    (hdepth : stackGetDepth (Operand.Var x) ps.stack = some dist)
+    (hsmall : dist ≤ 15)
+    (hpeek : stackPeek dist ps.stack = Operand.Var x)
+    (hlen : dist < base.length)
+    (hxbase : Operand.Var x ∈ base)
+    (hval : operandVal vs lo (Operand.Var x) = some w)
+    (hfresh : ¬ (Operand.Var out) ∈ base)
+    (hspill : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp "TLOAD" →
+          asmStep offsetToPc prog s = asmStateUnop (fun k s => tload k s.toVenomState) s)
+    (hoptnoop : optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+        { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+          stack := base ++ [Operand.Var out] }
+      = ([], { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+              stack := base ++ [Operand.Var out] }))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as
+             = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2 (updateVar out (tload w vs) vs) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  have hrev : inst.operands.reverse = [Operand.Var x] := by rw [hops]; rfl
+  have hdo : doDup dist ps
+      = ([StackOp.SODup (dist + 1)], { ps with stack := stackDup dist ps.stack }) := by
+    unfold doDup; rw [if_pos hsmall]
+  have hemiteq : emitInputPlan inst.opcode [Operand.Var x] nextLiveness ps = doDup dist ps := by
+    unfold emitInputPlan
+    simp only [List.foldl_cons, List.foldl_nil, List.nil_append]
+    rcases hdd : doDup dist ps with ⟨dupOps, ps2⟩
+    unfold emitOneInput
+    simp only [isVarOperand, hnospill, Option.isSome_none, Bool.and_false, Bool.false_eq_true,
+      if_false, hlivex, if_true, hdepth, hdd, List.nil_append]
+  rw [genRegularInstPlan_unopVar_eq hname hnjmp hcompute hops houts hstack0 hlive hnospill hlivex
+      hdepth hsmall hpeek, hoptnoop, hrev] at hblock ⊢
+  simp only [List.append_nil] at hblock ⊢
+  set ps1 := (emitInputPlan inst.opcode [Operand.Var x] nextLiveness ps).2 with hps1def
+  have hps1stack : ps1.stack = base ++ [Operand.Var x] := by
+    rw [hps1def, hemiteq, hdo]
+    show stackDup dist ps.stack = base ++ [Operand.Var x]
+    simp only [stackDup]; rw [hpeek, hstack0]
+  have hps1spill : AssocList.lookup Operand Nat ps1.spilled (Operand.Var out) = none := by
+    rw [hps1def, hemiteq, hdo]; exact hspill
+  rw [executePlan_append] at hblock
+  obtain ⟨hbI, hbE⟩ := asmBlockAt_append hblock
+  obtain ⟨as1, hrunI, hrelI, hpcI⟩ :=
+    emitInputPlan_single_var_sim hnospill hlivex hdepth hsmall hrel (by rw [hstack0]; exact hlen) hbI
+  have hstacktop : as1.stack = w :: as1.stack.drop 1 :=
+    venomAsmRel_asmStack_top1_var hrelI hps1stack hval
+  have hfresh1 : ¬ (Operand.Var out) ∈ ps1.stack := by
+    rw [hps1stack]; simp only [List.mem_append, List.mem_cons, List.not_mem_nil, or_false]
+    rintro (h | h)
+    · exact hfresh h
+    · rw [← h] at hxbase; exact hfresh hxbase
+  have hbE' : asmBlockAt prog as1.pc (executePlan [StackOp.SOEmit "TLOAD"]) := by
+    rw [hpcI]; exact hbE
+  obtain ⟨as2, hrunE, hrelE, hpcE⟩ :=
+    emit_tload_sim hrelI hstacktop hfresh1 hps1spill hbE' (fun h hg => hdisp as1 h hg)
+  have hps6 : ({ ps1 with stack := stackPush (Operand.Var out) (stackPop 1 ps1.stack) } : PlanState)
+      = { ps1 with stack := base ++ [Operand.Var out] } := by
+    rw [hps1stack, stackPop_1_append_single]; rfl
+  rw [hps6] at hrelE
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrelE
+  refine ⟨as2, ?_, hrelR, ?_⟩
+  · rw [executePlan_append, List.length_append]; exact runAsm_compose hrunI hrunE
+  · rw [executePlan_append, List.length_append, hpcE, hpcI]; omega
+
+/-- **Spilled TLOAD instruction sim — the first spill-aware `genRegularInstPlan` producer.** The
+    `x`-spilled reroute of `genRegularInstPlan_tload_sim`: the operand is *restored* from its spill slot
+    (not DUP'd), transitions onto the stack, and the TLOAD runs — the whole generated plan preserves
+    `venomAsmRel` across the Venom step `out := tload w`. Composes `genRegularInstPlan_unopVar_spilled_eq`
+    (plan reduction) + `emitInputPlan_single_var_sim_spilled` (spilled emit) + `emit_tload_sim`. Concrete
+    demonstration that a compiled op runs correctly with a spilled operand — the read-class instance of
+    the Gap-C producer reroute. -/
+theorem genRegularInstPlan_tload_spilled_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {x out : String} {base : List Operand} {off : Nat} {w : bytes32}
+    (hname : opcodeToEvmName inst.opcode = some "TLOAD")
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x]) (houts : inst.outputs = [out])
+    (hstack0 : ps.stack = base) (hlive : nextLiveness.contains out = true)
+    (hspill : alookup' ps.spilled (Operand.Var x) = some off) (hlivex : nextLiveness.contains x = true)
+    (hval : operandVal vs lo (Operand.Var x) = some w)
+    (hfresh : ¬ (Operand.Var out) ∈ base) (houtx : out ≠ x)
+    (hspill_out : alookup' ps.spilled (Operand.Var out) = none)
+    (hspillWf : ∀ o off, alookup' ps.spilled o = some off →
+        32 ∣ off ∧ off + 32 ≤ as.memory.size ∧ off < 2 ^ 256)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp "TLOAD" →
+          asmStep offsetToPc prog s = asmStateUnop (fun k s => tload k s.toVenomState) s)
+    (hoptnoop : optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+        { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+          stack := base ++ [Operand.Var x, Operand.Var out] }
+      = ([], { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+              stack := base ++ [Operand.Var x, Operand.Var out] }))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2 (updateVar out (tload w vs) vs) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  have hrev : inst.operands.reverse = [Operand.Var x] := by rw [hops]; rfl
+  rw [genRegularInstPlan_unopVar_spilled_eq hname hnjmp hcompute hops houts hstack0 hlive hspill hlivex,
+      hoptnoop, hrev] at hblock ⊢
+  simp only [List.append_nil] at hblock ⊢
+  set ps1 := (emitInputPlan inst.opcode [Operand.Var x] nextLiveness ps).2 with hps1def
+  have hemitshape : emitInputPlan inst.opcode [Operand.Var x] nextLiveness ps
+      = ([StackOp.SORestore off, StackOp.SODup 1],
+         { ps with stack := ps.stack ++ [Operand.Var x, Operand.Var x],
+                   spilled := aremove ps.spilled (Operand.Var x), alloc := freeSpillSlot off ps.alloc }) := by
+    unfold emitInputPlan
+    simp only [List.foldl_cons, List.foldl_nil, List.nil_append, emitOneInput_var_spilled_eq hspill hlivex]
+  have hps1stack : ps1.stack = base ++ [Operand.Var x, Operand.Var x] := by
+    rw [hps1def, hemitshape, hstack0]
+  have hps1spill : alookup' ps1.spilled (Operand.Var out) = none := by
+    rw [hps1def, hemitshape]
+    exact aremove_lookup_none ps.spilled (Operand.Var x) (Operand.Var out) hspill_out
+  rw [executePlan_append] at hblock
+  obtain ⟨hbI, hbE⟩ := asmBlockAt_append hblock
+  obtain ⟨as1, hrunI, hrelI, hpcI⟩ :=
+    emitInputPlan_single_var_sim_spilled (offsetToPc := offsetToPc) hspill hlivex hrel hspillWf hbI
+  have hps1stack'' : ps1.stack = (base ++ [Operand.Var x]) ++ [Operand.Var x] := by rw [hps1stack]; simp
+  have hstacktop : as1.stack = w :: as1.stack.drop 1 :=
+    venomAsmRel_asmStack_top1_var hrelI hps1stack'' hval
+  have hfresh1 : ¬ (Operand.Var out) ∈ ps1.stack := by
+    rw [hps1stack]; simp only [List.mem_append, List.mem_cons, List.not_mem_nil, or_false]
+    rintro (h | h | h)
+    · exact hfresh h
+    · exact houtx (by injection h)
+    · exact houtx (by injection h)
+  have hbE' : asmBlockAt prog as1.pc (executePlan [StackOp.SOEmit "TLOAD"]) := by rw [hpcI]; exact hbE
+  obtain ⟨as2, hrunE, hrelE, hpcE⟩ :=
+    emit_tload_sim hrelI hstacktop hfresh1 hps1spill hbE' (fun h hg => hdisp as1 h hg)
+  have hps6 : ({ ps1 with stack := stackPush (Operand.Var out) (stackPop 1 ps1.stack) } : PlanState)
+      = { ps1 with stack := base ++ [Operand.Var x, Operand.Var out] } := by
+    congr 1
+    rw [hps1stack, show base ++ [Operand.Var x, Operand.Var x] = (base ++ [Operand.Var x]) ++ [Operand.Var x] from by simp,
+        stackPop_1_append_single]
+    simp [stackPush, List.append_assoc]
+  rw [hps6] at hrelE
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrelE
+  refine ⟨as2, ?_, hrelR, ?_⟩
+  · rw [executePlan_append, List.length_append]; exact runAsm_compose hrunI hrunE
+  · rw [executePlan_append, List.length_append, hpcE, hpcI]; omega
+
+/-- **CALLDATALOAD instruction sim** — the calldata-word read over the real plan; the calldata twin of
+    `genRegularInstPlan_tload_sim` (same generic 1-input plan; `emit_calldataload_sim` reconciles). -/
+theorem genRegularInstPlan_calldataload_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {x out : String} {base : List Operand} {dist : Nat} {w : bytes32}
+    (hname : opcodeToEvmName inst.opcode = some "CALLDATALOAD")
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x])
+    (houts : inst.outputs = [out])
+    (hstack0 : ps.stack = base)
+    (hlive : nextLiveness.contains out = true)
+    (hnospill : alookup' ps.spilled (Operand.Var x) = none)
+    (hlivex : nextLiveness.contains x = true)
+    (hdepth : stackGetDepth (Operand.Var x) ps.stack = some dist)
+    (hsmall : dist ≤ 15)
+    (hpeek : stackPeek dist ps.stack = Operand.Var x)
+    (hlen : dist < base.length)
+    (hxbase : Operand.Var x ∈ base)
+    (hval : operandVal vs lo (Operand.Var x) = some w)
+    (hfresh : ¬ (Operand.Var out) ∈ base)
+    (hspill : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp "CALLDATALOAD" →
+          asmStep offsetToPc prog s = asmStateUnop (fun offset s =>
+            wordOfBytes ((⟨s.callCtx.calldata.toArray⟩ : ByteArray).readWithPadding offset.toNat 32)) s)
+    (hoptnoop : optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+        { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+          stack := base ++ [Operand.Var out] }
+      = ([], { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+              stack := base ++ [Operand.Var out] }))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as
+             = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2
+             (updateVar out (wordOfBytes
+               ((⟨vs.callCtx.calldata.toArray⟩ : ByteArray).readWithPadding w.toNat 32)) vs) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  have hrev : inst.operands.reverse = [Operand.Var x] := by rw [hops]; rfl
+  have hdo : doDup dist ps
+      = ([StackOp.SODup (dist + 1)], { ps with stack := stackDup dist ps.stack }) := by
+    unfold doDup; rw [if_pos hsmall]
+  have hemiteq : emitInputPlan inst.opcode [Operand.Var x] nextLiveness ps = doDup dist ps := by
+    unfold emitInputPlan
+    simp only [List.foldl_cons, List.foldl_nil, List.nil_append]
+    rcases hdd : doDup dist ps with ⟨dupOps, ps2⟩
+    unfold emitOneInput
+    simp only [isVarOperand, hnospill, Option.isSome_none, Bool.and_false, Bool.false_eq_true,
+      if_false, hlivex, if_true, hdepth, hdd, List.nil_append]
+  rw [genRegularInstPlan_unopVar_eq hname hnjmp hcompute hops houts hstack0 hlive hnospill hlivex
+      hdepth hsmall hpeek, hoptnoop, hrev] at hblock ⊢
+  simp only [List.append_nil] at hblock ⊢
+  set ps1 := (emitInputPlan inst.opcode [Operand.Var x] nextLiveness ps).2 with hps1def
+  have hps1stack : ps1.stack = base ++ [Operand.Var x] := by
+    rw [hps1def, hemiteq, hdo]
+    show stackDup dist ps.stack = base ++ [Operand.Var x]
+    simp only [stackDup]; rw [hpeek, hstack0]
+  have hps1spill : AssocList.lookup Operand Nat ps1.spilled (Operand.Var out) = none := by
+    rw [hps1def, hemiteq, hdo]; exact hspill
+  rw [executePlan_append] at hblock
+  obtain ⟨hbI, hbE⟩ := asmBlockAt_append hblock
+  obtain ⟨as1, hrunI, hrelI, hpcI⟩ :=
+    emitInputPlan_single_var_sim hnospill hlivex hdepth hsmall hrel (by rw [hstack0]; exact hlen) hbI
+  have hstacktop : as1.stack = w :: as1.stack.drop 1 :=
+    venomAsmRel_asmStack_top1_var hrelI hps1stack hval
+  have hfresh1 : ¬ (Operand.Var out) ∈ ps1.stack := by
+    rw [hps1stack]; simp only [List.mem_append, List.mem_cons, List.not_mem_nil, or_false]
+    rintro (h | h)
+    · exact hfresh h
+    · rw [← h] at hxbase; exact hfresh hxbase
+  have hbE' : asmBlockAt prog as1.pc (executePlan [StackOp.SOEmit "CALLDATALOAD"]) := by
+    rw [hpcI]; exact hbE
+  obtain ⟨as2, hrunE, hrelE, hpcE⟩ :=
+    emit_calldataload_sim hrelI hstacktop hfresh1 hps1spill hbE' (fun h hg => hdisp as1 h hg)
+  have hps6 : ({ ps1 with stack := stackPush (Operand.Var out) (stackPop 1 ps1.stack) } : PlanState)
+      = { ps1 with stack := base ++ [Operand.Var out] } := by
+    rw [hps1stack, stackPop_1_append_single]; rfl
+  rw [hps6] at hrelE
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrelE
+  refine ⟨as2, ?_, hrelR, ?_⟩
+  · rw [executePlan_append, List.length_append]; exact runAsm_compose hrunI hrunE
+  · rw [executePlan_append, List.length_append, hpcE, hpcI]; omega
+
+/-- **Generic account-read instruction sim** over the generic 1-input/1-output plan. BALANCE /
+    EXTCODESIZE / EXTCODEHASH instantiate `fRead` (and the per-opcode `name` / `asmStep_*_ok`). -/
+theorem genRegularInstPlan_accountRead_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {x out name : String} {base : List Operand} {dist : Nat} {w : bytes32}
+    {fRead : bytes32 → Accounts → bytes32}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x])
+    (houts : inst.outputs = [out])
+    (hstack0 : ps.stack = base)
+    (hlive : nextLiveness.contains out = true)
+    (hnospill : alookup' ps.spilled (Operand.Var x) = none)
+    (hlivex : nextLiveness.contains x = true)
+    (hdepth : stackGetDepth (Operand.Var x) ps.stack = some dist)
+    (hsmall : dist ≤ 15)
+    (hpeek : stackPeek dist ps.stack = Operand.Var x)
+    (hlen : dist < base.length)
+    (hxbase : Operand.Var x ∈ base)
+    (hval : operandVal vs lo (Operand.Var x) = some w)
+    (hfresh : ¬ (Operand.Var out) ∈ base)
+    (hspill : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp name →
+          asmStep offsetToPc prog s = asmStateUnop (fun addr s => fRead addr s.toVenomState.accounts) s)
+    (hoptnoop : optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+        { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+          stack := base ++ [Operand.Var out] }
+      = ([], { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+              stack := base ++ [Operand.Var out] }))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as
+             = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2
+             (updateVar out (fRead w vs.accounts) vs) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  have hrev : inst.operands.reverse = [Operand.Var x] := by rw [hops]; rfl
+  have hdo : doDup dist ps
+      = ([StackOp.SODup (dist + 1)], { ps with stack := stackDup dist ps.stack }) := by
+    unfold doDup; rw [if_pos hsmall]
+  have hemiteq : emitInputPlan inst.opcode [Operand.Var x] nextLiveness ps = doDup dist ps := by
+    unfold emitInputPlan
+    simp only [List.foldl_cons, List.foldl_nil, List.nil_append]
+    rcases hdd : doDup dist ps with ⟨dupOps, ps2⟩
+    unfold emitOneInput
+    simp only [isVarOperand, hnospill, Option.isSome_none, Bool.and_false, Bool.false_eq_true,
+      if_false, hlivex, if_true, hdepth, hdd, List.nil_append]
+  rw [genRegularInstPlan_unopVar_eq hname hnjmp hcompute hops houts hstack0 hlive hnospill hlivex
+      hdepth hsmall hpeek, hoptnoop, hrev] at hblock ⊢
+  simp only [List.append_nil] at hblock ⊢
+  set ps1 := (emitInputPlan inst.opcode [Operand.Var x] nextLiveness ps).2 with hps1def
+  have hps1stack : ps1.stack = base ++ [Operand.Var x] := by
+    rw [hps1def, hemiteq, hdo]
+    show stackDup dist ps.stack = base ++ [Operand.Var x]
+    simp only [stackDup]; rw [hpeek, hstack0]
+  have hps1spill : AssocList.lookup Operand Nat ps1.spilled (Operand.Var out) = none := by
+    rw [hps1def, hemiteq, hdo]; exact hspill
+  rw [executePlan_append] at hblock
+  obtain ⟨hbI, hbE⟩ := asmBlockAt_append hblock
+  obtain ⟨as1, hrunI, hrelI, hpcI⟩ :=
+    emitInputPlan_single_var_sim hnospill hlivex hdepth hsmall hrel (by rw [hstack0]; exact hlen) hbI
+  have hstacktop : as1.stack = w :: as1.stack.drop 1 :=
+    venomAsmRel_asmStack_top1_var hrelI hps1stack hval
+  have hfresh1 : ¬ (Operand.Var out) ∈ ps1.stack := by
+    rw [hps1stack]; simp only [List.mem_append, List.mem_cons, List.not_mem_nil, or_false]
+    rintro (h | h)
+    · exact hfresh h
+    · rw [← h] at hxbase; exact hfresh hxbase
+  have hbE' : asmBlockAt prog as1.pc (executePlan [StackOp.SOEmit name]) := by
+    rw [hpcI]; exact hbE
+  obtain ⟨as2, hrunE, hrelE, hpcE⟩ :=
+    emit_accountRead_sim hrelI hstacktop hfresh1 hps1spill hbE' (fun h hg => hdisp as1 h hg)
+  have hps6 : ({ ps1 with stack := stackPush (Operand.Var out) (stackPop 1 ps1.stack) } : PlanState)
+      = { ps1 with stack := base ++ [Operand.Var out] } := by
+    rw [hps1stack, stackPop_1_append_single]; rfl
+  rw [hps6] at hrelE
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrelE
+  refine ⟨as2, ?_, hrelR, ?_⟩
+  · rw [executePlan_append, List.length_append]; exact runAsm_compose hrunI hrunE
+  · rw [executePlan_append, List.length_append, hpcE, hpcI]; omega
+
 /-- **Plan decomposition** for a no-output *single*-var instruction (SELFDESTRUCT): the emitted ops
     are the one-operand input-emission `++ [SOEmit name]`. The single-operand analog of
     `genRegularInstPlan_noOutput2Var_ops_eq` (the commutative branch is dead — only one operand). -/
@@ -7305,5 +13375,3326 @@ theorem executePlan_blockOps (l : String) (cleanOps instOps : List StackOp) :
     executePlan (StackOp.SOLabel l :: cleanOps ++ instOps)
       = AsmInst.AsmLabel l :: (executePlan cleanOps ++ executePlan instOps) := by
   rw [executePlan_append, executePlan_label_cons, List.cons_append]
+
+
+/-! ## Memory monotonicity of the asm machine
+
+No `asmStep`/`runAsm` ever shrinks memory (reads pad, writes/`asmExpandMemory` grow, stack ops
+preserve). This discharges the `hmemmono` precondition of the spill-aware invariant
+(`StackDiscHS`) unconditionally. -/
+
+
+theorem byteArray_write_size_le (source : ByteArray) (sa : Nat) (dest : ByteArray) (da len : Nat) :
+    dest.size ≤ (source.write sa dest da len).size := by
+  simp only [ByteArray.write]
+  split
+  · exact le_refl _
+  · split
+    · rw [ByteArray.size_copySlice]; omega
+    · rw [ByteArray.size_copySlice, ByteArray.size_append]; omega
+
+theorem asmExpandMemory_size_mono (needed : Nat) (mem : ByteArray) :
+    mem.size ≤ (asmExpandMemory needed mem).size := by
+  simp only [asmExpandMemory]
+  split
+  · exact le_refl _
+  · exact byteArray_write_size_le _ 0 mem mem.size _
+
+/-- `s.memory.size ≤` an `if siz=0 then s.memory else asmExpandMemory …` — the shape every copy/SHA3/LOG
+    op takes for its expanded memory. -/
+theorem memCond_size (c : Prop) [Decidable c] (n : Nat) (m : ByteArray) :
+    m.size ≤ (if c then m else asmExpandMemory n m).size := by
+  split
+  · exact le_refl _
+  · exact asmExpandMemory_size_mono n m
+
+-- Memory-preserving helpers (result carries `s.memory` unchanged).
+theorem asmPushVal_memory_le {v s s'} (h : asmPushVal v s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmPushVal at h; injection h with h; subst h; exact le_refl _
+theorem asmPop_memory_le {s s'} (h : asmPop s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmPop at h; split at h
+  · injection h with h; subst h; exact le_refl _
+  · exact absurd h (by simp)
+theorem asmBinop_memory_le {f s s'} (h : asmBinop f s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmBinop at h; split at h
+  · injection h with h; subst h; exact le_refl _
+  · exact absurd h (by simp)
+theorem asmUnop_memory_le {f s s'} (h : asmUnop f s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmUnop at h; split at h
+  · injection h with h; subst h; exact le_refl _
+  · exact absurd h (by simp)
+theorem asmTernop_memory_le {f s s'} (h : asmTernop f s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmTernop at h; split at h
+  · injection h with h; subst h; exact le_refl _
+  · exact absurd h (by simp)
+theorem asmStateUnop_memory_le {f s s'} (h : asmStateUnop f s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmStateUnop at h; split at h
+  · injection h with h; subst h; exact le_refl _
+  · exact absurd h (by simp)
+theorem asmDup_memory_le {n s s'} (h : asmDup n s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmDup at h; split at h
+  · injection h with h; subst h; exact le_refl _
+  · exact absurd h (by simp)
+theorem asmSwap_memory_le {n s s'} (h : asmSwap n s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmSwap at h; split at h
+  · split at h
+    · injection h with h; subst h; exact le_refl _
+    · exact absurd h (by simp)
+  · exact absurd h (by simp)
+theorem asmSload_memory_le {s s'} (h : asmSload s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmSload at h; split at h
+  · injection h with h; subst h; exact le_refl _
+  · exact absurd h (by simp)
+theorem asmSstore_memory_le {s s'} (h : asmSstore s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmSstore at h; split at h
+  · injection h with h; subst h; exact le_refl _
+  · exact absurd h (by simp)
+theorem asmJump_memory_le {o2pc s s'} (h : asmJump o2pc s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmJump at h; split at h
+  · split at h
+    · injection h with h; subst h; exact le_refl _
+    · exact absurd h (by simp)
+  · exact absurd h (by simp)
+theorem asmJumpi_memory_le {o2pc s s'} (h : asmJumpi o2pc s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmJumpi at h; split at h
+  · split at h
+    · injection h with h; subst h; exact le_refl _
+    · split at h
+      · injection h with h; subst h; exact le_refl _
+      · exact absurd h (by simp)
+  · exact absurd h (by simp)
+
+-- Memory-monotone helpers (expand memory, never shrink).
+theorem asmMload_memory_le {s s'} (h : asmMload s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmMload at h; split at h
+  · injection h with h; subst h; dsimp only; exact asmExpandMemory_size_mono _ _
+  · exact absurd h (by simp)
+theorem asmMstore_memory_le {s s'} (h : asmMstore s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmMstore at h; split at h
+  · injection h with h; subst h; dsimp only
+    exact le_trans (asmExpandMemory_size_mono _ _) (byteArray_write_size_le _ 0 _ _ _)
+  · exact absurd h (by simp)
+theorem asmMstore8_memory_le {s s'} (h : asmMstore8 s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmMstore8 at h; split at h
+  · injection h with h; subst h; dsimp only
+    exact le_trans (asmExpandMemory_size_mono _ _) (byteArray_write_size_le _ 0 _ _ _)
+  · exact absurd h (by simp)
+theorem asmSha3_memory_le {s s'} (h : asmSha3 s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmSha3 at h; split at h
+  · injection h with h; subst h; dsimp only; exact memCond_size _ _ _
+  · exact absurd h (by simp)
+theorem asmCopyToMem_memory_le {src s s'} (h : asmCopyToMem src s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmCopyToMem at h; split at h
+  · injection h with h; subst h; dsimp only
+    exact le_trans (memCond_size _ _ _) (byteArray_write_size_le _ 0 _ _ _)
+  · exact absurd h (by simp)
+theorem asmExtcodecopy_memory_le {s s'} (h : asmExtcodecopy s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmExtcodecopy at h; split at h
+  · have h2 := asmCopyToMem_memory_le h; exact h2
+  · exact absurd h (by simp)
+theorem asmReturndatacopy_memory_le {s s'} (h : asmReturndatacopy s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmReturndatacopy at h; split at h
+  · dsimp only at h; split at h
+    · exact absurd h (by simp)
+    · injection h with h; subst h; dsimp only
+      exact le_trans (memCond_size _ _ _) (byteArray_write_size_le _ 0 _ _ _)
+  · exact absurd h (by simp)
+theorem asmMcopy_memory_le {s s'} (h : asmMcopy s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmMcopy at h; split at h
+  · injection h with h; subst h; dsimp only
+    exact le_trans (memCond_size _ _ _) (byteArray_write_size_le _ 0 _ _ _)
+  · exact absurd h (by simp)
+theorem asmLog_memory_le {n s s'} (h : asmLog n s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmLog at h; split at h
+  · exact absurd h (by simp)
+  · injection h with h; subst h; dsimp only; exact memCond_size _ _ _
+
+-- Never-AsmOK helpers (vacuous: these ops halt/revert/fault).
+theorem asmReturnOp_memory_le {s s'} (h : asmReturnOp s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmReturnOp at h; split at h <;> simp_all
+theorem asmRevertOp_memory_le {s s'} (h : asmRevertOp s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmRevertOp at h; split at h <;> simp_all
+theorem asmSelfdestruct_memory_le {s s'} (h : asmSelfdestruct s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmSelfdestruct at h; split at h <;> simp_all
+
+theorem asmCall_memory_le {s s'} (h : asmCall s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmCall asmCallWriteback at h; split at h
+  · injection h with h; subst h; dsimp only; exact byteArray_write_size_le _ 0 _ _ _
+  · exact absurd h (by simp)
+
+theorem asmStaticCall_memory_le {s s'} (h : asmStaticCall s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmStaticCall asmCallWriteback at h; split at h
+  · injection h with h; subst h; dsimp only; exact byteArray_write_size_le _ 0 _ _ _
+  · exact absurd h (by simp)
+
+theorem asmDelegateCall_memory_le {s s'} (h : asmDelegateCall s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmDelegateCall asmCallWriteback at h; split at h
+  · injection h with h; subst h; dsimp only; exact byteArray_write_size_le _ 0 _ _ _
+  · exact absurd h (by simp)
+
+theorem asmCreate_memory_le {s s'} (h : asmCreate s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmCreate at h; split at h
+  · injection h with h; subst h; exact le_refl _
+  · exact absurd h (by simp)
+
+theorem asmCreate2_memory_le {s s'} (h : asmCreate2 s = AsmResult.AsmOK s') : s.memory.size ≤ s'.memory.size := by
+  unfold asmCreate2 at h; split at h
+  · injection h with h; subst h; exact le_refl _
+  · exact absurd h (by simp)
+
+set_option maxHeartbeats 4000000 in
+/-- **A single `asmStep` never shrinks memory.** Case analysis over the instruction dispatch: every
+    `AsmOK`-producing branch either preserves `s.memory` or expands it (`asmExpandMemory`/write). -/
+theorem asmStep_memory_size_mono {o2pc prog s s'} (h : asmStep o2pc prog s = AsmResult.AsmOK s') :
+    s.memory.size ≤ s'.memory.size := by
+  unfold asmStep at h
+  split at h
+  · dsimp only at h
+    repeat' split at h
+    all_goals first
+      | exact asmPop_memory_le h
+      | exact asmBinop_memory_le h
+      | exact asmUnop_memory_le h
+      | exact asmTernop_memory_le h
+      | exact asmStateUnop_memory_le h
+      | exact asmPushVal_memory_le h
+      | exact asmDup_memory_le h
+      | exact asmSwap_memory_le h
+      | exact asmSload_memory_le h
+      | exact asmSstore_memory_le h
+      | exact asmMload_memory_le h
+      | exact asmMstore_memory_le h
+      | exact asmMstore8_memory_le h
+      | exact asmSha3_memory_le h
+      | exact asmCopyToMem_memory_le h
+      | exact asmExtcodecopy_memory_le h
+      | exact asmReturndatacopy_memory_le h
+      | exact asmMcopy_memory_le h
+      | exact asmLog_memory_le h
+      | exact asmJump_memory_le h
+      | exact asmJumpi_memory_le h
+      | exact asmReturnOp_memory_le h
+      | exact asmRevertOp_memory_le h
+      | exact asmSelfdestruct_memory_le h
+      | exact asmCall_memory_le h
+      | exact asmStaticCall_memory_le h
+      | exact asmDelegateCall_memory_le h
+      | exact asmCreate_memory_le h
+      | exact asmCreate2_memory_le h
+      | (injection h with h; subst h; exact le_refl _)
+      | (exact absurd h (by simp))
+  · exact absurd h (by simp)
+
+/-- **`runAsm` never shrinks memory.** Fuel induction over `asmStep_memory_size_mono`. -/
+theorem runAsm_memory_size_mono {n o2pc prog s s'} (h : runAsm n o2pc prog s = AsmResult.AsmOK s') :
+    s.memory.size ≤ s'.memory.size := by
+  induction n generalizing s with
+  | zero => rw [runAsm] at h; injection h with h; subst h; exact le_refl _
+  | succ n ih =>
+    rw [runAsm] at h
+    split at h
+    · rename_i s1 heq
+      exact le_trans (asmStep_memory_size_mono heq) (ih h)
+    · rename_i heq
+      exact absurd h (heq s')
+
+/-- **`emitInputPlan` sim for a mixed pair `[live v, spilled w]`** — the complement of
+    `emitInputPlan_pair_spill_first_sim`: the head is the ordinary DUP path for the live var `v`, the
+    tail the spilled-restore path for `w`. Since the head is a pure stack DUP (memory unchanged), the
+    spill well-formedness lifts to the tail via `runAsm_memory_size_mono` (placed after it here for the
+    forward reference). Completes the two-var mixed spill coverage (either operand spilled). -/
+theorem emitInputPlan_pair_spill_second_sim {opc nl v w ps lo vs as prog off d}
+    (hnospillv : alookup' ps.spilled (Operand.Var v) = none)
+    (hlivev : nl.contains v = true) (hlivew : nl.contains w = true)
+    (hdepthv : stackGetDepth (Operand.Var v) ps.stack = some d) (hsmall : d ≤ 15)
+    (hlenv : d < ps.stack.length)
+    (hspillw : alookup' ps.spilled (Operand.Var w) = some off)
+    (hrel : venomAsmRel lo ps vs as)
+    (hspillWf : ∀ o off, alookup' ps.spilled o = some off →
+        32 ∣ off ∧ off + 32 ≤ as.memory.size ∧ off < 2 ^ 256)
+    (hblock : asmBlockAt prog as.pc (executePlan (emitInputPlan opc [Operand.Var v, Operand.Var w] nl ps).1)) :
+    ∃ as', runAsm (executePlan (emitInputPlan opc [Operand.Var v, Operand.Var w] nl ps).1).length offsetToPc prog as
+             = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (emitInputPlan opc [Operand.Var v, Operand.Var w] nl ps).2 vs as' ∧
+           as'.pc = as.pc + (executePlan (emitInputPlan opc [Operand.Var v, Operand.Var w] nl ps).1).length := by
+  -- head: live v via doDup
+  set ps1 : PlanState := { ps with stack := stackDup d ps.stack } with hps1def
+  have hdd : doDup d ps = ([StackOp.SODup (d + 1)], ps1) := by
+    rw [hps1def]; unfold doDup; rw [if_pos hsmall]
+  have hhead : emitOneInput opc nl (Operand.Var v) ps = ([StackOp.SODup (d + 1)], ps1) := by
+    unfold emitOneInput
+    simp only [isVarOperand, hnospillv, Option.isSome_none, Bool.and_false, Bool.false_eq_true,
+      if_false, hlivev, if_true, hdepthv, hdd, List.nil_append]
+  have hspillw1 : alookup' ps1.spilled (Operand.Var w) = some off := by rw [hps1def]; exact hspillw
+  -- tail: spilled w via restore
+  set ps2 : PlanState := { ps1 with stack := ps1.stack ++ [Operand.Var w, Operand.Var w],
+                                     spilled := aremove ps1.spilled (Operand.Var w),
+                                     alloc := freeSpillSlot off ps1.alloc } with hps2def
+  have htail : emitOneInput opc nl (Operand.Var w) ps1 = ([StackOp.SORestore off, StackOp.SODup 1], ps2) :=
+    emitOneInput_var_spilled_eq hspillw1 hlivew
+  have hfold : emitInputPlan opc [Operand.Var v, Operand.Var w] nl ps
+      = ([StackOp.SODup (d + 1)] ++ [StackOp.SORestore off, StackOp.SODup 1], ps2) := by
+    unfold emitInputPlan
+    simp only [List.foldl_cons, List.foldl_nil, hhead, htail, List.nil_append]
+  rw [hfold] at hblock ⊢
+  rw [executePlan_append] at hblock
+  obtain ⟨hbHead, hbTail⟩ := asmBlockAt_append hblock
+  -- run head
+  obtain ⟨as1, hrunHead, hrelHead, hpcHead⟩ :=
+    doDup_sim (offsetToPc := offsetToPc) hdd hsmall hrel hlenv hbHead
+  -- lift spill wf to ps1/as1 (head is pure DUP; memory never shrinks)
+  have hmemmono : as.memory.size ≤ as1.memory.size := runAsm_memory_size_mono hrunHead
+  have hspillWf1 : ∀ o off', alookup' ps1.spilled o = some off' →
+      32 ∣ off' ∧ off' + 32 ≤ as1.memory.size ∧ off' < 2 ^ 256 := by
+    intro o off' ho
+    have ho' : alookup' ps.spilled o = some off' := by rw [hps1def] at ho; exact ho
+    obtain ⟨hdvd, hle, hlt⟩ := hspillWf o off' ho'
+    exact ⟨hdvd, le_trans hle hmemmono, hlt⟩
+  -- run tail
+  have hbTail' : asmBlockAt prog as1.pc (executePlan [StackOp.SORestore off, StackOp.SODup 1]) := by
+    rw [hpcHead]; exact hbTail
+  obtain ⟨as2, hrunTail, hrelTail, hpcTail⟩ :=
+    emitOneInput_sim_var_spilled (offsetToPc := offsetToPc) hspillw1 hlivew htail hrelHead hspillWf1 hbTail'
+  have hlen : (executePlan ([StackOp.SODup (d + 1)] ++ [StackOp.SORestore off, StackOp.SODup 1])).length
+      = (executePlan [StackOp.SODup (d + 1)]).length
+        + (executePlan [StackOp.SORestore off, StackOp.SODup 1]).length := by
+    rw [executePlan_append, List.length_append]
+  refine ⟨as2, ?_, hrelTail, ?_⟩
+  · rw [hlen]; exact runAsm_compose hrunHead hrunTail
+  · rw [hlen, hpcTail, hpcHead]; omega
+
+/-- **Key-spilled store sim — the first non-positioned reorder-under-spill producer.** `SSTORE x y`,
+    key `x` spilled, value `y` live: DUP `y`, restore `x`, then the reorder runs `SWAP2 ; SWAP1` to bring
+    the deep `y` to its store position, then SSTORE — the whole plan preserves `venomAsmRel` across
+    `sstore wx wy`. Composes the LS emit + two `doSwap_sim` + `emit_sstore_sim`. -/
+theorem genRegularInstPlan_sstore_keyspilled_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {offsetToPc : AssocList Nat Nat} {x y : String} {wx wy : bytes32} {base : List Operand} {offx d_y : Nat}
+    (hname : opcodeToEvmName inst.opcode = some "SSTORE")
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x, Operand.Var y])
+    (houts : inst.outputs = [])
+    (hxy : x ≠ y)
+    (hstack0 : ps.stack = base)
+    (hnospill_y : alookup' ps.spilled (Operand.Var y) = none)
+    (hlivey : nextLiveness.contains y = true)
+    (hdepth_y : stackGetDepth (Operand.Var y) ps.stack = some d_y)
+    (hsmall_y : d_y ≤ 15)
+    (hspill_x : alookup' ps.spilled (Operand.Var x) = some offx)
+    (hlivex : nextLiveness.contains x = true)
+    (hvx : operandVal vs lo (Operand.Var x) = some wx)
+    (hvy : operandVal vs lo (Operand.Var y) = some wy)
+    (hspillWf : ∀ o off, alookup' ps.spilled o = some off →
+        32 ∣ off ∧ off + 32 ≤ as.memory.size ∧ off < 2 ^ 256)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp "SSTORE" → asmStep offsetToPc prog s = asmSstore s)
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2 (sstore wx wy vs) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  have hrev : inst.operands.reverse = [Operand.Var y, Operand.Var x] := by rw [hops]; rfl
+  have hlenv : d_y < ps.stack.length := stackGetDepth_lt_length hdepth_y
+  rw [genRegularInstPlan_sstore_keyspilled_eq hname hncomm hnjmp hcompute hops houts hxy hstack0
+      hnospill_y hlivey hdepth_y hsmall_y hspill_x hlivex, hrev] at hblock ⊢
+  set ps1 := (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).2 with hps1def
+  have hps1stack : ps1.stack = base ++ [Operand.Var y, Operand.Var x, Operand.Var x] := by
+    rw [hps1def, emit2_keyspilled (opc := inst.opcode) (nl := nextLiveness) hstack0 hnospill_y hlivey hdepth_y hsmall_y hspill_x hlivex]
+  -- the plan tail as a right-nested append
+  rw [show ([StackOp.SOSwap 2, StackOp.SOSwap 1, StackOp.SOEmit "SSTORE"] : List StackOp)
+        = [StackOp.SOSwap 2] ++ ([StackOp.SOSwap 1] ++ [StackOp.SOEmit "SSTORE"]) from rfl] at hblock ⊢
+  rw [executePlan_append, executePlan_append, executePlan_append] at hblock
+  obtain ⟨hbI, hbRest⟩ := asmBlockAt_append hblock
+  obtain ⟨hbSwap2raw, hbRest2⟩ := asmBlockAt_append hbRest
+  obtain ⟨hbSwap1raw, hbStoreraw⟩ := asmBlockAt_append hbRest2
+  -- run emit
+  obtain ⟨as1, hrunI, hrelI, hpcI⟩ :=
+    emitInputPlan_pair_spill_second_sim (offsetToPc := offsetToPc) hnospill_y hlivey hlivex hdepth_y hsmall_y
+      hlenv hspill_x hrel hspillWf hbI
+  -- SWAP2
+  have hlen2 : (2 : Nat) < ps1.stack.length := by rw [hps1stack]; simp
+  have hswap2 : doSwap 2 ps1 = ([StackOp.SOSwap 2], { ps1 with stack := base ++ [Operand.Var x, Operand.Var x, Operand.Var y] }) := by
+    rw [doSwap_two]; congr 1
+    rw [hps1stack, stackSwap_2_append_triple base (Operand.Var y) (Operand.Var x) (Operand.Var x)]
+  have hbSwap2 : asmBlockAt prog as1.pc (executePlan [StackOp.SOSwap 2]) := by rw [hpcI]; exact hbSwap2raw
+  obtain ⟨as2, hrun2, hrel2, hpc2⟩ := doSwap_sim (offsetToPc := offsetToPc) hswap2 hrelI hlen2 hbSwap2 (by intro h; omega)
+  -- SWAP1
+  have hlen1 : (1 : Nat) < ({ ps1 with stack := base ++ [Operand.Var x, Operand.Var x, Operand.Var y] } : PlanState).stack.length := by simp
+  have hswap1 : doSwap 1 { ps1 with stack := base ++ [Operand.Var x, Operand.Var x, Operand.Var y] }
+      = ([StackOp.SOSwap 1], { ps1 with stack := base ++ [Operand.Var x, Operand.Var y, Operand.Var x] }) := by
+    rw [doSwap_one]; congr 1
+    rw [show ({ ps1 with stack := base ++ [Operand.Var x, Operand.Var x, Operand.Var y] } : PlanState).stack
+          = base ++ [Operand.Var x, Operand.Var x, Operand.Var y] from rfl,
+        stackSwap_1_append_triple base (Operand.Var x) (Operand.Var x) (Operand.Var y)]
+  have hbSwap1 : asmBlockAt prog as2.pc (executePlan [StackOp.SOSwap 1]) := by rw [hpc2, hpcI]; exact hbSwap1raw
+  obtain ⟨as3, hrun3, hrel3, hpc3⟩ := doSwap_sim (offsetToPc := offsetToPc) hswap1 hrel2 hlen1 hbSwap1 (by intro h; omega)
+  -- SSTORE
+  have hps3stack : ({ ps1 with stack := base ++ [Operand.Var x, Operand.Var y, Operand.Var x] } : PlanState).stack
+      = (base ++ [Operand.Var x]) ++ [Operand.Var y, Operand.Var x] := by simp
+  have hstacktop : as3.stack = wx :: wy :: as3.stack.drop 2 :=
+    venomAsmRel_asmStack_top2_var hrel3 hps3stack hvx hvy
+  have hbSST : asmBlockAt prog as3.pc (executePlan [StackOp.SOEmit "SSTORE"]) := by rw [hpc3, hpc2, hpcI]; exact hbStoreraw
+  obtain ⟨as4, hrun4, hrel4, hpc4⟩ := emit_sstore_sim hrel3 hstacktop hbSST (fun h hg => hdisp as3 h hg)
+  have hps5 : ({ { ps1 with stack := base ++ [Operand.Var x, Operand.Var y, Operand.Var x] } with
+      stack := stackPop 2 (base ++ [Operand.Var x, Operand.Var y, Operand.Var x]) } : PlanState)
+      = { ps1 with stack := base ++ [Operand.Var x] } := by
+    rw [show base ++ [Operand.Var x, Operand.Var y, Operand.Var x] = (base ++ [Operand.Var x]) ++ [Operand.Var y, Operand.Var x] from by simp,
+        stackPop_2_append_pair]
+  rw [hps5] at hrel4
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrel4
+  have hlenEq : (executePlan ((emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).1
+        ++ ([StackOp.SOSwap 2] ++ ([StackOp.SOSwap 1] ++ [StackOp.SOEmit "SSTORE"])))).length
+      = (executePlan (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).1).length
+        + ((executePlan [StackOp.SOSwap 2]).length
+           + ((executePlan [StackOp.SOSwap 1]).length + (executePlan [StackOp.SOEmit "SSTORE"]).length)) := by
+    rw [executePlan_append, executePlan_append, executePlan_append, List.length_append,
+        List.length_append, List.length_append]
+  refine ⟨as4, ?_, hrelR, ?_⟩
+  · rw [hlenEq]; exact runAsm_compose hrunI (runAsm_compose hrun2 (runAsm_compose hrun3 hrun4))
+  · rw [hlenEq, hpc4, hpc3, hpc2, hpcI]; omega
+
+/-- **Key-spilled non-commutative binop sim.** Value `y` live, key `x` spilled: DUP `y`, restore `x`,
+    run the `SWAP2 ; SWAP1` reorder, run the binop, push `out` — the whole plan preserves `venomAsmRel`
+    across `out := f wx wy`. Composes the LS emit sim, two `doSwap_sim`, and `emit_binop_sim`. -/
+theorem genRegularInstPlan_nonCommBinopVar_keyspilled_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {offsetToPc : AssocList Nat Nat} {x y out : String} {wx wy : bytes32} {base : List Operand}
+    {name : String} {offx d_y : Nat} {f : bytes32 → bytes32 → bytes32}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x, Operand.Var y])
+    (houts : inst.outputs = [out])
+    (hxy : x ≠ y) (hox : out ≠ x) (hoy : out ≠ y)
+    (hstack0 : ps.stack = base)
+    (hlive : nextLiveness.contains out = true)
+    (hfresh : ¬ (Operand.Var out) ∈ base)
+    (hspill_out : alookup' ps.spilled (Operand.Var out) = none)
+    (hnospill_y : alookup' ps.spilled (Operand.Var y) = none)
+    (hlivey : nextLiveness.contains y = true)
+    (hdepth_y : stackGetDepth (Operand.Var y) ps.stack = some d_y)
+    (hsmall_y : d_y ≤ 15)
+    (hspill_x : alookup' ps.spilled (Operand.Var x) = some offx)
+    (hlivex : nextLiveness.contains x = true)
+    (hvx : operandVal vs lo (Operand.Var x) = some wx)
+    (hvy : operandVal vs lo (Operand.Var y) = some wy)
+    (hspillWf : ∀ o off, alookup' ps.spilled o = some off →
+        32 ∣ off ∧ off + 32 ≤ as.memory.size ∧ off < 2 ^ 256)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp name → asmStep offsetToPc prog s = asmBinop f s)
+    (hoptnoop : optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+        { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+          stack := base ++ [Operand.Var x, Operand.Var out] }
+      = ([], { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+              stack := base ++ [Operand.Var x, Operand.Var out] }))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2 (updateVar out (f wx wy) vs) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  have hrev : inst.operands.reverse = [Operand.Var y, Operand.Var x] := by rw [hops]; rfl
+  have hlenv : d_y < ps.stack.length := stackGetDepth_lt_length hdepth_y
+  rw [genRegularInstPlan_nonCommBinopVar_keyspilled_eq hname hncomm hnjmp hcompute hops houts hxy hstack0
+      hlive hnospill_y hlivey hdepth_y hsmall_y hspill_x hlivex, hoptnoop, hrev] at hblock ⊢
+  simp only [List.append_nil] at hblock ⊢
+  set ps1 := (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).2 with hps1def
+  have hps1stack : ps1.stack = base ++ [Operand.Var y, Operand.Var x, Operand.Var x] := by
+    rw [hps1def, emit2_keyspilled (opc := inst.opcode) (nl := nextLiveness) hstack0 hnospill_y hlivey hdepth_y hsmall_y hspill_x hlivex]
+  have hps1spill : alookup' ps1.spilled (Operand.Var out) = none := by
+    rw [hps1def, emit2_keyspilled (opc := inst.opcode) (nl := nextLiveness) hstack0 hnospill_y hlivey hdepth_y hsmall_y hspill_x hlivex]
+    show alookup' (aremove ps.spilled (Operand.Var x)) (Operand.Var out) = none
+    exact aremove_lookup_none ps.spilled (Operand.Var x) (Operand.Var out) hspill_out
+  rw [show ((emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).1
+            ++ [StackOp.SOSwap 2, StackOp.SOSwap 1] ++ [StackOp.SOEmit name])
+        = (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).1
+            ++ ([StackOp.SOSwap 2] ++ ([StackOp.SOSwap 1] ++ [StackOp.SOEmit name])) from by simp] at hblock ⊢
+  rw [executePlan_append, executePlan_append, executePlan_append] at hblock
+  obtain ⟨hbI, hbRest⟩ := asmBlockAt_append hblock
+  obtain ⟨hbSwap2raw, hbRest2⟩ := asmBlockAt_append hbRest
+  obtain ⟨hbSwap1raw, hbEmitraw⟩ := asmBlockAt_append hbRest2
+  obtain ⟨as1, hrunI, hrelI, hpcI⟩ :=
+    emitInputPlan_pair_spill_second_sim (offsetToPc := offsetToPc) hnospill_y hlivey hlivex hdepth_y hsmall_y
+      hlenv hspill_x hrel hspillWf hbI
+  have hlen2 : (2 : Nat) < ps1.stack.length := by rw [hps1stack]; simp
+  have hswap2 : doSwap 2 ps1 = ([StackOp.SOSwap 2], { ps1 with stack := base ++ [Operand.Var x, Operand.Var x, Operand.Var y] }) := by
+    rw [doSwap_two]; congr 1
+    rw [hps1stack, stackSwap_2_append_triple base (Operand.Var y) (Operand.Var x) (Operand.Var x)]
+  have hbSwap2 : asmBlockAt prog as1.pc (executePlan [StackOp.SOSwap 2]) := by rw [hpcI]; exact hbSwap2raw
+  obtain ⟨as2, hrun2, hrel2, hpc2⟩ := doSwap_sim (offsetToPc := offsetToPc) hswap2 hrelI hlen2 hbSwap2 (by intro h; omega)
+  have hlen1 : (1 : Nat) < ({ ps1 with stack := base ++ [Operand.Var x, Operand.Var x, Operand.Var y] } : PlanState).stack.length := by simp
+  have hswap1 : doSwap 1 { ps1 with stack := base ++ [Operand.Var x, Operand.Var x, Operand.Var y] }
+      = ([StackOp.SOSwap 1], { ps1 with stack := base ++ [Operand.Var x, Operand.Var y, Operand.Var x] }) := by
+    rw [doSwap_one]; congr 1
+    rw [show ({ ps1 with stack := base ++ [Operand.Var x, Operand.Var x, Operand.Var y] } : PlanState).stack
+          = base ++ [Operand.Var x, Operand.Var x, Operand.Var y] from rfl,
+        stackSwap_1_append_triple base (Operand.Var x) (Operand.Var x) (Operand.Var y)]
+  have hbSwap1 : asmBlockAt prog as2.pc (executePlan [StackOp.SOSwap 1]) := by rw [hpc2, hpcI]; exact hbSwap1raw
+  obtain ⟨as3, hrun3, hrel3, hpc3⟩ := doSwap_sim (offsetToPc := offsetToPc) hswap1 hrel2 hlen1 hbSwap1 (by intro h; omega)
+  have hps3stack : ({ ps1 with stack := base ++ [Operand.Var x, Operand.Var y, Operand.Var x] } : PlanState).stack
+      = (base ++ [Operand.Var x]) ++ [Operand.Var y, Operand.Var x] := by simp
+  have hstacktop : as3.stack = wx :: wy :: as3.stack.drop 2 :=
+    venomAsmRel_asmStack_top2_var hrel3 hps3stack hvx hvy
+  have hfresh3 : ¬ (Operand.Var out) ∈ ({ ps1 with stack := base ++ [Operand.Var x, Operand.Var y, Operand.Var x] } : PlanState).stack := by
+    show ¬ (Operand.Var out) ∈ base ++ [Operand.Var x, Operand.Var y, Operand.Var x]
+    simp only [List.mem_append, List.mem_cons, List.not_mem_nil, or_false]
+    rintro (h | h | h | h)
+    · exact hfresh h
+    · exact hox (by injection h)
+    · exact hoy (by injection h)
+    · exact hox (by injection h)
+  have hps3spill : alookup' ({ ps1 with stack := base ++ [Operand.Var x, Operand.Var y, Operand.Var x] } : PlanState).spilled (Operand.Var out) = none := hps1spill
+  have hbEmit : asmBlockAt prog as3.pc (executePlan [StackOp.SOEmit name]) := by rw [hpc3, hpc2, hpcI]; exact hbEmitraw
+  obtain ⟨as4, hrun4, hrel4, hpc4⟩ := emit_binop_sim hrel3 hstacktop hfresh3 hps3spill hbEmit (fun h hg => hdisp as3 h hg)
+  have hps5 : ({ { ps1 with stack := base ++ [Operand.Var x, Operand.Var y, Operand.Var x] } with
+      stack := stackPush (Operand.Var out) (stackPop 2 (base ++ [Operand.Var x, Operand.Var y, Operand.Var x])) } : PlanState)
+      = { ps1 with stack := base ++ [Operand.Var x, Operand.Var out] } := by
+    rw [show base ++ [Operand.Var x, Operand.Var y, Operand.Var x] = (base ++ [Operand.Var x]) ++ [Operand.Var y, Operand.Var x] from by simp,
+        stackPop_2_append_pair]; simp [stackPush, List.append_assoc]
+  rw [hps5] at hrel4
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrel4
+  have hlenEq : (executePlan ((emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).1
+        ++ ([StackOp.SOSwap 2] ++ ([StackOp.SOSwap 1] ++ [StackOp.SOEmit name])))).length
+      = (executePlan (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).1).length
+        + ((executePlan [StackOp.SOSwap 2]).length
+           + ((executePlan [StackOp.SOSwap 1]).length + (executePlan [StackOp.SOEmit name]).length)) := by
+    rw [executePlan_append, executePlan_append, executePlan_append, List.length_append,
+        List.length_append, List.length_append]
+  refine ⟨as4, ?_, hrelR, ?_⟩
+  · rw [hlenEq]; exact runAsm_compose hrunI (runAsm_compose hrun2 (runAsm_compose hrun3 hrun4))
+  · rw [hlenEq, hpc4, hpc3, hpc2, hpcI]; omega
+
+/-- **Key-spilled commutative binop sim.** Value `y` live, key `x` spilled; the commutative
+    dispatch picks the swapped order, so the reorder is `SWAP1 ; SWAP2` (first SWAP1 transposes
+    the two equal restored `x`'s — a stack no-op) leaving `base ++ [x, x, y]`; the binop pops
+    `f wy wx`, rewritten to `f wx wy` by `hfcomm`. Preserves `venomAsmRel` across `out := f wx wy`. -/
+theorem genRegularInstPlan_commBinopVar_keyspilled_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {offsetToPc : AssocList Nat Nat} {x y out : String} {wx wy : bytes32} {base : List Operand}
+    {name : String} {offx d_y : Nat} {f : bytes32 → bytes32 → bytes32}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hcomm : isCommutative inst.opcode = true)
+    (hfcomm : ∀ (a b : bytes32), f a b = f b a)
+    (hops : inst.operands = [Operand.Var x, Operand.Var y]) (houts : inst.outputs = [out])
+    (hxy : x ≠ y) (hox : out ≠ x) (hoy : out ≠ y)
+    (hstack0 : ps.stack = base) (hlive : nextLiveness.contains out = true)
+    (hfresh : ¬ (Operand.Var out) ∈ base) (hspill_out : alookup' ps.spilled (Operand.Var out) = none)
+    (hnospill_y : alookup' ps.spilled (Operand.Var y) = none) (hlivey : nextLiveness.contains y = true)
+    (hdepth_y : stackGetDepth (Operand.Var y) ps.stack = some d_y) (hsmall_y : d_y ≤ 15)
+    (hspill_x : alookup' ps.spilled (Operand.Var x) = some offx) (hlivex : nextLiveness.contains x = true)
+    (hvx : operandVal vs lo (Operand.Var x) = some wx)
+    (hvy : operandVal vs lo (Operand.Var y) = some wy)
+    (hspillWf : ∀ o off, alookup' ps.spilled o = some off →
+        32 ∣ off ∧ off + 32 ≤ as.memory.size ∧ off < 2 ^ 256)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp name → asmStep offsetToPc prog s = asmBinop f s)
+    (hoptnoop : optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+        { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+          stack := base ++ [Operand.Var x, Operand.Var out] }
+      = ([], { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+              stack := base ++ [Operand.Var x, Operand.Var out] }))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2 (updateVar out (f wx wy) vs) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  have hrev : inst.operands.reverse = [Operand.Var y, Operand.Var x] := by rw [hops]; rfl
+  have hlenv : d_y < ps.stack.length := stackGetDepth_lt_length hdepth_y
+  rw [genRegularInstPlan_commBinopVar_keyspilled_eq hname hcomm hops houts hxy hstack0 hlive
+      hnospill_y hlivey hdepth_y hsmall_y hspill_x hlivex, hoptnoop, hrev] at hblock ⊢
+  simp only [List.append_nil] at hblock ⊢
+  set ps1 := (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).2 with hps1def
+  have hps1stack : ps1.stack = base ++ [Operand.Var y, Operand.Var x, Operand.Var x] := by
+    rw [hps1def, emit2_keyspilled (opc := inst.opcode) (nl := nextLiveness) hstack0 hnospill_y hlivey hdepth_y hsmall_y hspill_x hlivex]
+  have hps1spill : alookup' ps1.spilled (Operand.Var out) = none := by
+    rw [hps1def, emit2_keyspilled (opc := inst.opcode) (nl := nextLiveness) hstack0 hnospill_y hlivey hdepth_y hsmall_y hspill_x hlivex]
+    show alookup' (aremove ps.spilled (Operand.Var x)) (Operand.Var out) = none
+    exact aremove_lookup_none ps.spilled (Operand.Var x) (Operand.Var out) hspill_out
+  rw [show ((emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).1
+            ++ [StackOp.SOSwap 1, StackOp.SOSwap 2] ++ [StackOp.SOEmit name])
+        = (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).1
+            ++ ([StackOp.SOSwap 1] ++ ([StackOp.SOSwap 2] ++ [StackOp.SOEmit name])) from by simp] at hblock ⊢
+  rw [executePlan_append, executePlan_append, executePlan_append] at hblock
+  obtain ⟨hbI, hbRest⟩ := asmBlockAt_append hblock
+  obtain ⟨hbSwap1raw, hbRest2⟩ := asmBlockAt_append hbRest
+  obtain ⟨hbSwap2raw, hbEmitraw⟩ := asmBlockAt_append hbRest2
+  obtain ⟨as1, hrunI, hrelI, hpcI⟩ :=
+    emitInputPlan_pair_spill_second_sim (offsetToPc := offsetToPc) hnospill_y hlivey hlivex hdepth_y hsmall_y
+      hlenv hspill_x hrel hspillWf hbI
+  -- SWAP1 : swaps the two equal x's, a no-op on the stack
+  have hlen1 : (1 : Nat) < ps1.stack.length := by rw [hps1stack]; simp
+  have hswap1 : doSwap 1 ps1 = ([StackOp.SOSwap 1], { ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var x] }) := by
+    rw [doSwap_one]; congr 1
+    rw [hps1stack, stackSwap_1_append_triple base (Operand.Var y) (Operand.Var x) (Operand.Var x)]
+  have hbSwap1 : asmBlockAt prog as1.pc (executePlan [StackOp.SOSwap 1]) := by rw [hpcI]; exact hbSwap1raw
+  obtain ⟨as2, hrun2, hrel2, hpc2⟩ := doSwap_sim (offsetToPc := offsetToPc) hswap1 hrelI hlen1 hbSwap1 (by intro h; omega)
+  -- SWAP2 : rotate the deep y to TOS
+  have hlen2 : (2 : Nat) < ({ ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var x] } : PlanState).stack.length := by simp
+  have hswap2 : doSwap 2 { ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var x] }
+      = ([StackOp.SOSwap 2], { ps1 with stack := base ++ [Operand.Var x, Operand.Var x, Operand.Var y] }) := by
+    rw [doSwap_two]; congr 1
+    rw [show ({ ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var x] } : PlanState).stack
+          = base ++ [Operand.Var y, Operand.Var x, Operand.Var x] from rfl,
+        stackSwap_2_append_triple base (Operand.Var y) (Operand.Var x) (Operand.Var x)]
+  have hbSwap2 : asmBlockAt prog as2.pc (executePlan [StackOp.SOSwap 2]) := by rw [hpc2, hpcI]; exact hbSwap2raw
+  obtain ⟨as3, hrun3, hrel3, hpc3⟩ := doSwap_sim (offsetToPc := offsetToPc) hswap2 hrel2 hlen2 hbSwap2 (by intro h; omega)
+  -- binop : top two are y (TOS), x — value f wy wx, rewritten to f wx wy by commutativity
+  have hps3stack : ({ ps1 with stack := base ++ [Operand.Var x, Operand.Var x, Operand.Var y] } : PlanState).stack
+      = (base ++ [Operand.Var x]) ++ [Operand.Var x, Operand.Var y] := by simp
+  have hstacktop : as3.stack = wy :: wx :: as3.stack.drop 2 :=
+    venomAsmRel_asmStack_top2_var hrel3 hps3stack hvy hvx
+  have hfresh3 : ¬ (Operand.Var out) ∈ ({ ps1 with stack := base ++ [Operand.Var x, Operand.Var x, Operand.Var y] } : PlanState).stack := by
+    show ¬ (Operand.Var out) ∈ base ++ [Operand.Var x, Operand.Var x, Operand.Var y]
+    simp only [List.mem_append, List.mem_cons, List.not_mem_nil, or_false]
+    rintro (h | h | h | h)
+    · exact hfresh h
+    · exact hox (by injection h)
+    · exact hox (by injection h)
+    · exact hoy (by injection h)
+  have hbEmit : asmBlockAt prog as3.pc (executePlan [StackOp.SOEmit name]) := by rw [hpc3, hpc2, hpcI]; exact hbEmitraw
+  obtain ⟨as4, hrun4, hrel4, hpc4⟩ := emit_binop_sim hrel3 hstacktop hfresh3 hps1spill hbEmit (fun h hg => hdisp as3 h hg)
+  -- rewrite f wy wx -> f wx wy
+  rw [hfcomm wy wx] at hrel4
+  have hps5 : ({ { ps1 with stack := base ++ [Operand.Var x, Operand.Var x, Operand.Var y] } with
+      stack := stackPush (Operand.Var out) (stackPop 2 (base ++ [Operand.Var x, Operand.Var x, Operand.Var y])) } : PlanState)
+      = { ps1 with stack := base ++ [Operand.Var x, Operand.Var out] } := by
+    rw [show base ++ [Operand.Var x, Operand.Var x, Operand.Var y] = (base ++ [Operand.Var x]) ++ [Operand.Var x, Operand.Var y] from by simp,
+        stackPop_2_append_pair]; simp [stackPush, List.append_assoc]
+  rw [hps5] at hrel4
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrel4
+  have hlenEq : (executePlan ((emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).1
+        ++ ([StackOp.SOSwap 1] ++ ([StackOp.SOSwap 2] ++ [StackOp.SOEmit name])))).length
+      = (executePlan (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).1).length
+        + ((executePlan [StackOp.SOSwap 1]).length
+           + ((executePlan [StackOp.SOSwap 2]).length + (executePlan [StackOp.SOEmit name]).length)) := by
+    rw [executePlan_append, executePlan_append, executePlan_append, List.length_append,
+        List.length_append, List.length_append]
+  refine ⟨as4, ?_, hrelR, ?_⟩
+  · rw [hlenEq]; exact runAsm_compose hrunI (runAsm_compose hrun2 (runAsm_compose hrun3 hrun4))
+  · rw [hlenEq, hpc4, hpc3, hpc2, hpcI]; omega
+
+
+/-- Removing a *different* key preserves a lookup. -/
+theorem aremove_lookup_ne {β} (m : AssocList Operand β) (k o : Operand) (h : o ≠ k) :
+    AssocList.lookup Operand β (aremove m k) o = AssocList.lookup Operand β m o := by
+  rw [assocLookup_eq_listLookup, assocLookup_eq_listLookup]
+  exact listLookup_filter_ne _ k o h
+
+/-- **`emitInputPlan` sim for a pair of SPILLED vars `[spilled v, spilled w]`** — both operands
+    restored from their spill slots. The head restore frees `v`; `w` (a different key) stays spilled, so
+    the tail restore fires. Spill well-formedness lifts across the head via `runAsm_memory_size_mono`
+    and `aremove_lookup_some` (the head only removed `v`). Completes the 2-var spill matrix (LL/LS/SL/SS). -/
+theorem emitInputPlan_pair_both_spilled_sim {opc nl v w ps lo vs as prog offv offw}
+    (hvw : v ≠ w)
+    (hspillv : alookup' ps.spilled (Operand.Var v) = some offv)
+    (hspillw : alookup' ps.spilled (Operand.Var w) = some offw)
+    (hlivev : nl.contains v = true) (hlivew : nl.contains w = true)
+    (hrel : venomAsmRel lo ps vs as)
+    (hspillWf : ∀ o off, alookup' ps.spilled o = some off →
+        32 ∣ off ∧ off + 32 ≤ as.memory.size ∧ off < 2 ^ 256)
+    (hblock : asmBlockAt prog as.pc (executePlan (emitInputPlan opc [Operand.Var v, Operand.Var w] nl ps).1)) :
+    ∃ as', runAsm (executePlan (emitInputPlan opc [Operand.Var v, Operand.Var w] nl ps).1).length offsetToPc prog as
+             = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (emitInputPlan opc [Operand.Var v, Operand.Var w] nl ps).2 vs as' ∧
+           as'.pc = as.pc + (executePlan (emitInputPlan opc [Operand.Var v, Operand.Var w] nl ps).1).length := by
+  -- head: spilled v via restore
+  set ps1 : PlanState := { ps with stack := ps.stack ++ [Operand.Var v, Operand.Var v],
+                                    spilled := aremove ps.spilled (Operand.Var v),
+                                    alloc := freeSpillSlot offv ps.alloc } with hps1def
+  have hhead : emitOneInput opc nl (Operand.Var v) ps = ([StackOp.SORestore offv, StackOp.SODup 1], ps1) :=
+    emitOneInput_var_spilled_eq hspillv hlivev
+  have hspillw1 : alookup' ps1.spilled (Operand.Var w) = some offw := by
+    rw [hps1def]
+    show alookup' (aremove ps.spilled (Operand.Var v)) (Operand.Var w) = some offw
+    unfold alookup'
+    rw [aremove_lookup_ne ps.spilled (Operand.Var v) (Operand.Var w)
+      (by intro h; injection h with h'; exact hvw h'.symm)]
+    exact hspillw
+  -- tail: spilled w via restore
+  set ps2 : PlanState := { ps1 with stack := ps1.stack ++ [Operand.Var w, Operand.Var w],
+                                     spilled := aremove ps1.spilled (Operand.Var w),
+                                     alloc := freeSpillSlot offw ps1.alloc } with hps2def
+  have htail : emitOneInput opc nl (Operand.Var w) ps1 = ([StackOp.SORestore offw, StackOp.SODup 1], ps2) :=
+    emitOneInput_var_spilled_eq hspillw1 hlivew
+  have hfold : emitInputPlan opc [Operand.Var v, Operand.Var w] nl ps
+      = ([StackOp.SORestore offv, StackOp.SODup 1] ++ [StackOp.SORestore offw, StackOp.SODup 1], ps2) := by
+    unfold emitInputPlan
+    simp only [List.foldl_cons, List.foldl_nil, hhead, htail, List.nil_append]
+  rw [hfold] at hblock ⊢
+  rw [executePlan_append] at hblock
+  obtain ⟨hbHead, hbTail⟩ := asmBlockAt_append hblock
+  -- run head
+  obtain ⟨as1, hrunHead, hrelHead, hpcHead⟩ :=
+    emitOneInput_sim_var_spilled (offsetToPc := offsetToPc) hspillv hlivev hhead hrel hspillWf hbHead
+  -- lift spill wf to ps1/as1
+  have hmemmono : as.memory.size ≤ as1.memory.size := runAsm_memory_size_mono hrunHead
+  have hspillWf1 : ∀ o off', alookup' ps1.spilled o = some off' →
+      32 ∣ off' ∧ off' + 32 ≤ as1.memory.size ∧ off' < 2 ^ 256 := by
+    intro o off' ho
+    have ho' : alookup' ps.spilled o = some off' := by
+      rw [hps1def] at ho
+      exact aremove_lookup_some ps.spilled (Operand.Var v) o off' ho
+    obtain ⟨hdvd, hle, hlt⟩ := hspillWf o off' ho'
+    exact ⟨hdvd, le_trans hle hmemmono, hlt⟩
+  -- run tail
+  have hbTail' : asmBlockAt prog as1.pc (executePlan [StackOp.SORestore offw, StackOp.SODup 1]) := by
+    rw [hpcHead]; exact hbTail
+  obtain ⟨as2, hrunTail, hrelTail, hpcTail⟩ :=
+    emitOneInput_sim_var_spilled (offsetToPc := offsetToPc) hspillw1 hlivew htail hrelHead hspillWf1 hbTail'
+  have hlen : (executePlan ([StackOp.SORestore offv, StackOp.SODup 1] ++ [StackOp.SORestore offw, StackOp.SODup 1])).length
+      = (executePlan [StackOp.SORestore offv, StackOp.SODup 1]).length
+        + (executePlan [StackOp.SORestore offw, StackOp.SODup 1]).length := by
+    rw [executePlan_append, List.length_append]
+  refine ⟨as2, ?_, hrelTail, ?_⟩
+  · rw [hlen]; exact runAsm_compose hrunHead hrunTail
+  · rw [hlen, hpcTail, hpcHead]; omega
+
+/-! ### Both-spilled store — the SS 2-operand spill-aware producer (Gap C) -/
+
+/-- **Runnable N-input all-*spilled* emission sim.** The spill-aware companion of
+    `emitInputPlan_allVars_sim`: every operand is spilled, so each emits a `SORestore ; SODup` (rather
+    than a single `DUP`). Running the whole plan preserves `venomAsmRel` (emission never touches the
+    Venom state), advances the pc, and never shrinks asm memory. `Nodup` keeps the tail operands
+    spilled after each `aremove`; spill-wf lifts across each restore via `runAsm_memory_size_mono`. The
+    N-input generalisation of `emitInputPlan_pair_both_spilled_sim` — for a CALL/LOG whose operands are
+    all in spill slots. -/
+theorem emitInputPlan_allVars_all_spilled_sim (opc : Opcode) (nl : List String) :
+    ∀ (vs : List String) (ps : PlanState) {lo : AssocList String Nat} {vst : VenomState}
+      {as : AsmState} {prog : List AsmInst} {offsetToPc : AssocList Nat Nat},
+      vs.Nodup →
+      (∀ v ∈ vs, ∃ off, alookup' ps.spilled (Operand.Var v) = some off) →
+      (∀ v ∈ vs, nl.contains v = true) →
+      (∀ o off, alookup' ps.spilled o = some off → 32 ∣ off ∧ off + 32 ≤ as.memory.size ∧ off < 2 ^ 256) →
+      venomAsmRel lo ps vst as →
+      asmBlockAt prog as.pc (executePlan (emitInputPlan opc (vs.map Operand.Var) nl ps).1) →
+      ∃ as', runAsm (executePlan (emitInputPlan opc (vs.map Operand.Var) nl ps).1).length offsetToPc prog as
+               = AsmResult.AsmOK as' ∧
+             venomAsmRel lo (emitInputPlan opc (vs.map Operand.Var) nl ps).2 vst as' ∧
+             as'.pc = as.pc + (executePlan (emitInputPlan opc (vs.map Operand.Var) nl ps).1).length ∧
+             as.memory.size ≤ as'.memory.size := by
+  intro vs
+  induction vs with
+  | nil =>
+    intro ps lo vst as prog offsetToPc _ _ _ _ hrel hblock
+    refine ⟨as, ?_, ?_, ?_, le_refl _⟩
+    · show runAsm (executePlan (emitInputPlan opc [] nl ps).1).length offsetToPc prog as = _
+      simp [emitInputPlan, executePlan, runAsm]
+    · simpa [emitInputPlan] using hrel
+    · simp [emitInputPlan, executePlan]
+  | cons v vs ih =>
+    intro ps lo vst as prog offsetToPc hnodup hspilled hlive hwf hrel hblock
+    obtain ⟨offv, hspillv⟩ := hspilled v List.mem_cons_self
+    have hlivev : nl.contains v = true := hlive v List.mem_cons_self
+    have hvnotin : v ∉ vs := (List.nodup_cons.mp hnodup).1
+    set ps1 : PlanState := { ps with stack := ps.stack ++ [Operand.Var v, Operand.Var v],
+                                     spilled := aremove ps.spilled (Operand.Var v),
+                                     alloc := freeSpillSlot offv ps.alloc } with hps1
+    have hhead : emitOneInput opc nl (Operand.Var v) ps = ([StackOp.SORestore offv, StackOp.SODup 1], ps1) :=
+      emitOneInput_var_spilled_eq hspillv hlivev
+    have hpeel : emitInputPlan opc (Operand.Var v :: vs.map Operand.Var) nl ps
+        = ([StackOp.SORestore offv, StackOp.SODup 1] ++ (emitInputPlan opc (vs.map Operand.Var) nl ps1).1,
+           (emitInputPlan opc (vs.map Operand.Var) nl ps1).2) := by
+      show (Operand.Var v :: vs.map Operand.Var).foldl
+          (fun acc op => (acc.1 ++ (emitOneInput opc nl op acc.2).1, (emitOneInput opc nl op acc.2).2)) ([], ps) = _
+      rw [List.foldl_cons]
+      simp only [List.nil_append, hhead]
+      exact foldl_ops_acc (fun q op => emitOneInput opc nl op q) (vs.map Operand.Var) [StackOp.SORestore offv, StackOp.SODup 1] ps1
+    rw [List.map_cons] at hblock ⊢
+    rw [hpeel] at hblock ⊢
+    rw [executePlan_append] at hblock ⊢
+    obtain ⟨hb1, hbrest⟩ := asmBlockAt_append hblock
+    obtain ⟨as1, hrun1, hrel1, hpc1⟩ :=
+      emitOneInput_sim_var_spilled (offsetToPc := offsetToPc) hspillv hlivev hhead hrel hwf hb1
+    have hmemmono1 : as.memory.size ≤ as1.memory.size := runAsm_memory_size_mono hrun1
+    have hwf1 : ∀ o off, alookup' ps1.spilled o = some off →
+        32 ∣ off ∧ off + 32 ≤ as1.memory.size ∧ off < 2 ^ 256 := by
+      intro o off ho
+      rw [hps1] at ho
+      have ho' : alookup' ps.spilled o = some off := aremove_lookup_some ps.spilled (Operand.Var v) o off ho
+      obtain ⟨ha, hc, h2⟩ := hwf o off ho'
+      exact ⟨ha, by omega, h2⟩
+    have hnodup' : vs.Nodup := (List.nodup_cons.mp hnodup).2
+    have hspilled' : ∀ w ∈ vs, ∃ off, alookup' ps1.spilled (Operand.Var w) = some off := by
+      intro w hw
+      obtain ⟨off, hoff⟩ := hspilled w (List.mem_cons_of_mem _ hw)
+      have hwv : w ≠ v := by rintro rfl; exact hvnotin hw
+      refine ⟨off, ?_⟩
+      rw [hps1]
+      exact (aremove_lookup_ne ps.spilled (Operand.Var v) (Operand.Var w)
+        (by intro h; injection h with h'; exact hwv h')).trans hoff
+    have hlive' : ∀ w ∈ vs, nl.contains w = true := fun w hw => hlive w (List.mem_cons_of_mem _ hw)
+    have hbrest' : asmBlockAt prog as1.pc (executePlan (emitInputPlan opc (vs.map Operand.Var) nl ps1).1) := by
+      rw [hpc1]; exact hbrest
+    obtain ⟨as', hrun', hrel', hpc', hmem'⟩ :=
+      ih ps1 (lo := lo) (vst := vst) (as := as1) (prog := prog) (offsetToPc := offsetToPc)
+        hnodup' hspilled' hlive' hwf1 hrel1 hbrest'
+    refine ⟨as', ?_, hrel', ?_, ?_⟩
+    · rw [List.length_append]; exact runAsm_compose hrun1 hrun'
+    · rw [List.length_append, hpc', hpc1]; omega
+    · omega
+
+/-- **Per-operand emittability for a mixed live/spilled input list.** Threads the growing stack and the
+    shrinking spilled map: each live operand (`alookup' = none`) must sit at a DUP-reachable depth in the
+    current stack (which then grows by `[v]`); each spilled operand emits a restore (the map loses its
+    entry, the stack grows by `[v, v]`). The explicit threading handles a repeated operand (spilled
+    first, then live off the restored copy), so no `Nodup` is needed. The mixed generalisation of
+    `emitDepthsOk`. -/
+def emitMixedOk (nl : List String) : List String → SpilledMap → List Operand → Prop
+  | [], _, _ => True
+  | v :: vs, spl, base =>
+      nl.contains v = true ∧
+      (match alookup' spl (Operand.Var v) with
+       | none => ∃ d, stackGetDepth (Operand.Var v) base = some d ∧ d ≤ 15 ∧
+                    emitMixedOk nl vs spl (base ++ [Operand.Var v])
+       | some _ => emitMixedOk nl vs (aremove spl (Operand.Var v)) (base ++ [Operand.Var v, Operand.Var v]))
+
+/-- **Runnable mixed live/spilled N-input emission sim.** The general spill-aware companion of
+    `emitInputPlan_allVars_sim` (all live) and `emitInputPlan_allVars_all_spilled_sim` (all spilled):
+    each operand emits either a `DUP` (live) or a `SORestore ; SODup` (spilled), as `emitMixedOk`
+    prescribes. Running the whole plan preserves `venomAsmRel`, advances the pc, and never shrinks asm
+    memory. Live steps preserve memory (`doDup_runAsm_mem`) and the spill map; spilled steps lift
+    spill-wf across the restore (`runAsm_memory_size_mono`) and shrink the map (`aremove`) — the
+    realistic CALL/LOG case. -/
+theorem emitInputPlan_mixed_sim (opc : Opcode) (nl : List String) :
+    ∀ (vs : List String) (ps : PlanState) {lo : AssocList String Nat} {vst : VenomState}
+      {as : AsmState} {prog : List AsmInst} {offsetToPc : AssocList Nat Nat},
+      emitMixedOk nl vs ps.spilled ps.stack →
+      (∀ o off, alookup' ps.spilled o = some off → 32 ∣ off ∧ off + 32 ≤ as.memory.size ∧ off < 2 ^ 256) →
+      venomAsmRel lo ps vst as →
+      asmBlockAt prog as.pc (executePlan (emitInputPlan opc (vs.map Operand.Var) nl ps).1) →
+      ∃ as', runAsm (executePlan (emitInputPlan opc (vs.map Operand.Var) nl ps).1).length offsetToPc prog as
+               = AsmResult.AsmOK as' ∧
+             venomAsmRel lo (emitInputPlan opc (vs.map Operand.Var) nl ps).2 vst as' ∧
+             as'.pc = as.pc + (executePlan (emitInputPlan opc (vs.map Operand.Var) nl ps).1).length ∧
+             as.memory.size ≤ as'.memory.size := by
+  intro vs
+  induction vs with
+  | nil =>
+    intro ps lo vst as prog offsetToPc _ _ hrel hblock
+    refine ⟨as, ?_, ?_, ?_, le_refl _⟩
+    · show runAsm (executePlan (emitInputPlan opc [] nl ps).1).length offsetToPc prog as = _
+      simp [emitInputPlan, executePlan, runAsm]
+    · simpa [emitInputPlan] using hrel
+    · simp [emitInputPlan, executePlan]
+  | cons v vs ih =>
+    intro ps lo vst as prog offsetToPc hok hwf hrel hblock
+    obtain ⟨hlivev, hbranch⟩ := hok
+    rcases hsv : alookup' ps.spilled (Operand.Var v) with _ | offv
+    · -- LIVE: doDup at depth d
+      rw [hsv] at hbranch
+      obtain ⟨d, hdepth, hsmall, hoktail⟩ := hbranch
+      have hpeek : stackPeek d ps.stack = Operand.Var v := stackGetDepth_peek hdepth
+      have hdup : stackDup d ps.stack = ps.stack ++ [Operand.Var v] := by unfold stackDup; rw [hpeek]
+      set ps1 : PlanState := { ps with stack := ps.stack ++ [Operand.Var v] } with hps1
+      have hdo' : doDup d ps = ([StackOp.SODup (d + 1)], ps1) := by unfold doDup; rw [if_pos hsmall, hdup]
+      have hemit : emitOneInput opc nl (Operand.Var v) ps = ([StackOp.SODup (d + 1)], ps1) := by
+        rw [show emitOneInput opc nl (Operand.Var v) ps = doDup d ps from ?_, hdo']
+        rcases hdd : doDup d ps with ⟨_, _⟩
+        unfold emitOneInput
+        simp only [isVarOperand, hsv, Option.isSome_none, Bool.and_false, Bool.false_eq_true,
+          if_false, hlivev, if_true, hdepth, hdd, List.nil_append]
+      have hpeel : emitInputPlan opc (Operand.Var v :: vs.map Operand.Var) nl ps
+          = ([StackOp.SODup (d + 1)] ++ (emitInputPlan opc (vs.map Operand.Var) nl ps1).1,
+             (emitInputPlan opc (vs.map Operand.Var) nl ps1).2) := by
+        show (Operand.Var v :: vs.map Operand.Var).foldl
+            (fun acc op => (acc.1 ++ (emitOneInput opc nl op acc.2).1, (emitOneInput opc nl op acc.2).2)) ([], ps) = _
+        rw [List.foldl_cons]; simp only [List.nil_append, hemit]
+        exact foldl_ops_acc (fun q op => emitOneInput opc nl op q) (vs.map Operand.Var) [StackOp.SODup (d + 1)] ps1
+      rw [List.map_cons, hpeel, executePlan_append] at hblock ⊢
+      obtain ⟨hb1, hbrest⟩ := asmBlockAt_append hblock
+      have hlen : d < ps.stack.length := stackGetDepth_lt_length hdepth
+      obtain ⟨as1, hrun1, hrel1, hpc1⟩ := doDup_sim hdo' hsmall hrel hlen hb1
+      have hmem1 : as1.memory = as.memory := doDup_runAsm_mem hsmall (hrel.1.1 ▸ hlen) hb1 hrun1
+      have hwf1 : ∀ o off, alookup' ps1.spilled o = some off →
+          32 ∣ off ∧ off + 32 ≤ as1.memory.size ∧ off < 2 ^ 256 := by
+        intro o off ho; rw [hps1] at ho; obtain ⟨ha, hc, h2⟩ := hwf o off ho
+        exact ⟨ha, by rw [hmem1]; exact hc, h2⟩
+      have hoktail' : emitMixedOk nl vs ps1.spilled ps1.stack := by rw [hps1]; exact hoktail
+      have hbrest' : asmBlockAt prog as1.pc (executePlan (emitInputPlan opc (vs.map Operand.Var) nl ps1).1) := by
+        rw [hpc1]; exact hbrest
+      obtain ⟨as', hrun', hrel', hpc', hmem'⟩ :=
+        ih ps1 (lo := lo) (vst := vst) (as := as1) (prog := prog) (offsetToPc := offsetToPc)
+          hoktail' hwf1 hrel1 hbrest'
+      refine ⟨as', ?_, hrel', ?_, ?_⟩
+      · rw [List.length_append]; exact runAsm_compose hrun1 hrun'
+      · rw [List.length_append, hpc', hpc1]; omega
+      · rw [hmem1] at hmem'; omega
+    · -- SPILLED: restore + dup
+      rw [hsv] at hbranch
+      set ps1 : PlanState := { ps with stack := ps.stack ++ [Operand.Var v, Operand.Var v],
+                                       spilled := aremove ps.spilled (Operand.Var v),
+                                       alloc := freeSpillSlot offv ps.alloc } with hps1
+      have hhead : emitOneInput opc nl (Operand.Var v) ps = ([StackOp.SORestore offv, StackOp.SODup 1], ps1) :=
+        emitOneInput_var_spilled_eq hsv hlivev
+      have hpeel : emitInputPlan opc (Operand.Var v :: vs.map Operand.Var) nl ps
+          = ([StackOp.SORestore offv, StackOp.SODup 1] ++ (emitInputPlan opc (vs.map Operand.Var) nl ps1).1,
+             (emitInputPlan opc (vs.map Operand.Var) nl ps1).2) := by
+        show (Operand.Var v :: vs.map Operand.Var).foldl
+            (fun acc op => (acc.1 ++ (emitOneInput opc nl op acc.2).1, (emitOneInput opc nl op acc.2).2)) ([], ps) = _
+        rw [List.foldl_cons]; simp only [List.nil_append, hhead]
+        exact foldl_ops_acc (fun q op => emitOneInput opc nl op q) (vs.map Operand.Var) [StackOp.SORestore offv, StackOp.SODup 1] ps1
+      rw [List.map_cons, hpeel, executePlan_append] at hblock ⊢
+      obtain ⟨hb1, hbrest⟩ := asmBlockAt_append hblock
+      obtain ⟨as1, hrun1, hrel1, hpc1⟩ :=
+        emitOneInput_sim_var_spilled (offsetToPc := offsetToPc) hsv hlivev hhead hrel hwf hb1
+      have hmemmono1 : as.memory.size ≤ as1.memory.size := runAsm_memory_size_mono hrun1
+      have hwf1 : ∀ o off, alookup' ps1.spilled o = some off →
+          32 ∣ off ∧ off + 32 ≤ as1.memory.size ∧ off < 2 ^ 256 := by
+        intro o off ho; rw [hps1] at ho
+        have ho' : alookup' ps.spilled o = some off := aremove_lookup_some ps.spilled (Operand.Var v) o off ho
+        obtain ⟨ha, hc, h2⟩ := hwf o off ho'; exact ⟨ha, by omega, h2⟩
+      have hoktail' : emitMixedOk nl vs ps1.spilled ps1.stack := by rw [hps1]; exact hbranch
+      have hbrest' : asmBlockAt prog as1.pc (executePlan (emitInputPlan opc (vs.map Operand.Var) nl ps1).1) := by
+        rw [hpc1]; exact hbrest
+      obtain ⟨as', hrun', hrel', hpc', hmem'⟩ :=
+        ih ps1 (lo := lo) (vst := vst) (as := as1) (prog := prog) (offsetToPc := offsetToPc)
+          hoktail' hwf1 hrel1 hbrest'
+      refine ⟨as', ?_, hrel', ?_, ?_⟩
+      · rw [List.length_append]; exact runAsm_compose hrun1 hrun'
+      · rw [List.length_append, hpc', hpc1]; omega
+      · omega
+
+
+
+/-- All-live depth facts imply the mixed-emission spec (the map never fires). Bridges
+    `emitDepthsOk` into `emitMixedOk` so the all-live TAIL of a head-spilled N-ary emission can
+    reuse the depth-threading toolkit. -/
+theorem emitMixedOk_of_depthsOk {nl : List String} :
+    ∀ {vs : List String} {dists : List Nat} {spl : SpilledMap} {stk : List Operand},
+      (∀ v ∈ vs, alookup' spl (Operand.Var v) = none) →
+      emitDepthsOk nl vs dists stk →
+      emitMixedOk nl vs spl stk := by
+  intro vs
+  induction vs with
+  | nil => intro dists spl stk _ _; trivial
+  | cons v vs ih =>
+    intro dists spl stk hns hd
+    cases dists with
+    | nil => exact hd.elim
+    | cons d ds =>
+      obtain ⟨hlive, hdepth, hsmall, htail⟩ := hd
+      have hnsv : alookup' spl (Operand.Var v) = none := hns v List.mem_cons_self
+      refine ⟨hlive, ?_⟩
+      simp only [hnsv]
+      exact ⟨d, hdepth, hsmall, ih (fun w hw => hns w (List.mem_cons_of_mem v hw)) htail⟩
+
+/-- **Closed form of the head-spilled N-ary emission**: the first-emitted operand `v` is restored
+    from its slot (+ keep-alive DUP), the remaining distinct live vars DUP at their growing-stack
+    depths — stack grows by `[v, v] ++ rest`, `v` leaves the map, its slot is freed. The mixed
+    (1-spilled, N-live) generalization of `emitInputPlan_allVars_eq`. -/
+theorem emitInputPlan_headSpilled_eq (opc : Opcode) (nl : List String)
+    {v : String} {rest : List String} {dists : List Nat} {ps : PlanState} {off : Nat}
+    (hspill : alookup' ps.spilled (Operand.Var v) = some off)
+    (hlive : nl.contains v = true)
+    (hns : ∀ w ∈ rest, alookup' ps.spilled (Operand.Var w) = none)
+    (hd : emitDepthsOk nl rest dists (ps.stack ++ [Operand.Var v, Operand.Var v])) :
+    emitInputPlan opc ((v :: rest).map Operand.Var) nl ps
+      = ([StackOp.SORestore off, StackOp.SODup 1] ++ dists.map (fun d => StackOp.SODup (d + 1)),
+         { ps with stack := ps.stack ++ [Operand.Var v, Operand.Var v] ++ rest.map Operand.Var,
+                   spilled := aremove ps.spilled (Operand.Var v),
+                   alloc := freeSpillSlot off ps.alloc }) := by
+  set ps1 : PlanState := { ps with stack := ps.stack ++ [Operand.Var v, Operand.Var v],
+                                   spilled := aremove ps.spilled (Operand.Var v),
+                                   alloc := freeSpillSlot off ps.alloc } with hps1
+  have hhead : emitOneInput opc nl (Operand.Var v) ps
+      = ([StackOp.SORestore off, StackOp.SODup 1], ps1) :=
+    emitOneInput_var_spilled_eq hspill hlive
+  have hpeel : emitInputPlan opc (Operand.Var v :: rest.map Operand.Var) nl ps
+      = ([StackOp.SORestore off, StackOp.SODup 1]
+          ++ (emitInputPlan opc (rest.map Operand.Var) nl ps1).1,
+         (emitInputPlan opc (rest.map Operand.Var) nl ps1).2) := by
+    show (Operand.Var v :: rest.map Operand.Var).foldl
+        (fun acc op => (acc.1 ++ (emitOneInput opc nl op acc.2).1,
+          (emitOneInput opc nl op acc.2).2)) ([], ps) = _
+    rw [List.foldl_cons]
+    simp only [List.nil_append, hhead]
+    exact foldl_ops_acc (fun q op => emitOneInput opc nl op q) (rest.map Operand.Var)
+      [StackOp.SORestore off, StackOp.SODup 1] ps1
+  have hns1 : ∀ w ∈ rest, alookup' ps1.spilled (Operand.Var w) = none := by
+    intro w hw
+    show alookup' (aremove ps.spilled (Operand.Var v)) (Operand.Var w) = none
+    exact aremove_lookup_none ps.spilled (Operand.Var v) (Operand.Var w) (hns w hw)
+  have htail := emitInputPlan_allVars_eq opc nl rest dists ps1 hns1
+    (by show emitDepthsOk nl rest dists (ps.stack ++ [Operand.Var v, Operand.Var v]); exact hd)
+  rw [List.map_cons, hpeel, htail]
+
+/-- **Head-spilled LOG plan reduction**: the first-emitted operand is restored (its kept copy
+    lands just below the emitted run), the remaining live operands DUP — the emitted layout is
+    ALREADY positioned over `base ++ [v]` (`reorderPlan_allVars_nil`), the `LOGn` pops the inputs,
+    and the block nets `+1` (the kept restore). The first spilled VARIABLE-ARITY plan reduction. -/
+theorem genRegularInstPlan_log_headspilled_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {v : String} {rest : List String} {dists : List Nat} {tc : bytes32}
+    {base : List Operand} {off : Nat}
+    (hopc : inst.opcode = Opcode.LOG)
+    (hhead : inst.operands.head! = Operand.Lit tc)
+    (hcompute : computeOperands inst = (v :: rest).map Operand.Var)
+    (houts : inst.outputs = [])
+    (hstack0 : ps.stack = base)
+    (hnd : (v :: rest).Nodup)
+    (hspill : alookup' ps.spilled (Operand.Var v) = some off)
+    (hlive : nextLiveness.contains v = true)
+    (hns : ∀ w ∈ rest, alookup' ps.spilled (Operand.Var w) = none)
+    (hd : emitDepthsOk nextLiveness rest dists (ps.stack ++ [Operand.Var v, Operand.Var v])) :
+    generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator curBbLabel ps
+      = ((emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).1
+          ++ [StackOp.SOEmit ("LOG" ++ toString tc.toNat)],
+         releaseDeadSpills nextLiveness
+           { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+             stack := base ++ [Operand.Var v] }) := by
+  have hcL : isCommutative Opcode.LOG = false := rfl
+  have hjL : ¬ (Opcode.LOG = Opcode.JMP) := by decide
+  have hpvar := emitInputPlan_headSpilled_eq inst.opcode nextLiveness hspill hlive hns hd
+  unfold generateRegularInstPlan
+  simp only [hopc, hhead, hcompute, houts]
+  rcases hemit : emitInputPlan Opcode.LOG ((v :: rest).map Operand.Var) nextLiveness ps
+    with ⟨inputOps, ps1⟩
+  have h2 : (emitInputPlan Opcode.LOG ((v :: rest).map Operand.Var) nextLiveness ps).2 = ps1 := by
+    rw [hemit]
+  have hps1' : ps1.stack = (base ++ [Operand.Var v]) ++ (v :: rest).map Operand.Var := by
+    rw [← h2, show emitInputPlan Opcode.LOG ((v :: rest).map Operand.Var) nextLiveness ps
+        = emitInputPlan inst.opcode ((v :: rest).map Operand.Var) nextLiveness ps from by
+      rw [hopc], hpvar, hstack0]
+    simp
+  have hreo : reorderPlan (Operand.Var v :: rest.map Operand.Var) ps1 = ([], ps1) :=
+    reorderPlan_allVars_nil (base ++ [Operand.Var v]) (v :: rest) ps1 hps1' hnd
+  have hpop : stackPop (rest.length + 1)
+        (base ++ Operand.Var v :: Operand.Var v :: rest.map Operand.Var)
+      = base ++ [Operand.Var v] := by
+    have h := stackPop_append_top (base ++ [Operand.Var v]) ((v :: rest).map Operand.Var)
+    rw [List.length_map, show (v :: rest).length = rest.length + 1 from rfl] at h
+    rw [show base ++ Operand.Var v :: Operand.Var v :: rest.map Operand.Var
+          = (base ++ [Operand.Var v]) ++ (v :: rest).map Operand.Var from by simp]
+    exact h
+  simp [hcL, hjL, hreo, hps1', hpop, generateEmitOps_log hopc, List.append_assoc]
+
+/-- **Runnable head-spilled LOG sim** — the first spilled VARIABLE-ARITY op end-to-end: restore
+    the spilled first-emitted operand (keep-alive copy stays below the run), DUP the remaining
+    live operands, `LOGn` pops the inputs — `venomAsmRel` is preserved across the event append
+    and the block nets `+1`. Composes `emitInputPlan_mixed_sim` (the restore + DUPs) with
+    `emit_log_sim`; the reorder is a no-op by `reorderPlan_allVars_nil` over `base ++ [v]`. -/
+theorem genRegularInstPlan_log_headspilled_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {v : String} {rest : List String} {dists : List Nat} {tc : bytes32} {base : List Operand}
+    {off : Nat} {n : Nat} {offset size : bytes32} {topics : List bytes32}
+    (hopc : inst.opcode = Opcode.LOG)
+    (hhead : inst.operands.head! = Operand.Lit tc)
+    (hcompute : computeOperands inst = (v :: rest).map Operand.Var)
+    (houts : inst.outputs = [])
+    (hstack0 : ps.stack = base)
+    (hnd : (v :: rest).Nodup)
+    (hspill : alookup' ps.spilled (Operand.Var v) = some off)
+    (hlive : nextLiveness.contains v = true)
+    (hns : ∀ w ∈ rest, alookup' ps.spilled (Operand.Var w) = none)
+    (hd : emitDepthsOk nextLiveness rest dists (ps.stack ++ [Operand.Var v, Operand.Var v]))
+    (hlenes : (v :: rest).length = n + 2)
+    (htc : tc.toNat = n)
+    (htlen : topics.length = n)
+    (hvals : ((v :: rest).map Operand.Var).reverse.map (fun o => operandVal vs lo o)
+      = (offset :: size :: topics).map some)
+    (hcov : ((offset.toNat + size.toNat + 31) / 32) * 32 ≤ as.memory.size)
+    (hbelow : offset.toNat + size.toNat ≤ ps.alloc.fnEom)
+    (hsize : size.toNat < USize.size) (hn : n ≤ 4)
+    (hspillWf : ∀ o off', alookup' ps.spilled o = some off' →
+        32 ∣ off' ∧ off' + 32 ≤ as.memory.size ∧ off' < 2 ^ 256)
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as
+             = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2
+             { vs with logs := vs.logs ++ [({ logger := vs.callCtx.contract, topics := topics, data := (vs.memory.readWithPadding offset.toNat size.toNat).toList } : Event)] } as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  rw [genRegularInstPlan_log_headspilled_eq hopc hhead hcompute houts hstack0 hnd hspill hlive
+      hns hd, hcompute] at hblock ⊢
+  set ps1 := (emitInputPlan inst.opcode ((v :: rest).map Operand.Var) nextLiveness ps).2
+    with hps1def
+  have hpvar := emitInputPlan_headSpilled_eq inst.opcode nextLiveness hspill hlive hns hd
+  have hps1stack : ps1.stack
+      = (base ++ [Operand.Var v]) ++ (v :: rest).map Operand.Var := by
+    rw [hps1def, hpvar, hstack0]; simp
+  have hps1fnEom : ps1.alloc.fnEom = ps.alloc.fnEom := by
+    rw [hps1def, hpvar]
+    show (freeSpillSlot off ps.alloc).fnEom = ps.alloc.fnEom
+    rfl
+  have hok : emitMixedOk nextLiveness (v :: rest) ps.spilled ps.stack := by
+    refine ⟨hlive, ?_⟩
+    simp only [hspill]
+    exact emitMixedOk_of_depthsOk
+      (fun w hw => aremove_lookup_none ps.spilled (Operand.Var v) (Operand.Var w) (hns w hw))
+      (by rw [hstack0] at hd ⊢; exact hd)
+  rw [executePlan_append] at hblock ⊢
+  obtain ⟨hbI, hbE⟩ := asmBlockAt_append hblock
+  obtain ⟨as1, hrunI, hrelI, hpcI, hmono⟩ :=
+    emitInputPlan_mixed_sim inst.opcode nextLiveness (v :: rest) ps hok hspillWf hrel hbI
+  have hstacktop : as1.stack
+      = offset :: size :: topics ++ as1.stack.drop ((v :: rest).map Operand.Var).length :=
+    venomAsmRel_asmStack_topVals hrelI hps1stack hvals
+  have hbE' : asmBlockAt prog as1.pc (executePlan [StackOp.SOEmit ("LOG" ++ toString n)]) := by
+    rw [hpcI, ← htc]; exact hbE
+  obtain ⟨as2, hrunE, hrelE, hpcE⟩ :=
+    emit_log_sim hrelI hstacktop htlen (le_trans hcov hmono)
+      (by rw [hps1fnEom]; exact hbelow) hsize hn hbE'
+  have hps5 : ({ ps1 with stack := stackPop (n + 2) ps1.stack } : PlanState)
+      = { ps1 with stack := base ++ [Operand.Var v] } := by
+    rw [hps1stack, ← hlenes]
+    have h := stackPop_append_top (base ++ [Operand.Var v]) ((v :: rest).map Operand.Var)
+    rw [List.length_map] at h
+    rw [h]
+  rw [hps5] at hrelE
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrelE
+  refine ⟨as2, ?_, hrelR, ?_⟩
+  · rw [List.length_append, htc]; exact runAsm_compose hrunI hrunE
+  · rw [List.length_append, htc, hpcE, hpcI]; omega
+
+/-- **Head-spilled CALL plan reduction**: the first-emitted operand `v` is restored from its slot
+    (keep-alive copy below the run), the remaining six DUP — the layout is ALREADY positioned over
+    `base ++ [v]` (`reorderPlan_allVars_nil`), CALL pops the seven and pushes the success flag —
+    intermediate `base ++ [v, out]` (net +2). The spilled-CALL analogue of
+    `genRegularInstPlan_call_eq`; NO reorder theory needed (the `p = 0` family). -/
+theorem genRegularInstPlan_call_headspilled_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {v : String} {rest : List String} {dists : List Nat} {out : String}
+    {base : List Operand} {off : Nat}
+    (hopc : inst.opcode = Opcode.CALL)
+    (hcompute : computeOperands inst = (v :: rest).map Operand.Var)
+    (houts : inst.outputs = [out])
+    (hstack0 : ps.stack = base)
+    (hnd : (v :: rest).Nodup)
+    (hspill : alookup' ps.spilled (Operand.Var v) = some off)
+    (hlivev : nextLiveness.contains v = true)
+    (hns : ∀ w ∈ rest, alookup' ps.spilled (Operand.Var w) = none)
+    (hd : emitDepthsOk nextLiveness rest dists (ps.stack ++ [Operand.Var v, Operand.Var v]))
+    (hlive : nextLiveness.contains out = true) :
+    generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator
+        curBbLabel ps
+      = (((emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).1
+            ++ [StackOp.SOEmit "CALL"]
+            ++ (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+                  { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+                    stack := base ++ [Operand.Var v, Operand.Var out] }).1),
+         releaseDeadSpills nextLiveness
+           (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+             { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+               stack := base ++ [Operand.Var v, Operand.Var out] }).2) := by
+  have hname : opcodeToEvmName inst.opcode = some "CALL" := by rw [hopc]; rfl
+  have hncomm : isCommutative inst.opcode = false := by rw [hopc]; rfl
+  have hnjmp : ¬ (inst.opcode = Opcode.JMP) := by rw [hopc]; decide
+  have hpvar := emitInputPlan_headSpilled_eq inst.opcode nextLiveness hspill hlivev hns hd
+  unfold generateRegularInstPlan
+  simp only [hcompute, houts]
+  rcases hemit : emitInputPlan inst.opcode ((v :: rest).map Operand.Var) nextLiveness ps
+    with ⟨inputOps, ps1⟩
+  have h2 : (emitInputPlan inst.opcode ((v :: rest).map Operand.Var) nextLiveness ps).2 = ps1 := by
+    rw [hemit]
+  have hps1' : ps1.stack = (base ++ [Operand.Var v]) ++ (v :: rest).map Operand.Var := by
+    rw [← h2, hpvar, hstack0]; simp
+  have hreo : reorderPlan (Operand.Var v :: rest.map Operand.Var) ps1 = ([], ps1) :=
+    reorderPlan_allVars_nil (base ++ [Operand.Var v]) (v :: rest) ps1 hps1' hnd
+  have hmem : out ∈ nextLiveness := by simpa using hlive
+  have hpop : stackPop (rest.length + 1)
+        (base ++ Operand.Var v :: Operand.Var v :: rest.map Operand.Var)
+      = base ++ [Operand.Var v] := by
+    have h := stackPop_append_top (base ++ [Operand.Var v]) ((v :: rest).map Operand.Var)
+    rw [List.length_map, show (v :: rest).length = rest.length + 1 from rfl] at h
+    rw [show base ++ Operand.Var v :: Operand.Var v :: rest.map Operand.Var
+          = (base ++ [Operand.Var v]) ++ (v :: rest).map Operand.Var from by simp]
+    exact h
+  simp [generateEmitOps_evmName hname, hreo, hps1', hpop, stackPush, popmanyPlan_nil, hmem,
+        hncomm, hnjmp, List.append_assoc]
+
+set_option maxHeartbeats 800000 in
+/-- **Full-relation head-spilled CALL block core**: restore the spilled first-emitted operand
+    (keep-alive copy stays), DUP the six live ones, run CALL — concluding the COMPLETE
+    `venomAsmRel` at `{ps1 with stack := base ++ [v, out]}` (net +2) and the writeback state.
+    The spilled-config sibling of `call_block_emit_rel_full`; the emitted layout is positioned
+    over `base ++ [v]`, so no reorder runs. -/
+theorem call_block_emit_rel_full_headspilled {lo : AssocList String Nat} {vs : VenomState}
+    {as : AsmState} {prog : List AsmInst} {offsetToPc : AssocList Nat Nat} {inst : Instruction}
+    {out v : String} {rest : List String} {dists : List Nat} {nl : List String}
+    {gas addr value aOff aSz rOff rSz : bytes32} {vals : List bytes32}
+    {success : bytes32} {newAccs : Accounts} {ret : List byte} {ps : PlanState} {off : Nat}
+    (hopc : inst.opcode = Opcode.CALL)
+    (heval : evalOperands inst.operands vs = some [gas, addr, value, aOff, aSz, rOff, rSz])
+    (hout : inst.outputs = [out])
+    (hspill : alookup' ps.spilled (Operand.Var v) = some off)
+    (hlivev : nl.contains v = true)
+    (hns : ∀ w ∈ rest, alookup' ps.spilled (Operand.Var w) = none)
+    (hd : emitDepthsOk nl rest dists (ps.stack ++ [Operand.Var v, Operand.Var v]))
+    (hvals : List.map (operandVal vs lo) ((v :: rest).map Operand.Var) = List.map some vals)
+    (hvalrev : vals.reverse = [gas, addr, value, aOff, aSz, rOff, rSz])
+    (hargs : aOff.toNat + aSz.toNat ≤ ps.alloc.fnEom) (haszlt : aSz.toNat < USize.size)
+    (hro1 : rOff.toNat ≤ vs.memory.size)
+    (hretbelow : rOff.toNat + rSz.toNat ≤ ps.alloc.fnEom)
+    (hfnEom : ps.alloc.fnEom ≤ as.memory.size)
+    (hfreshS : ¬ Operand.Var out ∈ ps.stack) (houtv : out ≠ v) (houtrest : out ∉ rest)
+    (hspill_out : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none)
+    (hspillReg : ∀ op off', AssocList.lookup Operand Nat ps.spilled op = some off' →
+        ps.alloc.fnEom ≤ off')
+    (hspillWf : ∀ o off', alookup' ps.spilled o = some off' →
+        32 ∣ off' ∧ off' + 32 ≤ as.memory.size ∧ off' < 2 ^ 256)
+    (hcall : evmCall subEvmFuel vs.accounts vs.callCtx.contract vs.txCtx.origin
+      (AccountAddress.ofUInt256 addr) (AccountAddress.ofUInt256 addr) gas value value
+      (vs.memory.readWithPadding aOff.toNat aSz.toNat).toList vs.txCtx.gasprice 0 (!vs.callCtx.static)
+      = (success, newAccs, ret))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan ((emitInputPlan Opcode.CALL ((v :: rest).map Operand.Var) nl ps).1 ++ [StackOp.SOEmit "CALL"]))) :
+    ∃ s'', runAsm (executePlan ((emitInputPlan Opcode.CALL ((v :: rest).map Operand.Var) nl ps).1
+             ++ [StackOp.SOEmit "CALL"])).length offsetToPc prog as = AsmResult.AsmOK s''
+      ∧ stepExternalCall subEvmFuel inst vs
+          = some (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs)
+      ∧ venomAsmRel lo
+          { (emitInputPlan Opcode.CALL ((v :: rest).map Operand.Var) nl ps).2 with
+            stack := ps.stack ++ [Operand.Var v, Operand.Var out] }
+          (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs) s''
+      ∧ s''.pc = as.pc + (executePlan ((emitInputPlan Opcode.CALL ((v :: rest).map Operand.Var) nl ps).1
+          ++ [StackOp.SOEmit "CALL"])).length := by
+  have hemiteq := emitInputPlan_headSpilled_eq Opcode.CALL nl hspill hlivev hns hd
+  rw [executePlan_append] at hblock
+  obtain ⟨hbI, hbCall⟩ := asmBlockAt_append hblock
+  have hok : emitMixedOk nl (v :: rest) ps.spilled ps.stack := by
+    refine ⟨hlivev, ?_⟩
+    simp only [hspill]
+    exact emitMixedOk_of_depthsOk
+      (fun w hw => aremove_lookup_none ps.spilled (Operand.Var v) (Operand.Var w) (hns w hw)) hd
+  obtain ⟨as1, hrunE, hrelE, hpcE, hmono⟩ :=
+    emitInputPlan_mixed_sim (offsetToPc := offsetToPc) Opcode.CALL nl (v :: rest) ps hok
+      hspillWf hrel hbI
+  have hps'stack : (emitInputPlan Opcode.CALL ((v :: rest).map Operand.Var) nl ps).2.stack
+      = (ps.stack ++ [Operand.Var v]) ++ (v :: rest).map Operand.Var := by
+    rw [hemiteq]; simp
+  have hps'spill : (emitInputPlan Opcode.CALL ((v :: rest).map Operand.Var) nl ps).2.spilled
+      = aremove ps.spilled (Operand.Var v) := by rw [hemiteq]
+  have htop := venomAsmRel_asmStack_topOps (base := ps.stack ++ [Operand.Var v])
+    (ops := (v :: rest).map Operand.Var) (vals := vals) hrelE hps'stack hvals
+  rw [hvalrev] at htop
+  have hlenops : ((v :: rest).map Operand.Var).length = 7 := by
+    rw [List.length_map]
+    have h1 : (v :: rest).length = vals.length := by
+      have := congrArg List.length hvals; simpa [List.length_map] using this
+    have h2 : vals.length = 7 := by
+      have := congrArg List.length hvalrev; simpa using this
+    omega
+  rw [hlenops] at htop
+  obtain ⟨hStk1, hSpill1, hmemrel1, hacc1, htr1, hrd1, hlg1, hcc1, htx1, hbc1, hcode1, hph1⟩ := hrelE
+  have halloc1 : (emitInputPlan Opcode.CALL ((v :: rest).map Operand.Var) nl ps).2.alloc
+      = freeSpillSlot off ps.alloc := by rw [hemiteq]
+  have hmemrel1' : memoryRel ps.alloc vs.memory as1.memory := by
+    rw [halloc1] at hmemrel1
+    exact hmemrel1
+  have hro2 : rOff.toNat ≤ as1.memory.size := by omega
+  have hcall1 : evmCall subEvmFuel as1.accounts as1.callCtx.contract as1.txCtx.origin
+      (AccountAddress.ofUInt256 addr) (AccountAddress.ofUInt256 addr) gas value value
+      (as1.memory.readWithPadding aOff.toNat aSz.toNat).toList as1.txCtx.gasprice 0 (!as1.callCtx.static)
+      = (success, newAccs, ret) := by
+    rw [hacc1, hcc1, htx1,
+        ← memoryRel_readWithPadding_slice hmemrel1' hargs haszlt]
+    exact hcall
+  obtain ⟨hpcC, hgetC⟩ := asmBlockAt_one (by rw [← hpcE] at hbCall; exact hbCall)
+  obtain ⟨s'', hstepV, hasmOK, hacc', hmemrel', hframe', hrd', htr', hlg', hcc', htx', hbc',
+    hcode', hph', hout', hstk'⟩ :=
+    call_step_stateAgree_rel (alloc := ps.alloc) (as := as1) hopc heval hout htop
+      hacc1.symm hmemrel1' hargs haszlt hro1 hro2 hretbelow hcc1.symm htx1.symm htr1.symm
+      hlg1.symm hbc1.symm hcode1.symm hph1.symm hcall1
+  have hpcadv : s''.pc = as1.pc + 1 := by
+    have hcalleq : asmCall as1 = AsmResult.AsmOK s'' := hasmOK
+    unfold asmCall at hcalleq
+    rw [htop] at hcalleq
+    simp only [asmCallWriteback] at hcalleq
+    injection hcalleq with hc
+    rw [← hc]; rfl
+  have hstepeq : asmStep offsetToPc prog as1 = AsmResult.AsmOK s'' := by
+    rw [asmStep_call_ok hpcC hgetC]; exact hasmOK
+  have hrunC : runAsm (executePlan [StackOp.SOEmit "CALL"]).length offsetToPc prog as1
+      = AsmResult.AsmOK s'' := by
+    show runAsm 1 offsetToPc prog as1 = AsmResult.AsmOK s''
+    rw [runAsm_succ_ok hpcC hstepeq]; rfl
+  set cb := callWriteback out rOff.toNat rSz.toNat success newAccs ret vs with hcbdef
+  have hcongrStack : ∀ o ∈ (emitInputPlan Opcode.CALL ((v :: rest).map Operand.Var) nl ps).2.stack,
+      operandVal cb lo o = operandVal vs lo o := by
+    intro o ho
+    rw [hps'stack] at ho
+    refine callWriteback_operandVal_ne ?_
+    rcases List.mem_append.mp ho with h | h
+    · rcases List.mem_append.mp h with h2 | h2
+      · intro hc; rw [hc] at h2; exact hfreshS h2
+      · simp only [List.mem_cons, List.not_mem_nil, or_false] at h2
+        intro hc; rw [hc] at h2
+        injection h2 with h2'
+        exact houtv h2'
+    · intro hc
+      obtain ⟨w, hw, hwe⟩ := List.mem_map.mp h
+      rw [hc] at hwe
+      injection hwe with hwe'
+      subst hwe'
+      simp only [List.mem_cons] at hw
+      rcases hw with h3 | h3
+      · exact houtv h3
+      · exact houtrest h3
+  have hStkCb : planStackRel lo cb
+      (emitInputPlan Opcode.CALL ((v :: rest).map Operand.Var) nl ps).2.stack as1.stack :=
+    planStackRel_env_congr hcongrStack hStk1
+  have hlen7 : 7 ≤ (emitInputPlan Opcode.CALL ((v :: rest).map Operand.Var) nl ps).2.stack.length := by
+    rw [hps'stack, List.length_append]
+    have := hlenops
+    omega
+  have houtval : operandVal cb lo (Operand.Var out) = some success := by
+    rw [operandVal_var_eq_lookupVar]; exact hout'
+  have hStkFinal := planStackRel_push (planStackRel_popN hStkCb hlen7) houtval
+  have hpop7 : stackPop 7 (emitInputPlan Opcode.CALL ((v :: rest).map Operand.Var) nl ps).2.stack
+      = ps.stack ++ [Operand.Var v] := by
+    rw [hps'stack, ← hlenops]
+    exact stackPop_append_top (ps.stack ++ [Operand.Var v]) ((v :: rest).map Operand.Var)
+  rw [hpop7] at hStkFinal
+  have hSpillFinal : planSpillRel lo cb
+      (emitInputPlan Opcode.CALL ((v :: rest).map Operand.Var) nl ps).2.spilled s''.memory := by
+    refine planSpillRel_frame_congr hSpill1 ?_ ?_
+    · intro op off' hlook
+      rw [hps'spill] at hlook
+      refine callWriteback_operandVal_ne ?_
+      intro hc
+      rw [hc] at hlook
+      rw [aremove_lookup_none ps.spilled (Operand.Var v) (Operand.Var out) hspill_out] at hlook
+      simp at hlook
+    · intro op off' hlook
+      rw [hps'spill] at hlook
+      have hge : ps.alloc.fnEom ≤ off' :=
+        hspillReg op off' (aremove_lookup_some ps.spilled (Operand.Var v) op off' hlook)
+      have h32 : (32 : Nat) < USize.size :=
+        Nat.lt_of_lt_of_le (by norm_num) USize.le_size
+      apply ByteArray.readWithPadding_congr _ _ off' 32 h32
+      intro k hk
+      have := hframe' (off' + k) (by omega)
+      rw [readByte_eq_getElem?_getD, readByte_eq_getElem?_getD] at this
+      exact this
+  refine ⟨s'', ?_, hstepV, ?_, ?_⟩
+  · rw [executePlan_append, List.length_append]
+    exact runAsm_compose hrunE hrunC
+  · refine ⟨?_, hSpillFinal, ?_, hacc'.symm, htr'.symm, hrd'.symm, hlg'.symm, hcc'.symm,
+      htx'.symm, hbc'.symm, hcode'.symm, hph'.symm⟩
+    · show planStackRel lo cb (ps.stack ++ [Operand.Var v, Operand.Var out]) s''.stack
+      rw [hstk']
+      have hassoc : ps.stack ++ [Operand.Var v, Operand.Var out]
+          = (ps.stack ++ [Operand.Var v]) ++ [Operand.Var out] := by simp
+      rw [hassoc]
+      exact hStkFinal
+    · show memoryRel (emitInputPlan Opcode.CALL ((v :: rest).map Operand.Var) nl ps).2.alloc
+        cb.memory s''.memory
+      have halloc : (emitInputPlan Opcode.CALL ((v :: rest).map Operand.Var) nl ps).2.alloc
+          = freeSpillSlot off ps.alloc := by rw [hemiteq]
+      rw [halloc]
+      exact hmemrel'
+  · rw [executePlan_append, List.length_append, hpcadv, hpcE]
+    rfl
+
+/-- **The head-spilled CALL producer sim** — the first SPILLED external-call config end-to-end:
+    the spilled first-emitted operand is restored (net +2 with the success flag), the whole
+    generated plan preserves the complete `venomAsmRel` against the `stepExternalCall` writeback.
+    No reorder theory involved (the `p = 0` positioned family). -/
+theorem genRegularInstPlan_call_headspilled_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {offsetToPc : AssocList Nat Nat} {v : String} {rest : List String} {dists : List Nat}
+    {out : String} {base : List Operand} {off : Nat}
+    {gas addr value aOff aSz rOff rSz : bytes32} {vals : List bytes32}
+    {success : bytes32} {newAccs : Accounts} {ret : List byte}
+    (hopc : inst.opcode = Opcode.CALL)
+    (hcompute : computeOperands inst = (v :: rest).map Operand.Var)
+    (houts : inst.outputs = [out])
+    (hstack0 : ps.stack = base)
+    (hnd : (v :: rest).Nodup)
+    (hspill : alookup' ps.spilled (Operand.Var v) = some off)
+    (hlivev : nextLiveness.contains v = true)
+    (hns : ∀ w ∈ rest, alookup' ps.spilled (Operand.Var w) = none)
+    (hd : emitDepthsOk nextLiveness rest dists (ps.stack ++ [Operand.Var v, Operand.Var v]))
+    (hlive : nextLiveness.contains out = true)
+    (heval : evalOperands inst.operands vs = some [gas, addr, value, aOff, aSz, rOff, rSz])
+    (hvals : List.map (operandVal vs lo) ((v :: rest).map Operand.Var) = List.map some vals)
+    (hvalrev : vals.reverse = [gas, addr, value, aOff, aSz, rOff, rSz])
+    (hargs : aOff.toNat + aSz.toNat ≤ ps.alloc.fnEom) (haszlt : aSz.toNat < USize.size)
+    (hro1 : rOff.toNat ≤ vs.memory.size)
+    (hretbelow : rOff.toNat + rSz.toNat ≤ ps.alloc.fnEom)
+    (hfnEom : ps.alloc.fnEom ≤ as.memory.size)
+    (hfreshS : ¬ Operand.Var out ∈ ps.stack) (houtv : out ≠ v) (houtrest : out ∉ rest)
+    (hspill_out : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none)
+    (hspillReg : ∀ op off', AssocList.lookup Operand Nat ps.spilled op = some off' →
+        ps.alloc.fnEom ≤ off')
+    (hspillWf : ∀ o off', alookup' ps.spilled o = some off' →
+        32 ∣ off' ∧ off' + 32 ≤ as.memory.size ∧ off' < 2 ^ 256)
+    (hcall : evmCall subEvmFuel vs.accounts vs.callCtx.contract vs.txCtx.origin
+      (AccountAddress.ofUInt256 addr) (AccountAddress.ofUInt256 addr) gas value value
+      (vs.memory.readWithPadding aOff.toNat aSz.toNat).toList vs.txCtx.gasprice 0 (!vs.callCtx.static)
+      = (success, newAccs, ret))
+    (hoptnoop : optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+        { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+          stack := base ++ [Operand.Var v, Operand.Var out] }
+      = ([], { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+              stack := base ++ [Operand.Var v, Operand.Var out] }))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+           stepExternalCall subEvmFuel inst vs
+             = some (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs) ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2
+             (callWriteback out rOff.toNat rSz.toNat success newAccs ret vs) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  rw [genRegularInstPlan_call_headspilled_eq hopc hcompute houts hstack0 hnd hspill hlivev hns
+      hd hlive, hoptnoop] at hblock ⊢
+  simp only [List.append_nil] at hblock ⊢
+  rw [hcompute, hopc] at hblock ⊢
+  rw [← hstack0]
+  obtain ⟨s'', hrun, hstepV, hrelF, hpcF⟩ :=
+    call_block_emit_rel_full_headspilled (offsetToPc := offsetToPc) hopc heval houts hspill
+      hlivev hns hd hvals hvalrev hargs haszlt hro1 hretbelow hfnEom hfreshS houtv houtrest
+      hspill_out hspillReg hspillWf hcall hrel hblock
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrelF
+  exact ⟨s'', hrun, hstepV, hrelR, hpcF⟩
+
+/-- The N-input emission splits over an operand-list append. -/
+theorem emitInputPlan_append (opc : Opcode) (nl : List String) (l1 l2 : List Operand)
+    (ps : PlanState) :
+    emitInputPlan opc (l1 ++ l2) nl ps
+      = ((emitInputPlan opc l1 nl ps).1 ++ (emitInputPlan opc l2 nl (emitInputPlan opc l1 nl ps).2).1,
+         (emitInputPlan opc l2 nl (emitInputPlan opc l1 nl ps).2).2) := by
+  show (l1 ++ l2).foldl _ ([], ps) = _
+  rw [List.foldl_append]
+  rw [show (l1.foldl (fun (acc : List StackOp × PlanState) op =>
+        (acc.1 ++ (emitOneInput opc nl op acc.2).1, (emitOneInput opc nl op acc.2).2)) ([], ps))
+      = ((emitInputPlan opc l1 nl ps).1, (emitInputPlan opc l1 nl ps).2) from rfl]
+  exact foldl_ops_acc (fun q op => emitOneInput opc nl op q) l2
+    (emitInputPlan opc l1 nl ps).1 (emitInputPlan opc l1 nl ps).2
+
+/-- **Closed form of the last-spilled N-ary emission**: the live prefix DUPs at its depth chain,
+    then the spilled last-emitted operand restores (+ keep-alive DUP) — stack grows by
+    `rest ++ [v, v]`, `v` leaves the map, its slot is freed. The `q = 0` sibling of
+    `emitInputPlan_headSpilled_eq`. -/
+theorem emitInputPlan_lastSpilled_eq (opc : Opcode) (nl : List String)
+    {rest : List String} {v : String} {dists : List Nat} {ps : PlanState} {off : Nat}
+    (hns : ∀ w ∈ rest, alookup' ps.spilled (Operand.Var w) = none)
+    (hd : emitDepthsOk nl rest dists ps.stack)
+    (hspill : alookup' ps.spilled (Operand.Var v) = some off)
+    (hlive : nl.contains v = true) :
+    emitInputPlan opc ((rest ++ [v]).map Operand.Var) nl ps
+      = (dists.map (fun d => StackOp.SODup (d + 1)) ++ [StackOp.SORestore off, StackOp.SODup 1],
+         { ps with stack := (ps.stack ++ rest.map Operand.Var) ++ [Operand.Var v, Operand.Var v],
+                   spilled := aremove ps.spilled (Operand.Var v),
+                   alloc := freeSpillSlot off ps.alloc }) := by
+  rw [List.map_append, emitInputPlan_append,
+      emitInputPlan_allVars_eq opc nl rest dists ps hns hd]
+  have hlast : emitInputPlan opc ([v].map Operand.Var) nl
+      ({ ps with stack := ps.stack ++ rest.map Operand.Var } : PlanState)
+      = ([StackOp.SORestore off, StackOp.SODup 1],
+         { ps with stack := (ps.stack ++ rest.map Operand.Var) ++ [Operand.Var v, Operand.Var v],
+                   spilled := aremove ps.spilled (Operand.Var v),
+                   alloc := freeSpillSlot off ps.alloc }) := by
+    show ([Operand.Var v]).foldl _ ([], _) = _
+    rw [List.foldl_cons, List.foldl_nil]
+    simp only [List.nil_append,
+      emitOneInput_var_spilled_eq (ps := { ps with stack := ps.stack ++ rest.map Operand.Var })
+        (show alookup' ({ ps with stack := ps.stack ++ rest.map Operand.Var } : PlanState).spilled
+            (Operand.Var v) = some off from hspill) hlive]
+  rw [hlast]
+
+/-- All-live depth facts + a trailing spilled operand give the mixed-emission spec for the
+    snoc list. -/
+theorem emitMixedOk_snoc_spilled {nl : List String} :
+    ∀ {rest : List String} {dists : List Nat} {spl : SpilledMap} {stk : List Operand}
+      {v : String} {off : Nat},
+      (∀ w ∈ rest, alookup' spl (Operand.Var w) = none) →
+      emitDepthsOk nl rest dists stk →
+      alookup' spl (Operand.Var v) = some off →
+      nl.contains v = true →
+      emitMixedOk nl (rest ++ [v]) spl stk := by
+  intro rest
+  induction rest with
+  | nil =>
+    intro dists spl stk v off _ _ hspill hlive
+    refine ⟨hlive, ?_⟩
+    simp only [hspill]
+    trivial
+  | cons w rest' ih =>
+    intro dists spl stk v off hns hd hspill hlive
+    cases dists with
+    | nil => exact hd.elim
+    | cons d ds =>
+      obtain ⟨hlivew, hdepth, hsmall, htail⟩ := hd
+      have hnsw : alookup' spl (Operand.Var w) = none := hns w List.mem_cons_self
+      refine ⟨hlivew, ?_⟩
+      simp only [hnsw]
+      exact ⟨d, hdepth, hsmall,
+        ih (fun u hu => hns u (List.mem_cons_of_mem w hu)) htail hspill hlive⟩
+
+/-- **Last-spilled LOG plan reduction**: live prefix DUPs, spilled last operand restored, the
+    general `SWAP N; …; SWAP 1` doubles-reorder (`reorderPlan_lastspilled`), `LOGn` pops the
+    inputs — net `+1` (the kept restore). The FIRST consumer of the general reorder atoms. -/
+theorem genRegularInstPlan_log_lastspilled_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {rest : List String} {v : String} {dists : List Nat} {tc : bytes32}
+    {base : List Operand} {off : Nat}
+    (hopc : inst.opcode = Opcode.LOG)
+    (hhead : inst.operands.head! = Operand.Lit tc)
+    (hcompute : computeOperands inst = (rest ++ [v]).map Operand.Var)
+    (houts : inst.outputs = [])
+    (hstack0 : ps.stack = base)
+    (hrestne : rest ≠ [])
+    (h16 : rest.length + 1 ≤ 16)
+    (hvrest : v ∉ rest) (hnd : rest.Nodup)
+    (hns : ∀ w ∈ rest, alookup' ps.spilled (Operand.Var w) = none)
+    (hd : emitDepthsOk nextLiveness rest dists ps.stack)
+    (hspill : alookup' ps.spilled (Operand.Var v) = some off)
+    (hlive : nextLiveness.contains v = true) :
+    generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator curBbLabel ps
+      = ((emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).1
+          ++ descSwaps (rest.length + 1)
+          ++ [StackOp.SOEmit ("LOG" ++ toString tc.toNat)],
+         releaseDeadSpills nextLiveness
+           { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+             stack := base ++ [Operand.Var v] }) := by
+  have hcL : isCommutative Opcode.LOG = false := rfl
+  have hjL : ¬ (Opcode.LOG = Opcode.JMP) := by decide
+  have hpvar := emitInputPlan_lastSpilled_eq Opcode.LOG nextLiveness hns hd hspill hlive
+  unfold generateRegularInstPlan
+  simp only [hopc, hhead, hcompute, houts, List.map_append, List.map_cons, List.map_nil]
+  rcases hemit : emitInputPlan Opcode.LOG (rest.map Operand.Var ++ [Operand.Var v]) nextLiveness ps
+    with ⟨inputOps, ps1⟩
+  have h2 : (emitInputPlan Opcode.LOG (rest.map Operand.Var ++ [Operand.Var v]) nextLiveness ps).2
+      = ps1 := by
+    rw [hemit]
+  have hps1' : ps1.stack = base ++ rest.map Operand.Var ++ [Operand.Var v, Operand.Var v] := by
+    rw [← h2, show rest.map Operand.Var ++ [Operand.Var v] = (rest ++ [v]).map Operand.Var from by
+        simp, hpvar, hstack0]
+  have hndm : (rest.map Operand.Var).Nodup := hnd.map (fun _ _ h => Operand.Var.inj h)
+  have hvm : Operand.Var v ∉ rest.map Operand.Var := by
+    intro h
+    obtain ⟨w, hw, hwe⟩ := List.mem_map.mp h
+    injection hwe with hwe'
+    exact hvrest (hwe' ▸ hw)
+  have hreo := reorderPlan_lastspilled base (rest.map Operand.Var) (Operand.Var v) ps1
+    (by rw [hps1']) (by simpa using hrestne) (by simpa using h16) hvm hndm
+  have hreo' : reorderPlan (rest.map Operand.Var ++ [Operand.Var v]) ps1
+      = (descSwaps (rest.length + 1),
+         { ps1 with stack := base ++ Operand.Var v :: (rest.map Operand.Var ++ [Operand.Var v]) }) := by
+    rw [hreo]
+    simp
+  have hpop : stackPop (rest.length + 1)
+        (base ++ Operand.Var v :: (rest.map Operand.Var ++ [Operand.Var v]))
+      = base ++ [Operand.Var v] := by
+    have h := stackPop_append_top (base ++ [Operand.Var v]) ((rest ++ [v]).map Operand.Var)
+    rw [List.length_map, show (rest ++ [v]).length = rest.length + 1 from by simp] at h
+    rw [show base ++ Operand.Var v :: (rest.map Operand.Var ++ [Operand.Var v])
+          = (base ++ [Operand.Var v]) ++ (rest ++ [v]).map Operand.Var from by simp]
+    exact h
+  simp [hcL, hjL, hreo', hpop, generateEmitOps_log hopc, List.append_assoc]
+/-- A live-prefix extension of the mixed-emission spec: prepend depth-checked live legs to any
+    mixed tail. -/
+theorem emitMixedOk_append_live {nl : List String} :
+    ∀ {pre : List String} {dists : List Nat} {tail : List String} {spl : SpilledMap}
+      {stk : List Operand},
+      (∀ w ∈ pre, alookup' spl (Operand.Var w) = none) →
+      emitDepthsOk nl pre dists stk →
+      emitMixedOk nl tail spl (stk ++ pre.map Operand.Var) →
+      emitMixedOk nl (pre ++ tail) spl stk := by
+  intro pre
+  induction pre with
+  | nil =>
+    intro dists tail spl stk _ _ htail
+    simpa using htail
+  | cons w pre' ih =>
+    intro dists tail spl stk hns hd htail
+    cases dists with
+    | nil => exact hd.elim
+    | cons d ds =>
+      obtain ⟨hlivew, hdepth, hsmall, hdtail⟩ := hd
+      have hnsw : alookup' spl (Operand.Var w) = none := hns w List.mem_cons_self
+      refine ⟨hlivew, ?_⟩
+      simp only [hnsw]
+      refine ⟨d, hdepth, hsmall, ?_⟩
+      exact ih (fun u hu => hns u (List.mem_cons_of_mem w hu)) hdtail
+        (by rw [show stk ++ (w :: pre').map Operand.Var
+              = (stk ++ [Operand.Var w]) ++ pre'.map Operand.Var from by simp] at htail
+            exact htail)
+
+/-- **Closed form of the mid-spilled N-ary emission**: live prefix DUPs, the spilled middle
+    operand restores (+ keep-alive DUP), the live suffix DUPs over the grown stack — the layout
+    of `reorderPlan_midspilled`. -/
+theorem emitInputPlan_midSpilled_eq (opc : Opcode) (nl : List String)
+    {pre post : List String} {v : String} {dists dists' : List Nat} {ps : PlanState} {off : Nat}
+    (hnspre : ∀ w ∈ pre, alookup' ps.spilled (Operand.Var w) = none)
+    (hdpre : emitDepthsOk nl pre dists ps.stack)
+    (hspill : alookup' ps.spilled (Operand.Var v) = some off)
+    (hlivev : nl.contains v = true)
+    (hnspost : ∀ w ∈ post, alookup' (aremove ps.spilled (Operand.Var v)) (Operand.Var w) = none)
+    (hdpost : emitDepthsOk nl post dists'
+      ((ps.stack ++ pre.map Operand.Var) ++ [Operand.Var v, Operand.Var v])) :
+    emitInputPlan opc ((pre ++ [v] ++ post).map Operand.Var) nl ps
+      = (dists.map (fun d => StackOp.SODup (d + 1))
+          ++ ([StackOp.SORestore off, StackOp.SODup 1]
+            ++ dists'.map (fun d => StackOp.SODup (d + 1))),
+         { ps with stack := ((ps.stack ++ pre.map Operand.Var)
+                     ++ [Operand.Var v, Operand.Var v]) ++ post.map Operand.Var,
+                   spilled := aremove ps.spilled (Operand.Var v),
+                   alloc := freeSpillSlot off ps.alloc }) := by
+  rw [show (pre ++ [v] ++ post).map Operand.Var
+        = pre.map Operand.Var ++ (Operand.Var v :: post.map Operand.Var) from by simp,
+      emitInputPlan_append,
+      emitInputPlan_allVars_eq opc nl pre dists ps hnspre hdpre]
+  have hmid : emitInputPlan opc (Operand.Var v :: post.map Operand.Var) nl
+      ({ ps with stack := ps.stack ++ pre.map Operand.Var } : PlanState)
+      = ([StackOp.SORestore off, StackOp.SODup 1]
+          ++ dists'.map (fun d => StackOp.SODup (d + 1)),
+         { ps with stack := ((ps.stack ++ pre.map Operand.Var)
+                     ++ [Operand.Var v, Operand.Var v]) ++ post.map Operand.Var,
+                   spilled := aremove ps.spilled (Operand.Var v),
+                   alloc := freeSpillSlot off ps.alloc }) := by
+    rw [show (Operand.Var v :: post.map Operand.Var)
+          = [Operand.Var v] ++ post.map Operand.Var from rfl,
+        emitInputPlan_append]
+    have hv : emitInputPlan opc [Operand.Var v] nl
+        ({ ps with stack := ps.stack ++ pre.map Operand.Var } : PlanState)
+        = ([StackOp.SORestore off, StackOp.SODup 1],
+           { ps with stack := (ps.stack ++ pre.map Operand.Var) ++ [Operand.Var v, Operand.Var v],
+                     spilled := aremove ps.spilled (Operand.Var v),
+                     alloc := freeSpillSlot off ps.alloc }) := by
+      show ([Operand.Var v]).foldl _ ([], _) = _
+      rw [List.foldl_cons, List.foldl_nil]
+      simp only [List.nil_append,
+        emitOneInput_var_spilled_eq
+          (ps := { ps with stack := ps.stack ++ pre.map Operand.Var })
+          (show alookup' ({ ps with stack := ps.stack ++ pre.map Operand.Var } : PlanState).spilled
+              (Operand.Var v) = some off from hspill) hlivev]
+    rw [hv,
+        emitInputPlan_allVars_eq opc nl post dists'
+          ({ ps with stack := (ps.stack ++ pre.map Operand.Var) ++ [Operand.Var v, Operand.Var v],
+                     spilled := aremove ps.spilled (Operand.Var v),
+                     alloc := freeSpillSlot off ps.alloc } : PlanState)
+          hnspost hdpost]
+  rw [hmid]
+
+/-- **Mid-spilled LOG plan reduction**: live prefix + spilled middle restore + live suffix, the
+    general `SWAP N; …; SWAP q; SWAP N` doubles-reorder (`reorderPlan_midspilled`), `LOGn` —
+    net `+1`. Completes the spilled variable-arity trilogy (head / last / mid). -/
+theorem genRegularInstPlan_log_midspilled_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {pre post : List String} {v : String} {dists dists' : List Nat} {tc : bytes32}
+    {base : List Operand} {off : Nat}
+    (hopc : inst.opcode = Opcode.LOG)
+    (hhead : inst.operands.head! = Operand.Lit tc)
+    (hcompute : computeOperands inst = (pre ++ [v] ++ post).map Operand.Var)
+    (houts : inst.outputs = [])
+    (hstack0 : ps.stack = base)
+    (hprene : pre ≠ []) (hpostne : post ≠ [])
+    (h16 : pre.length + post.length + 1 ≤ 16)
+    (hvpre : v ∉ pre) (hvpost : v ∉ post)
+    (hndpre : pre.Nodup) (hndpost : post.Nodup)
+    (hdisj : ∀ x ∈ pre, x ∉ post)
+    (hnspre : ∀ w ∈ pre, alookup' ps.spilled (Operand.Var w) = none)
+    (hdpre : emitDepthsOk nextLiveness pre dists ps.stack)
+    (hspill : alookup' ps.spilled (Operand.Var v) = some off)
+    (hlivev : nextLiveness.contains v = true)
+    (hnspost : ∀ w ∈ post, alookup' (aremove ps.spilled (Operand.Var v)) (Operand.Var w) = none)
+    (hdpost : emitDepthsOk nextLiveness post dists'
+      ((ps.stack ++ pre.map Operand.Var) ++ [Operand.Var v, Operand.Var v])) :
+    generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator curBbLabel ps
+      = ((emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).1
+          ++ ((StackOp.SOSwap (pre.length + post.length + 1)
+                :: StackOp.SOSwap (pre.length + post.length)
+                :: descRun (post.length + 1) (pre.length - 1))
+              ++ [StackOp.SOSwap post.length]
+              ++ [StackOp.SOSwap (pre.length + post.length + 1)])
+          ++ [StackOp.SOEmit ("LOG" ++ toString tc.toNat)],
+         releaseDeadSpills nextLiveness
+           { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+             stack := base ++ [Operand.Var v] }) := by
+  have hcL : isCommutative Opcode.LOG = false := rfl
+  have hjL : ¬ (Opcode.LOG = Opcode.JMP) := by decide
+  have hpvar := emitInputPlan_midSpilled_eq Opcode.LOG nextLiveness hnspre hdpre hspill hlivev
+    hnspost hdpost
+  unfold generateRegularInstPlan
+  simp only [hopc, hhead, hcompute, houts, List.map_append, List.map_cons, List.map_nil]
+  rcases hemit : emitInputPlan Opcode.LOG
+      (pre.map Operand.Var ++ Operand.Var v :: post.map Operand.Var) nextLiveness ps
+    with ⟨inputOps, ps1⟩
+  have h2 : (emitInputPlan Opcode.LOG
+      (pre.map Operand.Var ++ Operand.Var v :: post.map Operand.Var) nextLiveness ps).2
+      = ps1 := by rw [hemit]
+  have hps1' : ps1.stack
+      = base ++ pre.map Operand.Var ++ [Operand.Var v, Operand.Var v] ++ post.map Operand.Var := by
+    rw [← h2, show pre.map Operand.Var ++ Operand.Var v :: post.map Operand.Var
+          = (pre ++ [v] ++ post).map Operand.Var from by simp, hpvar, hstack0]
+  have hndmpre : (pre.map Operand.Var).Nodup := hndpre.map (fun _ _ h => Operand.Var.inj h)
+  have hndmpost : (post.map Operand.Var).Nodup := hndpost.map (fun _ _ h => Operand.Var.inj h)
+  have hvmpre : Operand.Var v ∉ pre.map Operand.Var := by
+    intro h
+    obtain ⟨w, hw, hwe⟩ := List.mem_map.mp h
+    injection hwe with hwe'
+    exact hvpre (hwe' ▸ hw)
+  have hvmpost : Operand.Var v ∉ post.map Operand.Var := by
+    intro h
+    obtain ⟨w, hw, hwe⟩ := List.mem_map.mp h
+    injection hwe with hwe'
+    exact hvpost (hwe' ▸ hw)
+  have hdisjm : ∀ x ∈ pre.map Operand.Var, x ∉ post.map Operand.Var := by
+    intro x hx hx2
+    obtain ⟨w, hw, hwe⟩ := List.mem_map.mp hx
+    obtain ⟨u, hu, hue⟩ := List.mem_map.mp hx2
+    rw [← hwe] at hue
+    injection hue with hue'
+    exact hdisj w hw (hue' ▸ hu)
+  have hreo := reorderPlan_midspilled base (pre.map Operand.Var) (post.map Operand.Var)
+    (Operand.Var v) ps1
+    (by rw [hps1']) (by simpa using hprene) (by simpa using hpostne)
+    (by simpa using h16) hvmpre hvmpost hndmpre hndmpost hdisjm
+  have hreo' : reorderPlan (pre.map Operand.Var ++ Operand.Var v :: post.map Operand.Var) ps1
+      = ((StackOp.SOSwap (pre.length + post.length + 1)
+            :: StackOp.SOSwap (pre.length + post.length)
+            :: descRun (post.length + 1) (pre.length - 1))
+          ++ [StackOp.SOSwap post.length]
+          ++ [StackOp.SOSwap (pre.length + post.length + 1)],
+         { ps1 with stack := base ++ Operand.Var v
+             :: (pre.map Operand.Var ++ Operand.Var v :: post.map Operand.Var) }) := by
+    rw [show pre.map Operand.Var ++ Operand.Var v :: post.map Operand.Var
+          = pre.map Operand.Var ++ [Operand.Var v] ++ post.map Operand.Var from by simp,
+        hreo]
+    simp
+  have hpop : stackPop (pre.length + (post.length + 1))
+        (base ++ Operand.Var v :: (pre.map Operand.Var ++ Operand.Var v :: post.map Operand.Var))
+      = base ++ [Operand.Var v] := by
+    have h := stackPop_append_top (base ++ [Operand.Var v])
+      (pre.map Operand.Var ++ Operand.Var v :: post.map Operand.Var)
+    rw [show (pre.map Operand.Var ++ Operand.Var v :: post.map Operand.Var).length
+          = pre.length + (post.length + 1) from by simp] at h
+    rw [show base ++ Operand.Var v
+          :: (pre.map Operand.Var ++ Operand.Var v :: post.map Operand.Var)
+          = (base ++ [Operand.Var v])
+            ++ (pre.map Operand.Var ++ Operand.Var v :: post.map Operand.Var) from by simp]
+    exact h
+  simp [hcL, hjL, h2, hreo', hpop, generateEmitOps_log hopc, List.append_assoc]
+
+/-- **Mid-spilled CALL plan reduction**: live prefix + spilled middle restore + live suffix,
+    the general doubles-reorder (`reorderPlan_midspilled`), `CALL`, success push — net `+2`.
+    The non-positioned spilled external-call config, over the general atoms. -/
+theorem genRegularInstPlan_call_midspilled_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {pre post : List String} {v : String} {dists dists' : List Nat} {out : String}
+    {base : List Operand} {off : Nat}
+    (hopc : inst.opcode = Opcode.CALL)
+    (hcompute : computeOperands inst = (pre ++ [v] ++ post).map Operand.Var)
+    (houts : inst.outputs = [out])
+    (hstack0 : ps.stack = base)
+    (hprene : pre ≠ []) (hpostne : post ≠ [])
+    (h16 : pre.length + post.length + 1 ≤ 16)
+    (hvpre : v ∉ pre) (hvpost : v ∉ post)
+    (hndpre : pre.Nodup) (hndpost : post.Nodup)
+    (hdisj : ∀ x ∈ pre, x ∉ post)
+    (hnspre : ∀ w ∈ pre, alookup' ps.spilled (Operand.Var w) = none)
+    (hdpre : emitDepthsOk nextLiveness pre dists ps.stack)
+    (hspill : alookup' ps.spilled (Operand.Var v) = some off)
+    (hlivev : nextLiveness.contains v = true)
+    (hnspost : ∀ w ∈ post, alookup' (aremove ps.spilled (Operand.Var v)) (Operand.Var w) = none)
+    (hdpost : emitDepthsOk nextLiveness post dists'
+      ((ps.stack ++ pre.map Operand.Var) ++ [Operand.Var v, Operand.Var v]))
+    (hlive : nextLiveness.contains out = true) :
+    generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator
+        curBbLabel ps
+      = ((emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).1
+          ++ ((StackOp.SOSwap (pre.length + post.length + 1)
+                :: StackOp.SOSwap (pre.length + post.length)
+                :: descRun (post.length + 1) (pre.length - 1))
+              ++ [StackOp.SOSwap post.length]
+              ++ [StackOp.SOSwap (pre.length + post.length + 1)])
+          ++ [StackOp.SOEmit "CALL"]
+          ++ (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+                { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+                  stack := base ++ [Operand.Var v, Operand.Var out] }).1,
+         releaseDeadSpills nextLiveness
+           (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+             { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+               stack := base ++ [Operand.Var v, Operand.Var out] }).2) := by
+  have hname : opcodeToEvmName inst.opcode = some "CALL" := by rw [hopc]; rfl
+  have hncomm : isCommutative inst.opcode = false := by rw [hopc]; rfl
+  have hnjmp : ¬ (inst.opcode = Opcode.JMP) := by rw [hopc]; decide
+  have hpvar := emitInputPlan_midSpilled_eq inst.opcode nextLiveness hnspre hdpre hspill hlivev
+    hnspost hdpost
+  unfold generateRegularInstPlan
+  simp only [hcompute, houts, List.map_append, List.map_cons, List.map_nil]
+  rcases hemit : emitInputPlan inst.opcode
+      (pre.map Operand.Var ++ Operand.Var v :: post.map Operand.Var) nextLiveness ps
+    with ⟨inputOps, ps1⟩
+  have h2 : (emitInputPlan inst.opcode
+      (pre.map Operand.Var ++ Operand.Var v :: post.map Operand.Var) nextLiveness ps).2
+      = ps1 := by rw [hemit]
+  have hps1' : ps1.stack
+      = base ++ pre.map Operand.Var ++ [Operand.Var v, Operand.Var v] ++ post.map Operand.Var := by
+    rw [← h2, show pre.map Operand.Var ++ Operand.Var v :: post.map Operand.Var
+          = (pre ++ [v] ++ post).map Operand.Var from by simp, hpvar, hstack0]
+  have hndmpre : (pre.map Operand.Var).Nodup := hndpre.map (fun _ _ h => Operand.Var.inj h)
+  have hndmpost : (post.map Operand.Var).Nodup := hndpost.map (fun _ _ h => Operand.Var.inj h)
+  have hvmpre : Operand.Var v ∉ pre.map Operand.Var := by
+    intro h
+    obtain ⟨w, hw, hwe⟩ := List.mem_map.mp h
+    injection hwe with hwe'
+    exact hvpre (hwe' ▸ hw)
+  have hvmpost : Operand.Var v ∉ post.map Operand.Var := by
+    intro h
+    obtain ⟨w, hw, hwe⟩ := List.mem_map.mp h
+    injection hwe with hwe'
+    exact hvpost (hwe' ▸ hw)
+  have hdisjm : ∀ x ∈ pre.map Operand.Var, x ∉ post.map Operand.Var := by
+    intro x hx hx2
+    obtain ⟨w, hw, hwe⟩ := List.mem_map.mp hx
+    obtain ⟨u, hu, hue⟩ := List.mem_map.mp hx2
+    rw [← hwe] at hue
+    injection hue with hue'
+    exact hdisj w hw (hue' ▸ hu)
+  have hreo := reorderPlan_midspilled base (pre.map Operand.Var) (post.map Operand.Var)
+    (Operand.Var v) ps1
+    (by rw [hps1']) (by simpa using hprene) (by simpa using hpostne)
+    (by simpa using h16) hvmpre hvmpost hndmpre hndmpost hdisjm
+  have hreo' : reorderPlan (pre.map Operand.Var ++ Operand.Var v :: post.map Operand.Var) ps1
+      = ((StackOp.SOSwap (pre.length + post.length + 1)
+            :: StackOp.SOSwap (pre.length + post.length)
+            :: descRun (post.length + 1) (pre.length - 1))
+          ++ [StackOp.SOSwap post.length]
+          ++ [StackOp.SOSwap (pre.length + post.length + 1)],
+         { ps1 with stack := base ++ Operand.Var v
+             :: (pre.map Operand.Var ++ Operand.Var v :: post.map Operand.Var) }) := by
+    rw [show pre.map Operand.Var ++ Operand.Var v :: post.map Operand.Var
+          = pre.map Operand.Var ++ [Operand.Var v] ++ post.map Operand.Var from by simp,
+        hreo]
+    simp
+  have hmem : out ∈ nextLiveness := by simpa using hlive
+  have hpop : stackPop (pre.length + (post.length + 1))
+        (base ++ Operand.Var v :: (pre.map Operand.Var ++ Operand.Var v :: post.map Operand.Var))
+      = base ++ [Operand.Var v] := by
+    have h := stackPop_append_top (base ++ [Operand.Var v])
+      (pre.map Operand.Var ++ Operand.Var v :: post.map Operand.Var)
+    rw [show (pre.map Operand.Var ++ Operand.Var v :: post.map Operand.Var).length
+          = pre.length + (post.length + 1) from by simp] at h
+    rw [show base ++ Operand.Var v
+          :: (pre.map Operand.Var ++ Operand.Var v :: post.map Operand.Var)
+          = (base ++ [Operand.Var v])
+            ++ (pre.map Operand.Var ++ Operand.Var v :: post.map Operand.Var) from by simp]
+    exact h
+  simp [generateEmitOps_evmName hname, h2, hreo', hpop, stackPush, popmanyPlan_nil, hmem,
+        hncomm, hnjmp, List.append_assoc]
+
+/-- **Last-spilled CALL plan reduction**: live prefix DUPs, spilled last-emitted operand
+    restored, the general `SWAP N; …; SWAP 1` doubles-reorder (`reorderPlan_lastspilled`),
+    `CALL`, success push — net `+2`. The `q = 0` external-call config over the general atoms. -/
+theorem genRegularInstPlan_call_lastspilled_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {rest : List String} {v : String} {dists : List Nat} {out : String}
+    {base : List Operand} {off : Nat}
+    (hopc : inst.opcode = Opcode.CALL)
+    (hcompute : computeOperands inst = (rest ++ [v]).map Operand.Var)
+    (houts : inst.outputs = [out])
+    (hstack0 : ps.stack = base)
+    (hrestne : rest ≠ [])
+    (h16 : rest.length + 1 ≤ 16)
+    (hvrest : v ∉ rest) (hnd : rest.Nodup)
+    (hns : ∀ w ∈ rest, alookup' ps.spilled (Operand.Var w) = none)
+    (hd : emitDepthsOk nextLiveness rest dists ps.stack)
+    (hspill : alookup' ps.spilled (Operand.Var v) = some off)
+    (hlivev : nextLiveness.contains v = true)
+    (hlive : nextLiveness.contains out = true) :
+    generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator
+        curBbLabel ps
+      = ((emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).1
+          ++ descSwaps (rest.length + 1)
+          ++ [StackOp.SOEmit "CALL"]
+          ++ (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+                { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+                  stack := base ++ [Operand.Var v, Operand.Var out] }).1,
+         releaseDeadSpills nextLiveness
+           (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+             { (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2 with
+               stack := base ++ [Operand.Var v, Operand.Var out] }).2) := by
+  have hname : opcodeToEvmName inst.opcode = some "CALL" := by rw [hopc]; rfl
+  have hncomm : isCommutative inst.opcode = false := by rw [hopc]; rfl
+  have hnjmp : ¬ (inst.opcode = Opcode.JMP) := by rw [hopc]; decide
+  have hpvar := emitInputPlan_lastSpilled_eq inst.opcode nextLiveness hns hd hspill hlivev
+  unfold generateRegularInstPlan
+  simp only [hcompute, houts, List.map_append, List.map_cons, List.map_nil]
+  rcases hemit : emitInputPlan inst.opcode (rest.map Operand.Var ++ [Operand.Var v]) nextLiveness ps
+    with ⟨inputOps, ps1⟩
+  have h2 : (emitInputPlan inst.opcode (rest.map Operand.Var ++ [Operand.Var v]) nextLiveness ps).2
+      = ps1 := by
+    rw [hemit]
+  have hps1' : ps1.stack = base ++ rest.map Operand.Var ++ [Operand.Var v, Operand.Var v] := by
+    rw [← h2, show rest.map Operand.Var ++ [Operand.Var v] = (rest ++ [v]).map Operand.Var from by
+        simp, hpvar, hstack0]
+  have hndm : (rest.map Operand.Var).Nodup := hnd.map (fun _ _ h => Operand.Var.inj h)
+  have hvm : Operand.Var v ∉ rest.map Operand.Var := by
+    intro h
+    obtain ⟨w, hw, hwe⟩ := List.mem_map.mp h
+    injection hwe with hwe'
+    exact hvrest (hwe' ▸ hw)
+  have hreo := reorderPlan_lastspilled base (rest.map Operand.Var) (Operand.Var v) ps1
+    (by rw [hps1']) (by simpa using hrestne) (by simpa using h16) hvm hndm
+  have hreo' : reorderPlan (rest.map Operand.Var ++ [Operand.Var v]) ps1
+      = (descSwaps (rest.length + 1),
+         { ps1 with stack := base ++ Operand.Var v :: (rest.map Operand.Var ++ [Operand.Var v]) }) := by
+    rw [hreo]
+    simp
+  have hmem : out ∈ nextLiveness := by simpa using hlive
+  have hpop : stackPop (rest.length + 1)
+        (base ++ Operand.Var v :: (rest.map Operand.Var ++ [Operand.Var v]))
+      = base ++ [Operand.Var v] := by
+    have h := stackPop_append_top (base ++ [Operand.Var v]) ((rest ++ [v]).map Operand.Var)
+    rw [List.length_map, show (rest ++ [v]).length = rest.length + 1 from by simp] at h
+    rw [show base ++ Operand.Var v :: (rest.map Operand.Var ++ [Operand.Var v])
+          = (base ++ [Operand.Var v]) ++ (rest ++ [v]).map Operand.Var from by simp]
+    exact h
+  simp [generateEmitOps_evmName hname, h2, hreo', hpop, stackPush, popmanyPlan_nil, hmem,
+        hncomm, hnjmp, List.append_assoc]
+
+/-- Closed form of the SLL ternop input emission (`z` spilled, `y`/`x` live): restore+dup `z`,
+    then DUP the two live operands over the grown stack — `base ++ [z, z, y, x]`, the spill entry
+    gone, the slot freed. The 3-operand extension of `emit2_valspilled`. -/
+theorem emit3_zspilled {opc nl x y z ps base offz d_y d_x}
+    (hstack0 : ps.stack = base)
+    (hspill_z : alookup' ps.spilled (Operand.Var z) = some offz) (hlivez : nl.contains z = true)
+    (hnospill_y : alookup' ps.spilled (Operand.Var y) = none) (hlivey : nl.contains y = true)
+    (hnospill_x : alookup' ps.spilled (Operand.Var x) = none) (hlivex : nl.contains x = true)
+    (hyz : y ≠ z) (hxz : x ≠ z) (hxy : x ≠ y)
+    (hdepth_y : stackGetDepth (Operand.Var y) ps.stack = some d_y) (hsmall_y : d_y + 2 ≤ 15)
+    (hdepth_x : stackGetDepth (Operand.Var x) ps.stack = some d_x) (hsmall_x : d_x + 3 ≤ 15) :
+    (emitInputPlan opc [Operand.Var z, Operand.Var y, Operand.Var x] nl ps).2
+      = { ps with stack := base ++ [Operand.Var z, Operand.Var z, Operand.Var y, Operand.Var x],
+                  spilled := aremove ps.spilled (Operand.Var z),
+                  alloc := freeSpillSlot offz ps.alloc } := by
+  have hhead : emitOneInput opc nl (Operand.Var z) ps
+      = ([StackOp.SORestore offz, StackOp.SODup 1],
+         { ps with stack := ps.stack ++ [Operand.Var z, Operand.Var z],
+                   spilled := aremove ps.spilled (Operand.Var z),
+                   alloc := freeSpillSlot offz ps.alloc }) :=
+    emitOneInput_var_spilled_eq hspill_z hlivez
+  set psZ : PlanState := { ps with
+                             stack := ps.stack ++ [Operand.Var z, Operand.Var z],
+                             spilled := aremove ps.spilled (Operand.Var z),
+                             alloc := freeSpillSlot offz ps.alloc } with hpsZdef
+  have hpsZstack : psZ.stack = ps.stack ++ [Operand.Var z, Operand.Var z] := by rw [hpsZdef]
+  have hdepthy1 : stackGetDepth (Operand.Var y) psZ.stack = some (d_y + 2) := by
+    rw [hpsZstack, show ps.stack ++ [Operand.Var z, Operand.Var z]
+          = (ps.stack ++ [Operand.Var z]) ++ [Operand.Var z] from by simp,
+        stackGetDepth_append_ne (ps.stack ++ [Operand.Var z]) hyz,
+        stackGetDepth_append_ne ps.stack hyz, hdepth_y]; rfl
+  have hnospilly1 : alookup' psZ.spilled (Operand.Var y) = none := by
+    rw [hpsZdef]; exact aremove_lookup_none ps.spilled (Operand.Var z) (Operand.Var y) hnospill_y
+  have hpeeky : stackPeek (d_y + 2) psZ.stack = Operand.Var y := stackGetDepth_peek hdepthy1
+  have hddy : doDup (d_y + 2) psZ
+      = ([StackOp.SODup (d_y + 2 + 1)], { psZ with stack := stackDup (d_y + 2) psZ.stack }) := by
+    unfold doDup; rw [if_pos hsmall_y]
+  have hlegy : emitOneInput opc nl (Operand.Var y) psZ
+      = ([StackOp.SODup (d_y + 2 + 1)], { psZ with stack := stackDup (d_y + 2) psZ.stack }) := by
+    unfold emitOneInput
+    simp only [isVarOperand, hnospilly1, Option.isSome_none, Bool.and_false, Bool.false_eq_true,
+      if_false, hlivey, if_true, hdepthy1, hddy, List.nil_append]
+  set psY : PlanState := { psZ with stack := stackDup (d_y + 2) psZ.stack } with hpsYdef
+  have hpsYstack : psY.stack = ps.stack ++ [Operand.Var z, Operand.Var z, Operand.Var y] := by
+    rw [hpsYdef]; show stackDup (d_y + 2) psZ.stack = _
+    unfold stackDup; rw [hpeeky, hpsZstack]; simp
+  have hdepthx1 : stackGetDepth (Operand.Var x) psY.stack = some (d_x + 3) := by
+    rw [hpsYstack,
+        show ps.stack ++ [Operand.Var z, Operand.Var z, Operand.Var y]
+          = ((ps.stack ++ [Operand.Var z]) ++ [Operand.Var z]) ++ [Operand.Var y] from by simp,
+        stackGetDepth_append_ne ((ps.stack ++ [Operand.Var z]) ++ [Operand.Var z]) hxy,
+        stackGetDepth_append_ne (ps.stack ++ [Operand.Var z]) hxz,
+        stackGetDepth_append_ne ps.stack hxz, hdepth_x]; rfl
+  have hnospillx1 : alookup' psY.spilled (Operand.Var x) = none := by
+    rw [hpsYdef]
+    show alookup' psZ.spilled (Operand.Var x) = none
+    rw [hpsZdef]
+    exact aremove_lookup_none ps.spilled (Operand.Var z) (Operand.Var x) hnospill_x
+  have hpeekx : stackPeek (d_x + 3) psY.stack = Operand.Var x := stackGetDepth_peek hdepthx1
+  have hddx : doDup (d_x + 3) psY
+      = ([StackOp.SODup (d_x + 3 + 1)], { psY with stack := stackDup (d_x + 3) psY.stack }) := by
+    unfold doDup; rw [if_pos hsmall_x]
+  have hlegx : emitOneInput opc nl (Operand.Var x) psY
+      = ([StackOp.SODup (d_x + 3 + 1)], { psY with stack := stackDup (d_x + 3) psY.stack }) := by
+    unfold emitOneInput
+    simp only [isVarOperand, hnospillx1, Option.isSome_none, Bool.and_false, Bool.false_eq_true,
+      if_false, hlivex, if_true, hdepthx1, hddx, List.nil_append]
+  have hemit3 : (emitInputPlan opc [Operand.Var z, Operand.Var y, Operand.Var x] nl ps).2
+      = { psY with stack := stackDup (d_x + 3) psY.stack } := by
+    unfold emitInputPlan
+    simp only [List.foldl_cons, List.foldl_nil, hhead, hlegy, hlegx, List.nil_append]
+  have hdupx : stackDup (d_x + 3) psY.stack
+      = base ++ [Operand.Var z, Operand.Var z, Operand.Var y, Operand.Var x] := by
+    unfold stackDup; rw [hpeekx, hpsYstack, hstack0]; simp
+  rw [hemit3, hdupx]
+
+/-- **Z-spilled ternop plan reduction** — the FIRST spilled ternary config: the last operand `z`
+    (first emitted) comes off its spill slot, so the emission leaves the three operands POSITIONED
+    (`reorderPlan = []` over the kept restored copy, `base' = base ++ [z]`); the op pops three and
+    pushes `out`, leaving `base ++ [z, out]` (net +2). The 3-ary extension of
+    `genRegularInstPlan_nonCommBinopVar_spilled_eq`. -/
+theorem genRegularInstPlan_ternopVar_zspilled_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {x y z out : String} {base : List Operand} {name : String} {offz d_y d_x : Nat}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x, Operand.Var y, Operand.Var z])
+    (houts : inst.outputs = [out])
+    (hxy : x ≠ y) (hyz : y ≠ z) (hxz : x ≠ z)
+    (hstack0 : ps.stack = base)
+    (hlive : nextLiveness.contains out = true)
+    (hspill_z : alookup' ps.spilled (Operand.Var z) = some offz)
+    (hlivez : nextLiveness.contains z = true)
+    (hnospill_y : alookup' ps.spilled (Operand.Var y) = none)
+    (hlivey : nextLiveness.contains y = true)
+    (hnospill_x : alookup' ps.spilled (Operand.Var x) = none)
+    (hlivex : nextLiveness.contains x = true)
+    (hdepth_y : stackGetDepth (Operand.Var y) ps.stack = some d_y) (hsmall_y : d_y + 2 ≤ 15)
+    (hdepth_x : stackGetDepth (Operand.Var x) ps.stack = some d_x) (hsmall_x : d_x + 3 ≤ 15) :
+    generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator
+        curBbLabel ps
+      = (((emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).1
+            ++ [StackOp.SOEmit name]
+            ++ (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+                  { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+                    stack := base ++ [Operand.Var z, Operand.Var out] }).1),
+         releaseDeadSpills nextLiveness
+           (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+             { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+               stack := base ++ [Operand.Var z, Operand.Var out] }).2) := by
+  have hrev : inst.operands.reverse = [Operand.Var z, Operand.Var y, Operand.Var x] := by
+    rw [hops]; rfl
+  have hemitstack : (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2.stack
+      = base ++ [Operand.Var z, Operand.Var z, Operand.Var y, Operand.Var x] := by
+    rw [hrev, emit3_zspilled hstack0 hspill_z hlivez hnospill_y hlivey hnospill_x hlivex
+      hyz hxz hxy hdepth_y hsmall_y hdepth_x hsmall_x]
+  unfold generateRegularInstPlan
+  simp only [hcompute, hrev, houts]
+  rcases hemit : emitInputPlan inst.opcode [Operand.Var z, Operand.Var y, Operand.Var x]
+    nextLiveness ps with ⟨inputOps, ps1⟩
+  have hps1'' : ps1.stack
+      = (base ++ [Operand.Var z]) ++ [Operand.Var z, Operand.Var y, Operand.Var x] := by
+    have h2 : (emitInputPlan inst.opcode [Operand.Var z, Operand.Var y, Operand.Var x]
+        nextLiveness ps).2 = ps1 := by rw [hemit]
+    rw [hrev] at hemitstack
+    rw [← h2, hemitstack]; simp
+  have hmem : out ∈ nextLiveness := by simpa using hlive
+  have hpush : stackPop 3 ps1.stack ++ [Operand.Var out]
+      = base ++ [Operand.Var z, Operand.Var out] := by
+    rw [hps1'', stackPop_3_append_triple]; simp [List.append_assoc]
+  simp [generateEmitOps_evmName hname,
+        reorderPlan_triple_var_nil (base ++ [Operand.Var z]) z y x ps1 hps1''
+          (Ne.symm hyz) (Ne.symm hxy) (Ne.symm hxz),
+        hpush, stackPush, popmanyPlan_nil, hmem, hncomm, hnjmp]
+
+/-- **Z-spilled ternop sim** — restore `z`, DUP the live `y`/`x` (the mixed emission), run the
+    ternop over the positioned top three, push `out`: the whole plan preserves `venomAsmRel`
+    across `out := f wx wy wz`. The first runnable spilled ternary producer. -/
+theorem genRegularInstPlan_ternopVar_zspilled_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {offsetToPc : AssocList Nat Nat}
+    {x y z out : String} {wx wy wz : bytes32} {base : List Operand} {name : String}
+    {offz d_y d_x : Nat} {f : bytes32 → bytes32 → bytes32 → bytes32}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x, Operand.Var y, Operand.Var z])
+    (houts : inst.outputs = [out])
+    (hxy : x ≠ y) (hyz : y ≠ z) (hxz : x ≠ z) (hox : out ≠ x) (hoy : out ≠ y)
+    (hstack0 : ps.stack = base)
+    (hlive : nextLiveness.contains out = true)
+    (hfresh : ¬ (Operand.Var out) ∈ base)
+    (hspill_out : alookup' ps.spilled (Operand.Var out) = none)
+    (hspill_z : alookup' ps.spilled (Operand.Var z) = some offz)
+    (hlivez : nextLiveness.contains z = true)
+    (hnospill_y : alookup' ps.spilled (Operand.Var y) = none)
+    (hlivey : nextLiveness.contains y = true)
+    (hnospill_x : alookup' ps.spilled (Operand.Var x) = none)
+    (hlivex : nextLiveness.contains x = true)
+    (hdepth_y : stackGetDepth (Operand.Var y) ps.stack = some d_y) (hsmall_y : d_y + 2 ≤ 15)
+    (hdepth_x : stackGetDepth (Operand.Var x) ps.stack = some d_x) (hsmall_x : d_x + 3 ≤ 15)
+    (hvx : operandVal vs lo (Operand.Var x) = some wx)
+    (hvy : operandVal vs lo (Operand.Var y) = some wy)
+    (hvz : operandVal vs lo (Operand.Var z) = some wz)
+    (hspillWf : ∀ o off, alookup' ps.spilled o = some off →
+        32 ∣ off ∧ off + 32 ≤ as.memory.size ∧ off < 2 ^ 256)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp name → asmStep offsetToPc prog s = asmTernop f s)
+    (hoptnoop : optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+        { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+          stack := base ++ [Operand.Var z, Operand.Var out] }
+      = ([], { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+              stack := base ++ [Operand.Var z, Operand.Var out] }))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2 (updateVar out (f wx wy wz) vs) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  have hrev : inst.operands.reverse = [Operand.Var z, Operand.Var y, Operand.Var x] := by
+    rw [hops]; rfl
+  have hemit3 := emit3_zspilled (opc := inst.opcode) (nl := nextLiveness)
+    hstack0 hspill_z hlivez hnospill_y hlivey hnospill_x hlivex hyz hxz hxy
+    hdepth_y hsmall_y hdepth_x hsmall_x
+  rw [genRegularInstPlan_ternopVar_zspilled_eq hname hncomm hnjmp hcompute hops houts hxy hyz hxz
+      hstack0 hlive hspill_z hlivez hnospill_y hlivey hnospill_x hlivex hdepth_y hsmall_y
+      hdepth_x hsmall_x, hoptnoop, hrev] at hblock ⊢
+  simp only [List.append_nil] at hblock ⊢
+  set ps1 := (emitInputPlan inst.opcode [Operand.Var z, Operand.Var y, Operand.Var x]
+    nextLiveness ps).2 with hps1def
+  have hemit3flat : ps1
+      = { ps with stack := base ++ [Operand.Var z, Operand.Var z, Operand.Var y, Operand.Var x],
+                  spilled := aremove ps.spilled (Operand.Var z),
+                  alloc := freeSpillSlot offz ps.alloc } := by
+    rw [hps1def]; exact hemit3
+  have hps1stack : ps1.stack
+      = (base ++ [Operand.Var z]) ++ [Operand.Var z, Operand.Var y, Operand.Var x] := by
+    rw [hemit3flat]; simp
+  have hps1spill : alookup' ps1.spilled (Operand.Var out) = none := by
+    rw [hemit3flat]
+    show alookup' (aremove ps.spilled (Operand.Var z)) (Operand.Var out) = none
+    exact aremove_lookup_none ps.spilled (Operand.Var z) (Operand.Var out) hspill_out
+  rw [executePlan_append] at hblock
+  obtain ⟨hbI, hbE⟩ := asmBlockAt_append hblock
+  have hok : emitMixedOk nextLiveness [z, y, x] ps.spilled ps.stack := by
+    have hy' : alookup' (aremove ps.spilled (Operand.Var z)) (Operand.Var y) = none :=
+      aremove_lookup_none ps.spilled (Operand.Var z) (Operand.Var y) hnospill_y
+    have hx' : alookup' (aremove ps.spilled (Operand.Var z)) (Operand.Var x) = none :=
+      aremove_lookup_none ps.spilled (Operand.Var z) (Operand.Var x) hnospill_x
+    simp only [emitMixedOk, hspill_z]
+    rw [hy', hx']
+    refine ⟨hlivez, hlivey, ⟨d_y + 2, ?_, by omega, hlivex, ⟨d_x + 3, ?_, by omega, trivial⟩⟩⟩
+    · rw [show ps.stack ++ [Operand.Var z, Operand.Var z]
+            = (ps.stack ++ [Operand.Var z]) ++ [Operand.Var z] from by simp,
+          stackGetDepth_append_ne (ps.stack ++ [Operand.Var z]) hyz,
+          stackGetDepth_append_ne ps.stack hyz, hdepth_y]; rfl
+    · rw [show ps.stack ++ [Operand.Var z, Operand.Var z] ++ [Operand.Var y]
+            = ((ps.stack ++ [Operand.Var z]) ++ [Operand.Var z]) ++ [Operand.Var y] from by simp,
+          stackGetDepth_append_ne ((ps.stack ++ [Operand.Var z]) ++ [Operand.Var z]) hxy,
+          stackGetDepth_append_ne (ps.stack ++ [Operand.Var z]) hxz,
+          stackGetDepth_append_ne ps.stack hxz, hdepth_x]; rfl
+  obtain ⟨as1, hrunI, hrelI, hpcI, _⟩ :=
+    emitInputPlan_mixed_sim inst.opcode nextLiveness [z, y, x] ps hok hspillWf hrel hbI
+  simp only [show ([z, y, x].map Operand.Var)
+      = [Operand.Var z, Operand.Var y, Operand.Var x] from rfl] at hrunI hrelI hpcI
+  have hstacktop : as1.stack = wx :: wy :: wz :: as1.stack.drop 3 :=
+    venomAsmRel_asmStack_top3_var hrelI hps1stack hvx hvy hvz
+  have hfresh1 : ¬ (Operand.Var out) ∈ ps1.stack := by
+    rw [hps1stack]
+    simp only [List.mem_append, List.mem_cons, List.not_mem_nil, or_false]
+    rintro ((h | h) | h | h | h) <;> simp_all
+  have hbE' : asmBlockAt prog as1.pc (executePlan [StackOp.SOEmit name]) := by
+    rw [hpcI]; exact hbE
+  obtain ⟨as2, hrunE, hrelE, hpcE⟩ :=
+    emit_3op_sim hrelI hstacktop hfresh1 hps1spill hbE' (fun h hg => hdisp as1 h hg)
+  have hps6 : ({ ps1 with stack := stackPush (Operand.Var out) (stackPop 3 ps1.stack) } : PlanState)
+      = { ps1 with stack := base ++ [Operand.Var z, Operand.Var out] } := by
+    rw [hps1stack, stackPop_3_append_triple]
+    simp [stackPush, List.append_assoc]
+  rw [hps6] at hrelE
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrelE
+  refine ⟨as2, ?_, hrelR, ?_⟩
+  · rw [executePlan_append, List.length_append]; exact runAsm_compose hrunI hrunE
+  · rw [executePlan_append, List.length_append, hpcE, hpcI]; omega
+
+
+/-- Closed form of the LLS ternop input emission (`z`/`y` live, `x` spilled): DUP the two live
+    operands, then restore+dup `x` — `base ++ [z, y, x, x]`, the spill entry gone, the slot freed. -/
+theorem emit3_xspilled {opc nl x y z ps base offx d_z d_y}
+    (hstack0 : ps.stack = base)
+    (hnospill_z : alookup' ps.spilled (Operand.Var z) = none) (hlivez : nl.contains z = true)
+    (hnospill_y : alookup' ps.spilled (Operand.Var y) = none) (hlivey : nl.contains y = true)
+    (hspill_x : alookup' ps.spilled (Operand.Var x) = some offx) (hlivex : nl.contains x = true)
+    (hyz : y ≠ z)
+    (hdepth_z : stackGetDepth (Operand.Var z) ps.stack = some d_z) (hsmall_z : d_z ≤ 15)
+    (hdepth_y : stackGetDepth (Operand.Var y) ps.stack = some d_y) (hsmall_y : d_y + 1 ≤ 15) :
+    (emitInputPlan opc [Operand.Var z, Operand.Var y, Operand.Var x] nl ps).2
+      = { ps with stack := base ++ [Operand.Var z, Operand.Var y, Operand.Var x, Operand.Var x],
+                  spilled := aremove ps.spilled (Operand.Var x),
+                  alloc := freeSpillSlot offx ps.alloc } := by
+  -- leg z: DUP at d_z
+  have hpeekz : stackPeek d_z ps.stack = Operand.Var z := stackGetDepth_peek hdepth_z
+  have hddz : doDup d_z ps = ([StackOp.SODup (d_z + 1)], { ps with stack := stackDup d_z ps.stack }) := by
+    unfold doDup; rw [if_pos hsmall_z]
+  have hlegz : emitOneInput opc nl (Operand.Var z) ps
+      = ([StackOp.SODup (d_z + 1)], { ps with stack := stackDup d_z ps.stack }) := by
+    unfold emitOneInput
+    simp only [isVarOperand, hnospill_z, Option.isSome_none, Bool.and_false, Bool.false_eq_true,
+      if_false, hlivez, if_true, hdepth_z, hddz, List.nil_append]
+  set psZ : PlanState := { ps with stack := stackDup d_z ps.stack } with hpsZdef
+  have hpsZstack : psZ.stack = ps.stack ++ [Operand.Var z] := by
+    rw [hpsZdef]; show stackDup d_z ps.stack = _; unfold stackDup; rw [hpeekz]
+  -- leg y: DUP at d_y + 1 over base ++ [z]
+  have hdepthy1 : stackGetDepth (Operand.Var y) psZ.stack = some (d_y + 1) := by
+    rw [hpsZstack, stackGetDepth_append_ne ps.stack hyz, hdepth_y]; rfl
+  have hnospilly1 : alookup' psZ.spilled (Operand.Var y) = none := hnospill_y
+  have hpeeky : stackPeek (d_y + 1) psZ.stack = Operand.Var y := stackGetDepth_peek hdepthy1
+  have hddy : doDup (d_y + 1) psZ
+      = ([StackOp.SODup (d_y + 1 + 1)], { psZ with stack := stackDup (d_y + 1) psZ.stack }) := by
+    unfold doDup; rw [if_pos hsmall_y]
+  have hlegy : emitOneInput opc nl (Operand.Var y) psZ
+      = ([StackOp.SODup (d_y + 1 + 1)], { psZ with stack := stackDup (d_y + 1) psZ.stack }) := by
+    unfold emitOneInput
+    simp only [isVarOperand, hnospilly1, Option.isSome_none, Bool.and_false, Bool.false_eq_true,
+      if_false, hlivey, if_true, hdepthy1, hddy, List.nil_append]
+  set psY : PlanState := { psZ with stack := stackDup (d_y + 1) psZ.stack } with hpsYdef
+  have hpsYstack : psY.stack = ps.stack ++ [Operand.Var z, Operand.Var y] := by
+    rw [hpsYdef]; show stackDup (d_y + 1) psZ.stack = _
+    unfold stackDup; rw [hpeeky, hpsZstack]; simp
+  -- leg x: restore + dup (the spilled map untouched by the DUPs)
+  have hspillx1 : alookup' psY.spilled (Operand.Var x) = some offx := hspill_x
+  have hlegx : emitOneInput opc nl (Operand.Var x) psY
+      = ([StackOp.SORestore offx, StackOp.SODup 1],
+         { psY with stack := psY.stack ++ [Operand.Var x, Operand.Var x],
+                    spilled := aremove psY.spilled (Operand.Var x),
+                    alloc := freeSpillSlot offx psY.alloc }) :=
+    emitOneInput_var_spilled_eq hspillx1 hlivex
+  have hemit3 : (emitInputPlan opc [Operand.Var z, Operand.Var y, Operand.Var x] nl ps).2
+      = { psY with stack := psY.stack ++ [Operand.Var x, Operand.Var x],
+                   spilled := aremove psY.spilled (Operand.Var x),
+                   alloc := freeSpillSlot offx psY.alloc } := by
+    unfold emitInputPlan
+    simp only [List.foldl_cons, List.foldl_nil, hlegz, hlegy, hlegx, List.nil_append]
+  rw [hemit3, hpsYstack, hstack0]
+  simp [hpsYdef, hpsZdef, List.append_assoc]
+
+/-- **First-spilled ternop plan reduction**: LLS emit, the proven `SWAP3;SWAP2;SWAP1` reorder
+    (`reorderPlan_ternop_firstspilled`), the op over the positioned top three, `out` pushed —
+    intermediate `base ++ [x, out]` (net +2 over the kept restored copy). -/
+theorem genRegularInstPlan_ternopVar_xspilled_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {x y z out : String} {base : List Operand} {name : String} {offx d_z d_y : Nat}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x, Operand.Var y, Operand.Var z])
+    (houts : inst.outputs = [out])
+    (hyz : y ≠ z) (hxz : x ≠ z)
+    (hstack0 : ps.stack = base)
+    (hlive : nextLiveness.contains out = true)
+    (hnospill_z : alookup' ps.spilled (Operand.Var z) = none)
+    (hlivez : nextLiveness.contains z = true)
+    (hnospill_y : alookup' ps.spilled (Operand.Var y) = none)
+    (hlivey : nextLiveness.contains y = true)
+    (hspill_x : alookup' ps.spilled (Operand.Var x) = some offx)
+    (hlivex : nextLiveness.contains x = true)
+    (hdepth_z : stackGetDepth (Operand.Var z) ps.stack = some d_z) (hsmall_z : d_z ≤ 15)
+    (hdepth_y : stackGetDepth (Operand.Var y) ps.stack = some d_y) (hsmall_y : d_y + 1 ≤ 15) :
+    generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator
+        curBbLabel ps
+      = (((emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).1
+            ++ [StackOp.SOSwap 3, StackOp.SOSwap 2, StackOp.SOSwap 1] ++ [StackOp.SOEmit name]
+            ++ (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+                  { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+                    stack := base ++ [Operand.Var x, Operand.Var out] }).1),
+         releaseDeadSpills nextLiveness
+           (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+             { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+               stack := base ++ [Operand.Var x, Operand.Var out] }).2) := by
+  have hrev : inst.operands.reverse = [Operand.Var z, Operand.Var y, Operand.Var x] := by
+    rw [hops]; rfl
+  have hemit3 := emit3_xspilled (opc := inst.opcode) (nl := nextLiveness) hstack0 hnospill_z hlivez
+    hnospill_y hlivey hspill_x hlivex hyz hdepth_z hsmall_z hdepth_y hsmall_y
+  unfold generateRegularInstPlan
+  simp only [hcompute, hrev, houts]
+  rcases hemit : emitInputPlan inst.opcode [Operand.Var z, Operand.Var y, Operand.Var x]
+    nextLiveness ps with ⟨inputOps, ps1⟩
+  have h2 : (emitInputPlan inst.opcode [Operand.Var z, Operand.Var y, Operand.Var x]
+      nextLiveness ps).2 = ps1 := by rw [hemit]
+  have hps1stack : ps1.stack
+      = base ++ [Operand.Var z, Operand.Var y, Operand.Var x, Operand.Var x] := by
+    rw [← h2, hemit3]
+  have hreorder : reorderPlan [Operand.Var z, Operand.Var y, Operand.Var x] ps1
+      = ([StackOp.SOSwap 3, StackOp.SOSwap 2, StackOp.SOSwap 1],
+         { ps1 with stack := base ++ [Operand.Var x, Operand.Var z, Operand.Var y, Operand.Var x] }) :=
+    reorderPlan_ternop_firstspilled base x y z ps1 hxz hyz hps1stack
+  have hmem : out ∈ nextLiveness := by simpa using hlive
+  have hpush : stackPop 3 (base ++ [Operand.Var x, Operand.Var z, Operand.Var y, Operand.Var x])
+      ++ [Operand.Var out] = base ++ [Operand.Var x, Operand.Var out] := by
+    rw [show base ++ [Operand.Var x, Operand.Var z, Operand.Var y, Operand.Var x]
+          = (base ++ [Operand.Var x]) ++ [Operand.Var z, Operand.Var y, Operand.Var x] from by simp,
+        stackPop_3_append_triple]; simp [List.append_assoc]
+  simp [generateEmitOps_evmName hname, hreorder, hpush, stackPush, popmanyPlan_nil, hmem,
+        hncomm, hnjmp]
+
+/-- **First-spilled ternop sim**: DUP the live `z`/`y`, restore `x`, run the proven
+    `SWAP3;SWAP2;SWAP1` reorder, the ternop over the positioned top three, push `out` — the whole
+    plan preserves `venomAsmRel` across `out := f wx wy wz`. Composes the mixed emission sim, three
+    `doSwap_sim`, and `emit_3op_sim`. -/
+theorem genRegularInstPlan_ternopVar_xspilled_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {offsetToPc : AssocList Nat Nat}
+    {x y z out : String} {wx wy wz : bytes32} {base : List Operand} {name : String}
+    {offx d_z d_y : Nat} {f : bytes32 → bytes32 → bytes32 → bytes32}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x, Operand.Var y, Operand.Var z])
+    (houts : inst.outputs = [out])
+    (hyz : y ≠ z) (hxz : x ≠ z) (hox : out ≠ x) (hoy : out ≠ y) (hoz : out ≠ z)
+    (hstack0 : ps.stack = base)
+    (hlive : nextLiveness.contains out = true)
+    (hfresh : ¬ (Operand.Var out) ∈ base)
+    (hspill_out : alookup' ps.spilled (Operand.Var out) = none)
+    (hnospill_z : alookup' ps.spilled (Operand.Var z) = none)
+    (hlivez : nextLiveness.contains z = true)
+    (hnospill_y : alookup' ps.spilled (Operand.Var y) = none)
+    (hlivey : nextLiveness.contains y = true)
+    (hspill_x : alookup' ps.spilled (Operand.Var x) = some offx)
+    (hlivex : nextLiveness.contains x = true)
+    (hdepth_z : stackGetDepth (Operand.Var z) ps.stack = some d_z) (hsmall_z : d_z ≤ 15)
+    (hdepth_y : stackGetDepth (Operand.Var y) ps.stack = some d_y) (hsmall_y : d_y + 1 ≤ 15)
+    (hvx : operandVal vs lo (Operand.Var x) = some wx)
+    (hvy : operandVal vs lo (Operand.Var y) = some wy)
+    (hvz : operandVal vs lo (Operand.Var z) = some wz)
+    (hspillWf : ∀ o off, alookup' ps.spilled o = some off →
+        32 ∣ off ∧ off + 32 ≤ as.memory.size ∧ off < 2 ^ 256)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp name → asmStep offsetToPc prog s = asmTernop f s)
+    (hoptnoop : optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+        { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+          stack := base ++ [Operand.Var x, Operand.Var out] }
+      = ([], { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+              stack := base ++ [Operand.Var x, Operand.Var out] }))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2 (updateVar out (f wx wy wz) vs) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  have hrev : inst.operands.reverse = [Operand.Var z, Operand.Var y, Operand.Var x] := by
+    rw [hops]; rfl
+  rw [genRegularInstPlan_ternopVar_xspilled_eq hname hncomm hnjmp hcompute hops houts hyz hxz
+      hstack0 hlive hnospill_z hlivez hnospill_y hlivey hspill_x hlivex hdepth_z hsmall_z
+      hdepth_y hsmall_y, hoptnoop, hrev] at hblock ⊢
+  simp only [List.append_nil] at hblock ⊢
+  set ps1 := (emitInputPlan inst.opcode [Operand.Var z, Operand.Var y, Operand.Var x]
+    nextLiveness ps).2 with hps1def
+  have hemit3 := emit3_xspilled (opc := inst.opcode) (nl := nextLiveness) hstack0 hnospill_z hlivez
+    hnospill_y hlivey hspill_x hlivex hyz hdepth_z hsmall_z hdepth_y hsmall_y
+  have hps1stack : ps1.stack
+      = base ++ [Operand.Var z, Operand.Var y, Operand.Var x, Operand.Var x] := by
+    rw [hps1def, hemit3]
+  have hps1spill : alookup' ps1.spilled (Operand.Var out) = none := by
+    rw [hps1def, hemit3]
+    show alookup' (aremove ps.spilled (Operand.Var x)) (Operand.Var out) = none
+    exact aremove_lookup_none ps.spilled (Operand.Var x) (Operand.Var out) hspill_out
+  rw [show ((emitInputPlan inst.opcode [Operand.Var z, Operand.Var y, Operand.Var x]
+            nextLiveness ps).1
+            ++ [StackOp.SOSwap 3, StackOp.SOSwap 2, StackOp.SOSwap 1] ++ [StackOp.SOEmit name])
+        = (emitInputPlan inst.opcode [Operand.Var z, Operand.Var y, Operand.Var x]
+            nextLiveness ps).1
+            ++ ([StackOp.SOSwap 3] ++ ([StackOp.SOSwap 2]
+              ++ ([StackOp.SOSwap 1] ++ [StackOp.SOEmit name]))) from by simp] at hblock ⊢
+  rw [executePlan_append, executePlan_append, executePlan_append, executePlan_append] at hblock
+  obtain ⟨hbI, hbRest⟩ := asmBlockAt_append hblock
+  obtain ⟨hbSwap3raw, hbRest2⟩ := asmBlockAt_append hbRest
+  obtain ⟨hbSwap2raw, hbRest3⟩ := asmBlockAt_append hbRest2
+  obtain ⟨hbSwap1raw, hbEmitraw⟩ := asmBlockAt_append hbRest3
+  -- the LLS emission
+  have hok : emitMixedOk nextLiveness [z, y, x] ps.spilled ps.stack := by
+    have hdy1 : stackGetDepth (Operand.Var y) (ps.stack ++ [Operand.Var z]) = some (d_y + 1) := by
+      rw [stackGetDepth_append_ne ps.stack hyz, hdepth_y]; rfl
+    simp only [emitMixedOk, hnospill_z, hnospill_y, hspill_x]
+    exact ⟨hlivez, ⟨d_z, hdepth_z, by omega, ⟨hlivey, ⟨d_y + 1, hdy1, by omega,
+      ⟨hlivex, trivial⟩⟩⟩⟩⟩
+  obtain ⟨as1, hrunI, hrelI, hpcI, _⟩ :=
+    emitInputPlan_mixed_sim inst.opcode nextLiveness [z, y, x] ps hok hspillWf hrel hbI
+  simp only [show ([z, y, x].map Operand.Var)
+      = [Operand.Var z, Operand.Var y, Operand.Var x] from rfl] at hrunI hrelI hpcI
+  -- SWAP3
+  have hlen3 : (3 : Nat) < ps1.stack.length := by rw [hps1stack]; simp
+  have hswap3 : doSwap 3 ps1
+      = ([StackOp.SOSwap 3], { ps1 with stack := base ++ [Operand.Var x, Operand.Var y,
+          Operand.Var x, Operand.Var z] }) := by
+    rw [doSwap_three]; congr 1
+    rw [hps1stack,
+        stackSwap_3_append_quad base (Operand.Var z) (Operand.Var y) (Operand.Var x) (Operand.Var x)]
+  have hbSwap3 : asmBlockAt prog as1.pc (executePlan [StackOp.SOSwap 3]) := by
+    rw [hpcI]; exact hbSwap3raw
+  obtain ⟨as2, hrun2, hrel2, hpc2⟩ :=
+    doSwap_sim (offsetToPc := offsetToPc) hswap3 hrelI hlen3 hbSwap3 (by intro h; omega)
+  -- SWAP2
+  have hlen2 : (2 : Nat) < ({ ps1 with stack := base ++ [Operand.Var x, Operand.Var y,
+      Operand.Var x, Operand.Var z] } : PlanState).stack.length := by simp
+  have hswap2 : doSwap 2 { ps1 with stack := base ++ [Operand.Var x, Operand.Var y,
+        Operand.Var x, Operand.Var z] }
+      = ([StackOp.SOSwap 2], { ps1 with stack := base ++ [Operand.Var x, Operand.Var z,
+          Operand.Var x, Operand.Var y] }) := by
+    rw [doSwap_two]; congr 1
+    rw [show ({ ps1 with stack := base ++ [Operand.Var x, Operand.Var y, Operand.Var x,
+          Operand.Var z] } : PlanState).stack
+          = base ++ [Operand.Var x, Operand.Var y, Operand.Var x, Operand.Var z] from rfl,
+        stackSwap_2_append_quad base (Operand.Var x) (Operand.Var y) (Operand.Var x) (Operand.Var z)]
+  have hbSwap2 : asmBlockAt prog as2.pc (executePlan [StackOp.SOSwap 2]) := by
+    rw [hpc2, hpcI]; exact hbSwap2raw
+  obtain ⟨as3, hrun3, hrel3, hpc3⟩ :=
+    doSwap_sim (offsetToPc := offsetToPc) hswap2 hrel2 hlen2 hbSwap2 (by intro h; omega)
+  -- SWAP1
+  have hlen1 : (1 : Nat) < ({ ps1 with stack := base ++ [Operand.Var x, Operand.Var z,
+      Operand.Var x, Operand.Var y] } : PlanState).stack.length := by simp
+  have hswap1 : doSwap 1 { ps1 with stack := base ++ [Operand.Var x, Operand.Var z,
+        Operand.Var x, Operand.Var y] }
+      = ([StackOp.SOSwap 1], { ps1 with stack := base ++ [Operand.Var x, Operand.Var z,
+          Operand.Var y, Operand.Var x] }) := by
+    rw [doSwap_one]; congr 1
+    rw [show ({ ps1 with stack := base ++ [Operand.Var x, Operand.Var z, Operand.Var x,
+          Operand.Var y] } : PlanState).stack
+          = base ++ [Operand.Var x, Operand.Var z, Operand.Var x, Operand.Var y] from rfl,
+        stackSwap_1_append_quad base (Operand.Var x) (Operand.Var z) (Operand.Var x) (Operand.Var y)]
+  have hbSwap1 : asmBlockAt prog as3.pc (executePlan [StackOp.SOSwap 1]) := by
+    rw [hpc3, hpc2, hpcI]; exact hbSwap1raw
+  obtain ⟨as4, hrun4, hrel4, hpc4⟩ :=
+    doSwap_sim (offsetToPc := offsetToPc) hswap1 hrel3 hlen1 hbSwap1 (by intro h; omega)
+  -- the ternop over the positioned top three
+  have hps4stack : ({ ps1 with stack := base ++ [Operand.Var x, Operand.Var z, Operand.Var y,
+      Operand.Var x] } : PlanState).stack
+      = (base ++ [Operand.Var x]) ++ [Operand.Var z, Operand.Var y, Operand.Var x] := by simp
+  have hstacktop : as4.stack = wx :: wy :: wz :: as4.stack.drop 3 :=
+    venomAsmRel_asmStack_top3_var hrel4 hps4stack hvx hvy hvz
+  have hfresh4 : ¬ (Operand.Var out) ∈ ({ ps1 with stack := base ++ [Operand.Var x,
+      Operand.Var z, Operand.Var y, Operand.Var x] } : PlanState).stack := by
+    show ¬ (Operand.Var out) ∈ base ++ [Operand.Var x, Operand.Var z, Operand.Var y, Operand.Var x]
+    simp only [List.mem_append, List.mem_cons, List.not_mem_nil, or_false]
+    rintro (h | h | h | h | h)
+    · exact hfresh h
+    · exact hox (by injection h)
+    · exact hoz (by injection h)
+    · exact hoy (by injection h)
+    · exact hox (by injection h)
+  have hps4spill : AssocList.lookup Operand Nat ({ ps1 with stack := base ++ [Operand.Var x,
+      Operand.Var z, Operand.Var y, Operand.Var x] } : PlanState).spilled (Operand.Var out)
+      = none := hps1spill
+  have hbEmit : asmBlockAt prog as4.pc (executePlan [StackOp.SOEmit name]) := by
+    rw [hpc4, hpc3, hpc2, hpcI]; exact hbEmitraw
+  obtain ⟨as5, hrun5, hrel5, hpc5⟩ :=
+    emit_3op_sim hrel4 hstacktop hfresh4 hps4spill hbEmit (fun h hg => hdisp as4 h hg)
+  have hps6 : ({ { ps1 with stack := base ++ [Operand.Var x, Operand.Var z, Operand.Var y,
+        Operand.Var x] } with
+        stack := stackPush (Operand.Var out) (stackPop 3 (base ++ [Operand.Var x, Operand.Var z,
+          Operand.Var y, Operand.Var x])) } : PlanState)
+      = { ps1 with stack := base ++ [Operand.Var x, Operand.Var out] } := by
+    rw [show base ++ [Operand.Var x, Operand.Var z, Operand.Var y, Operand.Var x]
+          = (base ++ [Operand.Var x]) ++ [Operand.Var z, Operand.Var y, Operand.Var x] from by simp,
+        stackPop_3_append_triple]
+    simp [stackPush, List.append_assoc]
+  rw [hps6] at hrel5
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrel5
+  have hlenEq : (executePlan ((emitInputPlan inst.opcode [Operand.Var z, Operand.Var y,
+        Operand.Var x] nextLiveness ps).1
+        ++ ([StackOp.SOSwap 3] ++ ([StackOp.SOSwap 2]
+          ++ ([StackOp.SOSwap 1] ++ [StackOp.SOEmit name]))))).length
+      = (executePlan (emitInputPlan inst.opcode [Operand.Var z, Operand.Var y, Operand.Var x]
+          nextLiveness ps).1).length
+        + ((executePlan [StackOp.SOSwap 3]).length + ((executePlan [StackOp.SOSwap 2]).length
+           + ((executePlan [StackOp.SOSwap 1]).length + (executePlan [StackOp.SOEmit name]).length))) := by
+    rw [executePlan_append, executePlan_append, executePlan_append, executePlan_append,
+        List.length_append, List.length_append, List.length_append, List.length_append]
+  refine ⟨as5, ?_, hrelR, ?_⟩
+  · rw [hlenEq]
+    exact runAsm_compose hrunI (runAsm_compose hrun2 (runAsm_compose hrun3
+      (runAsm_compose hrun4 hrun5)))
+  · rw [hlenEq, hpc5, hpc4, hpc3, hpc2, hpcI]; omega
+
+/-- **Mid-spilled ternary emission**: `z` live (DUP at `d_z`), `y` spilled (restore + keep-alive
+    DUP), `x` live (DUP at `d_x + 3` over the three pushes) — stack grows by
+    `[z, y, y, x]`, `y` leaves the spilled map, its slot is freed. -/
+theorem emit3_yspilled {opc nl x y z ps base offy d_z d_x}
+    (hstack0 : ps.stack = base)
+    (hnospill_z : alookup' ps.spilled (Operand.Var z) = none) (hlivez : nl.contains z = true)
+    (hspill_y : alookup' ps.spilled (Operand.Var y) = some offy) (hlivey : nl.contains y = true)
+    (hnospill_x : alookup' ps.spilled (Operand.Var x) = none) (hlivex : nl.contains x = true)
+    (hxy : x ≠ y) (hxz : x ≠ z)
+    (hdepth_z : stackGetDepth (Operand.Var z) ps.stack = some d_z) (hsmall_z : d_z ≤ 15)
+    (hdepth_x : stackGetDepth (Operand.Var x) ps.stack = some d_x) (hsmall_x : d_x + 3 ≤ 15) :
+    (emitInputPlan opc [Operand.Var z, Operand.Var y, Operand.Var x] nl ps).2
+      = { ps with stack := base ++ [Operand.Var z, Operand.Var y, Operand.Var y, Operand.Var x],
+                  spilled := aremove ps.spilled (Operand.Var y),
+                  alloc := freeSpillSlot offy ps.alloc } := by
+  -- leg z: DUP at d_z
+  have hpeekz : stackPeek d_z ps.stack = Operand.Var z := stackGetDepth_peek hdepth_z
+  have hddz : doDup d_z ps = ([StackOp.SODup (d_z + 1)], { ps with stack := stackDup d_z ps.stack }) := by
+    unfold doDup; rw [if_pos hsmall_z]
+  have hlegz : emitOneInput opc nl (Operand.Var z) ps
+      = ([StackOp.SODup (d_z + 1)], { ps with stack := stackDup d_z ps.stack }) := by
+    unfold emitOneInput
+    simp only [isVarOperand, hnospill_z, Option.isSome_none, Bool.and_false, Bool.false_eq_true,
+      if_false, hlivez, if_true, hdepth_z, hddz, List.nil_append]
+  set psZ : PlanState := { ps with stack := stackDup d_z ps.stack } with hpsZdef
+  have hpsZstack : psZ.stack = ps.stack ++ [Operand.Var z] := by
+    rw [hpsZdef]; show stackDup d_z ps.stack = _; unfold stackDup; rw [hpeekz]
+  -- leg y: restore + dup (the spilled map untouched by the z DUP)
+  have hspilly1 : alookup' psZ.spilled (Operand.Var y) = some offy := hspill_y
+  have hlegy : emitOneInput opc nl (Operand.Var y) psZ
+      = ([StackOp.SORestore offy, StackOp.SODup 1],
+         { psZ with stack := psZ.stack ++ [Operand.Var y, Operand.Var y],
+                    spilled := aremove psZ.spilled (Operand.Var y),
+                    alloc := freeSpillSlot offy psZ.alloc }) :=
+    emitOneInput_var_spilled_eq hspilly1 hlivey
+  set psY : PlanState :=
+    { psZ with
+        stack := psZ.stack ++ [Operand.Var y, Operand.Var y],
+        spilled := aremove psZ.spilled (Operand.Var y),
+        alloc := freeSpillSlot offy psZ.alloc } with hpsYdef
+  have hpsYstack : psY.stack
+      = ps.stack ++ [Operand.Var z, Operand.Var y, Operand.Var y] := by
+    rw [hpsYdef]; show psZ.stack ++ _ = _; rw [hpsZstack]; simp
+  -- leg x: DUP at d_x + 3 over the grown stack, past the removed y
+  have hnospillx1 : alookup' psY.spilled (Operand.Var x) = none := by
+    show alookup' (aremove psZ.spilled (Operand.Var y)) (Operand.Var x) = none
+    exact aremove_lookup_none psZ.spilled (Operand.Var y) (Operand.Var x) hnospill_x
+  have hdepthx3 : stackGetDepth (Operand.Var x) psY.stack = some (d_x + 3) := by
+    rw [hpsYstack,
+        show ps.stack ++ [Operand.Var z, Operand.Var y, Operand.Var y]
+          = ((ps.stack ++ [Operand.Var z]) ++ [Operand.Var y]) ++ [Operand.Var y] from by simp,
+        stackGetDepth_append_ne ((ps.stack ++ [Operand.Var z]) ++ [Operand.Var y]) hxy,
+        stackGetDepth_append_ne (ps.stack ++ [Operand.Var z]) hxy,
+        stackGetDepth_append_ne ps.stack hxz, hdepth_x]; rfl
+  have hpeekx : stackPeek (d_x + 3) psY.stack = Operand.Var x := stackGetDepth_peek hdepthx3
+  have hddx : doDup (d_x + 3) psY
+      = ([StackOp.SODup (d_x + 3 + 1)], { psY with stack := stackDup (d_x + 3) psY.stack }) := by
+    unfold doDup; rw [if_pos hsmall_x]
+  have hlegx : emitOneInput opc nl (Operand.Var x) psY
+      = ([StackOp.SODup (d_x + 3 + 1)], { psY with stack := stackDup (d_x + 3) psY.stack }) := by
+    unfold emitOneInput
+    simp only [isVarOperand, hnospillx1, Option.isSome_none, Bool.and_false, Bool.false_eq_true,
+      if_false, hlivex, if_true, hdepthx3, hddx, List.nil_append]
+  have hemit3 : (emitInputPlan opc [Operand.Var z, Operand.Var y, Operand.Var x] nl ps).2
+      = { psY with stack := stackDup (d_x + 3) psY.stack } := by
+    unfold emitInputPlan
+    simp only [List.foldl_cons, List.foldl_nil, hlegz, hlegy, hlegx, List.nil_append]
+  have hstk : stackDup (d_x + 3) psY.stack
+      = ps.stack ++ [Operand.Var z, Operand.Var y, Operand.Var y, Operand.Var x] := by
+    unfold stackDup; rw [hpeekx, hpsYstack]; simp
+  rw [hemit3, hstk, hstack0]
+
+/-- **Mid-spilled ternop plan reduction**: LLS emit, the proven `SWAP3;SWAP2;SWAP1;SWAP3` reorder
+    (`reorderPlan_ternop_midspilled`, equal-`y` SWAP1 no-op included), the op over the positioned
+    top three, `out` pushed — intermediate `base ++ [y, out]` (net +2 over the kept restored copy). -/
+theorem genRegularInstPlan_ternopVar_yspilled_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {x y z out : String} {base : List Operand} {name : String} {offy d_z d_x : Nat}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x, Operand.Var y, Operand.Var z])
+    (houts : inst.outputs = [out])
+    (hxy : x ≠ y) (hxz : x ≠ z) (hyz : y ≠ z)
+    (hstack0 : ps.stack = base)
+    (hlive : nextLiveness.contains out = true)
+    (hnospill_z : alookup' ps.spilled (Operand.Var z) = none)
+    (hlivez : nextLiveness.contains z = true)
+    (hspill_y : alookup' ps.spilled (Operand.Var y) = some offy)
+    (hlivey : nextLiveness.contains y = true)
+    (hnospill_x : alookup' ps.spilled (Operand.Var x) = none)
+    (hlivex : nextLiveness.contains x = true)
+    (hdepth_z : stackGetDepth (Operand.Var z) ps.stack = some d_z) (hsmall_z : d_z ≤ 15)
+    (hdepth_x : stackGetDepth (Operand.Var x) ps.stack = some d_x) (hsmall_x : d_x + 3 ≤ 15) :
+    generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator
+        curBbLabel ps
+      = (((emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).1
+            ++ [StackOp.SOSwap 3, StackOp.SOSwap 2, StackOp.SOSwap 1, StackOp.SOSwap 3]
+            ++ [StackOp.SOEmit name]
+            ++ (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+                  { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+                    stack := base ++ [Operand.Var y, Operand.Var out] }).1),
+         releaseDeadSpills nextLiveness
+           (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+             { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+               stack := base ++ [Operand.Var y, Operand.Var out] }).2) := by
+  have hrev : inst.operands.reverse = [Operand.Var z, Operand.Var y, Operand.Var x] := by
+    rw [hops]; rfl
+  have hemit3 := emit3_yspilled (opc := inst.opcode) (nl := nextLiveness) hstack0 hnospill_z hlivez
+    hspill_y hlivey hnospill_x hlivex hxy hxz hdepth_z hsmall_z hdepth_x hsmall_x
+  unfold generateRegularInstPlan
+  simp only [hcompute, hrev, houts]
+  rcases hemit : emitInputPlan inst.opcode [Operand.Var z, Operand.Var y, Operand.Var x]
+    nextLiveness ps with ⟨inputOps, ps1⟩
+  have h2 : (emitInputPlan inst.opcode [Operand.Var z, Operand.Var y, Operand.Var x]
+      nextLiveness ps).2 = ps1 := by rw [hemit]
+  have hps1stack : ps1.stack
+      = base ++ [Operand.Var z, Operand.Var y, Operand.Var y, Operand.Var x] := by
+    rw [← h2, hemit3]
+  have hreorder : reorderPlan [Operand.Var z, Operand.Var y, Operand.Var x] ps1
+      = ([StackOp.SOSwap 3, StackOp.SOSwap 2, StackOp.SOSwap 1, StackOp.SOSwap 3],
+         { ps1 with stack := base ++ [Operand.Var y, Operand.Var z, Operand.Var y, Operand.Var x] }) :=
+    reorderPlan_ternop_midspilled base x y z ps1 hxy hxz hyz hps1stack
+  have hmem : out ∈ nextLiveness := by simpa using hlive
+  have hpush : stackPop 3 (base ++ [Operand.Var y, Operand.Var z, Operand.Var y, Operand.Var x])
+      ++ [Operand.Var out] = base ++ [Operand.Var y, Operand.Var out] := by
+    rw [show base ++ [Operand.Var y, Operand.Var z, Operand.Var y, Operand.Var x]
+          = (base ++ [Operand.Var y]) ++ [Operand.Var z, Operand.Var y, Operand.Var x] from by simp,
+        stackPop_3_append_triple]; simp [List.append_assoc]
+  simp [generateEmitOps_evmName hname, hreorder, hpush, stackPush, popmanyPlan_nil, hmem,
+        hncomm, hnjmp]
+
+/-- **Mid-spilled ternop sim**: DUP the live `z`, restore `y`, DUP the live `x`, run the proven
+    `SWAP3;SWAP2;SWAP1;SWAP3` reorder (the equal-`y` SWAP1 is a stack no-op), the ternop over the
+    positioned top three, push `out` — the whole plan preserves `venomAsmRel` across
+    `out := f wx wy wz`. -/
+theorem genRegularInstPlan_ternopVar_yspilled_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {offsetToPc : AssocList Nat Nat}
+    {x y z out : String} {wx wy wz : bytes32} {base : List Operand} {name : String}
+    {offy d_z d_x : Nat} {f : bytes32 → bytes32 → bytes32 → bytes32}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x, Operand.Var y, Operand.Var z])
+    (houts : inst.outputs = [out])
+    (hxy : x ≠ y) (hxz : x ≠ z) (hyz : y ≠ z) (hox : out ≠ x) (hoy : out ≠ y) (hoz : out ≠ z)
+    (hstack0 : ps.stack = base)
+    (hlive : nextLiveness.contains out = true)
+    (hfresh : ¬ (Operand.Var out) ∈ base)
+    (hspill_out : alookup' ps.spilled (Operand.Var out) = none)
+    (hnospill_z : alookup' ps.spilled (Operand.Var z) = none)
+    (hlivez : nextLiveness.contains z = true)
+    (hspill_y : alookup' ps.spilled (Operand.Var y) = some offy)
+    (hlivey : nextLiveness.contains y = true)
+    (hnospill_x : alookup' ps.spilled (Operand.Var x) = none)
+    (hlivex : nextLiveness.contains x = true)
+    (hdepth_z : stackGetDepth (Operand.Var z) ps.stack = some d_z) (hsmall_z : d_z ≤ 15)
+    (hdepth_x : stackGetDepth (Operand.Var x) ps.stack = some d_x) (hsmall_x : d_x + 3 ≤ 15)
+    (hvx : operandVal vs lo (Operand.Var x) = some wx)
+    (hvy : operandVal vs lo (Operand.Var y) = some wy)
+    (hvz : operandVal vs lo (Operand.Var z) = some wz)
+    (hspillWf : ∀ o off, alookup' ps.spilled o = some off →
+        32 ∣ off ∧ off + 32 ≤ as.memory.size ∧ off < 2 ^ 256)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp name → asmStep offsetToPc prog s = asmTernop f s)
+    (hoptnoop : optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+        { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+          stack := base ++ [Operand.Var y, Operand.Var out] }
+      = ([], { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+              stack := base ++ [Operand.Var y, Operand.Var out] }))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2 (updateVar out (f wx wy wz) vs) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  have hrev : inst.operands.reverse = [Operand.Var z, Operand.Var y, Operand.Var x] := by
+    rw [hops]; rfl
+  rw [genRegularInstPlan_ternopVar_yspilled_eq hname hncomm hnjmp hcompute hops houts hxy hxz hyz
+      hstack0 hlive hnospill_z hlivez hspill_y hlivey hnospill_x hlivex hdepth_z hsmall_z
+      hdepth_x hsmall_x, hoptnoop, hrev] at hblock ⊢
+  simp only [List.append_nil] at hblock ⊢
+  set ps1 := (emitInputPlan inst.opcode [Operand.Var z, Operand.Var y, Operand.Var x]
+    nextLiveness ps).2 with hps1def
+  have hemit3 := emit3_yspilled (opc := inst.opcode) (nl := nextLiveness) hstack0 hnospill_z hlivez
+    hspill_y hlivey hnospill_x hlivex hxy hxz hdepth_z hsmall_z hdepth_x hsmall_x
+  have hps1stack : ps1.stack
+      = base ++ [Operand.Var z, Operand.Var y, Operand.Var y, Operand.Var x] := by
+    rw [hps1def, hemit3]
+  have hps1spill : alookup' ps1.spilled (Operand.Var out) = none := by
+    rw [hps1def, hemit3]
+    show alookup' (aremove ps.spilled (Operand.Var y)) (Operand.Var out) = none
+    exact aremove_lookup_none ps.spilled (Operand.Var y) (Operand.Var out) hspill_out
+  rw [show ((emitInputPlan inst.opcode [Operand.Var z, Operand.Var y, Operand.Var x]
+            nextLiveness ps).1
+            ++ [StackOp.SOSwap 3, StackOp.SOSwap 2, StackOp.SOSwap 1, StackOp.SOSwap 3]
+            ++ [StackOp.SOEmit name])
+        = (emitInputPlan inst.opcode [Operand.Var z, Operand.Var y, Operand.Var x]
+            nextLiveness ps).1
+            ++ ([StackOp.SOSwap 3] ++ ([StackOp.SOSwap 2]
+              ++ ([StackOp.SOSwap 1] ++ ([StackOp.SOSwap 3]
+                ++ [StackOp.SOEmit name])))) from by simp] at hblock ⊢
+  rw [executePlan_append, executePlan_append, executePlan_append, executePlan_append,
+      executePlan_append] at hblock
+  obtain ⟨hbI, hbRest⟩ := asmBlockAt_append hblock
+  obtain ⟨hbSwap3raw, hbRest2⟩ := asmBlockAt_append hbRest
+  obtain ⟨hbSwap2raw, hbRest3⟩ := asmBlockAt_append hbRest2
+  obtain ⟨hbSwap1raw, hbRest4⟩ := asmBlockAt_append hbRest3
+  obtain ⟨hbSwap3braw, hbEmitraw⟩ := asmBlockAt_append hbRest4
+  -- the LLS emission
+  have hok : emitMixedOk nextLiveness [z, y, x] ps.spilled ps.stack := by
+    have hx' : alookup' (aremove ps.spilled (Operand.Var y)) (Operand.Var x) = none :=
+      aremove_lookup_none ps.spilled (Operand.Var y) (Operand.Var x) hnospill_x
+    simp only [emitMixedOk, hnospill_z, hspill_y, hx']
+    refine ⟨hlivez, d_z, hdepth_z, by omega, hlivey, hlivex, d_x + 3, ?_, by omega, trivial⟩
+    rw [show ps.stack ++ [Operand.Var z] ++ [Operand.Var y, Operand.Var y]
+          = ((ps.stack ++ [Operand.Var z]) ++ [Operand.Var y]) ++ [Operand.Var y] from by simp,
+        stackGetDepth_append_ne ((ps.stack ++ [Operand.Var z]) ++ [Operand.Var y]) hxy,
+        stackGetDepth_append_ne (ps.stack ++ [Operand.Var z]) hxy,
+        stackGetDepth_append_ne ps.stack hxz, hdepth_x]; rfl
+  obtain ⟨as1, hrunI, hrelI, hpcI, _⟩ :=
+    emitInputPlan_mixed_sim inst.opcode nextLiveness [z, y, x] ps hok hspillWf hrel hbI
+  simp only [show ([z, y, x].map Operand.Var)
+      = [Operand.Var z, Operand.Var y, Operand.Var x] from rfl] at hrunI hrelI hpcI
+  -- SWAP3
+  have hlen3 : (3 : Nat) < ps1.stack.length := by rw [hps1stack]; simp
+  have hswap3 : doSwap 3 ps1
+      = ([StackOp.SOSwap 3], { ps1 with stack := base ++ [Operand.Var x, Operand.Var y,
+          Operand.Var y, Operand.Var z] }) := by
+    rw [doSwap_three]; congr 1
+    rw [hps1stack,
+        stackSwap_3_append_quad base (Operand.Var z) (Operand.Var y) (Operand.Var y) (Operand.Var x)]
+  have hbSwap3 : asmBlockAt prog as1.pc (executePlan [StackOp.SOSwap 3]) := by
+    rw [hpcI]; exact hbSwap3raw
+  obtain ⟨as2, hrun2, hrel2, hpc2⟩ :=
+    doSwap_sim (offsetToPc := offsetToPc) hswap3 hrelI hlen3 hbSwap3 (by intro h; omega)
+  -- SWAP2
+  have hlen2 : (2 : Nat) < ({ ps1 with stack := base ++ [Operand.Var x, Operand.Var y,
+      Operand.Var y, Operand.Var z] } : PlanState).stack.length := by simp
+  have hswap2 : doSwap 2 { ps1 with stack := base ++ [Operand.Var x, Operand.Var y,
+        Operand.Var y, Operand.Var z] }
+      = ([StackOp.SOSwap 2], { ps1 with stack := base ++ [Operand.Var x, Operand.Var z,
+          Operand.Var y, Operand.Var y] }) := by
+    rw [doSwap_two]; congr 1
+    rw [show ({ ps1 with stack := base ++ [Operand.Var x, Operand.Var y, Operand.Var y,
+          Operand.Var z] } : PlanState).stack
+          = base ++ [Operand.Var x, Operand.Var y, Operand.Var y, Operand.Var z] from rfl,
+        stackSwap_2_append_quad base (Operand.Var x) (Operand.Var y) (Operand.Var y) (Operand.Var z)]
+  have hbSwap2 : asmBlockAt prog as2.pc (executePlan [StackOp.SOSwap 2]) := by
+    rw [hpc2, hpcI]; exact hbSwap2raw
+  obtain ⟨as3, hrun3, hrel3, hpc3⟩ :=
+    doSwap_sim (offsetToPc := offsetToPc) hswap2 hrel2 hlen2 hbSwap2 (by intro h; omega)
+  -- SWAP1 (equal-y stack no-op)
+  have hlen1 : (1 : Nat) < ({ ps1 with stack := base ++ [Operand.Var x, Operand.Var z,
+      Operand.Var y, Operand.Var y] } : PlanState).stack.length := by simp
+  have hswap1 : doSwap 1 { ps1 with stack := base ++ [Operand.Var x, Operand.Var z,
+        Operand.Var y, Operand.Var y] }
+      = ([StackOp.SOSwap 1], { ps1 with stack := base ++ [Operand.Var x, Operand.Var z,
+          Operand.Var y, Operand.Var y] }) := by
+    rw [doSwap_one]; congr 1
+    rw [show ({ ps1 with stack := base ++ [Operand.Var x, Operand.Var z, Operand.Var y,
+          Operand.Var y] } : PlanState).stack
+          = base ++ [Operand.Var x, Operand.Var z, Operand.Var y, Operand.Var y] from rfl,
+        stackSwap_1_append_quad base (Operand.Var x) (Operand.Var z) (Operand.Var y) (Operand.Var y)]
+  have hbSwap1 : asmBlockAt prog as3.pc (executePlan [StackOp.SOSwap 1]) := by
+    rw [hpc3, hpc2, hpcI]; exact hbSwap1raw
+  obtain ⟨as4, hrun4, hrel4, hpc4⟩ :=
+    doSwap_sim (offsetToPc := offsetToPc) hswap1 hrel3 hlen1 hbSwap1 (by intro h; omega)
+  -- second SWAP3
+  have hlen3b : (3 : Nat) < ({ ps1 with stack := base ++ [Operand.Var x, Operand.Var z,
+      Operand.Var y, Operand.Var y] } : PlanState).stack.length := by simp
+  have hswap3b : doSwap 3 { ps1 with stack := base ++ [Operand.Var x, Operand.Var z,
+        Operand.Var y, Operand.Var y] }
+      = ([StackOp.SOSwap 3], { ps1 with stack := base ++ [Operand.Var y, Operand.Var z,
+          Operand.Var y, Operand.Var x] }) := by
+    rw [doSwap_three]; congr 1
+    rw [show ({ ps1 with stack := base ++ [Operand.Var x, Operand.Var z, Operand.Var y,
+          Operand.Var y] } : PlanState).stack
+          = base ++ [Operand.Var x, Operand.Var z, Operand.Var y, Operand.Var y] from rfl,
+        stackSwap_3_append_quad base (Operand.Var x) (Operand.Var z) (Operand.Var y) (Operand.Var y)]
+  have hbSwap3b : asmBlockAt prog as4.pc (executePlan [StackOp.SOSwap 3]) := by
+    rw [hpc4, hpc3, hpc2, hpcI]; exact hbSwap3braw
+  obtain ⟨as5, hrun5, hrel5, hpc5⟩ :=
+    doSwap_sim (offsetToPc := offsetToPc) hswap3b hrel4 hlen3b hbSwap3b (by intro h; omega)
+  -- the ternop over the positioned top three
+  have hps5stack : ({ ps1 with stack := base ++ [Operand.Var y, Operand.Var z, Operand.Var y,
+      Operand.Var x] } : PlanState).stack
+      = (base ++ [Operand.Var y]) ++ [Operand.Var z, Operand.Var y, Operand.Var x] := by simp
+  have hstacktop : as5.stack = wx :: wy :: wz :: as5.stack.drop 3 :=
+    venomAsmRel_asmStack_top3_var hrel5 hps5stack hvx hvy hvz
+  have hfresh5 : ¬ (Operand.Var out) ∈ ({ ps1 with stack := base ++ [Operand.Var y,
+      Operand.Var z, Operand.Var y, Operand.Var x] } : PlanState).stack := by
+    show ¬ (Operand.Var out) ∈ base ++ [Operand.Var y, Operand.Var z, Operand.Var y, Operand.Var x]
+    simp only [List.mem_append, List.mem_cons, List.not_mem_nil, or_false]
+    rintro (h | h | h | h | h)
+    · exact hfresh h
+    · exact hoy (by injection h)
+    · exact hoz (by injection h)
+    · exact hoy (by injection h)
+    · exact hox (by injection h)
+  have hps5spill : AssocList.lookup Operand Nat ({ ps1 with stack := base ++ [Operand.Var y,
+      Operand.Var z, Operand.Var y, Operand.Var x] } : PlanState).spilled (Operand.Var out)
+      = none := hps1spill
+  have hbEmit : asmBlockAt prog as5.pc (executePlan [StackOp.SOEmit name]) := by
+    rw [hpc5, hpc4, hpc3, hpc2, hpcI]; exact hbEmitraw
+  obtain ⟨as6, hrun6, hrel6, hpc6⟩ :=
+    emit_3op_sim hrel5 hstacktop hfresh5 hps5spill hbEmit (fun h hg => hdisp as5 h hg)
+  have hps7 : ({ { ps1 with stack := base ++ [Operand.Var y, Operand.Var z, Operand.Var y,
+        Operand.Var x] } with
+        stack := stackPush (Operand.Var out) (stackPop 3 (base ++ [Operand.Var y, Operand.Var z,
+          Operand.Var y, Operand.Var x])) } : PlanState)
+      = { ps1 with stack := base ++ [Operand.Var y, Operand.Var out] } := by
+    rw [show base ++ [Operand.Var y, Operand.Var z, Operand.Var y, Operand.Var x]
+          = (base ++ [Operand.Var y]) ++ [Operand.Var z, Operand.Var y, Operand.Var x] from by simp,
+        stackPop_3_append_triple]
+    simp [stackPush, List.append_assoc]
+  rw [hps7] at hrel6
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrel6
+  have hlenEq : (executePlan ((emitInputPlan inst.opcode [Operand.Var z, Operand.Var y,
+        Operand.Var x] nextLiveness ps).1
+        ++ ([StackOp.SOSwap 3] ++ ([StackOp.SOSwap 2]
+          ++ ([StackOp.SOSwap 1] ++ ([StackOp.SOSwap 3] ++ [StackOp.SOEmit name])))))).length
+      = (executePlan (emitInputPlan inst.opcode [Operand.Var z, Operand.Var y, Operand.Var x]
+          nextLiveness ps).1).length
+        + ((executePlan [StackOp.SOSwap 3]).length + ((executePlan [StackOp.SOSwap 2]).length
+           + ((executePlan [StackOp.SOSwap 1]).length + ((executePlan [StackOp.SOSwap 3]).length
+             + (executePlan [StackOp.SOEmit name]).length)))) := by
+    rw [executePlan_append, executePlan_append, executePlan_append, executePlan_append,
+        executePlan_append, List.length_append, List.length_append, List.length_append,
+        List.length_append, List.length_append]
+  refine ⟨as6, ?_, hrelR, ?_⟩
+  · rw [hlenEq]
+    exact runAsm_compose hrunI (runAsm_compose hrun2 (runAsm_compose hrun3
+      (runAsm_compose hrun4 (runAsm_compose hrun5 hrun6))))
+  · rw [hlenEq, hpc6, hpc5, hpc4, hpc3, hpc2, hpcI]; omega
+/-- Full emit `.2` for a both-spilled 2-var op (`y`, `x` both spilled): stack `base ++ [y,y,x,x]`,
+    both slots freed. The SS analogue of `emit2_keyspilled`/`emit2_valspilled`. -/
+theorem emit2_bothspilled {opc nl x y ps base offx offy}
+    (hstack0 : ps.stack = base)
+    (hspill_y : alookup' ps.spilled (Operand.Var y) = some offy) (hlivey : nl.contains y = true)
+    (hspill_x : alookup' ps.spilled (Operand.Var x) = some offx) (hlivex : nl.contains x = true)
+    (hxy : x ≠ y) :
+    (emitInputPlan opc [Operand.Var y, Operand.Var x] nl ps).2
+      = { ps with stack := base ++ [Operand.Var y, Operand.Var y, Operand.Var x, Operand.Var x],
+                  spilled := aremove (aremove ps.spilled (Operand.Var y)) (Operand.Var x),
+                  alloc := freeSpillSlot offx (freeSpillSlot offy ps.alloc) } := by
+  have hhead : emitOneInput opc nl (Operand.Var y) ps
+      = ([StackOp.SORestore offy, StackOp.SODup 1],
+         { ps with stack := ps.stack ++ [Operand.Var y, Operand.Var y],
+                   spilled := aremove ps.spilled (Operand.Var y), alloc := freeSpillSlot offy ps.alloc }) :=
+    emitOneInput_var_spilled_eq hspill_y hlivey
+  set ps1 : PlanState := { ps with stack := ps.stack ++ [Operand.Var y, Operand.Var y],
+                                   spilled := aremove ps.spilled (Operand.Var y), alloc := freeSpillSlot offy ps.alloc } with hps1def
+  have hxney : (Operand.Var x) ≠ (Operand.Var y) := by intro h; injection h with h'; exact hxy h'
+  have hspillx1 : alookup' ps1.spilled (Operand.Var x) = some offx := by
+    rw [hps1def]
+    exact (aremove_lookup_ne ps.spilled (Operand.Var y) (Operand.Var x) hxney).trans hspill_x
+  have htail : emitOneInput opc nl (Operand.Var x) ps1
+      = ([StackOp.SORestore offx, StackOp.SODup 1],
+         { ps1 with stack := ps1.stack ++ [Operand.Var x, Operand.Var x],
+                    spilled := aremove ps1.spilled (Operand.Var x), alloc := freeSpillSlot offx ps1.alloc }) :=
+    emitOneInput_var_spilled_eq hspillx1 hlivex
+  have hemit2 : (emitInputPlan opc [Operand.Var y, Operand.Var x] nl ps).2
+      = { ps1 with stack := ps1.stack ++ [Operand.Var x, Operand.Var x],
+                   spilled := aremove ps1.spilled (Operand.Var x), alloc := freeSpillSlot offx ps1.alloc } := by
+    unfold emitInputPlan; simp only [List.foldl_cons, List.foldl_nil, hhead, htail, List.nil_append]
+  rw [hemit2, hps1def, hstack0]; simp
+
+/-- **Both-spilled store plan reduction.** `SSTORE x y`, both key `x` and value `y` spilled: emit
+    restores+DUPs each (`base ++ [y, y, x, x]`), the reorder is the same `SWAP2 ; SWAP1`
+    (`reorderPlan_bothspilled`) giving `base ++ [y, x, y, x]`, `stackPop 2` leaves `base ++ [y, x]`
+    (the two kept restored operands). -/
+theorem genRegularInstPlan_sstore_bothspilled_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {x y : String} {base : List Operand} {name : String} {offx offy : Nat}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x, Operand.Var y]) (houts : inst.outputs = [])
+    (hxy : x ≠ y) (hstack0 : ps.stack = base)
+    (hspill_y : alookup' ps.spilled (Operand.Var y) = some offy) (hlivey : nextLiveness.contains y = true)
+    (hspill_x : alookup' ps.spilled (Operand.Var x) = some offx) (hlivex : nextLiveness.contains x = true) :
+    generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator curBbLabel ps
+      = ((emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).1
+           ++ [StackOp.SOSwap 2, StackOp.SOSwap 1, StackOp.SOEmit name],
+         releaseDeadSpills nextLiveness
+           { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+             stack := base ++ [Operand.Var y, Operand.Var x] }) := by
+  have hrev : inst.operands.reverse = [Operand.Var y, Operand.Var x] := by rw [hops]; rfl
+  have hemit2 := emit2_bothspilled (opc := inst.opcode) (nl := nextLiveness) hstack0 hspill_y hlivey hspill_x hlivex hxy
+  unfold generateRegularInstPlan
+  simp only [hcompute, hrev, houts]
+  rcases hemit : emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps with ⟨inputOps, ps1⟩
+  have h2 : (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).2 = ps1 := by rw [hemit]
+  have hps1stack : ps1.stack = base ++ [Operand.Var y, Operand.Var y, Operand.Var x, Operand.Var x] := by
+    rw [← h2, hemit2]
+  have hreorder : reorderPlan [Operand.Var y, Operand.Var x] ps1
+      = ([StackOp.SOSwap 2, StackOp.SOSwap 1],
+         { ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var y, Operand.Var x] }) :=
+    reorderPlan_bothspilled base x y ps1 hxy hps1stack
+  have hpop2 : stackPop 2 (base ++ [Operand.Var y, Operand.Var x, Operand.Var y, Operand.Var x])
+      = base ++ [Operand.Var y, Operand.Var x] := by
+    rw [show base ++ [Operand.Var y, Operand.Var x, Operand.Var y, Operand.Var x]
+          = (base ++ [Operand.Var y, Operand.Var x]) ++ [Operand.Var y, Operand.Var x] from by simp,
+        stackPop_2_append_pair]
+  simp [generateEmitOps_evmName hname, hreorder, hpop2, hncomm, hnjmp]
+
+/-- **Both-spilled store sim.** `SSTORE x y` with both operands spilled runs correctly: restore+DUP
+    both (`base ++ [y,y,x,x]`), the `SWAP2 ; SWAP1` reorder (`base ++ [y,x,y,x]`), then `SSTORE`
+    consumes key+value — preserving `venomAsmRel` across `sstore wx wy vs`. Composes the both-restore
+    emit sim, two `doSwap_sim`, and `emit_sstore_sim`. -/
+theorem genRegularInstPlan_sstore_bothspilled_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {offsetToPc : AssocList Nat Nat} {x y : String} {wx wy : bytes32} {base : List Operand} {offx offy : Nat}
+    (hname : opcodeToEvmName inst.opcode = some "SSTORE")
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x, Operand.Var y]) (houts : inst.outputs = [])
+    (hxy : x ≠ y) (hstack0 : ps.stack = base)
+    (hspill_y : alookup' ps.spilled (Operand.Var y) = some offy) (hlivey : nextLiveness.contains y = true)
+    (hspill_x : alookup' ps.spilled (Operand.Var x) = some offx) (hlivex : nextLiveness.contains x = true)
+    (hvx : operandVal vs lo (Operand.Var x) = some wx)
+    (hvy : operandVal vs lo (Operand.Var y) = some wy)
+    (hspillWf : ∀ o off, alookup' ps.spilled o = some off →
+        32 ∣ off ∧ off + 32 ≤ as.memory.size ∧ off < 2 ^ 256)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp "SSTORE" → asmStep offsetToPc prog s = asmSstore s)
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2 (sstore wx wy vs) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  have hrev : inst.operands.reverse = [Operand.Var y, Operand.Var x] := by rw [hops]; rfl
+  rw [genRegularInstPlan_sstore_bothspilled_eq hname hncomm hnjmp hcompute hops houts hxy hstack0
+      hspill_y hlivey hspill_x hlivex, hrev] at hblock ⊢
+  set ps1 := (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).2 with hps1def
+  have hps1stack : ps1.stack = base ++ [Operand.Var y, Operand.Var y, Operand.Var x, Operand.Var x] := by
+    rw [hps1def, emit2_bothspilled (opc := inst.opcode) (nl := nextLiveness) hstack0 hspill_y hlivey hspill_x hlivex hxy]
+  rw [show ([StackOp.SOSwap 2, StackOp.SOSwap 1, StackOp.SOEmit "SSTORE"] : List StackOp)
+        = [StackOp.SOSwap 2] ++ ([StackOp.SOSwap 1] ++ [StackOp.SOEmit "SSTORE"]) from rfl] at hblock ⊢
+  rw [executePlan_append, executePlan_append, executePlan_append] at hblock
+  obtain ⟨hbI, hbRest⟩ := asmBlockAt_append hblock
+  obtain ⟨hbSwap2raw, hbRest2⟩ := asmBlockAt_append hbRest
+  obtain ⟨hbSwap1raw, hbStoreraw⟩ := asmBlockAt_append hbRest2
+  obtain ⟨as1, hrunI, hrelI, hpcI⟩ :=
+    emitInputPlan_pair_both_spilled_sim (offsetToPc := offsetToPc) (Ne.symm hxy) hspill_y hspill_x hlivey hlivex hrel hspillWf hbI
+  have hlen2 : (2 : Nat) < ps1.stack.length := by rw [hps1stack]; simp
+  have hswap2 : doSwap 2 ps1 = ([StackOp.SOSwap 2],
+      { ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var x, Operand.Var y] }) := by
+    rw [doSwap_two]; congr 1
+    rw [hps1stack, show base ++ [Operand.Var y, Operand.Var y, Operand.Var x, Operand.Var x]
+          = (base ++ [Operand.Var y]) ++ [Operand.Var y, Operand.Var x, Operand.Var x] from by simp,
+        stackSwap_2_append_triple (base ++ [Operand.Var y]) (Operand.Var y) (Operand.Var x) (Operand.Var x)]
+    simp
+  have hbSwap2 : asmBlockAt prog as1.pc (executePlan [StackOp.SOSwap 2]) := by rw [hpcI]; exact hbSwap2raw
+  obtain ⟨as2, hrun2, hrel2, hpc2⟩ := doSwap_sim (offsetToPc := offsetToPc) hswap2 hrelI hlen2 hbSwap2 (by intro h; omega)
+  have hlen1 : (1 : Nat) < ({ ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var x, Operand.Var y] } : PlanState).stack.length := by simp
+  have hswap1 : doSwap 1 { ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var x, Operand.Var y] }
+      = ([StackOp.SOSwap 1],
+         { ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var y, Operand.Var x] }) := by
+    rw [doSwap_one]; congr 1
+    rw [show ({ ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var x, Operand.Var y] } : PlanState).stack
+          = (base ++ [Operand.Var y]) ++ [Operand.Var x, Operand.Var x, Operand.Var y] from by simp,
+        stackSwap_1_append_triple (base ++ [Operand.Var y]) (Operand.Var x) (Operand.Var x) (Operand.Var y)]
+    simp
+  have hbSwap1 : asmBlockAt prog as2.pc (executePlan [StackOp.SOSwap 1]) := by rw [hpc2, hpcI]; exact hbSwap1raw
+  obtain ⟨as3, hrun3, hrel3, hpc3⟩ := doSwap_sim (offsetToPc := offsetToPc) hswap1 hrel2 hlen1 hbSwap1 (by intro h; omega)
+  have hps3stack : ({ ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var y, Operand.Var x] } : PlanState).stack
+      = (base ++ [Operand.Var y, Operand.Var x]) ++ [Operand.Var y, Operand.Var x] := by simp
+  have hstacktop : as3.stack = wx :: wy :: as3.stack.drop 2 :=
+    venomAsmRel_asmStack_top2_var hrel3 hps3stack hvx hvy
+  have hbSST : asmBlockAt prog as3.pc (executePlan [StackOp.SOEmit "SSTORE"]) := by rw [hpc3, hpc2, hpcI]; exact hbStoreraw
+  obtain ⟨as4, hrun4, hrel4, hpc4⟩ := emit_sstore_sim hrel3 hstacktop hbSST (fun h hg => hdisp as3 h hg)
+  have hps5 : ({ { ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var y, Operand.Var x] } with
+      stack := stackPop 2 (base ++ [Operand.Var y, Operand.Var x, Operand.Var y, Operand.Var x]) } : PlanState)
+      = { ps1 with stack := base ++ [Operand.Var y, Operand.Var x] } := by
+    rw [show base ++ [Operand.Var y, Operand.Var x, Operand.Var y, Operand.Var x]
+          = (base ++ [Operand.Var y, Operand.Var x]) ++ [Operand.Var y, Operand.Var x] from by simp,
+        stackPop_2_append_pair]
+  rw [hps5] at hrel4
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrel4
+  have hlenEq : (executePlan ((emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).1
+        ++ ([StackOp.SOSwap 2] ++ ([StackOp.SOSwap 1] ++ [StackOp.SOEmit "SSTORE"])))).length
+      = (executePlan (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).1).length
+        + ((executePlan [StackOp.SOSwap 2]).length
+           + ((executePlan [StackOp.SOSwap 1]).length + (executePlan [StackOp.SOEmit "SSTORE"]).length)) := by
+    rw [executePlan_append, executePlan_append, executePlan_append, List.length_append,
+        List.length_append, List.length_append]
+  refine ⟨as4, ?_, hrelR, ?_⟩
+  · rw [hlenEq]; exact runAsm_compose hrunI (runAsm_compose hrun2 (runAsm_compose hrun3 hrun4))
+  · rw [hlenEq, hpc4, hpc3, hpc2, hpcI]; omega
+
+/-- **Both-spilled non-commutative binop plan reduction.** Both operands spilled: emit
+    restores+DUPs each (`base ++ [y, y, x, x]`), the `SWAP2 ; SWAP1` reorder
+    (`reorderPlan_bothspilled`) gives `base ++ [y, x, y, x]`, the op pops two and pushes `out`
+    (optSwap intermediate `base ++ [y, x, out]` — both restored operands kept, net +3). -/
+theorem genRegularInstPlan_nonCommBinopVar_bothspilled_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {x y out : String} {base : List Operand} {name : String} {offx offy : Nat}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x, Operand.Var y])
+    (houts : inst.outputs = [out])
+    (hxy : x ≠ y)
+    (hstack0 : ps.stack = base)
+    (hlive : nextLiveness.contains out = true)
+    (hspill_y : alookup' ps.spilled (Operand.Var y) = some offy)
+    (hlivey : nextLiveness.contains y = true)
+    (hspill_x : alookup' ps.spilled (Operand.Var x) = some offx)
+    (hlivex : nextLiveness.contains x = true) :
+    generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator curBbLabel ps
+      = (((emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).1
+            ++ [StackOp.SOSwap 2, StackOp.SOSwap 1] ++ [StackOp.SOEmit name]
+            ++ (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+                  { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+                    stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var out] }).1),
+         releaseDeadSpills nextLiveness
+           (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+             { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+               stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var out] }).2) := by
+  have hrev : inst.operands.reverse = [Operand.Var y, Operand.Var x] := by rw [hops]; rfl
+  have hemit2 := emit2_bothspilled (opc := inst.opcode) (nl := nextLiveness) hstack0 hspill_y hlivey hspill_x hlivex hxy
+  unfold generateRegularInstPlan
+  simp only [hcompute, hrev, houts]
+  rcases hemit : emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps with ⟨inputOps, ps1⟩
+  have h2 : (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).2 = ps1 := by rw [hemit]
+  have hps1stack : ps1.stack = base ++ [Operand.Var y, Operand.Var y, Operand.Var x, Operand.Var x] := by
+    rw [← h2, hemit2]
+  have hreorder : reorderPlan [Operand.Var y, Operand.Var x] ps1
+      = ([StackOp.SOSwap 2, StackOp.SOSwap 1], { ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var y, Operand.Var x] }) :=
+    reorderPlan_bothspilled base x y ps1 hxy hps1stack
+  have hmem : out ∈ nextLiveness := by simpa using hlive
+  have hpush : stackPop 2 (base ++ [Operand.Var y, Operand.Var x, Operand.Var y, Operand.Var x]) ++ [Operand.Var out]
+      = base ++ [Operand.Var y, Operand.Var x, Operand.Var out] := by
+    rw [show base ++ [Operand.Var y, Operand.Var x, Operand.Var y, Operand.Var x]
+          = (base ++ [Operand.Var y, Operand.Var x]) ++ [Operand.Var y, Operand.Var x] from by simp,
+        stackPop_2_append_pair]; simp [List.append_assoc]
+  simp [generateEmitOps_evmName hname, hreorder, hpush, stackPush, popmanyPlan_nil, hmem, hncomm, hnjmp]
+
+/-- **Both-spilled non-commutative binop sim.** Both operands off spill slots: restore both,
+    `SWAP2 ; SWAP1` reorder, run the binop, push `out` — preserves `venomAsmRel` across
+    `out := f wx wy`. Composes the both-restore emit sim, two `doSwap_sim`, and `emit_binop_sim`. -/
+theorem genRegularInstPlan_nonCommBinopVar_bothspilled_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {offsetToPc : AssocList Nat Nat} {x y out : String} {wx wy : bytes32} {base : List Operand}
+    {name : String} {offx offy : Nat} {f : bytes32 → bytes32 → bytes32}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x, Operand.Var y])
+    (houts : inst.outputs = [out])
+    (hxy : x ≠ y) (hox : out ≠ x) (hoy : out ≠ y)
+    (hstack0 : ps.stack = base)
+    (hlive : nextLiveness.contains out = true)
+    (hfresh : ¬ (Operand.Var out) ∈ base)
+    (hspill_out : alookup' ps.spilled (Operand.Var out) = none)
+    (hspill_y : alookup' ps.spilled (Operand.Var y) = some offy)
+    (hlivey : nextLiveness.contains y = true)
+    (hspill_x : alookup' ps.spilled (Operand.Var x) = some offx)
+    (hlivex : nextLiveness.contains x = true)
+    (hvx : operandVal vs lo (Operand.Var x) = some wx)
+    (hvy : operandVal vs lo (Operand.Var y) = some wy)
+    (hspillWf : ∀ o off, alookup' ps.spilled o = some off →
+        32 ∣ off ∧ off + 32 ≤ as.memory.size ∧ off < 2 ^ 256)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp name → asmStep offsetToPc prog s = asmBinop f s)
+    (hoptnoop : optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+        { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+          stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var out] }
+      = ([], { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+              stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var out] }))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2 (updateVar out (f wx wy) vs) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  have hrev : inst.operands.reverse = [Operand.Var y, Operand.Var x] := by rw [hops]; rfl
+  rw [genRegularInstPlan_nonCommBinopVar_bothspilled_eq hname hncomm hnjmp hcompute hops houts hxy hstack0
+      hlive hspill_y hlivey hspill_x hlivex, hoptnoop, hrev] at hblock ⊢
+  simp only [List.append_nil] at hblock ⊢
+  set ps1 := (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).2 with hps1def
+  have hps1stack : ps1.stack = base ++ [Operand.Var y, Operand.Var y, Operand.Var x, Operand.Var x] := by
+    rw [hps1def, emit2_bothspilled (opc := inst.opcode) (nl := nextLiveness) hstack0 hspill_y hlivey hspill_x hlivex hxy]
+  have hps1spill : alookup' ps1.spilled (Operand.Var out) = none := by
+    rw [hps1def, emit2_bothspilled (opc := inst.opcode) (nl := nextLiveness) hstack0 hspill_y hlivey hspill_x hlivex hxy]
+    show alookup' (aremove (aremove ps.spilled (Operand.Var y)) (Operand.Var x)) (Operand.Var out) = none
+    exact ((aremove_lookup_ne _ (Operand.Var x) (Operand.Var out) (by intro h; injection h with h'; exact hox h')).trans
+      (aremove_lookup_ne _ (Operand.Var y) (Operand.Var out) (by intro h; injection h with h'; exact hoy h'))).trans hspill_out
+  rw [show ((emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).1
+            ++ [StackOp.SOSwap 2, StackOp.SOSwap 1] ++ [StackOp.SOEmit name])
+        = (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).1
+            ++ ([StackOp.SOSwap 2] ++ ([StackOp.SOSwap 1] ++ [StackOp.SOEmit name])) from by simp] at hblock ⊢
+  rw [executePlan_append, executePlan_append, executePlan_append] at hblock
+  obtain ⟨hbI, hbRest⟩ := asmBlockAt_append hblock
+  obtain ⟨hbSwap2raw, hbRest2⟩ := asmBlockAt_append hbRest
+  obtain ⟨hbSwap1raw, hbEmitraw⟩ := asmBlockAt_append hbRest2
+  obtain ⟨as1, hrunI, hrelI, hpcI⟩ :=
+    emitInputPlan_pair_both_spilled_sim (offsetToPc := offsetToPc) (Ne.symm hxy) hspill_y hspill_x hlivey hlivex hrel hspillWf hbI
+  have hlen2 : (2 : Nat) < ps1.stack.length := by rw [hps1stack]; simp
+  have hswap2 : doSwap 2 ps1 = ([StackOp.SOSwap 2],
+      { ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var x, Operand.Var y] }) := by
+    rw [doSwap_two]; congr 1
+    rw [hps1stack, show base ++ [Operand.Var y, Operand.Var y, Operand.Var x, Operand.Var x]
+          = (base ++ [Operand.Var y]) ++ [Operand.Var y, Operand.Var x, Operand.Var x] from by simp,
+        stackSwap_2_append_triple (base ++ [Operand.Var y]) (Operand.Var y) (Operand.Var x) (Operand.Var x)]
+    simp
+  have hbSwap2 : asmBlockAt prog as1.pc (executePlan [StackOp.SOSwap 2]) := by rw [hpcI]; exact hbSwap2raw
+  obtain ⟨as2, hrun2, hrel2, hpc2⟩ := doSwap_sim (offsetToPc := offsetToPc) hswap2 hrelI hlen2 hbSwap2 (by intro h; omega)
+  have hlen1 : (1 : Nat) < ({ ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var x, Operand.Var y] } : PlanState).stack.length := by simp
+  have hswap1 : doSwap 1 { ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var x, Operand.Var y] }
+      = ([StackOp.SOSwap 1],
+         { ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var y, Operand.Var x] }) := by
+    rw [doSwap_one]; congr 1
+    rw [show ({ ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var x, Operand.Var y] } : PlanState).stack
+          = (base ++ [Operand.Var y]) ++ [Operand.Var x, Operand.Var x, Operand.Var y] from by simp,
+        stackSwap_1_append_triple (base ++ [Operand.Var y]) (Operand.Var x) (Operand.Var x) (Operand.Var y)]
+    simp
+  have hbSwap1 : asmBlockAt prog as2.pc (executePlan [StackOp.SOSwap 1]) := by rw [hpc2, hpcI]; exact hbSwap1raw
+  obtain ⟨as3, hrun3, hrel3, hpc3⟩ := doSwap_sim (offsetToPc := offsetToPc) hswap1 hrel2 hlen1 hbSwap1 (by intro h; omega)
+  have hps3stack : ({ ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var y, Operand.Var x] } : PlanState).stack
+      = (base ++ [Operand.Var y, Operand.Var x]) ++ [Operand.Var y, Operand.Var x] := by simp
+  have hstacktop : as3.stack = wx :: wy :: as3.stack.drop 2 :=
+    venomAsmRel_asmStack_top2_var hrel3 hps3stack hvx hvy
+  have hfresh3 : ¬ (Operand.Var out) ∈ ({ ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var y, Operand.Var x] } : PlanState).stack := by
+    show ¬ (Operand.Var out) ∈ base ++ [Operand.Var y, Operand.Var x, Operand.Var y, Operand.Var x]
+    simp only [List.mem_append, List.mem_cons, List.not_mem_nil, or_false]
+    rintro (h | h | h | h | h)
+    · exact hfresh h
+    · exact hoy (by injection h)
+    · exact hox (by injection h)
+    · exact hoy (by injection h)
+    · exact hox (by injection h)
+  have hps3spill : alookup' ({ ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var y, Operand.Var x] } : PlanState).spilled (Operand.Var out) = none := hps1spill
+  have hbEmit : asmBlockAt prog as3.pc (executePlan [StackOp.SOEmit name]) := by rw [hpc3, hpc2, hpcI]; exact hbEmitraw
+  obtain ⟨as4, hrun4, hrel4, hpc4⟩ := emit_binop_sim hrel3 hstacktop hfresh3 hps3spill hbEmit (fun h hg => hdisp as3 h hg)
+  have hps5 : ({ { ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var y, Operand.Var x] } with
+      stack := stackPush (Operand.Var out) (stackPop 2 (base ++ [Operand.Var y, Operand.Var x, Operand.Var y, Operand.Var x])) } : PlanState)
+      = { ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var out] } := by
+    rw [show base ++ [Operand.Var y, Operand.Var x, Operand.Var y, Operand.Var x]
+          = (base ++ [Operand.Var y, Operand.Var x]) ++ [Operand.Var y, Operand.Var x] from by simp,
+        stackPop_2_append_pair]; simp [stackPush, List.append_assoc]
+  rw [hps5] at hrel4
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrel4
+  have hlenEq : (executePlan ((emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).1
+        ++ ([StackOp.SOSwap 2] ++ ([StackOp.SOSwap 1] ++ [StackOp.SOEmit name])))).length
+      = (executePlan (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).1).length
+        + ((executePlan [StackOp.SOSwap 2]).length
+           + ((executePlan [StackOp.SOSwap 1]).length + (executePlan [StackOp.SOEmit name]).length)) := by
+    rw [executePlan_append, executePlan_append, executePlan_append, List.length_append,
+        List.length_append, List.length_append]
+  refine ⟨as4, ?_, hrelR, ?_⟩
+  · rw [hlenEq]; exact runAsm_compose hrunI (runAsm_compose hrun2 (runAsm_compose hrun3 hrun4))
+  · rw [hlenEq, hpc4, hpc3, hpc2, hpcI]; omega
+
+/-- **Both-spilled commutative binop plan reduction.** Both operands spilled; the commutative dispatch
+    takes the swapped order (`reorderCost` tie), so the reorder is `SWAP1 ; SWAP2`
+    (`reorderPlan_bothspilled_swapped`, `base ++ [y,y,x,x]` → `base ++ [y,x,x,y]`); pop 2 then push
+    `out` gives optSwap intermediate `base ++ [y, x, out]` (net +3). -/
+theorem genRegularInstPlan_commBinopVar_bothspilled_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {x y out : String} {base : List Operand} {name : String} {offx offy : Nat}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hcomm : isCommutative inst.opcode = true)
+    (hops : inst.operands = [Operand.Var x, Operand.Var y])
+    (houts : inst.outputs = [out]) (hxy : x ≠ y) (hstack0 : ps.stack = base)
+    (hlive : nextLiveness.contains out = true)
+    (hspill_y : alookup' ps.spilled (Operand.Var y) = some offy) (hlivey : nextLiveness.contains y = true)
+    (hspill_x : alookup' ps.spilled (Operand.Var x) = some offx) (hlivex : nextLiveness.contains x = true) :
+    generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator curBbLabel ps
+      = (((emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).1
+            ++ [StackOp.SOSwap 1, StackOp.SOSwap 2] ++ [StackOp.SOEmit name]
+            ++ (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+                  { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+                    stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var out] }).1),
+         releaseDeadSpills nextLiveness
+           (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+             { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+               stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var out] }).2) := by
+  have hco := computeOperands_of_commutative inst hcomm
+  have hjmp := commutative_ne_jmp hcomm
+  have hrev : inst.operands.reverse = [Operand.Var y, Operand.Var x] := by rw [hops]; rfl
+  have hemit2 := emit2_bothspilled (opc := inst.opcode) (nl := nextLiveness) hstack0 hspill_y hlivey hspill_x hlivex hxy
+  unfold generateRegularInstPlan
+  simp only [hco, hrev, houts]
+  rcases hemit : emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps with ⟨inputOps, ps1⟩
+  have h2 : (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).2 = ps1 := by rw [hemit]
+  have hps1flat : ps1.stack = base ++ [Operand.Var y, Operand.Var y, Operand.Var x, Operand.Var x] := by rw [← h2, hemit2]
+  have hmem : out ∈ nextLiveness := by simpa using hlive
+  have hpush : stackPop 2 (base ++ [Operand.Var y, Operand.Var x, Operand.Var x, Operand.Var y]) ++ [Operand.Var out]
+      = base ++ [Operand.Var y, Operand.Var x, Operand.Var out] := by
+    rw [show base ++ [Operand.Var y, Operand.Var x, Operand.Var x, Operand.Var y]
+          = (base ++ [Operand.Var y, Operand.Var x]) ++ [Operand.Var x, Operand.Var y] from by simp,
+        stackPop_2_append_pair]; simp [List.append_assoc]
+  simp [generateEmitOps_evmName hname,
+        reorderPlan_bothspilled base x y ps1 hxy hps1flat,
+        reorderPlan_bothspilled_swapped base x y ps1 hxy hps1flat,
+        hpush, stackPush, popmanyPlan_nil, hmem, reorderCost, hcomm, hjmp]
+
+/-- **Both-spilled commutative binop sim.** Both operands off slots; the commutative dispatch
+    picks the swapped order (`SWAP1 ; SWAP2`); the binop pops `f wy wx`, rewritten to `f wx wy`
+    by `hfcomm`. Preserves `venomAsmRel` across `out := f wx wy`. -/
+theorem genRegularInstPlan_commBinopVar_bothspilled_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {offsetToPc : AssocList Nat Nat} {x y out : String} {wx wy : bytes32} {base : List Operand}
+    {name : String} {offx offy : Nat} {f : bytes32 → bytes32 → bytes32}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hcomm : isCommutative inst.opcode = true)
+    (hfcomm : ∀ (a b : bytes32), f a b = f b a)
+    (hops : inst.operands = [Operand.Var x, Operand.Var y]) (houts : inst.outputs = [out])
+    (hxy : x ≠ y) (hox : out ≠ x) (hoy : out ≠ y)
+    (hstack0 : ps.stack = base) (hlive : nextLiveness.contains out = true)
+    (hfresh : ¬ (Operand.Var out) ∈ base) (hspill_out : alookup' ps.spilled (Operand.Var out) = none)
+    (hspill_y : alookup' ps.spilled (Operand.Var y) = some offy) (hlivey : nextLiveness.contains y = true)
+    (hspill_x : alookup' ps.spilled (Operand.Var x) = some offx) (hlivex : nextLiveness.contains x = true)
+    (hvx : operandVal vs lo (Operand.Var x) = some wx)
+    (hvy : operandVal vs lo (Operand.Var y) = some wy)
+    (hspillWf : ∀ o off, alookup' ps.spilled o = some off →
+        32 ∣ off ∧ off + 32 ≤ as.memory.size ∧ off < 2 ^ 256)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp name → asmStep offsetToPc prog s = asmBinop f s)
+    (hoptnoop : optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+        { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+          stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var out] }
+      = ([], { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+              stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var out] }))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2 (updateVar out (f wx wy) vs) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  have hrev : inst.operands.reverse = [Operand.Var y, Operand.Var x] := by rw [hops]; rfl
+  rw [genRegularInstPlan_commBinopVar_bothspilled_eq hname hcomm hops houts hxy hstack0 hlive
+      hspill_y hlivey hspill_x hlivex, hoptnoop, hrev] at hblock ⊢
+  simp only [List.append_nil] at hblock ⊢
+  set ps1 := (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).2 with hps1def
+  have hps1stack : ps1.stack = base ++ [Operand.Var y, Operand.Var y, Operand.Var x, Operand.Var x] := by
+    rw [hps1def, emit2_bothspilled (opc := inst.opcode) (nl := nextLiveness) hstack0 hspill_y hlivey hspill_x hlivex hxy]
+  have hps1spill : alookup' ps1.spilled (Operand.Var out) = none := by
+    rw [hps1def, emit2_bothspilled (opc := inst.opcode) (nl := nextLiveness) hstack0 hspill_y hlivey hspill_x hlivex hxy]
+    show alookup' (aremove (aremove ps.spilled (Operand.Var y)) (Operand.Var x)) (Operand.Var out) = none
+    exact ((aremove_lookup_ne _ (Operand.Var x) (Operand.Var out) (by intro h; injection h with h'; exact hox h')).trans
+      (aremove_lookup_ne _ (Operand.Var y) (Operand.Var out) (by intro h; injection h with h'; exact hoy h'))).trans hspill_out
+  rw [show ((emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).1
+            ++ [StackOp.SOSwap 1, StackOp.SOSwap 2] ++ [StackOp.SOEmit name])
+        = (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).1
+            ++ ([StackOp.SOSwap 1] ++ ([StackOp.SOSwap 2] ++ [StackOp.SOEmit name])) from by simp] at hblock ⊢
+  rw [executePlan_append, executePlan_append, executePlan_append] at hblock
+  obtain ⟨hbI, hbRest⟩ := asmBlockAt_append hblock
+  obtain ⟨hbSwap1raw, hbRest2⟩ := asmBlockAt_append hbRest
+  obtain ⟨hbSwap2raw, hbEmitraw⟩ := asmBlockAt_append hbRest2
+  obtain ⟨as1, hrunI, hrelI, hpcI⟩ :=
+    emitInputPlan_pair_both_spilled_sim (offsetToPc := offsetToPc) (Ne.symm hxy) hspill_y hspill_x hlivey hlivex hrel hspillWf hbI
+  have hlen1 : (1 : Nat) < ps1.stack.length := by rw [hps1stack]; simp
+  have hswap1 : doSwap 1 ps1 = ([StackOp.SOSwap 1], { ps1 with stack := base ++ [Operand.Var y, Operand.Var y, Operand.Var x, Operand.Var x] }) := by
+    rw [doSwap_one]; congr 1
+    rw [hps1stack, show base ++ [Operand.Var y, Operand.Var y, Operand.Var x, Operand.Var x]
+          = (base ++ [Operand.Var y]) ++ [Operand.Var y, Operand.Var x, Operand.Var x] from by simp,
+        stackSwap_1_append_triple (base ++ [Operand.Var y]) (Operand.Var y) (Operand.Var x) (Operand.Var x)]
+  have hbSwap1 : asmBlockAt prog as1.pc (executePlan [StackOp.SOSwap 1]) := by rw [hpcI]; exact hbSwap1raw
+  obtain ⟨as2, hrun2, hrel2, hpc2⟩ := doSwap_sim (offsetToPc := offsetToPc) hswap1 hrelI hlen1 hbSwap1 (by intro h; omega)
+  have hlen2 : (2 : Nat) < ({ ps1 with stack := base ++ [Operand.Var y, Operand.Var y, Operand.Var x, Operand.Var x] } : PlanState).stack.length := by simp
+  have hswap2 : doSwap 2 { ps1 with stack := base ++ [Operand.Var y, Operand.Var y, Operand.Var x, Operand.Var x] }
+      = ([StackOp.SOSwap 2], { ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var x, Operand.Var y] }) := by
+    rw [doSwap_two]; congr 1
+    rw [show ({ ps1 with stack := base ++ [Operand.Var y, Operand.Var y, Operand.Var x, Operand.Var x] } : PlanState).stack
+          = (base ++ [Operand.Var y]) ++ [Operand.Var y, Operand.Var x, Operand.Var x] from by simp,
+        stackSwap_2_append_triple (base ++ [Operand.Var y]) (Operand.Var y) (Operand.Var x) (Operand.Var x)]
+    simp
+  have hbSwap2 : asmBlockAt prog as2.pc (executePlan [StackOp.SOSwap 2]) := by rw [hpc2, hpcI]; exact hbSwap2raw
+  obtain ⟨as3, hrun3, hrel3, hpc3⟩ := doSwap_sim (offsetToPc := offsetToPc) hswap2 hrel2 hlen2 hbSwap2 (by intro h; omega)
+  have hps3stack : ({ ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var x, Operand.Var y] } : PlanState).stack
+      = (base ++ [Operand.Var y, Operand.Var x]) ++ [Operand.Var x, Operand.Var y] := by simp
+  have hstacktop : as3.stack = wy :: wx :: as3.stack.drop 2 :=
+    venomAsmRel_asmStack_top2_var hrel3 hps3stack hvy hvx
+  have hfresh3 : ¬ (Operand.Var out) ∈ ({ ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var x, Operand.Var y] } : PlanState).stack := by
+    show ¬ (Operand.Var out) ∈ base ++ [Operand.Var y, Operand.Var x, Operand.Var x, Operand.Var y]
+    simp only [List.mem_append, List.mem_cons, List.not_mem_nil, or_false]
+    rintro (h | h | h | h | h)
+    · exact hfresh h
+    · exact hoy (by injection h)
+    · exact hox (by injection h)
+    · exact hox (by injection h)
+    · exact hoy (by injection h)
+  have hbEmit : asmBlockAt prog as3.pc (executePlan [StackOp.SOEmit name]) := by rw [hpc3, hpc2, hpcI]; exact hbEmitraw
+  obtain ⟨as4, hrun4, hrel4, hpc4⟩ := emit_binop_sim hrel3 hstacktop hfresh3 hps1spill hbEmit (fun h hg => hdisp as3 h hg)
+  rw [hfcomm wy wx] at hrel4
+  have hps5 : ({ { ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var x, Operand.Var y] } with
+      stack := stackPush (Operand.Var out) (stackPop 2 (base ++ [Operand.Var y, Operand.Var x, Operand.Var x, Operand.Var y])) } : PlanState)
+      = { ps1 with stack := base ++ [Operand.Var y, Operand.Var x, Operand.Var out] } := by
+    rw [show base ++ [Operand.Var y, Operand.Var x, Operand.Var x, Operand.Var y] = (base ++ [Operand.Var y, Operand.Var x]) ++ [Operand.Var x, Operand.Var y] from by simp,
+        stackPop_2_append_pair]; simp [stackPush, List.append_assoc]
+  rw [hps5] at hrel4
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrel4
+  have hlenEq : (executePlan ((emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).1
+        ++ ([StackOp.SOSwap 1] ++ ([StackOp.SOSwap 2] ++ [StackOp.SOEmit name])))).length
+      = (executePlan (emitInputPlan inst.opcode [Operand.Var y, Operand.Var x] nextLiveness ps).1).length
+        + ((executePlan [StackOp.SOSwap 1]).length
+           + ((executePlan [StackOp.SOSwap 2]).length + (executePlan [StackOp.SOEmit name]).length)) := by
+    rw [executePlan_append, executePlan_append, executePlan_append, List.length_append,
+        List.length_append, List.length_append]
+  refine ⟨as4, ?_, hrelR, ?_⟩
+  · rw [hlenEq]; exact runAsm_compose hrunI (runAsm_compose hrun2 (runAsm_compose hrun3 hrun4))
+  · rw [hlenEq, hpc4, hpc3, hpc2, hpcI]; omega
+
 
 end EvmYul.Venom.Hol.Codegen

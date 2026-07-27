@@ -8,10 +8,10 @@ require mathlib from git
 -- pull evm-abi-lean's computable keccak/encoder so the ERC-20 selector *values*
 -- are checked inside this build instead of only out-of-process (abi_crossval.sh).
 -- Pinned to a commit for reproducible verification (see the `AbiCrossval` target);
--- `fix_roundtrip` drops the flawed unconditional dynamic roundtrips, so the whole
--- evm-abi-lean library is sorry-free at this pin.
+-- The pin tracks upstream main (modular Roundtrip split + the general
+-- `roundtrip_wf`/`roundtrip_args_wff` capstones); sorry-free at this pin.
 require «abi-lean» from git
-  "https://github.com/yihuang/evm-abi-lean.git" @ "d5f903eb2b509ef4e77fb83d9550a80e1c45b7ee"
+  "https://github.com/yihuang/evm-abi-lean.git" @ "c6c2a9afa7cb725c5a515f56f8ee911a4e88feb0"
 
 package «evmyul» {
   moreLeanArgs := #["-DautoImplicit=false"]

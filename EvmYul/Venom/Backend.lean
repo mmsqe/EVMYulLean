@@ -1943,4 +1943,39 @@ theorem guarded_debit
   · rw [he_k, he_sto, he_amt] at hkf; exact hkf
   · rw [← hbalval]; exact hle
 
+
+/-- **Fully packaged block-level load equivalence.** The orig tail `KECCAK256; SLOAD` and the
+    optimized tail `NOT; SLOAD` push equal values, with the storage relation *derived* from both
+    states realizing the same abstract balance map (not assumed), and the optimized key pinned by
+    the strong `NOT` shape (`~aP`). The **only** residual is `hkeyO` — identifying the key the real
+    EVM `KECCAK256` produces with the balance-slot function's value `fslot aP` (the keccak *value*
+    through FFI; under faithful `List` memory this is `balanceKeccak_is_slot_keccak`). -/
+theorem evm_balanceLoad_block_equiv_of_realizes
+    (s_o0 s_o1 s_o2 s_p0 s_p1 s_p2 : EVM.State) (f cost : ℕ)
+    (argK argSO argN argSP : Option (UInt256 × Nat))
+    (szO offO : UInt256) (tlO : Stack UInt256)
+    (aP : UInt256) (tlP : Stack UInt256)
+    (B fslot : UInt256 → UInt256)
+    (hO0 : s_o0.stack = szO :: offO :: tlO)
+    (hOkec : EVM.step (f + 1) cost (some (.KECCAK256, argK)) s_o0 = .ok s_o1)
+    (hOsl  : EVM.step (f + 1) cost (some (.SLOAD, argSO)) s_o1 = .ok s_o2)
+    (hP0 : s_p0.stack = aP :: tlP)
+    (hPnot : EVM.step (f + 1) cost (some (.NOT, argN)) s_p0 = .ok s_p1)
+    (hPsl  : EVM.step (f + 1) cost (some (.SLOAD, argSP)) s_p1 = .ok s_p2)
+    (hkeyO : ∀ kO, s_o1.stack = kO :: tlO → kO = fslot aP)
+    (hO : Realizes (evmStorage s_o1) B fslot)
+    (hP : Realizes (evmStorage s_p1) B UInt256.lnot) :
+    s_o2.stack.head? = s_p2.stack.head? := by
+  refine evm_balanceLoad_block_equiv s_o0 s_o1 s_o2 s_p0 s_p1 s_p2 f cost argK argSO argN argSP
+    szO offO tlO aP tlP hO0 hOkec hOsl hP0 hPnot hPsl ?_
+  intro kO kP hkO hkP
+  obtain ⟨_, hPstk1, _, _⟩ := step_NOT_shape_strong s_p0 s_p1 f cost argN aP tlP hP0 hPnot
+  have hkP' : kP = UInt256.lnot aP := by
+    have h : some (UInt256.lnot aP) = some kP := by
+      simpa using congrArg List.head? (hPstk1.symm.trans hkP)
+    exact (Option.some.inj h).symm
+  rw [hkeyO kO hkO, hkP']
+  exact evmStorageRel_of_realizes s_o1 s_p1 B fslot hO hP aP
+
+
 end EvmYul.Venom.Backend

@@ -22,6 +22,7 @@ default `EvmYul` build stays decoupled from the sibling checkout.
 import EvmAbi.Hash
 import EvmAbi.Encode
 import EvmAbi.Decode
+import EvmAbi.Roundtrip
 import EvmYul.Venom.AbiDispatch
 import EvmYul.Venom.AbiBridge
 import EvmYul.Venom.AbiSelector
@@ -121,6 +122,45 @@ theorem abiLean_transfer_decodes (s : VenomState) (selVal : UInt256)
       (Asm.beBytesN_length 4 selVal (by decide)) (by rw [hcd]; simp [List.append_assoc])
   · exact VenomState.calldataload_transfer_amount s (Abi.selectorBytes selVal) [] recvU amtU
       (Asm.beBytesN_length 4 selVal (by decide)) (by rw [hcd]; simp [List.append_assoc])
+
+/-- **Roundtrip capstone, instantiated (generic route).** evm-abi-lean's headline
+    `roundtrip_args_wff` — any well-formed argument list decodes back after encoding — applied at
+    the transfer signature `(address, uint256)`, well-formedness by constructors. Whatever bytes
+    the encoder produced for the transfer arguments, the decoder returns exactly the original
+    values. Base axioms (no `native_decide`). -/
+theorem abiLean_transferArgs_roundtrip_wff (data : ByteArray)
+    (hsz : data.size < 2 ^ 256)
+    (henc : EvmAbi.ABI.Encode.encodeArgs
+        [.address, .uint (EvmAbi.ABI.ByteSize.ofLen 32 (by omega))]
+        [.address recvBytes, .uint amtU.toNat] = Except.ok data) :
+    EvmAbi.ABI.Decode.decodeArgs
+        [.address, .uint (EvmAbi.ABI.ByteSize.ofLen 32 (by omega))] data
+      = Except.ok [.address recvBytes, .uint amtU.toNat] :=
+  roundtrip_args_wff _ data _
+    (by intro t ht
+        rcases List.mem_cons.mp ht with rfl | ht2
+        · exact .address
+        · rcases List.mem_cons.mp ht2 with rfl | h3
+          · exact .uint _
+          · exact absurd h3 (by simp))
+    hsz henc
+
+/-- **Roundtrip capstone, computed (concrete route).** Encode → decode → re-encode on the transfer
+    arguments is a byte-level fixpoint — the `native_decide` cross-check of the roundtrip on the
+    same concrete data the encoder-agreement theorems feed (`ABIValue` equality is checked through
+    the injective re-encoding, keeping the comparison on decidable `ByteArray`s). -/
+theorem abiLean_transferArgs_roundtrip_bytes :
+    ((EvmAbi.ABI.Encode.encodeArgs
+        [.address, .uint (EvmAbi.ABI.ByteSize.ofLen 32 (by omega))]
+        [.address recvBytes, .uint amtU.toNat]).toOption.bind fun data =>
+      (EvmAbi.ABI.Decode.decodeArgs
+        [.address, .uint (EvmAbi.ABI.ByteSize.ofLen 32 (by omega))] data).toOption.bind fun vals =>
+      (EvmAbi.ABI.Encode.encodeArgs
+        [.address, .uint (EvmAbi.ABI.ByteSize.ofLen 32 (by omega))] vals).toOption)
+      = (EvmAbi.ABI.Encode.encodeArgs
+        [.address, .uint (EvmAbi.ABI.ByteSize.ofLen 32 (by omega))]
+        [.address recvBytes, .uint amtU.toNat]).toOption := by
+  native_decide
 
 /-! ## Dynamic-array calldata cross-validation (offset → length → data)
 

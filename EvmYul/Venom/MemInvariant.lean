@@ -259,4 +259,74 @@ theorem two_spills_alloc (m : Mem) (base i j : ℕ) (v1 v2 : UInt256) (hij : i �
       = v1 :=
   spill_reload_frame m (spillSlot base i) (spillSlot base j) v1 v2 (spillSlot_disjoint base i j hij hi hj)
 
+/-! ## Whole register-file spilling (the M4 allocator capstone)
+
+`two_spills_alloc` recovers a register spilled alongside ONE other. These lift it
+to an arbitrary set of allocated registers: a value survives spilling every other
+register (`spill_recover_across_allocator`), and — for a register file with
+pairwise-distinct indices — every spilled register reloads to its stored value
+(`allocator_spill_all_recover`). Disjointness is discharged by `spillSlot_disjoint`
+from the allocation scheme, never assumed. -/
+
+/-- **One write to `slot` among otherwise-disjoint writes wins.** In a store
+sequence `pre ++ (slot, v) :: post` where every write in `post` targets a slot
+disjoint from `slot`, loading `slot` yields `v` — `pre` is irrelevant (overwritten
+by the `slot` write), `post` cannot disturb it (frame). -/
+theorem loadWord_storeWords_single (slot v : UInt256)
+    (pre post : List (UInt256 × UInt256)) (m : Mem)
+    (hpost : ∀ q ∈ post, slot.toNat + 32 ≤ q.1.toNat ∨ q.1.toNat + 32 ≤ slot.toNat) :
+    (storeWords m (pre ++ (slot, v) :: post)).loadWord slot = v := by
+  have key : storeWords m (pre ++ (slot, v) :: post)
+      = storeWords ((storeWords m pre).storeWord slot v) post := by
+    unfold storeWords
+    rw [List.foldl_append, List.foldl_cons]
+  rw [key, loadWord_storeWords_disjoint slot post ((storeWords m pre).storeWord slot v) hpost,
+      loadWord_storeWord_self']
+
+/-- **A spilled register survives spilling every other allocated register.** For a
+target register `i` spilled to its allocator slot and a list of `(index, value)`
+writes for OTHER registers (`p.1 ≠ i`), all spilled to their own allocator slots,
+reloading register `i` recovers its value. The N-register generalization of
+`two_spills_alloc`; slot disjointness is discharged per-write by
+`spillSlot_disjoint`. -/
+theorem spill_recover_across_allocator (m : Mem) (base i : ℕ) (v : UInt256)
+    (writes : List (ℕ × UInt256))
+    (hne : ∀ p ∈ writes, p.1 ≠ i)
+    (hi : base + i * 32 + 32 ≤ 2 ^ 256)
+    (hb : ∀ p ∈ writes, base + p.1 * 32 + 32 ≤ 2 ^ 256) :
+    (storeWords (m.storeWord (spillSlot base i) v)
+        (writes.map (fun p => (spillSlot base p.1, p.2)))).loadWord (spillSlot base i) = v := by
+  refine spill_survives_writes m (spillSlot base i) v _ ?_
+  intro q hq
+  obtain ⟨p, hp, rfl⟩ := List.mem_map.mp hq
+  exact spillSlot_disjoint base i p.1 (fun h => hne p hp h.symm) hi (hb p hp)
+
+/-- **The whole register file spills correctly.** Given registers with pairwise
+distinct indices, all spilled to their allocator slots in one store sequence,
+EVERY register reloads to exactly its stored value — the full-allocator
+generalization: distinct indices ⇒ disjoint slots ⇒ each recovered independently. -/
+theorem allocator_spill_all_recover (m : Mem) (base : ℕ) (regs : List (ℕ × UInt256))
+    (hnd : regs.Pairwise (fun p q => p.1 ≠ q.1))
+    (hb : ∀ p ∈ regs, base + p.1 * 32 + 32 ≤ 2 ^ 256) :
+    ∀ p ∈ regs, (storeWords m
+        (regs.map (fun r => (spillSlot base r.1, r.2)))).loadWord (spillSlot base p.1) = p.2 := by
+  intro p hp
+  obtain ⟨pre, post, hsplit⟩ := List.mem_iff_append.mp hp
+  subst hsplit
+  -- pairwise gives p distinct from everything after it (in post)
+  have hpost_ne : ∀ r ∈ post, p.1 ≠ r.1 :=
+    (List.pairwise_cons.mp (List.pairwise_append.mp hnd).2.1).1
+  have hbp : base + p.1 * 32 + 32 ≤ 2 ^ 256 := hb p (by simp)
+  -- the mapped store list splits at p's slot
+  have hmap : (pre ++ p :: post).map (fun r => (spillSlot base r.1, r.2))
+      = pre.map (fun r => (spillSlot base r.1, r.2))
+        ++ (spillSlot base p.1, p.2) :: post.map (fun r => (spillSlot base r.1, r.2)) := by
+    simp [List.map_append]
+  rw [hmap]
+  refine loadWord_storeWords_single (spillSlot base p.1) p.2 _ _ m ?_
+  intro q hq
+  obtain ⟨r, hr, rfl⟩ := List.mem_map.mp hq
+  exact spillSlot_disjoint base p.1 r.1 (hpost_ne r hr) hbp
+    (hb r (by simp [List.mem_append, List.mem_cons]; tauto))
+
 end EvmYul.Venom.Mem
