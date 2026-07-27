@@ -153,6 +153,11 @@ def u256 : Ty := .uint 256
 def u (n : Nat) (h : n < 2 ^ 256 := by decide) : Ty.Val u256 := ⟨n, h⟩
 def recipient : Ty.Val .address := ⟨1, by decide⟩
 
+-- Since C4 ("bounds are intrinsic to decoding") an array value is a subtype
+-- carrying its own `< 2 ^ 256` length proof, not a bare `List`.
+def arr (vs : List (Ty.Val u256)) (h : vs.length < 2 ^ 256 := by decide) :
+    Ty.Val (.array u256) := ⟨vs, h⟩
+
 def hexBytes (bs : List UInt8) : String :=
   String.join (bs.map fun b =>
     let s := Nat.toDigits 16 b.toNat
@@ -161,8 +166,8 @@ def hexBytes (bs : List UInt8) : String :=
 -- An argument list is exactly the tuple of its types, so the argument region is
 -- `encode (.tuple ts)` -- no argument-level wrapper needed from the library.
 #eval IO.println ("ARGS "   ++ hexBytes (encode (.tuple [.address, u256]) (recipient, u 100, ⟨⟩)))
-#eval IO.println ("DYNARR " ++ hexBytes (encode (.tuple [.array u256]) ([u 10, u 20, u 30], ⟨⟩)))
-#eval IO.println ("MIXED "  ++ hexBytes (encode (.tuple [u256, .array u256]) (u 7, [u 10, u 20, u 30], ⟨⟩)))
+#eval IO.println ("DYNARR " ++ hexBytes (encode (.tuple [.array u256]) (arr [u 10, u 20, u 30], ⟨⟩)))
+#eval IO.println ("MIXED "  ++ hexBytes (encode (.tuple [u256, .array u256]) (u 7, arr [u 10, u 20, u 30], ⟨⟩)))
 
 -- Roundtrip drift guard: encode -> decode -> re-encode is a byte fixpoint.
 #eval do
