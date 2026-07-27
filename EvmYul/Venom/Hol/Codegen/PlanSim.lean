@@ -1769,6 +1769,78 @@ theorem popmanyPlan_sim {toPop ps ps' ops labelOffsets vs as prog}
       · exact fold_case _ hpop
     · exact fold_case _ hpop
 
+set_option maxHeartbeats 1000000 in
+/-- **`popmanyPlan` simulation with a state invariant** — the usable form of `popmanyPlan_sim`.
+
+    `popmanyPlan_sim`'s `hpopstep` residual is quantified over *every* plan state, which is why it was
+    never discharged and has no callers: at an unbounded stack depth a `doSwap` may exceed `SWAP16` and
+    route through the temp spill region, dragging in `doSwap_sim`'s big-swap side condition, and there
+    is no way to establish that for an arbitrary `p`.
+
+    Here the per-step sim need only hold on states satisfying an invariant `Inv` that the step itself
+    preserves (`foldl_ops_sim_inv`, built for exactly this). A caller instantiating `Inv` with a shallow
+    stack bound gets every swap distance `≤ 16`, making the big-swap condition vacuous. `hcontig` (the
+    closed-form contiguous branch — one `doSwap n` + one `SOPop n`) stays a parameter; it has no fold,
+    so it carries no ∀-quantified residual and is dischargeable directly. -/
+theorem popmanyPlan_sim_inv {toPop ps ps' ops labelOffsets vs as prog}
+    (Inv : PlanState → Prop)
+    (hInvStep : ∀ (v : Operand) (p : PlanState), Inv p → Inv (gpop p v).2)
+    (hInv0 : Inv ps)
+    (hpop : popmanyPlan toPop ps = (ops, ps'))
+    (hrel : venomAsmRel labelOffsets ps vs as)
+    (hblock : asmBlockAt prog as.pc (executePlan ops))
+    (hpopstep : ∀ (v : Operand) (p : PlanState) (s : AsmState),
+        Inv p →
+        venomAsmRel labelOffsets p vs s →
+        asmBlockAt prog s.pc (executePlan (gpop p v).1) →
+        ∃ s', runAsm (executePlan (gpop p v).1).length offsetToPc prog s
+                = AsmResult.AsmOK s' ∧
+              venomAsmRel labelOffsets (gpop p v).2 vs s' ∧
+              s'.pc = s.pc + (executePlan (gpop p v).1).length)
+    (hcontig :
+        asmBlockAt prog as.pc
+          (executePlan ((doSwap toPop.length ps).1 ++ [StackOp.SOPop toPop.length])) →
+        ∃ as', runAsm (executePlan ((doSwap toPop.length ps).1
+                  ++ [StackOp.SOPop toPop.length])).length offsetToPc prog as
+                = AsmResult.AsmOK as' ∧
+              venomAsmRel labelOffsets
+                { (doSwap toPop.length ps).2 with
+                  stack := stackPop toPop.length (doSwap toPop.length ps).2.stack } vs as' ∧
+              as'.pc = as.pc + (executePlan ((doSwap toPop.length ps).1
+                  ++ [StackOp.SOPop toPop.length])).length) :
+    ∃ as', runAsm (executePlan ops).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+           venomAsmRel labelOffsets ps' vs as' ∧
+           as'.pc = as.pc + (executePlan ops).length := by
+  have fold_case : ∀ (l : List Operand),
+      (l.foldl (fun (x : List StackOp × PlanState) (v : Operand) =>
+        match x with
+        | (ops, ps) =>
+          match stackGetDepth v ps.stack with
+          | none => (ops, ps)
+          | some dist =>
+            let (swapOps, ps') := if dist = 0 then ([], ps) else doSwap dist ps
+            (ops ++ swapOps ++ [StackOp.SOPop 1], { ps' with stack := stackPop 1 ps'.stack }))
+        ([], ps)) = (ops, ps') →
+      ∃ as', runAsm (executePlan ops).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+             venomAsmRel labelOffsets ps' vs as' ∧
+             as'.pc = as.pc + (executePlan ops).length := by
+    intro l hfold
+    rw [popmany_step_eq] at hfold
+    have h := foldl_ops_sim_inv labelOffsets vs prog offsetToPc gpop Inv hInvStep hpopstep
+      l ps as hInv0 hrel (by rw [hfold]; exact hblock)
+    rw [hfold] at h
+    exact h
+  simp only [popmanyPlan] at hpop
+  split at hpop
+  · rw [Prod.mk.injEq] at hpop; obtain ⟨rfl, rfl⟩ := hpop
+    exact ⟨as, by simp [executePlan, runAsm], hrel, by simp [executePlan]⟩
+  · split at hpop
+    · split at hpop
+      · rw [Prod.mk.injEq] at hpop; obtain ⟨rfl, rfl⟩ := hpop
+        exact hcontig hblock
+      · exact fold_case _ hpop
+    · exact fold_case _ hpop
+
 /- Removed vestigial port artifacts (`asmStep_error_nonempty`,
    `execStackOp_step_sim`, `executePlan_sim`): they were unused by everything
    substantive (codegen_correct and the spill/restore sims don't reference them),

@@ -120,6 +120,127 @@ theorem planStackRel_peek {labelOffsets vs psStack asmStack dist}
   rw [heq]
   exact hrel
 
+/-! ### The phi's poke, and why a join may be compiled against one predecessor
+
+A join with two or more predecessors gets no stack reconciliation and is compiled against whichever
+predecessor the plan DFS reached first. Entering it from a *different* predecessor, `planStackRel`
+genuinely **fails** at the phi slot: the recorded plan stack names the compiled-against edge's source
+(say `a`), and on this path `a` was never assigned, so `operandVal` there is `none` — not the value in
+the asm slot.
+
+The phi is what repairs it, and the repair is exact. Its plan emits no EVM code (`SOPoke` is a
+plan-only rename), so the asm stack is untouched; the Venom side binds the phi output `p` to the value
+arriving on *this* edge — which is precisely the value already sitting in that asm slot, because every
+predecessor delivers its own source at the same depth (`stackGetPhiDepth_congr`). Poking the slot to
+`p` therefore makes the two sides agree there, and everywhere else the relation already held and is
+undisturbed.
+
+So the relation to carry *into* a join is the one **after** the phis, not before: pre-phi it is false
+on every edge except the compiled-against one; post-phi it is true on all of them.
+
+`planStackRel_phi_poke` (in `GenBlockSimComp`) already carries the rename through on the
+compiled-against edge, but it *assumes* the relation holds beforehand, so it says nothing about the
+other edges. `planStackRel_phi_poke_offSlot` below asks only for what is true on all of them. -/
+
+/-- Poking at depth `d` sets exactly index `d` of the TOS-first view. -/
+theorem stackPoke_reverse {s : List Operand} {d : Nat} {op : Operand} (hd : d < s.length) :
+    (stackPoke d op s).reverse = s.reverse.set d op := by
+  unfold stackPoke
+  dsimp only
+  apply List.ext_getElem
+  · simp
+  · intro i h1 h2
+    simp only [List.length_reverse, List.length_set] at h1 h2
+    rw [List.getElem_reverse, List.getElem_set, List.getElem_set]
+    simp only [List.length_set]
+    rcases eq_or_ne i d with rfl | h
+    · simp
+    · have hne : s.length - 1 - d ≠ s.length - 1 - i := by
+        intro heq; exact h (by omega)
+      rw [if_neg hne, if_neg (Ne.symm h), List.getElem_reverse]
+
+/-- Reading the TOS-first view of a poked stack: depth `d` reads the new operand, every other depth is
+unchanged. -/
+theorem stackPoke_reverse_getElem! {s : List Operand} {d i : Nat} {op : Operand}
+    (hd : d < s.length) (hi : i < s.length) :
+    (stackPoke d op s).reverse[i]! = if i = d then op else s.reverse[i]! := by
+  rw [stackPoke_reverse hd]
+  rcases eq_or_ne i d with rfl | h
+  · rw [getElem!_pos _ _ (by simpa using hi), List.getElem_set_self, if_pos rfl]
+  · rw [getElem!_pos _ _ (by simpa using hi), List.getElem_set_ne (Ne.symm h), if_neg h,
+        ← getElem!_pos _ _ (by simpa using hi)]
+
+/-- **A block's whole phi prologue establishes `planStackRel`** — on the arrival of a predecessor the
+join was *not* compiled against, where the relation does **not** hold beforehand.
+
+`planStackRel_phi_poke` (in `GenBlockSimComp`) handles the compiled-against edge: it *assumes* the full
+relation already holds, with that edge's own source named in the slot, and carries it through the
+rename. On any other edge that assumption is false — the slot names a variable this path never assigned
+— so that lemma does not apply.
+
+It also matters that this is stated for **all** the phis at once. A join may carry several, each owning
+one slot, and on the other edge the relation fails at *every* one of them simultaneously. So a
+single-phi lemma cannot simply be iterated: its "relation holds off *the* slot" hypothesis is still
+false while any other phi slot is unrepaired. The phis have to be taken together — assume the relation
+off the whole set of phi slots, and that each phi binds its output to the value that slot actually
+received; poking them all then restores the relation everywhere.
+
+No distinctness of the depths is needed: if two phis named the same slot the later poke simply wins,
+and that phi's hypothesis is the one that has to hold.
+
+This is the semantic reason a join can be compiled once and still be correct on every incoming edge. -/
+theorem planStackRel_phi_pokes {labelOffsets : AssocList String Nat} {vs : VenomState}
+    {asmStack : List bytes32} :
+    ∀ (dps : List (Nat × String)) (psStack : List Operand),
+      psStack.length = asmStack.length →
+      (∀ dp ∈ dps, dp.1 < psStack.length) →
+      (∀ i, i < psStack.length → (∀ dp ∈ dps, i ≠ dp.1) →
+          operandVal vs labelOffsets (psStack.reverse[i]!) = some (asmStack[i]!)) →
+      (∀ dp ∈ dps, operandVal vs labelOffsets (Operand.Var dp.2) = some (asmStack[dp.1]!)) →
+      planStackRel labelOffsets vs
+        (dps.foldl (fun s dp => stackPoke dp.1 (Operand.Var dp.2) s) psStack) asmStack := by
+  intro dps
+  induction dps with
+  | nil =>
+    intro psStack hlen _ hoff _
+    exact ⟨hlen, fun i hi => hoff i hi (by simp)⟩
+  | cons dp rest ih =>
+    intro psStack hlen hdlt hoff hp
+    simp only [List.foldl_cons]
+    have hd : dp.1 < psStack.length := hdlt dp (by simp)
+    have hlen' : (stackPoke dp.1 (Operand.Var dp.2) psStack).length = psStack.length := by
+      simp [stackPoke]
+    refine ih (stackPoke dp.1 (Operand.Var dp.2) psStack) (by rw [hlen']; exact hlen)
+      (fun q hq => by rw [hlen']; exact hdlt q (List.mem_cons_of_mem _ hq)) ?_ ?_
+    · -- the relation now holds off the *remaining* phi slots: this phi's slot is repaired
+      intro i hi hne
+      rw [hlen'] at hi
+      rw [stackPoke_reverse_getElem! hd hi]
+      rcases eq_or_ne i dp.1 with rfl | hid
+      · rw [if_pos rfl]; exact hp dp (by simp)
+      · rw [if_neg hid]
+        refine hoff i hi ?_
+        intro q hq
+        rcases List.mem_cons.mp hq with rfl | hqr
+        · exact hid
+        · exact hne q hqr
+    · intro q hq; exact hp q (List.mem_cons_of_mem _ hq)
+
+/-- The single-phi case — the one-element instance of `planStackRel_phi_pokes`. -/
+theorem planStackRel_phi_poke_offSlot {labelOffsets : AssocList String Nat} {vs : VenomState}
+    {psStack : List Operand} {asmStack : List bytes32} {d : Nat} {p : String}
+    (hlen : psStack.length = asmStack.length)
+    (hd : d < psStack.length)
+    (hoff : ∀ i, i < psStack.length → i ≠ d →
+        operandVal vs labelOffsets (psStack.reverse[i]!) = some (asmStack[i]!))
+    (hp : operandVal vs labelOffsets (Operand.Var p) = some (asmStack[d]!)) :
+    planStackRel labelOffsets vs (stackPoke d (Operand.Var p) psStack) asmStack := by
+  have := planStackRel_phi_pokes (labelOffsets := labelOffsets) (vs := vs) (asmStack := asmStack)
+    [(d, p)] psStack hlen (by simpa using hd)
+    (fun i hi hne => hoff i hi (by simpa using hne (d, p) (by simp)))
+    (by simpa using hp)
+  simpa using this
+
 /-- `planStackRel` is preserved by a swap of TOS with the element at distance
     `dist`: venom `stackSwap dist psStack` (LAST=TOS) corresponds to asm
     swapping `asStack[0]` (HD=TOS) with `asStack[dist]`. The two swapped

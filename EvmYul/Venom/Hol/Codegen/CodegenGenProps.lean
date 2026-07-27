@@ -1021,4 +1021,590 @@ theorem generateBlockPlan_head {L : DfState (List String)} {D : DfgAnalysis} {C 
     | simp only [reduceCtorEq] at h
     | (simp only [Option.some.injEq, Prod.mk.injEq] at h; exact ⟨_, h.1.symm⟩)
 
+/-! ## The phi plan is predecessor-independent, and it equalises the two states
+
+`inputVarsFrom_slot_agree` (in `Liveness`) says the two predecessors of a join are handed target
+layouts that agree slot by slot, differing only where a phi sits — and there each names its *own*
+edge's source. This section turns that into the fact the genuine-join `hstep` actually needs: the
+join's phi plan emits the **same code** from either predecessor, and applying it makes the two plan
+states **identical**. After that the rest of the block is generated from one and the same state, so it
+does not matter which predecessor the plan DFS reached first.
+
+The mechanism is that `stackFind` reads its list only through the *boolean image* of its predicate.
+The two stacks differ in the phi slot's *name* but not in *which* slots hold one of the phi's sources
+— so the search returns the same depth, and the single positional `SOPoke` lands on the right slot for
+both. -/
+
+/-- `stackFind` depends on the list only through the boolean image of `p`: two stacks with the same
+match-pattern give the same depth. (Axiom-free.) -/
+theorem stackFind_congr {p : Operand → Bool} {s1 s2 : List Operand}
+    (h : List.Forall₂ (fun a b => p a = p b) s1 s2) :
+    stackFind p s1 = stackFind p s2 := by
+  induction h with
+  | nil => rfl
+  | @cons a b l1 l2 hab _ ih =>
+    unfold stackFind
+    rw [hab, ih]
+
+/-- **The phi-depth search finds the same slot in both predecessors' stacks.** The names in that slot
+differ — each edge delivers its own source — but the *depth* does not, which is what makes a single
+positional `SOPoke` correct on every incoming edge. -/
+theorem stackGetPhiDepth_congr {srcs : List Operand} {s1 s2 : List Operand}
+    (h : List.Forall₂ (fun a b => srcs.contains a = srcs.contains b) s1 s2) :
+    stackGetPhiDepth srcs s1 = stackGetPhiDepth srcs s2 := by
+  unfold stackGetPhiDepth
+  exact stackFind_congr (List.rel_reverse h)
+
+/-- **The phi's poke equalises the two states.** Stacks that agree off the phi slot become *identical*
+once the phi output is written into that slot — the sense in which the phi "reconciles" the join. -/
+theorem stackPoke_congr_off {s1 s2 : List Operand} {d : Nat} {ret : Operand}
+    (hlen : s1.length = s2.length)
+    (hoff : ∀ i, i ≠ s1.length - 1 - d → s1[i]? = s2[i]?) :
+    stackPoke d ret s1 = stackPoke d ret s2 := by
+  unfold stackPoke
+  dsimp only
+  have hidx : s2.length - 1 - d = s1.length - 1 - d := by rw [hlen]
+  rw [hidx]
+  apply List.ext_getElem?
+  intro i
+  rcases eq_or_ne (s1.length - 1 - d) i with h | h
+  · subst h
+    rw [List.getElem?_set_self', List.getElem?_set_self']
+    rcases Nat.lt_or_ge (s1.length - 1 - d) s1.length with hlt | hge
+    · rw [List.getElem?_eq_getElem hlt,
+          List.getElem?_eq_getElem (show s1.length - 1 - d < s2.length by omega)]
+      rfl
+    · rw [List.getElem?_eq_none hge,
+          List.getElem?_eq_none (show s2.length ≤ s1.length - 1 - d by omega)]
+  · rw [List.getElem?_set_ne h, List.getElem?_set_ne h]
+    exact hoff i (Ne.symm h)
+
+/-- **The join's phi plan is predecessor-independent, and it equalises the two states.**
+
+Arriving from either predecessor the phi's source sits in the *same slot*, so the plan emits the same
+single `SOPoke`, and writing the phi output into that slot makes the two plan states identical. This
+is precisely why the join can be compiled once — against whichever predecessor the DFS reached first —
+and still be correct for all of them.
+
+The liveness hypotheses say the incoming source is not itself live past the phi. That is true of the
+phi-aware transfer, because a phi's operands are uses of the *edge* and not of the join; before that
+fix they *were* live at the join, and this is one of the places it broke. -/
+theorem generatePhiPlan_congr {inst : Instruction} {nextLive : List String} {ps1 ps2 : PlanState}
+    {d : Nat}
+    (hlen : ps1.stack.length = ps2.stack.length)
+    (hpat : List.Forall₂
+        (fun a b => (inst.operands.filter isVarOperand).contains a
+                  = (inst.operands.filter isVarOperand).contains b) ps1.stack ps2.stack)
+    (hd : stackGetPhiDepth (inst.operands.filter isVarOperand) ps1.stack = some d)
+    (hoff : ∀ i, i ≠ ps1.stack.length - 1 - d → ps1.stack[i]? = ps2.stack[i]?)
+    (hnl1 : nextLive.contains (operandToString (stackPeek d ps1.stack)) = false)
+    (hnl2 : nextLive.contains (operandToString (stackPeek d ps2.stack)) = false) :
+    (generatePhiPlan inst nextLive ps1).1 = (generatePhiPlan inst nextLive ps2).1
+    ∧ (generatePhiPlan inst nextLive ps1).2.stack = (generatePhiPlan inst nextLive ps2).2.stack := by
+  have hd2 : stackGetPhiDepth (inst.operands.filter isVarOperand) ps2.stack = some d := by
+    rw [← stackGetPhiDepth_congr hpat]; exact hd
+  unfold generatePhiPlan
+  dsimp only
+  rw [hd, hd2]
+  simp only [hnl1, hnl2, Bool.false_eq_true, if_false]
+  exact ⟨trivial, stackPoke_congr_off hlen hoff⟩
+
+
+/-! ## The whole phi prologue is predecessor-independent — for any number of phis
+
+`generatePhiPlan_congr` above settles a single phi. A real join may carry several, and they cannot
+simply be handled one at a time: the agreement between the two predecessors' stacks is *not* equality
+while other phi slots are still unprocessed, so the single-phi lemma's hypotheses do not hold at the
+second phi.
+
+The invariant that does survive is weaker and exactly right: at every slot the two stacks either name
+the same operand, or they name the two edges' own sources for one of the phis *still to be processed*
+(`PhiSlotRel`). Each phi then finds its slot at the same depth on both edges and emits the same
+`SOPoke`; poking re-establishes the invariant for the phis that remain. When none remain the relation
+*is* equality — the two plan states coincide, and the rest of the block is generated from one and the
+same state.
+
+Two well-formedness facts are needed, both true of SSA the compiler is fed: the phis' source sets are
+pairwise disjoint (so a later phi's slot cannot masquerade as a source of this one), and each phi owns
+exactly one slot. The liveness side condition — the incoming source is dead past the phi — is what the
+phi-aware transfer delivers. -/
+
+theorem forall2_of_getElem {R : Operand → Operand → Prop} :
+    ∀ {a b : List Operand}, a.length = b.length →
+      (∀ i, i < a.length → R (a[i]!) (b[i]!)) → List.Forall₂ R a b := by
+  intro a
+  induction a with
+  | nil =>
+    intro b hlen _
+    cases b with
+    | nil => exact List.Forall₂.nil
+    | cons y u => simp at hlen
+  | cons x t ih =>
+    intro b hlen h
+    cases b with
+    | nil => simp at hlen
+    | cons y u =>
+      have hlen' : t.length = u.length := by simpa using hlen
+      refine List.Forall₂.cons ?_ (ih hlen' ?_)
+      · have h0 := h 0 (by simp)
+        rwa [getElem!_pos (x :: t) 0 (by simp), getElem!_pos (y :: u) 0 (by simp)] at h0
+      · intro i hi
+        have hs := h (i + 1) (by simp only [List.length_cons]; omega)
+        rw [getElem!_pos (x :: t) (i+1) (by simp only [List.length_cons]; omega),
+            getElem!_pos (y :: u) (i+1) (by simp only [List.length_cons]; omega),
+            List.getElem_cons_succ, List.getElem_cons_succ] at hs
+        rwa [getElem!_pos t i hi, getElem!_pos u i (by omega)]
+
+theorem forall2_getElem {R : Operand → Operand → Prop} {a b : List Operand}
+    (h : List.Forall₂ R a b) : ∀ i, i < a.length → R (a[i]!) (b[i]!) := by
+  induction h with
+  | nil => intro i hi; simp at hi
+  | @cons x y t u hxy htu ih =>
+    have hlen' : t.length = u.length := htu.length_eq
+    intro i hi
+    cases i with
+    | zero => rwa [getElem!_pos (x :: t) 0 (by simp), getElem!_pos (y :: u) 0 (by simp)]
+    | succ n =>
+      have hn : n < t.length := by simp only [List.length_cons] at hi; omega
+      have hrec := ih n hn
+      rw [getElem!_pos t n hn, getElem!_pos u n (by omega)] at hrec
+      rw [getElem!_pos (x :: t) (n+1) (by simp only [List.length_cons]; omega),
+          getElem!_pos (y :: u) (n+1) (by simp only [List.length_cons]; omega),
+          List.getElem_cons_succ, List.getElem_cons_succ]
+      exact hrec
+
+
+
+/-- The var operands a `PHI` selects among — exactly what `generatePhiPlan` searches the stack for. -/
+def phiSrcs (inst : Instruction) : List Operand := inst.operands.filter isVarOperand
+
+/-- **Two predecessors' stacks agree slot-wise up to the phis still to be processed**: at every slot
+they either name the same operand, or they name the two edges' own sources for one of those phis. -/
+def PhiSlotRel (phis : List Instruction) (a b : Operand) : Prop :=
+  a = b ∨ ∃ φ ∈ phis, (phiSrcs φ).contains a = true ∧ (phiSrcs φ).contains b = true
+
+/-- **Agreement gives the head phi a matching search pattern.** With the phis' source sets pairwise
+disjoint, a slot owned by a *later* phi cannot look like a source of this one — so both stacks match
+this phi in exactly the same places, and the depth search returns the same slot. -/
+theorem phiPattern_of_agree {φ : Instruction} {rest : List Instruction} {s1 s2 : List Operand}
+    (hdisj : ∀ ψ ∈ rest, ∀ x, (phiSrcs ψ).contains x = true → (phiSrcs φ).contains x = false)
+    (h : List.Forall₂ (PhiSlotRel (φ :: rest)) s1 s2) :
+    List.Forall₂ (fun a b => (phiSrcs φ).contains a = (phiSrcs φ).contains b) s1 s2 := by
+  induction h with
+  | nil => exact List.Forall₂.nil
+  | @cons a b l1 l2 hab _ ih =>
+    refine List.Forall₂.cons ?_ ih
+    rcases hab with rfl | ⟨ψ, hψ, ha, hb⟩
+    · rfl
+    · rcases List.mem_cons.mp hψ with rfl | hψr
+      · rw [ha, hb]
+      · rw [hdisj ψ hψr a ha, hdisj ψ hψr b hb]
+
+/-- **The poke re-establishes agreement for the remaining phis.** The head phi's slot now holds its
+output on both sides, so it agrees outright; every other slot is untouched, and by uniqueness it
+cannot have been owned by this phi — so its witness is one of the phis still to come. -/
+theorem forall2_poke {φ : Instruction} {rest : List Instruction} {s1 s2 : List Operand}
+    {j : Nat} {out : Operand}
+    (h : List.Forall₂ (PhiSlotRel (φ :: rest)) s1 s2)
+    (hu1 : ∀ i, i < s1.length → i ≠ j → (phiSrcs φ).contains (s1[i]!) = false)
+    (hu2 : ∀ i, i < s2.length → i ≠ j → (phiSrcs φ).contains (s2[i]!) = false) :
+    List.Forall₂ (PhiSlotRel rest) (s1.set j out) (s2.set j out) := by
+  have hlen : s1.length = s2.length := h.length_eq
+  refine forall2_of_getElem (by simp [hlen]) ?_
+  intro i hi
+  simp only [List.length_set] at hi
+  rcases eq_or_ne i j with rfl | hij
+  · -- the head phi's own slot: both sides now hold its output
+    rw [getElem!_pos _ _ (by simpa using hi), List.getElem_set_self,
+        getElem!_pos _ _ (by simp [← hlen]; omega), List.getElem_set_self]
+    exact Or.inl rfl
+  · -- every other slot is unchanged, and cannot belong to the head phi
+    rw [getElem!_pos _ _ (by simpa using hi), List.getElem_set_ne (Ne.symm hij),
+        getElem!_pos _ _ (by simp [← hlen]; omega), List.getElem_set_ne (Ne.symm hij),
+        ← getElem!_pos s1 i hi, ← getElem!_pos s2 i (by omega)]
+    rcases forall2_getElem h i hi with heq | ⟨ψ, hψ, ha, hb⟩
+    · exact Or.inl heq
+    · rcases List.mem_cons.mp hψ with rfl | hψr
+      · exact absurd ha (by rw [hu1 i hi hij]; simp)
+      · exact Or.inr ⟨ψ, hψr, ha, hb⟩
+
+
+
+theorem stackFind_none_spec {p : Operand → Bool} :
+    ∀ {l : List Operand}, stackFind p l = none → ∀ i, i < l.length → p (l[i]!) = false := by
+  intro l
+  induction l with
+  | nil => intro _ i hi; simp at hi
+  | cons a t ih =>
+    intro h i hi
+    unfold stackFind at h
+    by_cases ha : p a
+    · rw [if_pos ha] at h; simp at h
+    · rw [if_neg ha] at h
+      cases hk : stackFind p t with
+      | some k => rw [hk] at h; simp at h
+      | none =>
+        cases i with
+        | zero => rw [getElem!_pos (a :: t) 0 (by simp)]; simpa using ha
+        | succ n =>
+          have hn : n < t.length := by simp only [List.length_cons] at hi; omega
+          have := ih hk n hn
+          rw [getElem!_pos t n hn] at this
+          rw [getElem!_pos (a :: t) (n+1) (by simp only [List.length_cons]; omega),
+              List.getElem_cons_succ]
+          exact this
+
+/-- If the phi's search finds nothing, no slot holds any of its sources. -/
+theorem stackGetPhiDepth_none_spec {srcs : List Operand} {s : List Operand}
+    (h : stackGetPhiDepth srcs s = none) : ∀ i, i < s.length → srcs.contains (s[i]!) = false := by
+  intro i hi
+  have hr := stackFind_none_spec (p := fun x => srcs.contains x) (l := s.reverse) h
+    (s.length - 1 - i) (by simp; omega)
+  rw [getElem!_pos s.reverse _ (by simp; omega), List.getElem_reverse] at hr
+  rw [getElem!_pos s i hi]
+  simpa [show s.length - 1 - (s.length - 1 - i) = i by omega] using hr
+
+theorem generatePhiPlan_eq_poke {φ : Instruction} {nl : List String} {ps : PlanState} {d : Nat}
+    (hd : stackGetPhiDepth (phiSrcs φ) ps.stack = some d)
+    (hnl : nl.contains (operandToString (stackPeek d ps.stack)) = false) :
+    generatePhiPlan φ nl ps
+      = ([StackOp.SOPoke d (Operand.Var φ.outputs.head!)],
+         { ps with stack := stackPoke d (Operand.Var φ.outputs.head!) ps.stack }) := by
+  simp only [phiSrcs] at hd
+  unfold generatePhiPlan
+  dsimp only
+  rw [hd]
+  simp only [hnl, Bool.false_eq_true, if_false]
+
+theorem generatePhiPlan_eq_nil {φ : Instruction} {nl : List String} {ps : PlanState}
+    (hd : stackGetPhiDepth (phiSrcs φ) ps.stack = none) :
+    generatePhiPlan φ nl ps = ([], ps) := by
+  simp only [phiSrcs] at hd
+  unfold generatePhiPlan
+  dsimp only
+  rw [hd]
+
+
+
+/-- The plan for a block's leading phis, in the shape the block fold builds it (each phi carries the
+liveness the generator hands it at that position). -/
+def phiPrefixPlan : List (Instruction × List String) → PlanState → List StackOp × PlanState
+  | [], ps => ([], ps)
+  | (φ, nl) :: rest, ps =>
+      let r  := generatePhiPlan φ nl ps
+      let r2 := phiPrefixPlan rest r.2
+      (r.1 ++ r2.1, r2.2)
+
+/-- What one phi needs of the two states: its slot is the *only* one holding any of its sources (in
+both stacks), and its incoming source is dead past it (both edges). Both are facts about well-formed
+SSA — the second is exactly what the phi-aware liveness transfer delivers. -/
+def PhiStepWf (φ : Instruction) (nl : List String) (ps1 ps2 : PlanState) : Prop :=
+  ∀ d, stackGetPhiDepth (phiSrcs φ) ps1.stack = some d →
+      (∀ i, i < ps1.stack.length → i ≠ ps1.stack.length - 1 - d →
+          (phiSrcs φ).contains (ps1.stack[i]!) = false)
+    ∧ (∀ i, i < ps2.stack.length → i ≠ ps2.stack.length - 1 - d →
+          (phiSrcs φ).contains (ps2.stack[i]!) = false)
+    ∧ nl.contains (operandToString (stackPeek d ps1.stack)) = false
+    ∧ nl.contains (operandToString (stackPeek d ps2.stack)) = false
+
+/-- …and what the prologue needs: each phi's sources disjoint from those of the phis after it, plus
+each step's own condition, threaded through the states the fold produces. -/
+def PhiPrefixWf : List (Instruction × List String) → PlanState → PlanState → Prop
+  | [], _, _ => True
+  | (φ, nl) :: rest, ps1, ps2 =>
+      (∀ ψ ∈ rest.map Prod.fst, ∀ x, (phiSrcs ψ).contains x = true → (phiSrcs φ).contains x = false)
+    ∧ PhiStepWf φ nl ps1 ps2
+    ∧ PhiPrefixWf rest (generatePhiPlan φ nl ps1).2 (generatePhiPlan φ nl ps2).2
+
+/-- **The whole phi prologue is predecessor-independent, for any number of phis.**
+
+Each phi finds its slot at the same depth on both edges (`phiPattern_of_agree` +
+`stackGetPhiDepth_congr`), so it emits the same `SOPoke`; poking re-establishes the agreement for the
+phis still to come (`forall2_poke`). When they run out, the relation is plain equality — the two plan
+states coincide, and the rest of the block is generated from one and the same state.
+
+`generatePhiPlan_congr` is the single-phi case of this. -/
+theorem phiPrefixPlan_congr :
+    ∀ (pairs : List (Instruction × List String)) (ps1 ps2 : PlanState),
+      ps1.spilled = ps2.spilled → ps1.alloc = ps2.alloc → ps1.labelCounter = ps2.labelCounter →
+      List.Forall₂ (PhiSlotRel (pairs.map Prod.fst)) ps1.stack ps2.stack →
+      PhiPrefixWf pairs ps1 ps2 →
+      phiPrefixPlan pairs ps1 = phiPrefixPlan pairs ps2 := by
+  intro pairs
+  induction pairs with
+  | nil =>
+    intro ps1 ps2 hsp hal hlc hagree _
+    -- no phis left: the relation is equality, so the states coincide
+    have hst : ps1.stack = ps2.stack := by
+      have := forall2_getElem hagree
+      refine List.ext_getElem hagree.length_eq ?_
+      intro i h1 h2
+      rcases this i h1 with heq | ⟨ψ, hψ, _, _⟩
+      · rwa [getElem!_pos ps1.stack i h1, getElem!_pos ps2.stack i h2] at heq
+      · simp at hψ
+    have : ps1 = ps2 := by
+      cases ps1; cases ps2; simp_all
+    rw [this]
+  | cons p rest ih =>
+    obtain ⟨φ, nl⟩ := p
+    intro ps1 ps2 hsp hal hlc hagree hwf
+    obtain ⟨hdisj, hstep, hrest⟩ := hwf
+    simp only [List.map_cons] at hagree
+    have hpat := phiPattern_of_agree (φ := φ) (rest := rest.map Prod.fst) hdisj hagree
+    have hdep : stackGetPhiDepth (phiSrcs φ) ps1.stack = stackGetPhiDepth (phiSrcs φ) ps2.stack :=
+      stackGetPhiDepth_congr hpat
+    unfold phiPrefixPlan
+    cases hd1 : stackGetPhiDepth (phiSrcs φ) ps1.stack with
+    | none =>
+      have hd2 : stackGetPhiDepth (phiSrcs φ) ps2.stack = none := by rw [← hdep, hd1]
+      have hg1 := generatePhiPlan_eq_nil (φ := φ) (nl := nl) (ps := ps1) hd1
+      have hg2 := generatePhiPlan_eq_nil (φ := φ) (nl := nl) (ps := ps2) hd2
+      -- nothing matches this phi anywhere, so every witness is one of the later phis
+      have hagree' : List.Forall₂ (PhiSlotRel (rest.map Prod.fst)) ps1.stack ps2.stack := by
+        refine forall2_of_getElem hagree.length_eq ?_
+        intro i hi
+        rcases forall2_getElem hagree i hi with heq | ⟨ψ, hψ, ha, hb⟩
+        · exact Or.inl heq
+        · rcases List.mem_cons.mp hψ with rfl | hψr
+          · exact absurd ha (by rw [stackGetPhiDepth_none_spec hd1 i hi]; simp)
+          · exact Or.inr ⟨ψ, hψr, ha, hb⟩
+      have hrest' : PhiPrefixWf rest ps1 ps2 := by simpa only [hg1, hg2] using hrest
+      simp only [hg1, hg2]
+      rw [ih ps1 ps2 hsp hal hlc hagree' hrest']
+    | some d =>
+      have hd2 : stackGetPhiDepth (phiSrcs φ) ps2.stack = some d := by rw [← hdep, hd1]
+      obtain ⟨hu1, hu2, hnl1, hnl2⟩ := hstep d hd1
+      have hg1 := generatePhiPlan_eq_poke (φ := φ) (nl := nl) (ps := ps1) hd1 hnl1
+      have hg2 := generatePhiPlan_eq_poke (φ := φ) (nl := nl) (ps := ps2) hd2 hnl2
+      have hlen : ps1.stack.length = ps2.stack.length := hagree.length_eq
+      -- poking the phi's slot restores agreement for the phis still to come
+      have h2 : ∀ i, i < ps2.stack.length → i ≠ ps1.stack.length - 1 - d →
+          (phiSrcs φ).contains (ps2.stack[i]!) = false := by
+        intro i hi hne; exact hu2 i hi (by rw [← hlen]; exact hne)
+      have hpk1 : stackPoke d (Operand.Var φ.outputs.head!) ps1.stack
+          = ps1.stack.set (ps1.stack.length - 1 - d) (Operand.Var φ.outputs.head!) := rfl
+      have hpk2 : stackPoke d (Operand.Var φ.outputs.head!) ps2.stack
+          = ps2.stack.set (ps1.stack.length - 1 - d) (Operand.Var φ.outputs.head!) := by
+        unfold stackPoke; rw [hlen]
+      have hagree' : List.Forall₂ (PhiSlotRel (rest.map Prod.fst))
+          (stackPoke d (Operand.Var φ.outputs.head!) ps1.stack)
+          (stackPoke d (Operand.Var φ.outputs.head!) ps2.stack) := by
+        rw [hpk1, hpk2]
+        exact forall2_poke hagree hu1 h2
+      have hrest' : PhiPrefixWf rest
+          { ps1 with stack := stackPoke d (Operand.Var φ.outputs.head!) ps1.stack }
+          { ps2 with stack := stackPoke d (Operand.Var φ.outputs.head!) ps2.stack } := by
+        simpa only [hg1, hg2] using hrest
+      simp only [hg1, hg2]
+      rw [ih { ps1 with stack := stackPoke d (Operand.Var φ.outputs.head!) ps1.stack }
+             { ps2 with stack := stackPoke d (Operand.Var φ.outputs.head!) ps2.stack }
+             hsp hal hlc hagree' hrest']
+
+
+
+/-! ## …and it really is what the generator does
+
+`phiPrefixPlan` is a definition written here, so on its own `phiPrefixPlan_congr` proves nothing about
+the compiler. This section closes that gap: on a prefix of `PHI`s, `generateBlockPlan`'s own fold *is*
+`phiPrefixPlan`. Composing the two gives the plan-generator half of join agreement outright — at a
+genuine join, the block plan does not depend on which predecessor the DFS compiled it against. -/
+
+/-- A `PHI` reaches `generatePhiPlan`: it is not a pre-codegen opcode, so the dispatch falls to the
+phi branch. -/
+theorem generateInstPlan_phi {L : DfState (List String)} {D : DfgAnalysis} {C : CfgAnalysis}
+    {fn : IrFunction} {inst : Instruction} {nl : List String} {isH nIT : Bool} {lbl : String}
+    {ps : PlanState} (h : inst.opcode = Opcode.PHI) :
+    generateInstPlan L D C fn inst nl isH nIT lbl ps = some (generatePhiPlan inst nl ps) := by
+  unfold generateInstPlan
+  have hpre : isPreCodegenOpcode inst.opcode = false := by rw [h]; rfl
+  rw [hpre, h]
+  simp
+
+/-- **`phiPrefixPlan` really is what `generateBlockPlan` does to a block's leading phis.**
+
+The block plan folds `generateInstPlan` over the (non-param) instructions, threading `PlanState` and
+appending ops. On a prefix of `PHI`s that fold *is* `phiPrefixPlan` — so `phiPrefixPlan_congr` is a
+statement about the real generator, not about a lookalike. -/
+theorem foldl_instPlan_phi_prefix {L : DfState (List String)} {D : DfgAnalysis} {C : CfgAnalysis}
+    {fn : IrFunction} {lbl : String} {isHalting : Bool}
+    (nextLiveOf : Nat → List String) (nextIsTermOf : Nat → Bool) :
+    ∀ (l : List (Instruction × Nat)) (ops0 : List StackOp) (ps0 : PlanState),
+      (∀ x ∈ l, x.1.opcode = Opcode.PHI) →
+      l.foldl (fun (acc : Option (List StackOp × PlanState)) (instI : Instruction × Nat) =>
+          match acc with
+          | none => none
+          | some (ops, ps) =>
+            let (inst, i) := instI
+            match generateInstPlan L D C fn inst (nextLiveOf i) isHalting (nextIsTermOf i) lbl ps with
+            | none => none
+            | some (stepOps, ps') => some (ops ++ stepOps, ps'))
+        (some (ops0, ps0))
+      = some (ops0 ++ (phiPrefixPlan (l.map (fun it => (it.1, nextLiveOf it.2))) ps0).1,
+              (phiPrefixPlan (l.map (fun it => (it.1, nextLiveOf it.2))) ps0).2) := by
+  intro l
+  induction l with
+  | nil => intro ops0 ps0 _; simp [phiPrefixPlan]
+  | cons it rest ih =>
+    intro ops0 ps0 hphi
+    obtain ⟨φ, i⟩ := it
+    have hp : φ.opcode = Opcode.PHI := hphi (φ, i) (by simp)
+    simp only [List.foldl_cons, List.map_cons]
+    rw [generateInstPlan_phi (L := L) (D := D) (C := C) (fn := fn) (nl := nextLiveOf i)
+        (isH := isHalting) (nIT := nextIsTermOf i) (lbl := lbl) (ps := ps0) hp]
+    rw [ih _ _ (fun x hx => hphi x (List.mem_cons_of_mem _ hx))]
+    simp only [phiPrefixPlan, List.append_assoc]
+
+
+
+/-- The plan of a **genuine join that is not the entry block**: no params, no clean-stack
+reconciliation, so it is just its `JUMPDEST` followed by the instruction fold started from the
+incoming state. -/
+theorem generateBlockPlan_join_eq {L : DfState (List String)} {D : DfgAnalysis} {C : CfgAnalysis}
+    {fn : IrFunction} {bb : BasicBlock} {ps : PlanState}
+    (hentry : ((fn.blocks.head?.map (·.label)) == some bb.label) = false)
+    (hjoin : ¬ ((C.predsOf bb.label).length = 1)) :
+    generateBlockPlan L D C fn bb ps
+      = (match (nonParamInsts bb).zipIdx.foldl
+            (fun (acc : Option (List StackOp × PlanState)) (instI : Instruction × Nat) =>
+              match acc with
+              | none => none
+              | some (ops, ps) =>
+                let (inst, i) := instI
+                let nextLive :=
+                  if i + 1 < (nonParamInsts bb).length
+                  then liveVarsAt L bb.label (i + (getParams bb.instructions).length + 1)
+                  else liveVarsAt L bb.label bb.instructions.length
+                let nextIsTerm :=
+                  if i + 1 < (nonParamInsts bb).length
+                  then isTerminator (nonParamInsts bb)[i + 1]!.opcode else false
+                match generateInstPlan L D C fn inst nextLive (bbIsHalting bb) nextIsTerm bb.label ps with
+                | none => none
+                | some (stepOps, ps') => some (ops ++ stepOps, ps'))
+            (some ([], ps)) with
+          | none => none
+          | some (instOps, ps3) => some ([StackOp.SOLabel bb.label] ++ instOps, ps3)) := by
+  unfold generateBlockPlan
+  simp only [hentry, Bool.false_eq_true, if_false, if_neg hjoin, List.append_nil]
+  rfl
+
+/-- **The capstone: at a genuine join the block plan does not depend on which predecessor it was
+compiled against.**
+
+A genuine (≥ 2-predecessor) join gets no `cleanStackPlan` reconciliation and is not the entry block, so
+its plan is exactly `JUMPDEST` followed by the instruction fold, started from whichever predecessor's
+exit state the DFS happened to arrive with. The leading phis of that fold are `phiPrefixPlan`
+(`foldl_instPlan_phi_prefix`), and they leave the two states *identical* (`phiPrefixPlan_congr`) — after
+which the remaining instructions fold over one and the same state.
+
+So the DFS's choice of predecessor is invisible in the generated code. This is the plan-generator half of
+the join-agreement invariant, for any number of phis. -/
+theorem generateBlockPlan_congr_at_join
+    {L : DfState (List String)} {D : DfgAnalysis} {C : CfgAnalysis} {fn : IrFunction}
+    {bb : BasicBlock} {ps1 ps2 : PlanState} {k : Nat}
+    (hentry : ((fn.blocks.head?.map (·.label)) == some bb.label) = false)
+    (hjoin : ¬ ((C.predsOf bb.label).length = 1))
+    (hphis : ∀ x ∈ (nonParamInsts bb).zipIdx.take k, x.1.opcode = Opcode.PHI)
+    (hpfx : phiPrefixPlan
+              (((nonParamInsts bb).zipIdx.take k).map (fun it =>
+                (it.1, if it.2 + 1 < (nonParamInsts bb).length
+                       then liveVarsAt L bb.label (it.2 + (getParams bb.instructions).length + 1)
+                       else liveVarsAt L bb.label bb.instructions.length))) ps1
+            = phiPrefixPlan
+              (((nonParamInsts bb).zipIdx.take k).map (fun it =>
+                (it.1, if it.2 + 1 < (nonParamInsts bb).length
+                       then liveVarsAt L bb.label (it.2 + (getParams bb.instructions).length + 1)
+                       else liveVarsAt L bb.label bb.instructions.length))) ps2) :
+    generateBlockPlan L D C fn bb ps1 = generateBlockPlan L D C fn bb ps2 := by
+  rw [generateBlockPlan_join_eq hentry hjoin, generateBlockPlan_join_eq hentry hjoin]
+  -- the fold splits at the phi prefix
+  have hsplit : (nonParamInsts bb).zipIdx
+      = (nonParamInsts bb).zipIdx.take k ++ (nonParamInsts bb).zipIdx.drop k :=
+    (List.take_append_drop k _).symm
+  rw [hsplit, List.foldl_append, List.foldl_append]
+  rw [foldl_instPlan_phi_prefix
+        (L := L) (D := D) (C := C) (fn := fn) (lbl := bb.label) (isHalting := bbIsHalting bb)
+        (nextLiveOf := fun i => if i + 1 < (nonParamInsts bb).length
+                       then liveVarsAt L bb.label (i + (getParams bb.instructions).length + 1)
+                       else liveVarsAt L bb.label bb.instructions.length)
+        (nextIsTermOf := fun i => if i + 1 < (nonParamInsts bb).length
+                       then isTerminator (nonParamInsts bb)[i + 1]!.opcode else false)
+        _ [] ps1 hphis,
+      foldl_instPlan_phi_prefix
+        (L := L) (D := D) (C := C) (fn := fn) (lbl := bb.label) (isHalting := bbIsHalting bb)
+        (nextLiveOf := fun i => if i + 1 < (nonParamInsts bb).length
+                       then liveVarsAt L bb.label (i + (getParams bb.instructions).length + 1)
+                       else liveVarsAt L bb.label bb.instructions.length)
+        (nextIsTermOf := fun i => if i + 1 < (nonParamInsts bb).length
+                       then isTerminator (nonParamInsts bb)[i + 1]!.opcode else false)
+        _ [] ps2 hphis]
+  rw [hpfx]
+
+
+
+theorem executePlan_append (a b : List StackOp) :
+    executePlan (a ++ b) = executePlan a ++ executePlan b := by
+  unfold executePlan
+  simp [List.flatMap_append]
+
+/-- Each phi of the prologue takes the rename branch — its source is dead past it, which is what the
+phi-aware liveness delivers. -/
+def PhiPrefixPokes : List (Instruction × List String) → PlanState → Prop
+  | [], _ => True
+  | (φ, nl) :: rest, ps =>
+      (∀ d, stackGetPhiDepth (phiSrcs φ) ps.stack = some d →
+          nl.contains (operandToString (stackPeek d ps.stack)) = false)
+    ∧ PhiPrefixPokes rest (generatePhiPlan φ nl ps).2
+
+/-- **The phi prologue emits no EVM code.** `SOPoke` is a plan-only rename — `execStackOp` sends it to
+`[]` — so the whole prologue assembles to nothing. This is what makes "the asm stack does not move
+across the phis" *true* rather than merely plausible; it has been leaned on throughout the join
+development, and here it is actually proved. -/
+theorem phiPrefixPlan_asm_nil :
+    ∀ (pairs : List (Instruction × List String)) (ps : PlanState),
+      PhiPrefixPokes pairs ps → executePlan (phiPrefixPlan pairs ps).1 = [] := by
+  intro pairs
+  induction pairs with
+  | nil => intro ps _; rfl
+  | cons p rest ih =>
+    obtain ⟨φ, nl⟩ := p
+    intro ps hwf
+    obtain ⟨hnl, hrest⟩ := hwf
+    have hstep : executePlan (generatePhiPlan φ nl ps).1 = [] := by
+      cases hd : stackGetPhiDepth (phiSrcs φ) ps.stack with
+      | none => rw [generatePhiPlan_eq_nil hd]; rfl
+      | some d => rw [generatePhiPlan_eq_poke hd (hnl d hd)]; rfl
+    show executePlan ((generatePhiPlan φ nl ps).1 ++ (phiPrefixPlan rest _).1) = []
+    rw [executePlan_append, hstep, ih _ hrest]
+    rfl
+
+
+/-! ### Why the join and its residual may share a program
+
+`genBlockSimulation_join` hands the residual block's simulation to the join using the *same* `ops`. The
+two plans are not the same — the join's carries the phi pokes and the residual's does not — so that reuse
+needs a licence. Here it is: a phi prologue assembles to nothing, so the two plans produce the same
+program, which is all the simulation ever looks at. -/
+
+/-- **A phi prologue is invisible in the assembly.** Prepending it to any plan changes nothing about
+the program that plan assembles to — `SOPoke` emits no code.
+
+This is what licenses `genBlockSimulation_join` to use the *same* `ops` for the join and its residual.
+The join's plan carries the phi pokes and the residual's does not, so the two plans differ; but they
+assemble to the same program, which is all the simulation ever sees. Without this the reuse would be an
+unjustified assumption. -/
+theorem executePlan_phi_prefix (pairs : List (Instruction × List String)) (ps : PlanState)
+    (rest : List StackOp) (hwf : PhiPrefixPokes pairs ps) :
+    executePlan ((phiPrefixPlan pairs ps).1 ++ rest) = executePlan rest := by
+  rw [executePlan_append, phiPrefixPlan_asm_nil pairs ps hwf, List.nil_append]
+
+/-- …and so a block plan of the shape `label ++ phi-prologue ++ body` assembles to exactly what
+`label ++ body` assembles to: the residual's program. -/
+theorem executePlan_join_eq_residual (l : String) (pairs : List (Instruction × List String))
+    (ps : PlanState) (body : List StackOp) (hwf : PhiPrefixPokes pairs ps) :
+    executePlan ([StackOp.SOLabel l] ++ ((phiPrefixPlan pairs ps).1 ++ body))
+      = executePlan ([StackOp.SOLabel l] ++ body) := by
+  rw [executePlan_append [StackOp.SOLabel l] ((phiPrefixPlan pairs ps).1 ++ body),
+      executePlan_phi_prefix pairs ps body hwf,
+      executePlan_append [StackOp.SOLabel l] body]
+
 end EvmYul.Venom.Hol.Codegen

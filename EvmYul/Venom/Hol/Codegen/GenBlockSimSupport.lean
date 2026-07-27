@@ -103,6 +103,209 @@ theorem generateBlockPlan_decompose
       exact hf
     · rw [← hblk]; simp
 
+/-- The per-instruction Option-threading fold body inside `generateBlockPlan` /
+    `generateBlockPlan_decompose`, named so `generateBlockPlan_split_term` can refer to it. -/
+def instFoldF (L : DfState (List String)) (D : DfgAnalysis) (C : CfgAnalysis)
+    (fn : IrFunction) (bb : BasicBlock) :
+    Option (List StackOp × PlanState) → Instruction × Nat → Option (List StackOp × PlanState) :=
+  fun acc instI =>
+    match acc with
+    | none => none
+    | some (ops, psc) =>
+      let (inst, i) := instI
+      let nextLive :=
+        if i + 1 < (nonParamInsts bb).length then
+          liveVarsAt L bb.label (i + (getParams bb.instructions).length + 1)
+        else liveVarsAt L bb.label bb.instructions.length
+      let nextIsTerm :=
+        if i + 1 < (nonParamInsts bb).length then
+          isTerminator (nonParamInsts bb)[i + 1]!.opcode else false
+      match generateInstPlan L D C fn inst nextLive (bbIsHalting bb) nextIsTerm bb.label psc with
+      | none => none
+      | some (stepOps, psn) => some (ops ++ stepOps, psn)
+
+/-- **The block's clean-stack plan is trivially empty.** `cleanStackPlan` only does work at a *branch
+    join*: a block with exactly one predecessor whose predecessor **branches** (≥2 successors). So it is
+    `([], ps)` whenever either
+      * the block is not a single-predecessor block (entry, or a real join with ≥2 preds), or
+      * its single predecessor doesn't branch (a JMP pred — its exit layout already IS this block's entry).
+
+    The second case is what makes the per-block machinery apply to the *intermediate blocks of a JMP
+    chain*, which have exactly one predecessor and were previously excluded by the over-strong
+    `(predsOf bb.label).length ≠ 1`. -/
+def CleanTrivial (L : DfState (List String)) (C : CfgAnalysis) (fn : IrFunction)
+    (bb : BasicBlock) : Prop :=
+  ∀ ps : PlanState, cleanStackPlan L C fn bb ps = ([], ps)
+
+/-- Not a single-pred block (entry, or a real join with ≥2 preds) ⇒ nothing to clean. -/
+theorem cleanTrivial_of_multi {L : DfState (List String)} {C : CfgAnalysis} {fn : IrFunction}
+    {bb : BasicBlock} (h : (C.predsOf bb.label).length ≠ 1) : CleanTrivial L C fn bb := by
+  intro ps
+  unfold cleanStackPlan
+  split
+  · rename_i p heq; rw [heq] at h; simp at h
+  · rfl
+
+/-- **A single, non-branching predecessor (a JMP pred)** ⇒ nothing to clean: the predecessor's exit
+    layout already IS this block's entry. This is every intermediate block of a JMP chain. -/
+theorem cleanTrivial_of_jmp_pred {L : DfState (List String)} {C : CfgAnalysis} {fn : IrFunction}
+    {bb : BasicBlock} {p : String}
+    (hp : C.predsOf bb.label = [p]) (hs : (C.succsOf p).length ≤ 1) : CleanTrivial L C fn bb := by
+  intro ps
+  unfold cleanStackPlan
+  rw [hp]
+  exact if_pos hs
+
+/-- The single predecessor isn't a block of `fn` ⇒ nothing to clean. -/
+theorem cleanTrivial_of_pred_missing {L : DfState (List String)} {C : CfgAnalysis} {fn : IrFunction}
+    {bb : BasicBlock} {p : String}
+    (hp : C.predsOf bb.label = [p]) (hf : fn.blocks.find? (·.label == p) = none) :
+    CleanTrivial L C fn bb := by
+  intro ps
+  unfold cleanStackPlan
+  rw [hp]
+  simp only []
+  by_cases hs : (C.succsOf p).length ≤ 1
+  · rw [if_pos hs]
+  · rw [if_neg hs, hf]
+
+/-- **Nothing dead at the join** ⇒ nothing to clean, EVEN at a branch target. `cleanStackPlan` pops the
+    values the branching predecessor's exit layout carries but this block doesn't want; when that set is
+    empty (`popmanyPlan [] = ([], ps)`) the plan is the identity. Crucially `toPop` depends only on the
+    liveness/CFG — not on the plan state — so this is a static condition.
+
+    This is what lets a JNZ's *branch target* (single pred, and that pred branches) be covered without
+    threading a clean-stack prefix through the block layout. -/
+theorem cleanTrivial_of_no_dead {L : DfState (List String)} {C : CfgAnalysis} {fn : IrFunction}
+    {bb : BasicBlock} {p : String} {predBb : BasicBlock}
+    (hp : C.predsOf bb.label = [p])
+    (hf : fn.blocks.find? (·.label == p) = some predBb)
+    (hdead : (liveVarsAt L p predBb.instructions.length).filter
+        (fun v => ¬ (inputVarsFrom p bb.instructions (liveVarsAt L bb.label 0)).contains v) = []) :
+    CleanTrivial L C fn bb := by
+  intro ps
+  unfold cleanStackPlan
+  rw [hp]
+  simp only []
+  by_cases hs : (C.succsOf p).length ≤ 1
+  · rw [if_pos hs]
+  · rw [if_neg hs, hf]
+    simp only []
+    rw [hdead]
+    simp [popmanyPlan]
+
+/-- The condition `generateBlockPlan_split_term` actually needs. -/
+theorem cleanStackPlan_nil_of_cleanTrivial (L : DfState (List String)) (C : CfgAnalysis)
+    (fn : IrFunction) (bb : BasicBlock) (ps : PlanState) (h : CleanTrivial L C fn bb) :
+    cleanStackPlan L C fn bb ps = ([], ps) := h ps
+
+/-- **`generateBlockPlan` terminator-split** (multi-pred, phi/param-free block whose
+    `nonParamInsts` is `front ++ [term]`): the per-instruction fold factors as a body-fold over
+    `front` (`instFoldF`) followed by the single terminator step
+    `generateInstPlan term (liveVarsAt … instructions.length) … false`, and the block's output plan
+    state `ps'` is exactly that terminator step applied to the body-fold output `ps_body`.
+
+    This is the structural spine of the plan-representation bridge: with `psOfFn_entry_succ` /
+    `psOfFn_chain` (which give `psOf successor = ps'`, the predecessor's full-block output), the
+    per-block `hstep` residual `body-fold = psOf successor` is pinned precisely to the terminator's
+    plan effect — for a JMP, the join-reorder (`reorderPlan targetStack`) plus `releaseDeadSpills`. -/
+theorem generateBlockPlan_split_term
+    (L : DfState (List String)) (D : DfgAnalysis) (C : CfgAnalysis) (fn : IrFunction)
+    (bb : BasicBlock) (ps : PlanState) (blockOps : List StackOp) (ps' : PlanState)
+    (front : List Instruction) (term : Instruction)
+    (hentry : ∀ entry, fn.blocks.head? = some entry → getParams entry.instructions = [])
+    (hmulti : CleanTrivial L C fn bb)
+    (hnp : nonParamInsts bb = front ++ [term])
+    (hplan : generateBlockPlan L D C fn bb ps = some (blockOps, ps')) :
+    ∃ bodyOps ps_body termOps,
+      (front.zipIdx 0).foldl (instFoldF L D C fn bb) (some ([], ps)) = some (bodyOps, ps_body) ∧
+      generateInstPlan L D C fn term (liveVarsAt L bb.label bb.instructions.length)
+        (bbIsHalting bb) false bb.label ps_body = some (termOps, ps') ∧
+      blockOps = StackOp.SOLabel bb.label :: bodyOps ++ termOps := by
+  obtain ⟨cleanOps, ps2, instOps, hclean, hfold, hblk⟩ :=
+    generateBlockPlan_decompose L D C fn bb ps blockOps ps' hentry hplan
+  have hcn := cleanStackPlan_nil_of_cleanTrivial L C fn bb ps hmulti
+  have hc : cleanOps = [] ∧ ps2 = ps := by
+    rcases hclean with ⟨_, hcs⟩ | ⟨_, hce, hps2⟩
+    · rw [hcn] at hcs; simp only [Prod.mk.injEq] at hcs; exact ⟨hcs.1.symm, hcs.2.symm⟩
+    · exact ⟨hce, hps2⟩
+  obtain ⟨hce, hps2⟩ := hc
+  subst hce
+  rw [hps2] at hfold
+  have hzi : (nonParamInsts bb).zipIdx 0 = front.zipIdx 0 ++ [(term, front.length)] := by
+    rw [hnp, List.zipIdx_append]; simp
+  have hlen : (nonParamInsts bb).length = front.length + 1 := by rw [hnp]; simp
+  rw [hzi, List.foldl_append] at hfold
+  simp only [List.foldl_cons, List.foldl_nil] at hfold
+  change instFoldF L D C fn bb
+    ((front.zipIdx 0).foldl (instFoldF L D C fn bb) (some ([], ps))) (term, front.length)
+      = some (instOps, ps') at hfold
+  have hlt : ¬ front.length + 1 < (nonParamInsts bb).length := by omega
+  rcases hbr : (front.zipIdx 0).foldl (instFoldF L D C fn bb) (some ([], ps)) with _ | ⟨bodyOps, ps_body⟩
+  · rw [hbr] at hfold; simp [instFoldF] at hfold
+  · rw [hbr] at hfold
+    simp only [instFoldF] at hfold
+    rw [if_neg hlt, if_neg hlt] at hfold
+    rcases hts : generateInstPlan L D C fn term (liveVarsAt L bb.label bb.instructions.length)
+        (bbIsHalting bb) false bb.label ps_body with _ | ⟨termOps, psT⟩
+    · rw [hts] at hfold; simp at hfold
+    · rw [hts] at hfold
+      simp only [Option.some.injEq, Prod.mk.injEq] at hfold
+      obtain ⟨hops, hpsT⟩ := hfold
+      exact ⟨bodyOps, ps_body, termOps, rfl, by rw [hts, hpsT], by rw [hblk, ← hops]; simp⟩
+
+/-- **`generateBlockPlan_split_term` without `CleanTrivial` — the clean-stack prefix is kept.**
+
+    `generateBlockPlan_split_term` assumes `CleanTrivial`, i.e. that the block's clean-stack prologue
+    is empty, and so pins the body fold to start at the block's *entry* state `ps` and the body's asm
+    to start right after the label. That is false at a join that genuinely drops values: a block with
+    exactly one predecessor which itself has several successors (a JNZ target) pops every variable that
+    was live at the predecessor's exit but is not an input here (`cleanStackPlan` → `popmanyPlan`).
+
+    This version keeps that prefix. The body fold starts at `ps2` — the state *after* the pops — and the
+    block's ops are `SOLabel :: cleanOps ++ bodyOps ++ termOps`. Every downstream layout lemma's pc
+    arithmetic has to shift by `(executePlan cleanOps).length` accordingly; the semantic side is already
+    available (`popmanyPlan_sim`, which leaves the Venom state untouched — popping dead variables is
+    invisible to Venom). Specialising `cleanOps = []`/`ps2 = ps` recovers the old statement. -/
+theorem generateBlockPlan_split_term_clean
+    (L : DfState (List String)) (D : DfgAnalysis) (C : CfgAnalysis) (fn : IrFunction)
+    (bb : BasicBlock) (ps : PlanState) (blockOps : List StackOp) (ps' : PlanState)
+    (front : List Instruction) (term : Instruction)
+    (hentry : ∀ entry, fn.blocks.head? = some entry → getParams entry.instructions = [])
+    (hnp : nonParamInsts bb = front ++ [term])
+    (hplan : generateBlockPlan L D C fn bb ps = some (blockOps, ps')) :
+    ∃ cleanOps ps2 bodyOps ps_body termOps,
+      ((C.predsOf bb.label).length = 1 ∧ cleanStackPlan L C fn bb ps = (cleanOps, ps2) ∨
+       (C.predsOf bb.label).length ≠ 1 ∧ cleanOps = [] ∧ ps2 = ps) ∧
+      (front.zipIdx 0).foldl (instFoldF L D C fn bb) (some ([], ps2)) = some (bodyOps, ps_body) ∧
+      generateInstPlan L D C fn term (liveVarsAt L bb.label bb.instructions.length)
+        (bbIsHalting bb) false bb.label ps_body = some (termOps, ps') ∧
+      blockOps = StackOp.SOLabel bb.label :: cleanOps ++ bodyOps ++ termOps := by
+  obtain ⟨cleanOps, ps2, instOps, hclean, hfold, hblk⟩ :=
+    generateBlockPlan_decompose L D C fn bb ps blockOps ps' hentry hplan
+  have hzi : (nonParamInsts bb).zipIdx 0 = front.zipIdx 0 ++ [(term, front.length)] := by
+    rw [hnp, List.zipIdx_append]; simp
+  have hlen : (nonParamInsts bb).length = front.length + 1 := by rw [hnp]; simp
+  rw [hzi, List.foldl_append] at hfold
+  simp only [List.foldl_cons, List.foldl_nil] at hfold
+  change instFoldF L D C fn bb
+    ((front.zipIdx 0).foldl (instFoldF L D C fn bb) (some ([], ps2))) (term, front.length)
+      = some (instOps, ps') at hfold
+  have hlt : ¬ front.length + 1 < (nonParamInsts bb).length := by omega
+  rcases hbr : (front.zipIdx 0).foldl (instFoldF L D C fn bb) (some ([], ps2)) with _ | ⟨bodyOps, ps_body⟩
+  · rw [hbr] at hfold; simp [instFoldF] at hfold
+  · rw [hbr] at hfold
+    simp only [instFoldF] at hfold
+    rw [if_neg hlt, if_neg hlt] at hfold
+    rcases hts : generateInstPlan L D C fn term (liveVarsAt L bb.label bb.instructions.length)
+        (bbIsHalting bb) false bb.label ps_body with _ | ⟨termOps, psT⟩
+    · rw [hts] at hfold; simp at hfold
+    · rw [hts] at hfold
+      simp only [Option.some.injEq, Prod.mk.injEq] at hfold
+      obtain ⟨hops, hpsT⟩ := hfold
+      exact ⟨cleanOps, ps2, bodyOps, ps_body, termOps, hclean, hbr, by rw [hts, hpsT],
+        by rw [hblk, ← hops]; simp⟩
+
 /-! ## Venom-side `runBlock` decomposition (phi-free blocks)
 
 The execution-side counterpart to `generateBlockPlan_decompose`: for a block whose first

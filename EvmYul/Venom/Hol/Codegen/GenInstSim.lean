@@ -321,14 +321,14 @@ theorem genInstPlan_sim_stop
 theorem asmStep_invalid_ok {offsetToPc prog s}
     (hpc : s.pc < prog.length)
     (hprog : prog.get ⟨s.pc, hpc⟩ = AsmInst.AsmOp "INVALID") :
-    asmStep offsetToPc prog s = AsmResult.AsmFault (asmNext s) := by
+    asmStep offsetToPc prog s = AsmResult.AsmFault { asmNext s with returndata := ByteArray.empty } := by
   unfold asmStep; rw [dif_pos hpc, hprog]; rfl
 
 /-- `INVALID` (terminal/aborting, `ExHaltAbort`): the generator emits `[SOEmit "INVALID"]`;
     the Venom step aborts with returndata cleared and the asm `INVALID` faults (`AsmFault`).
-    `venomAsmTerminalRel` holds given `vs.returndata = empty` (in-scope, since message calls
-    are out of scope, returndata is always empty): the Venom step clears returndata while
-    `asmStep`'s `AsmFault (asmNext s)` keeps it, so they agree exactly when already empty. -/
+    `venomAsmTerminalRel` holds **unconditionally**: both sides clear returndata (the Venom
+    step via `setReturndata empty`, the asm `INVALID` via `AsmFault { asmNext s with
+    returndata := empty }`), so the terminal returndata match is `empty = empty` by `rfl`. -/
 theorem genInstPlan_sim_invalid
     {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
     {inst : Instruction} {nextLive : List String} {isHalting nextIsTerm : Bool} {curBb : String}
@@ -338,7 +338,6 @@ theorem genInstPlan_sim_invalid
     (hgen : generateInstPlan liveness dfg cfg fn inst nextLive isHalting nextIsTerm curBb ps
               = some (ops, ps'))
     (hrel : venomAsmRel lo ps vs as)
-    (hrd : vs.returndata = ByteArray.empty)
     (hblock : asmBlockAt prog as.pc (executePlan ops)) :
     ops = [StackOp.SOEmit "INVALID"] ∧
     stepInstBase inst vs
@@ -352,12 +351,12 @@ theorem genInstPlan_sim_invalid
       hops houts (by rw [hinv]; rfl) hgen
   subst hops_eq
   obtain ⟨hpc, hget⟩ := asmBlockAt_one hblock
-  obtain ⟨_, _, _, hAcc, hTrans, hRet, hLog, _⟩ := hrel
-  refine ⟨rfl, by simp only [stepInstBase, hinv], asmNext as, ?_, ?_⟩
-  · show runAsm 1 offsetToPc prog as = AsmResult.AsmFault (asmNext as)
+  obtain ⟨_, _, _, hAcc, hTrans, _, hLog, _⟩ := hrel
+  refine ⟨rfl, by simp only [stepInstBase, hinv], { asmNext as with returndata := ByteArray.empty }, ?_, ?_⟩
+  · show runAsm 1 offsetToPc prog as = AsmResult.AsmFault { asmNext as with returndata := ByteArray.empty }
     unfold runAsm
     rw [asmStep_invalid_ok hpc hget]
-  · exact ⟨hAcc, hTrans, hRet.trans hrd, hLog⟩
+  · exact ⟨hAcc, hTrans, rfl, hLog⟩
 
 /-- **Asm-side sim for a bare STOP terminal block** (`[SOLabel l, SOEmit "STOP"]`) — the simplest
     `hasm` for `hfsim_jmp_then_halt`. Running the block (`JUMPDEST ; STOP`) from the block's entry
@@ -3050,6 +3049,13 @@ theorem releaseDeadSpills_noSpill (nextLiveness : List String) (ps : PlanState)
     rw [hnone] at hsub
     nomatch hsub
 
+/-- `releaseDeadSpills` is the identity when there are no spills (`ps.spilled = []`): the fold over
+    the spill map is a fold over `[]`. Used by `generateRegularInstPlan_jmp_id`. -/
+theorem releaseDeadSpills_empty (nl : List String) (ps : PlanState)
+    (h : ps.spilled = ([] : AssocList Operand Nat)) :
+    releaseDeadSpills nl ps = ps := by
+  unfold releaseDeadSpills; rw [h]; rfl
+
 /-- `releaseDeadSpills` simulation: it emits no asm and touches only the spill bookkeeping
     (`spilled`/`alloc.freeSlots`), so `venomAsmRel` is preserved.
 
@@ -3132,6 +3138,8 @@ theorem emit_pop1_sim {ps lo vs as prog a rest}
     rw [runAsm_succ_ok hpc hstep]; rfl
   · exact venomAsmRel_pop hrel hstack
   · rfl
+
+
 
 /-- `generateEmitOps` for an opcode with a direct EVM name emits exactly `[SOEmit name]` and
     leaves the plan state unchanged — the shape `emit_binop_sim` consumes for the arithmetic
@@ -4310,6 +4318,962 @@ theorem generateEmitOps_jmp {inst : Instruction} {target : String} {ps : PlanSta
       = ([StackOp.SOPushLabel target, StackOp.SOEmit "JUMP"], ps) := by
   unfold generateEmitOps
   rw [hjmp, hops]; rfl
+
+/-- **JMP terminator-step is PlanState-identity** when the successor consumes no stack inputs
+    (`inputVarsFrom = []`, so the join-reorder `reorderPlan targetStack` is empty) and there are no
+    live spills (`ps.spilled = []`, so `releaseDeadSpills` is the identity). Every intermediate stage
+    threads `ps` unchanged: `emitInputPlan [] = id` (JMP has no Var operands, `computeOperands_jmp`),
+    the join-reorder is `reorderPlan [] = id`, the commutative branch's plan state is `ps` regardless,
+    `reorderPlan [] = id`, `stackPop 0 = id`, no outputs, `generateEmitOps` leaves `ps`, and
+    `releaseDeadSpills` is the identity.
+
+    With the plan-representation spine (`generateBlockPlan_split_term`, giving
+    `ps' = term-step ps_body`) and `psOfFn_entry_succ` (`psOf successor = ps'`), this discharges the
+    per-block `hstep` residual (`hstk/hsp/hfe/hno`) for such JMP blocks: `psOf successor = ps_body`,
+    the body-fold output — reducing the residual to the body-fold representation reconciliation. -/
+theorem generateRegularInstPlan_jmp_id
+    {L : DfState (List String)} {D : DfgAnalysis} {C : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {target : String} {nextLive : List String}
+    {isH nextT : Bool} {curBb : String} {ps : PlanState}
+    (hjmp : inst.opcode = Opcode.JMP)
+    (hops : inst.operands = [Operand.Label target])
+    (houts : inst.outputs = [])
+    (hjoin : ∀ targetBb, fn.blocks.find? (·.label == target) = some targetBb →
+              inputVarsFrom curBb targetBb.instructions (liveVarsAt L target 0) = [])
+    (hsp : ps.spilled = ([] : AssocList Operand Nat)) :
+    (generateRegularInstPlan L D C fn inst nextLive isH nextT curBb ps).2 = ps := by
+  have hc : (isCommutative Opcode.JMP && decide ((0:Nat) ≥ 2)) = false := by decide
+  unfold generateRegularInstPlan
+  rw [computeOperands_jmp hjmp hops]
+  rcases hf : fn.blocks.find? (fun x => x.label == target) with _ | targetBb
+  · simp only [hjmp, hops, houts, emitInputPlan_nil, hf, reorderPlan_empty, hc,
+      List.length_nil, if_true, Bool.false_eq_true, if_false, stackPop_zero,
+      List.foldl_nil, List.isEmpty_nil, generateEmitOps_jmp hjmp hops,
+      releaseDeadSpills_empty nextLive ps hsp]
+  · simp only [hjmp, hops, houts, emitInputPlan_nil, hf, hjoin targetBb hf, List.map_nil,
+      reorderPlan_empty, hc, List.length_nil, if_true, Bool.false_eq_true, if_false,
+      stackPop_zero, List.foldl_nil, List.isEmpty_nil, generateEmitOps_jmp hjmp hops,
+      releaseDeadSpills_empty nextLive ps hsp]
+
+/-- **Full aligned-JMP terminator-step characterization.** For an aligned JMP (successor with no stack
+    inputs, no live spills), the plan step is exactly `([SOPushLabel target, SOEmit "JUMP"], ps)` — the
+    ops-side (foundation for the asm-layout `hpush`/`hjump`) strengthening `generateRegularInstPlan_jmp_id`
+    (which gave only the `ps`-identity). -/
+theorem generateRegularInstPlan_jmp_full
+    {L : DfState (List String)} {D : DfgAnalysis} {C : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {target : String} {nextLive : List String}
+    {isH nextT : Bool} {curBb : String} {ps : PlanState}
+    (hjmp : inst.opcode = Opcode.JMP)
+    (hops : inst.operands = [Operand.Label target])
+    (houts : inst.outputs = [])
+    (hjoin : ∀ targetBb, fn.blocks.find? (·.label == target) = some targetBb →
+              inputVarsFrom curBb targetBb.instructions (liveVarsAt L target 0) = [])
+    (hsp : ps.spilled = ([] : AssocList Operand Nat)) :
+    generateRegularInstPlan L D C fn inst nextLive isH nextT curBb ps
+      = ([StackOp.SOPushLabel target, StackOp.SOEmit "JUMP"], ps) := by
+  have hc : (isCommutative Opcode.JMP && decide ((0:Nat) ≥ 2)) = false := by decide
+  unfold generateRegularInstPlan
+  rw [computeOperands_jmp hjmp hops]
+  rcases hf : fn.blocks.find? (fun x => x.label == target) with _ | targetBb
+  · simp only [hjmp, hops, houts, emitInputPlan_nil, hf, reorderPlan_empty, hc,
+      List.length_nil, if_true, Bool.false_eq_true, if_false, stackPop_zero,
+      List.foldl_nil, List.isEmpty_nil, generateEmitOps_jmp hjmp hops,
+      releaseDeadSpills_empty nextLive ps hsp, List.nil_append, List.append_nil]
+  · simp only [hjmp, hops, houts, emitInputPlan_nil, hf, hjoin targetBb hf, List.map_nil,
+      reorderPlan_empty, hc, List.length_nil, if_true, Bool.false_eq_true, if_false,
+      stackPop_zero, List.foldl_nil, List.isEmpty_nil, generateEmitOps_jmp hjmp hops,
+      releaseDeadSpills_empty nextLive ps hsp, List.nil_append, List.append_nil]
+
+/-- `computeOperands` of an operand-free instruction is `[]` (all three branches — `getNonLabelOperands`,
+    `.tail.reverse`, `.reverse` — collapse on the empty operand list). -/
+theorem computeOperands_nil {inst : Instruction} (hops : inst.operands = []) :
+    computeOperands inst = [] := by
+  unfold computeOperands getNonLabelOperands
+  rw [hops]; simp
+
+/-- **Full bare-halting-terminator plan characterization.** For a terminal op with no operands, no
+    outputs, and a single EVM name (`STOP`/`INVALID` — `opcodeToEvmName = some name`), and no live spills,
+    the plan step is exactly `([SOEmit name], ps)`: every stage threads `ps` unchanged (`emitInputPlan [] = id`,
+    no join since not JMP, the commutative branch is skipped on the empty operand list, `reorderPlan [] = id`,
+    `stackPop 0 = id`, no outputs, `generateEmitOps` leaves `ps`, `releaseDeadSpills` identity). The bare-op
+    analogue of `generateRegularInstPlan_jmp_full` — foundation for the aligned STOP/INVALID asm layout. -/
+theorem generateRegularInstPlan_bareHalt_full
+    {L : DfState (List String)} {D : DfgAnalysis} {C : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {name : String} {nextLive : List String}
+    {isH nextT : Bool} {curBb : String} {ps : PlanState}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hops : inst.operands = [])
+    (houts : inst.outputs = [])
+    (hsp : ps.spilled = ([] : AssocList Operand Nat)) :
+    generateRegularInstPlan L D C fn inst nextLive isH nextT curBb ps
+      = ([StackOp.SOEmit name], ps) := by
+  unfold generateRegularInstPlan
+  rw [computeOperands_nil hops]
+  simp [hops, houts, emitInputPlan_nil, reorderPlan_empty,
+    stackPop_zero, generateEmitOps_evmName hname, releaseDeadSpills_empty nextLive ps hsp]
+
+/-- **Aligned two-operand-terminal plan ops = emit ++ `[SOEmit name]`** (RETURN/REVERT). The operand-
+    terminal analogue of `generateRegularInstPlan_bareHalt_full`: for a terminator with a single EVM name
+    (`opcodeToEvmName = some name`), two operands `[off, sz]` (computed as `[sz, off]` = `computeOperands`,
+    given `hco`), no outputs, non-commutative, and the join-reorder already positioned after emission
+    (`hreorderNil` — the alignment condition, discharged separately as `generateBlockPlan_aligned_jmp` took
+    `hjoin`), the plan *ops* are exactly the operand emission followed by `[SOEmit name]` (no reorder). We
+    characterize only `.1` (the ops) — enough for the layout `hblock`/`hget`; the terminal `ps'` is
+    irrelevant since RETURN/REVERT halt (the OK-not-halted branch is vacuous). -/
+theorem generateRegularInstPlan_return_full
+    {L : DfState (List String)} {D : DfgAnalysis} {C : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {name : String} {offv szv : String} {nextLive : List String}
+    {isH nextT : Bool} {curBb : String} {ps : PlanState}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hncomm : isCommutative inst.opcode = false)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hco : computeOperands inst = [Operand.Var szv, Operand.Var offv])
+    (houts : inst.outputs = [])
+    (hreorderNil : (reorderPlan [Operand.Var szv, Operand.Var offv]
+        (emitInputPlan inst.opcode [Operand.Var szv, Operand.Var offv] nextLive ps).2).1 = []) :
+    (generateRegularInstPlan L D C fn inst nextLive isH nextT curBb ps).1
+      = (emitInputPlan inst.opcode [Operand.Var szv, Operand.Var offv] nextLive ps).1
+        ++ [StackOp.SOEmit name] := by
+  unfold generateRegularInstPlan
+  rw [hco]
+  simp [if_neg hnjmp, hncomm, houts, generateEmitOps_evmName hname, hreorderNil]
+
+/-- `generateEmitOps` for a JNZ emits `[push ifNz; JUMPI; push ifZ; JUMP]` (`opcodeToEvmName JNZ = none`,
+    then the JNZ branch with the two label operands). -/
+theorem generateEmitOps_jnz {inst : Instruction} {c ifNz ifZ : String} {ps : PlanState} {n : Nat}
+    (hjnz : inst.opcode = Opcode.JNZ)
+    (hops : inst.operands = [Operand.Var c, Operand.Label ifNz, Operand.Label ifZ]) :
+    generateEmitOps inst n ps
+      = ([StackOp.SOPushLabel ifNz, StackOp.SOEmit "JUMPI",
+          StackOp.SOPushLabel ifZ, StackOp.SOEmit "JUMP"], ps) := by
+  unfold generateEmitOps
+  rw [hjnz, hops]; rfl
+
+/-- **Full aligned-JNZ plan characterization.** For a JNZ `[cond, ifNz, ifZ]` whose condition is emitted
+    as a single `DUP1` (`hemit` — the live condition sits at the plan-stack top) with the join-reorder then
+    positioned (`hreorder`), the plan *ops* are `[DUP1, push ifNz, JUMPI, push ifZ, JUMP]` — the 5-op tail
+    the `hstep_regularHSVP_jnz_{taken,nottaken}` layout reads. Alignment (`hemit`/`hreorder`) is discharged
+    separately, as `generateBlockPlan_aligned_jmp` took `hjoin`. Only `.1` (ops); terminal `ps'` unused
+    (JNZ continues, but the successor `psOf` comes from the DFS, not this plan). -/
+theorem generateRegularInstPlan_jnz_full
+    {L : DfState (List String)} {D : DfgAnalysis} {C : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {c ifNz ifZ : String} {nl : List String}
+    {isH nextT : Bool} {curBb : String} {ps : PlanState}
+    (hjnz : inst.opcode = Opcode.JNZ)
+    (hops : inst.operands = [Operand.Var c, Operand.Label ifNz, Operand.Label ifZ])
+    (houts : inst.outputs = [])
+    (hemit : (emitInputPlan Opcode.JNZ [Operand.Var c] nl ps).1 = [StackOp.SODup 1])
+    (hreorder : (reorderPlan [Operand.Var c]
+        (emitInputPlan Opcode.JNZ [Operand.Var c] nl ps).2).1 = []) :
+    (generateRegularInstPlan L D C fn inst nl isH nextT curBb ps).1
+      = [StackOp.SODup 1, StackOp.SOPushLabel ifNz, StackOp.SOEmit "JUMPI",
+         StackOp.SOPushLabel ifZ, StackOp.SOEmit "JUMP"] := by
+  have hco : computeOperands inst = [Operand.Var c] := by
+    unfold computeOperands getNonLabelOperands; rw [hjnz, hops]; simp [isLabelOperand]
+  unfold generateRegularInstPlan
+  rw [hco]
+  simp [houts, hjnz, hemit, hreorder, generateEmitOps_jnz hjnz hops]
+
+/-- **`stackPop 1 (stackDup 0 s) = s`.** Duplicating the TOS then popping one recovers the original stack —
+    the net stack effect of a JNZ terminator's condition-DUP followed by the `JUMPI` operand pop. -/
+theorem stackPop_stackDup_zero (s : List Operand) : stackPop 1 (stackDup 0 s) = s := by
+  unfold stackPop stackDup
+  simp [List.length_append]
+
+/-- **JNZ terminator-step is PlanState-identity for an aligned block.** When the live condition sits at
+    the plan-stack top so its emission is a single `DUP1` (`hemit` — leaving `ps` with the TOS duplicated),
+    the join-reorder is positioned (`hreorder`, no state change), and there are no live spills
+    (`hsp`, so `releaseDeadSpills` is the identity), every stage threads `ps` unchanged: the DUP+`stackPop 1`
+    cancel (`stackPop_stackDup_zero`), no outputs, `generateEmitOps` leaves `ps`. The JNZ analogue of
+    `generateRegularInstPlan_jmp_id` — the plan-effect fact a JNZ scheduling-residual discharge needs
+    (`(lg.foldl gp).2 = psOf successor`), alongside a JNZ two-successor DFS recording. -/
+theorem generateRegularInstPlan_jnz_id
+    {L : DfState (List String)} {D : DfgAnalysis} {C : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {c ifNz ifZ : String} {nl : List String}
+    {isH nextT : Bool} {curBb : String} {ps : PlanState}
+    (hjnz : inst.opcode = Opcode.JNZ)
+    (hops : inst.operands = [Operand.Var c, Operand.Label ifNz, Operand.Label ifZ])
+    (houts : inst.outputs = [])
+    (hemit : emitInputPlan Opcode.JNZ [Operand.Var c] nl ps
+        = ([StackOp.SODup 1], { ps with stack := stackDup 0 ps.stack }))
+    (hreorder : reorderPlan [Operand.Var c] { ps with stack := stackDup 0 ps.stack }
+        = ([], { ps with stack := stackDup 0 ps.stack }))
+    (hsp : ps.spilled = ([] : AssocList Operand Nat)) :
+    (generateRegularInstPlan L D C fn inst nl isH nextT curBb ps).2 = ps := by
+  have hco : computeOperands inst = [Operand.Var c] := by
+    unfold computeOperands getNonLabelOperands; rw [hjnz, hops]; simp [isLabelOperand]
+  unfold generateRegularInstPlan
+  rw [hco]
+  simp only [hjnz, hemit, hreorder, houts, generateEmitOps_jnz hjnz hops, List.length_singleton,
+    stackPop_stackDup_zero, show isCommutative Opcode.JNZ = false from rfl, Bool.false_and,
+    List.foldl_nil, List.isEmpty_nil, reduceCtorEq, reduceIte, if_false, if_true,
+    List.append_nil, List.nil_append]
+  exact releaseDeadSpills_empty nl _ hsp
+
+/-- **`executePlan` is label-free when no stack-op is a label push.** `execStackOp` produces an
+    `AsmPushLabel`/`AsmPushOfst` only from `SOPushLabel`/`SOPushOfst`/`SOPush (Operand.Label _)`; every
+    other stack op yields `AsmPush`/`AsmOp`/`AsmLabel`/`POP`. So a plan free of those three label-push ops
+    compiles to asm with no label pushes — the hypothesis `asmBlockAt_resolved_of_middle_no_label` needs
+    for the operand-emission segment of a RETURN/REVERT block. -/
+theorem executePlan_no_label (ops : List StackOp)
+    (h : ∀ so ∈ ops, (∀ l, so ≠ StackOp.SOPushLabel l) ∧ (∀ l d, so ≠ StackOp.SOPushOfst l d)
+      ∧ (∀ l, so ≠ StackOp.SOPush (Operand.Label l))) :
+    ∀ a ∈ executePlan ops, (∀ l, a ≠ AsmInst.AsmPushLabel l) ∧ (∀ l d, a ≠ AsmInst.AsmPushOfst l d) := by
+  intro a ha
+  have ha' : a ∈ ops.flatMap execStackOp := ha
+  rw [List.mem_flatMap] at ha'
+  obtain ⟨so, hso, hain⟩ := ha'
+  obtain ⟨hnpl, hnpo, hnplit⟩ := h so hso
+  cases so with
+  | SOPush op =>
+    cases op with
+    | Lit v => simp [execStackOp] at hain; subst hain; exact ⟨by simp, by simp⟩
+    | Var v => simp [execStackOp] at hain
+    | Label l => exact absurd rfl (hnplit l)
+  | SOPushLabel l => exact absurd rfl (hnpl l)
+  | SOPushOfst l d => exact absurd rfl (hnpo l d)
+  | SOPop n =>
+    simp only [execStackOp, List.mem_replicate] at hain
+    rw [hain.2]; exact ⟨by simp, by simp⟩
+  | SOSwap n => simp [execStackOp] at hain; subst hain; exact ⟨by simp, by simp⟩
+  | SODup n => simp [execStackOp] at hain; subst hain; exact ⟨by simp, by simp⟩
+  | SOPoke a b => simp [execStackOp] at hain
+  | SOSpill off => simp [execStackOp] at hain; rcases hain with h | h <;> subst h <;> exact ⟨by simp, by simp⟩
+  | SORestore off => simp [execStackOp] at hain; rcases hain with h | h <;> subst h <;> exact ⟨by simp, by simp⟩
+  | SOEmit opc => simp [execStackOp] at hain; subst hain; exact ⟨by simp, by simp⟩
+  | SOLabel lbl => simp [execStackOp] at hain; subst hain; exact ⟨by simp, by simp⟩
+
+/-- The spill fold of `doDup`/`doSwap`'s bulk branch appends only `SOSpill` ops, so every produced op is
+    label-push-free (helper for `doDup_no_label`). -/
+theorem spillFold_no_label :
+    ∀ (items : List Operand) (acc : List StackOp × List Nat × SpillAlloc),
+    (∀ so ∈ acc.1, (∀ l, so ≠ StackOp.SOPushLabel l) ∧ (∀ l d, so ≠ StackOp.SOPushOfst l d)
+      ∧ (∀ l, so ≠ StackOp.SOPush (Operand.Label l))) →
+    ∀ so ∈ (items.foldl (fun (x : List StackOp × List Nat × SpillAlloc) (item : Operand) =>
+        let (off, al') := allocSpillSlot x.2.2
+        (x.1 ++ [StackOp.SOSpill off], x.2.1 ++ [off], al')) acc).1,
+      (∀ l, so ≠ StackOp.SOPushLabel l) ∧ (∀ l d, so ≠ StackOp.SOPushOfst l d)
+        ∧ (∀ l, so ≠ StackOp.SOPush (Operand.Label l)) := by
+  intro items
+  induction items with
+  | nil => intro acc hacc so hso; exact hacc so hso
+  | cons hd tl ih =>
+    intro acc hacc so hso
+    rw [List.foldl_cons] at hso
+    refine ih _ ?_ so hso
+    intro so' hso'
+    rw [List.mem_append] at hso'
+    rcases hso' with h | h
+    · exact hacc so' h
+    · simp only [List.mem_singleton] at h; subst h; exact ⟨by simp, by simp, by simp⟩
+
+/-- **`doDup` produces no label-push stack-op.** Both branches emit only `SODup`/`SOSpill`/`SORestore`. -/
+theorem doDup_no_label (dist : Nat) (ps : PlanState) :
+    ∀ so ∈ (doDup dist ps).1, (∀ l, so ≠ StackOp.SOPushLabel l) ∧ (∀ l d, so ≠ StackOp.SOPushOfst l d)
+      ∧ (∀ l, so ≠ StackOp.SOPush (Operand.Label l)) := by
+  intro so hso
+  unfold doDup at hso
+  split at hso
+  · simp only [List.mem_singleton] at hso; subst hso; exact ⟨by simp, by simp, by simp⟩
+  · simp only [List.mem_append] at hso
+    rcases hso with h | h
+    · exact spillFold_no_label _ ([], [], ps.alloc) (by simp) so h
+    · rw [List.mem_map] at h; obtain ⟨idx, _, rfl⟩ := h; exact ⟨by simp, by simp, by simp⟩
+
+/-- **`doRestore` produces no label-push stack-op** (`[]` or `[SORestore off]`). -/
+theorem doRestore_no_label (op : Operand) (ps : PlanState) :
+    ∀ so ∈ (doRestore op ps).1, (∀ l, so ≠ StackOp.SOPushLabel l) ∧ (∀ l d, so ≠ StackOp.SOPushOfst l d)
+      ∧ (∀ l, so ≠ StackOp.SOPush (Operand.Label l)) := by
+  intro so hso
+  unfold doRestore at hso
+  split at hso
+  · simp at hso
+  · simp only [List.mem_singleton] at hso; subst hso; exact ⟨by simp, by simp, by simp⟩
+
+/-- **`emitOneInput` of a non-label operand produces no label-push stack-op.** For a `Var`/`Lit` operand,
+    the emission is `restoreOps ++ (SOPush(Lit) | doDup)` — all `SORestore`/`SODup`/`SOSpill`/`SOPush(Lit)`,
+    never a label push (only `Operand.Label` emits `SOPushLabel`). -/
+theorem emitOneInput_no_label (opc : Opcode) (nl : List String) (op : Operand)
+    (hop : ∀ l, op ≠ Operand.Label l) (ps : PlanState) :
+    ∀ so ∈ (emitOneInput opc nl op ps).1, (∀ l, so ≠ StackOp.SOPushLabel l)
+      ∧ (∀ l d, so ≠ StackOp.SOPushOfst l d) ∧ (∀ l, so ≠ StackOp.SOPush (Operand.Label l)) := by
+  intro so hso
+  have hrestore : ∀ so' ∈ (if isVarOperand op && (alookup' ps.spilled op).isSome
+      then doRestore op ps else ([], ps)).1, (∀ l, so' ≠ StackOp.SOPushLabel l)
+      ∧ (∀ l d, so' ≠ StackOp.SOPushOfst l d) ∧ (∀ l, so' ≠ StackOp.SOPush (Operand.Label l)) := by
+    intro so' hso'; split at hso'
+    · exact doRestore_no_label op ps so' hso'
+    · simp at hso'
+  unfold emitOneInput at hso
+  cases op with
+  | Label l => exact absurd rfl (hop l)
+  | Lit v =>
+    simp only [List.mem_append] at hso
+    rcases hso with h | h
+    · exact hrestore so h
+    · simp only [List.mem_singleton] at h; subst h; exact ⟨by simp, by simp, by simp⟩
+  | Var v =>
+    simp only at hso
+    split at hso
+    · split at hso
+      · rw [List.mem_append] at hso
+        rcases hso with h | h
+        · exact hrestore so h
+        · exact doDup_no_label _ _ so h
+      · exact hrestore so hso
+    · exact hrestore so hso
+
+/-- **`emitInputPlan` of non-label operands produces no label-push stack-op** (fold of
+    `emitOneInput_no_label`), so its compiled asm is label-free — the emit segment of a RETURN/REVERT block
+    resolves pointwise. -/
+theorem emitInputPlan_no_label (opc : Opcode) (nl : List String) :
+    ∀ (ops : List Operand), (∀ op ∈ ops, ∀ l, op ≠ Operand.Label l) → ∀ (ps : PlanState),
+    ∀ so ∈ (emitInputPlan opc ops nl ps).1, (∀ l, so ≠ StackOp.SOPushLabel l)
+      ∧ (∀ l d, so ≠ StackOp.SOPushOfst l d) ∧ (∀ l, so ≠ StackOp.SOPush (Operand.Label l)) := by
+  have hfold : ∀ (ops : List Operand), (∀ op ∈ ops, ∀ l, op ≠ Operand.Label l) →
+      ∀ (acc : List StackOp × PlanState),
+      (∀ so ∈ acc.1, (∀ l, so ≠ StackOp.SOPushLabel l) ∧ (∀ l d, so ≠ StackOp.SOPushOfst l d)
+        ∧ (∀ l, so ≠ StackOp.SOPush (Operand.Label l))) →
+      ∀ so ∈ (ops.foldl (fun (acc : List StackOp × PlanState) op =>
+          (acc.1 ++ (emitOneInput opc nl op acc.2).1, (emitOneInput opc nl op acc.2).2)) acc).1,
+        (∀ l, so ≠ StackOp.SOPushLabel l) ∧ (∀ l d, so ≠ StackOp.SOPushOfst l d)
+          ∧ (∀ l, so ≠ StackOp.SOPush (Operand.Label l)) := by
+    intro ops
+    induction ops with
+    | nil => intro _ acc hacc so hso; exact hacc so hso
+    | cons hd tl ih =>
+      intro hlbl acc hacc so hso
+      rw [List.foldl_cons] at hso
+      refine ih (fun op hop => hlbl op (List.mem_cons_of_mem _ hop)) _ ?_ so hso
+      intro so' hso'
+      rw [List.mem_append] at hso'
+      rcases hso' with h | h
+      · exact hacc so' h
+      · exact emitOneInput_no_label opc nl hd (hlbl hd (List.mem_cons_self ..)) acc.2 so' h
+  intro ops hlbl ps so hso
+  exact hfold ops hlbl ([], ps) (by simp) so hso
+
+/-! ### No `SOLabel` in the plan ops — the other half of `hpreuniq`
+
+`hpreuniq` reduces (via `asmLabelCount_executePlan`) to counting `SOLabel` in the plan. `SOLabel` is
+emitted ONLY by `generateBlockPlan`'s own leading label and by `generateEmitOps` for INVOKE /
+ASSERT_UNREACHABLE / DJMP (which mint fresh labels). Everything else — the whole spill/reorder/emit
+machinery — emits none. These mirror the `SOPushLabel` chain above. Note NO non-label-operand side
+condition is needed: even an `Operand.Label` emits `SOPushLabel`, never `SOLabel`. -/
+
+theorem spillFold_no_soLabel :
+    ∀ (items : List Operand) (acc : List StackOp × List Nat × SpillAlloc),
+    (∀ so ∈ acc.1, ∀ l, so ≠ StackOp.SOLabel l) →
+    ∀ so ∈ (items.foldl (fun (x : List StackOp × List Nat × SpillAlloc) (item : Operand) =>
+        let (off, al') := allocSpillSlot x.2.2
+        (x.1 ++ [StackOp.SOSpill off], x.2.1 ++ [off], al')) acc).1,
+      ∀ l, so ≠ StackOp.SOLabel l := by
+  intro items
+  induction items with
+  | nil => intro acc hacc so hso; exact hacc so hso
+  | cons hd tl ih =>
+    intro acc hacc so hso
+    rw [List.foldl_cons] at hso
+    refine ih _ ?_ so hso
+    intro so' hso'
+    rw [List.mem_append] at hso'
+    rcases hso' with h | h
+    · exact hacc so' h
+    · simp only [List.mem_singleton] at h; subst h; simp
+
+theorem doDup_no_soLabel (dist : Nat) (ps : PlanState) :
+    ∀ so ∈ (doDup dist ps).1, ∀ l, so ≠ StackOp.SOLabel l := by
+  intro so hso
+  unfold doDup at hso
+  split at hso
+  · simp only [List.mem_singleton] at hso; subst hso; simp
+  · simp only [List.mem_append] at hso
+    rcases hso with h | h
+    · exact spillFold_no_soLabel _ ([], [], ps.alloc) (by simp) so h
+    · rw [List.mem_map] at h; obtain ⟨idx, _, rfl⟩ := h; simp
+
+theorem doSwap_no_soLabel (dist : Nat) (ps : PlanState) :
+    ∀ so ∈ (doSwap dist ps).1, ∀ l, so ≠ StackOp.SOLabel l := by
+  intro so hso
+  unfold doSwap at hso
+  split at hso
+  · simp at hso
+  · split at hso
+    · simp only [List.mem_singleton] at hso; subst hso; simp
+    · simp only [List.mem_append] at hso
+      rcases hso with h | h
+      · exact spillFold_no_soLabel _ ([], [], ps.alloc) (by simp) so h
+      · rw [List.mem_map] at h; obtain ⟨idx, _, rfl⟩ := h; simp
+
+theorem doRestore_no_soLabel (op : Operand) (ps : PlanState) :
+    ∀ so ∈ (doRestore op ps).1, ∀ l, so ≠ StackOp.SOLabel l := by
+  intro so hso
+  unfold doRestore at hso
+  split at hso
+  · simp at hso
+  · simp only [List.mem_singleton] at hso; subst hso; simp
+
+theorem emitOneInput_no_soLabel (opc : Opcode) (nl : List String) (op : Operand) (ps : PlanState) :
+    ∀ so ∈ (emitOneInput opc nl op ps).1, ∀ l, so ≠ StackOp.SOLabel l := by
+  intro so hso
+  have hrestore : ∀ so' ∈ (if isVarOperand op && (alookup' ps.spilled op).isSome
+      then doRestore op ps else ([], ps)).1, ∀ l, so' ≠ StackOp.SOLabel l := by
+    intro so' hso'; split at hso'
+    · exact doRestore_no_soLabel op ps so' hso'
+    · simp at hso'
+  unfold emitOneInput at hso
+  cases op with
+  | Label l =>
+    simp only at hso
+    split at hso
+    · exact hrestore so hso
+    · simp only [List.mem_append] at hso
+      rcases hso with h | h
+      · exact hrestore so h
+      · simp only [List.mem_singleton] at h; subst h; simp
+  | Lit v =>
+    simp only [List.mem_append] at hso
+    rcases hso with h | h
+    · exact hrestore so h
+    · simp only [List.mem_singleton] at h; subst h; simp
+  | Var v =>
+    simp only at hso
+    split at hso
+    · split at hso
+      · rw [List.mem_append] at hso
+        rcases hso with h | h
+        · exact hrestore so h
+        · exact doDup_no_soLabel _ _ so h
+      · exact hrestore so hso
+    · exact hrestore so hso
+
+theorem emitInputPlan_no_soLabel (opc : Opcode) (nl : List String) :
+    ∀ (ops : List Operand) (ps : PlanState),
+    ∀ so ∈ (emitInputPlan opc ops nl ps).1, ∀ l, so ≠ StackOp.SOLabel l := by
+  have hfold : ∀ (ops : List Operand) (acc : List StackOp × PlanState),
+      (∀ so ∈ acc.1, ∀ l, so ≠ StackOp.SOLabel l) →
+      ∀ so ∈ (ops.foldl (fun (acc : List StackOp × PlanState) op =>
+          (acc.1 ++ (emitOneInput opc nl op acc.2).1, (emitOneInput opc nl op acc.2).2)) acc).1,
+        ∀ l, so ≠ StackOp.SOLabel l := by
+    intro ops
+    induction ops with
+    | nil => intro acc hacc so hso; exact hacc so hso
+    | cons hd tl ih =>
+      intro acc hacc so hso
+      rw [List.foldl_cons] at hso
+      refine ih _ ?_ so hso
+      intro so' hso'
+      rw [List.mem_append] at hso'
+      rcases hso' with h | h
+      · exact hacc so' h
+      · exact emitOneInput_no_soLabel opc nl hd acc.2 so' h
+  intro ops ps
+  exact hfold ops ([], ps) (by simp)
+theorem reorderOne_no_soLabel (dfg : Unit) (targetOps : List Operand) (targetIdx : Nat)
+    (op : Operand) (ps : PlanState) :
+    ∀ so ∈ (reorderOne dfg targetOps targetIdx op ps).1, ∀ l, so ≠ StackOp.SOLabel l := by
+  have hrest : ∀ so' ∈ ((match stackGetDepth op ps.stack with
+      | some _ => ([], ps)
+      | none =>
+        match alookup' ps.spilled op with
+        | some _ => doRestore op ps
+        | none => ([], ps)) : List StackOp × PlanState).1,
+      ∀ l, so' ≠ StackOp.SOLabel l := by
+    intro so' hso'
+    split at hso'
+    · simp at hso'
+    · split at hso'
+      · exact doRestore_no_soLabel op ps so' hso'
+      · simp at hso'
+  intro so hso
+  unfold reorderOne at hso
+  simp only [] at hso
+  split at hso
+  · exact hrest so hso
+  · split at hso
+    · exact hrest so hso
+    · simp only [List.mem_append] at hso
+      rcases hso with (h | h) | h
+      · exact hrest so h
+      · exact doSwap_no_soLabel _ _ so h
+      · exact doSwap_no_soLabel _ _ so h
+
+theorem reorderPlan_no_soLabel (targetOps : List Operand) (ps : PlanState) :
+    ∀ so ∈ (reorderPlan targetOps ps).1, ∀ l, so ≠ StackOp.SOLabel l := by
+  have hfold : ∀ (xs : List (Nat × Operand)) (acc : List StackOp × PlanState),
+      (∀ so ∈ acc.1, ∀ l, so ≠ StackOp.SOLabel l) →
+      ∀ so ∈ (xs.foldl (fun (acc : List StackOp × PlanState) (x : Nat × Operand) =>
+          (acc.1 ++ (reorderOne () targetOps x.1 x.2 acc.2).1,
+           (reorderOne () targetOps x.1 x.2 acc.2).2)) acc).1,
+        ∀ l, so ≠ StackOp.SOLabel l := by
+    intro xs
+    induction xs with
+    | nil => intro acc hacc so hso; exact hacc so hso
+    | cons hd tl ih =>
+      intro acc hacc so hso
+      rw [List.foldl_cons] at hso
+      refine ih _ ?_ so hso
+      intro so' hso'
+      rw [List.mem_append] at hso'
+      rcases hso' with h | h
+      · exact hacc so' h
+      · exact reorderOne_no_soLabel () targetOps hd.1 hd.2 acc.2 so' h
+  intro so hso
+  exact hfold _ ([], ps) (by simp) so hso
+
+/-- Generic fold lift: if each step only ever adds ops that are not `SOLabel`, the whole fold is
+    `SOLabel`-free. Stated so `refine` can infer the fold function from the goal (writing the fold out
+    longhand is what fights the unifier). -/
+theorem foldl_pair_no_soLabel {α : Type} (l : List α)
+    (f : List StackOp × PlanState → α → List StackOp × PlanState)
+    (hf : ∀ acc x, ∀ so ∈ (f acc x).1, so ∈ acc.1 ∨ ∀ m, so ≠ StackOp.SOLabel m) :
+    ∀ (acc : List StackOp × PlanState), (∀ so ∈ acc.1, ∀ m, so ≠ StackOp.SOLabel m) →
+      ∀ so ∈ (l.foldl f acc).1, ∀ m, so ≠ StackOp.SOLabel m := by
+  induction l with
+  | nil => intro acc hacc so hso; exact hacc so hso
+  | cons hd tl ih =>
+    intro acc hacc so hso
+    rw [List.foldl_cons] at hso
+    refine ih _ ?_ so hso
+    intro so' hso'
+    rcases hf acc hd so' hso' with h | h
+    · exact hacc so' h
+    · exact h
+
+theorem popmanyPlan_no_soLabel (toPop : List Operand) (ps : PlanState) :
+    ∀ so ∈ (popmanyPlan toPop ps).1, ∀ l, so ≠ StackOp.SOLabel l := by
+  unfold popmanyPlan
+  simp only []
+  split
+  · intro so hso; exact absurd hso (by simp)
+  · split
+    · split
+      · -- contiguous top: doSwap ++ [SOPop n]
+        intro so hso
+        simp only [List.mem_append, List.mem_singleton] at hso
+        rcases hso with h | h
+        · exact doSwap_no_soLabel _ _ so h
+        · subst h; simp
+      · -- individual swap+pop fold
+        refine foldl_pair_no_soLabel _ _ ?_ ([], ps) (by simp)
+        intro acc v so hso
+        split at hso
+        · exact Or.inl hso
+        · simp only [List.mem_append, List.mem_singleton] at hso
+          rcases hso with (h | h) | h
+          · exact Or.inl h
+          · refine Or.inr ?_
+            split at h
+            · exact absurd h (by simp)
+            · exact doSwap_no_soLabel _ _ so h
+          · refine Or.inr ?_
+            subst h
+            simp
+    · -- fallback individual fold
+        refine foldl_pair_no_soLabel _ _ ?_ ([], ps) (by simp)
+        intro acc v so hso
+        split at hso
+        · exact Or.inl hso
+        · simp only [List.mem_append, List.mem_singleton] at hso
+          rcases hso with (h | h) | h
+          · exact Or.inl h
+          · refine Or.inr ?_
+            split at h
+            · exact absurd h (by simp)
+            · exact doSwap_no_soLabel _ _ so h
+          · refine Or.inr ?_
+            subst h
+            simp
+
+theorem optimisticSwapPlan_no_soLabel (dfg : DfgAnalysis) (inst : Instruction)
+    (nextLiveness : List String) (nextIsTerminator : Bool) (ps : PlanState) :
+    ∀ so ∈ (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator ps).1,
+      ∀ l, so ≠ StackOp.SOLabel l := by
+  intro so hso
+  unfold optimisticSwapPlan at hso
+  simp only [] at hso
+  (repeat' split at hso) <;>
+    first
+    | simp at hso
+    | exact doSwap_no_soLabel _ _ so hso
+
+theorem generatePhiPlan_no_soLabel (inst : Instruction) (nextLiveness : List String)
+    (ps : PlanState) :
+    ∀ so ∈ (generatePhiPlan inst nextLiveness ps).1, ∀ l, so ≠ StackOp.SOLabel l := by
+  intro so hso l hcontra
+  subst hcontra
+  unfold generatePhiPlan at hso
+  simp only [] at hso
+  split at hso
+  · simp at hso
+  · split at hso
+    · simp only [List.mem_append, List.mem_singleton] at hso
+      rcases hso with h | h
+      · exact doDup_no_soLabel _ _ _ h l rfl
+      · simp at h
+    · simp at hso
+
+theorem generateOffsetPlan_no_soLabel (inst : Instruction) (ps : PlanState) :
+    ∀ so ∈ (generateOffsetPlan inst ps).1, ∀ l, so ≠ StackOp.SOLabel l := by
+  intro so hso l hcontra
+  subst hcontra
+  unfold generateOffsetPlan at hso
+  simp only [] at hso
+  (repeat' split at hso) <;> simp_all
+
+/-- **`generateEmitOps` emits no `SOLabel`** — unless the opcode is one of the three that MINT a fresh
+    label (`INVOKE` / `ASSERT_UNREACHABLE` / `DJMP`). So in a function free of those three, the only
+    `SOLabel`s in the whole plan are the blocks' own leading labels. -/
+theorem generateEmitOps_no_soLabel (inst : Instruction) (n : Nat) (ps : PlanState)
+    (hinv : inst.opcode ≠ Opcode.INVOKE)
+    (hau : inst.opcode ≠ Opcode.ASSERT_UNREACHABLE)
+    (hdjmp : inst.opcode ≠ Opcode.DJMP) :
+    ∀ so ∈ (generateEmitOps inst n ps).1, ∀ l, so ≠ StackOp.SOLabel l := by
+  intro so hso l hcontra
+  subst hcontra
+  unfold generateEmitOps at hso
+  simp only [] at hso
+  (repeat' split at hso) <;> simp_all
+
+/-- The whole per-instruction plan emits no `SOLabel`, provided the opcode isn't one of the three
+    fresh-label minters. Its ops are `emitInput ++ join-reorder ++ reorder ++ emit (++ popmany ++ optswap)`,
+    every piece of which is `SOLabel`-free. -/
+theorem generateRegularInstPlan_no_soLabel (liveness : DfState (List String)) (dfg : DfgAnalysis)
+    (cfg : CfgAnalysis) (fn : IrFunction) (inst : Instruction) (nextLiveness : List String)
+    (isHalting nextIsTerminator : Bool) (curBbLabel : String) (ps : PlanState)
+    (hinv : inst.opcode ≠ Opcode.INVOKE)
+    (hau : inst.opcode ≠ Opcode.ASSERT_UNREACHABLE)
+    (hdjmp : inst.opcode ≠ Opcode.DJMP) :
+    ∀ so ∈ (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness isHalting
+      nextIsTerminator curBbLabel ps).1, ∀ l, so ≠ StackOp.SOLabel l := by
+  intro so hso l hcontra
+  subst hcontra
+  unfold generateRegularInstPlan at hso
+  simp only [] at hso
+  have hjoin : ∀ h : StackOp.SOLabel l ∈ (if inst.opcode = Opcode.JMP then
+      (match inst.operands with
+       | [Operand.Label target] =>
+         match fn.blocks.find? (·.label == target) with
+         | none => ([], (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2)
+         | some targetBb =>
+           reorderPlan ((inputVarsFrom curBbLabel targetBb.instructions
+             (liveVarsAt liveness target 0)).map Operand.Var)
+             (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2
+       | _ => ([], (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2))
+    else ([], (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2)).1, False := by
+    intro h
+    (repeat' split at h) <;>
+      first
+      | exact absurd h List.not_mem_nil
+      | exact reorderPlan_no_soLabel _ _ _ h l rfl
+  split at hso
+  · simp only [List.mem_append] at hso
+    rcases hso with ((h | h) | h) | h
+    · exact emitInputPlan_no_soLabel _ _ _ _ _ h l rfl
+    · exact hjoin h
+    · exact reorderPlan_no_soLabel _ _ _ h l rfl
+    · exact generateEmitOps_no_soLabel _ _ _ hinv hau hdjmp _ h l rfl
+  · simp only [List.mem_append] at hso
+    rcases hso with (((( h | h) | h) | h) | h) | h
+    · exact emitInputPlan_no_soLabel _ _ _ _ _ h l rfl
+    · exact hjoin h
+    · exact reorderPlan_no_soLabel _ _ _ h l rfl
+    · exact generateEmitOps_no_soLabel _ _ _ hinv hau hdjmp _ h l rfl
+    · (repeat' split at h) <;>
+        first
+        | exact absurd h List.not_mem_nil
+        | exact popmanyPlan_no_soLabel _ _ _ h l rfl
+    · (repeat' split at h) <;>
+        first
+        | exact absurd h List.not_mem_nil
+        | exact optimisticSwapPlan_no_soLabel _ _ _ _ _ _ h l rfl
+
+theorem generateInstPlan_no_soLabel (liveness : DfState (List String)) (dfg : DfgAnalysis)
+    (cfg : CfgAnalysis) (fn : IrFunction) (inst : Instruction) (nextLiveness : List String)
+    (isHalting nextIsTerminator : Bool) (curBbLabel : String) (ps : PlanState)
+    {ops : List StackOp} {ps' : PlanState}
+    (hinv : inst.opcode ≠ Opcode.INVOKE)
+    (hau : inst.opcode ≠ Opcode.ASSERT_UNREACHABLE)
+    (hdjmp : inst.opcode ≠ Opcode.DJMP)
+    (h : generateInstPlan liveness dfg cfg fn inst nextLiveness isHalting nextIsTerminator
+      curBbLabel ps = some (ops, ps')) :
+    ∀ so ∈ ops, ∀ l, so ≠ StackOp.SOLabel l := by
+  intro so hso l hcontra
+  subst hcontra
+  unfold generateInstPlan at h
+  split at h
+  · exact absurd h (by simp)
+  · split at h
+    · simp only [Option.some.injEq, Prod.ext_iff] at h
+      obtain ⟨rfl, -⟩ := h
+      exact generatePhiPlan_no_soLabel _ _ _ _ hso l rfl
+    · split at h
+      · simp only [Option.some.injEq, Prod.ext_iff] at h
+        obtain ⟨rfl, -⟩ := h
+        exact generateOffsetPlan_no_soLabel _ _ _ hso l rfl
+      · split at h
+        · simp only [Option.some.injEq, Prod.ext_iff] at h
+          obtain ⟨rfl, -⟩ := h
+          exact absurd hso (by simp)
+        · split at h
+          · simp only [Option.some.injEq, Prod.ext_iff] at h
+            obtain ⟨rfl, -⟩ := h
+            exact absurd hso (by simp)
+          · simp only [Option.some.injEq, Prod.ext_iff] at h
+            obtain ⟨rfl, -⟩ := h
+            exact generateRegularInstPlan_no_soLabel _ _ _ _ _ _ _ _ _ _ hinv hau hdjmp
+              _ hso l rfl
+
+theorem prepareParamsPlan_no_soLabel (liveness : DfState (List String)) (fn : IrFunction)
+    (ps : PlanState) :
+    ∀ so ∈ (prepareParamsPlan liveness fn ps).1, ∀ l, so ≠ StackOp.SOLabel l := by
+  intro so hso l hcontra
+  subst hcontra
+  unfold prepareParamsPlan at hso
+  split at hso
+  · exact absurd hso (by simp)
+  · simp only [] at hso
+    split at hso
+    · exact absurd hso (by simp)
+    · simp only [List.mem_append] at hso
+      rcases hso with h | h
+      · exact popmanyPlan_no_soLabel _ _ _ h l rfl
+      · exact optimisticSwapPlan_no_soLabel _ _ _ _ _ _ h l rfl
+
+theorem cleanStackPlan_no_soLabel (liveness : DfState (List String)) (cfg : CfgAnalysis)
+    (fn : IrFunction) (bb : BasicBlock) (ps : PlanState) :
+    ∀ so ∈ (cleanStackPlan liveness cfg fn bb ps).1, ∀ l, so ≠ StackOp.SOLabel l := by
+  intro so hso l hcontra
+  subst hcontra
+  unfold cleanStackPlan at hso
+  simp only [] at hso
+  (repeat' split at hso) <;>
+    first
+    | exact absurd hso List.not_mem_nil
+    | exact popmanyPlan_no_soLabel _ _ _ hso l rfl
+
+/-! ### Push-label-freeness of the plan machinery — the other undischarged hstep input (`hlblfree`)
+
+Every canonical `hstep` also takes `hlblfree` (the block's body asm emits no `AsmPushLabel`/`AsmPushOfst`)
+as an INPUT, and it was never discharged either. `AsmPushLabel`/`AsmPushOfst` come only from
+`SOPushLabel` / `SOPushOfst` / `SOPush (Operand.Label _)` (see `executePlan_no_label`), and among the
+plan-producing operations only `generateEmitOps` ever emits those — for JMP / JNZ / DJMP / INVOKE /
+ASSERT / ASSERT_UNREACHABLE. A *body* instruction is a non-terminator, which already rules out
+JMP / JNZ / DJMP; the remaining three are an explicit side condition. -/
+
+/-- Predicate-generic fold lift over the ops component. -/
+theorem foldl_pair_ops_pred {α : Type} (P : StackOp → Prop) (l : List α)
+    (f : List StackOp × PlanState → α → List StackOp × PlanState)
+    (hf : ∀ acc x, ∀ so ∈ (f acc x).1, so ∈ acc.1 ∨ P so) :
+    ∀ (acc : List StackOp × PlanState), (∀ so ∈ acc.1, P so) →
+      ∀ so ∈ (l.foldl f acc).1, P so := by
+  induction l with
+  | nil => intro acc hacc so hso; exact hacc so hso
+  | cons hd tl ih =>
+    intro acc hacc so hso
+    rw [List.foldl_cons] at hso
+    refine ih _ ?_ so hso
+    intro so' hso'
+    rcases hf acc hd so' hso' with h | h
+    · exact hacc so' h
+    · exact h
+
+theorem doSwap_no_label (dist : Nat) (ps : PlanState) :
+    ∀ so ∈ (doSwap dist ps).1, (∀ l, so ≠ StackOp.SOPushLabel l) ∧ (∀ l d, so ≠ StackOp.SOPushOfst l d)
+      ∧ (∀ l, so ≠ StackOp.SOPush (Operand.Label l)) := by
+  intro so hso
+  unfold doSwap at hso
+  split at hso
+  · simp at hso
+  · split at hso
+    · simp only [List.mem_singleton] at hso; subst hso; exact ⟨by simp, by simp, by simp⟩
+    · simp only [List.mem_append] at hso
+      rcases hso with h | h
+      · exact spillFold_no_label _ ([], [], ps.alloc) (by simp) so h
+      · rw [List.mem_map] at h; obtain ⟨idx, _, rfl⟩ := h; exact ⟨by simp, by simp, by simp⟩
+
+theorem reorderOne_no_label (dfg : Unit) (targetOps : List Operand) (targetIdx : Nat)
+    (op : Operand) (ps : PlanState) :
+    ∀ so ∈ (reorderOne dfg targetOps targetIdx op ps).1, (∀ l, so ≠ StackOp.SOPushLabel l) ∧ (∀ l d, so ≠ StackOp.SOPushOfst l d)
+      ∧ (∀ l, so ≠ StackOp.SOPush (Operand.Label l)) := by
+  have hrest : ∀ so' ∈ ((match stackGetDepth op ps.stack with
+      | some _ => ([], ps)
+      | none =>
+        match alookup' ps.spilled op with
+        | some _ => doRestore op ps
+        | none => ([], ps)) : List StackOp × PlanState).1,
+      (∀ l, so' ≠ StackOp.SOPushLabel l) ∧ (∀ l d, so' ≠ StackOp.SOPushOfst l d)
+      ∧ (∀ l, so' ≠ StackOp.SOPush (Operand.Label l)) := by
+    intro so' hso'
+    split at hso'
+    · simp at hso'
+    · split at hso'
+      · exact doRestore_no_label op ps so' hso'
+      · simp at hso'
+  intro so hso
+  unfold reorderOne at hso
+  simp only [] at hso
+  split at hso
+  · exact hrest so hso
+  · split at hso
+    · exact hrest so hso
+    · simp only [List.mem_append] at hso
+      rcases hso with (h | h) | h
+      · exact hrest so h
+      · exact doSwap_no_label _ _ so h
+      · exact doSwap_no_label _ _ so h
+
+theorem reorderPlan_no_label (targetOps : List Operand) (ps : PlanState) :
+    ∀ so ∈ (reorderPlan targetOps ps).1, (∀ l, so ≠ StackOp.SOPushLabel l) ∧ (∀ l d, so ≠ StackOp.SOPushOfst l d)
+      ∧ (∀ l, so ≠ StackOp.SOPush (Operand.Label l)) := by
+  unfold reorderPlan
+  refine foldl_pair_ops_pred _ _ _ ?_ ([], ps) (by simp)
+  intro acc x so hso
+  rw [List.mem_append] at hso
+  rcases hso with h | h
+  · exact Or.inl h
+  · exact Or.inr (reorderOne_no_label () targetOps x.1 x.2 acc.2 so h)
+
+theorem popmanyPlan_no_label (toPop : List Operand) (ps : PlanState) :
+    ∀ so ∈ (popmanyPlan toPop ps).1, (∀ l, so ≠ StackOp.SOPushLabel l) ∧ (∀ l d, so ≠ StackOp.SOPushOfst l d)
+      ∧ (∀ l, so ≠ StackOp.SOPush (Operand.Label l)) := by
+  unfold popmanyPlan
+  simp only []
+  split
+  · intro so hso; exact absurd hso List.not_mem_nil
+  · split
+    · split
+      · intro so hso
+        simp only [List.mem_append, List.mem_singleton] at hso
+        rcases hso with h | h
+        · exact doSwap_no_label _ _ so h
+        · subst h; exact ⟨by simp, by simp, by simp⟩
+      · refine foldl_pair_ops_pred _ _ _ ?_ ([], ps) (by simp)
+        intro acc v so hso
+        split at hso
+        · exact Or.inl hso
+        · simp only [List.mem_append, List.mem_singleton] at hso
+          rcases hso with (h | h) | h
+          · exact Or.inl h
+          · refine Or.inr ?_
+            split at h
+            · exact absurd h List.not_mem_nil
+            · exact doSwap_no_label _ _ so h
+          · exact Or.inr (by subst h; exact ⟨by simp, by simp, by simp⟩)
+    · refine foldl_pair_ops_pred _ _ _ ?_ ([], ps) (by simp)
+      intro acc v so hso
+      split at hso
+      · exact Or.inl hso
+      · simp only [List.mem_append, List.mem_singleton] at hso
+        rcases hso with (h | h) | h
+        · exact Or.inl h
+        · refine Or.inr ?_
+          split at h
+          · exact absurd h List.not_mem_nil
+          · exact doSwap_no_label _ _ so h
+        · exact Or.inr (by subst h; exact ⟨by simp, by simp, by simp⟩)
+
+theorem optimisticSwapPlan_no_label (dfg : DfgAnalysis) (inst : Instruction)
+    (nextLiveness : List String) (nextIsTerminator : Bool) (ps : PlanState) :
+    ∀ so ∈ (optimisticSwapPlan dfg inst nextLiveness nextIsTerminator ps).1, (∀ l, so ≠ StackOp.SOPushLabel l) ∧ (∀ l d, so ≠ StackOp.SOPushOfst l d)
+      ∧ (∀ l, so ≠ StackOp.SOPush (Operand.Label l)) := by
+  intro so hso
+  unfold optimisticSwapPlan at hso
+  simp only [] at hso
+  (repeat' split at hso) <;>
+    first
+    | exact absurd hso List.not_mem_nil
+    | exact doSwap_no_label _ _ so hso
+
+/-- **`generateEmitOps` emits no label-push** unless the opcode is one of the six that reference a label:
+    JMP / JNZ / DJMP / INVOKE / ASSERT / ASSERT_UNREACHABLE. -/
+theorem generateEmitOps_no_label (inst : Instruction) (n : Nat) (ps : PlanState)
+    (hjmp : inst.opcode ≠ Opcode.JMP) (hjnz : inst.opcode ≠ Opcode.JNZ)
+    (hdjmp : inst.opcode ≠ Opcode.DJMP) (hinv : inst.opcode ≠ Opcode.INVOKE)
+    (hassert : inst.opcode ≠ Opcode.ASSERT) (hau : inst.opcode ≠ Opcode.ASSERT_UNREACHABLE) :
+    ∀ so ∈ (generateEmitOps inst n ps).1, (∀ l, so ≠ StackOp.SOPushLabel l) ∧ (∀ l d, so ≠ StackOp.SOPushOfst l d)
+      ∧ (∀ l, so ≠ StackOp.SOPush (Operand.Label l)) := by
+  intro so hso
+  refine ⟨fun l hc => ?_, fun l d hc => ?_, fun l hc => ?_⟩ <;>
+    subst hc <;>
+    (unfold generateEmitOps at hso
+     simp only [] at hso
+     (repeat' split at hso) <;> simp_all)
+
+/-- **The whole per-instruction plan is label-push-free** for a body instruction: the opcode references
+    no label (six exclusions) and its operands carry none. -/
+theorem generateRegularInstPlan_no_label (liveness : DfState (List String)) (dfg : DfgAnalysis)
+    (cfg : CfgAnalysis) (fn : IrFunction) (inst : Instruction) (nextLiveness : List String)
+    (isHalting nextIsTerminator : Bool) (curBbLabel : String) (ps : PlanState)
+    (hops : ∀ op ∈ computeOperands inst, ∀ l, op ≠ Operand.Label l)
+    (hjmp : inst.opcode ≠ Opcode.JMP) (hjnz : inst.opcode ≠ Opcode.JNZ)
+    (hdjmp : inst.opcode ≠ Opcode.DJMP) (hinv : inst.opcode ≠ Opcode.INVOKE)
+    (hassert : inst.opcode ≠ Opcode.ASSERT) (hau : inst.opcode ≠ Opcode.ASSERT_UNREACHABLE) :
+    ∀ so ∈ (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness isHalting
+      nextIsTerminator curBbLabel ps).1, (∀ l, so ≠ StackOp.SOPushLabel l) ∧ (∀ l d, so ≠ StackOp.SOPushOfst l d)
+      ∧ (∀ l, so ≠ StackOp.SOPush (Operand.Label l)) := by
+  intro so hso
+  unfold generateRegularInstPlan at hso
+  simp only [] at hso
+  -- the JMP join-reorder branch is dead (opcode ≠ JMP)
+  have hjoin : ∀ so' ∈ (if inst.opcode = Opcode.JMP then
+      (match inst.operands with
+       | [Operand.Label target] =>
+         match fn.blocks.find? (·.label == target) with
+         | none => ([], (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2)
+         | some targetBb =>
+           reorderPlan ((inputVarsFrom curBbLabel targetBb.instructions
+             (liveVarsAt liveness target 0)).map Operand.Var)
+             (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2
+       | _ => ([], (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2))
+    else ([], (emitInputPlan inst.opcode (computeOperands inst) nextLiveness ps).2)).1,
+      (∀ l, so' ≠ StackOp.SOPushLabel l) ∧ (∀ l d, so' ≠ StackOp.SOPushOfst l d)
+        ∧ (∀ l, so' ≠ StackOp.SOPush (Operand.Label l)) := by
+    intro so' hso'
+    (repeat' split at hso') <;>
+      first
+      | exact absurd hso' List.not_mem_nil
+      | exact reorderPlan_no_label _ _ so' hso'
+  have handle : ∀ h : so ∈ ([] : List StackOp), (∀ l, so ≠ StackOp.SOPushLabel l) ∧
+      (∀ l d, so ≠ StackOp.SOPushOfst l d) ∧ (∀ l, so ≠ StackOp.SOPush (Operand.Label l)) :=
+    fun h => absurd h List.not_mem_nil
+  split at hso <;>
+    (simp only [List.mem_append] at hso
+     (repeat' rcases hso with hso | hso) <;>
+       first
+       | exact handle hso
+       | exact emitInputPlan_no_label _ _ _ hops _ so hso
+       | exact hjoin so hso
+       | exact reorderPlan_no_label _ _ so hso
+       | exact generateEmitOps_no_label _ _ _ hjmp hjnz hdjmp hinv hassert hau so hso
+       | ((repeat' split at hso) <;>
+           first
+           | exact handle hso
+           | exact popmanyPlan_no_label _ _ so hso
+           | exact optimisticSwapPlan_no_label _ _ _ _ _ so hso))
+
+theorem generateInstPlan_no_label (liveness : DfState (List String)) (dfg : DfgAnalysis)
+    (cfg : CfgAnalysis) (fn : IrFunction) (inst : Instruction) (nextLiveness : List String)
+    (isHalting nextIsTerminator : Bool) (curBbLabel : String) (ps : PlanState)
+    {ops : List StackOp} {ps' : PlanState}
+    (hops : ∀ op ∈ computeOperands inst, ∀ l, op ≠ Operand.Label l)
+    (hreg : ¬ isPreCodegenOpcode inst.opcode ∧ inst.opcode ≠ Opcode.PHI ∧
+      inst.opcode ≠ Opcode.OFFSET ∧ inst.opcode ≠ Opcode.PARAM ∧ inst.opcode ≠ Opcode.NOP)
+    (hjmp : inst.opcode ≠ Opcode.JMP) (hjnz : inst.opcode ≠ Opcode.JNZ)
+    (hdjmp : inst.opcode ≠ Opcode.DJMP) (hinv : inst.opcode ≠ Opcode.INVOKE)
+    (hassert : inst.opcode ≠ Opcode.ASSERT) (hau : inst.opcode ≠ Opcode.ASSERT_UNREACHABLE)
+    (h : generateInstPlan liveness dfg cfg fn inst nextLiveness isHalting nextIsTerminator
+      curBbLabel ps = some (ops, ps')) :
+    ∀ so ∈ ops, (∀ l, so ≠ StackOp.SOPushLabel l) ∧ (∀ l d, so ≠ StackOp.SOPushOfst l d)
+      ∧ (∀ l, so ≠ StackOp.SOPush (Operand.Label l)) := by
+  obtain ⟨h0, h1, h2, h3, h4⟩ := hreg
+  intro so hso
+  unfold generateInstPlan at h
+  rw [if_neg h0, if_neg h1, if_neg h2, if_neg h3, if_neg h4] at h
+  simp only [Option.some.injEq, Prod.ext_iff] at h
+  obtain ⟨rfl, -⟩ := h
+  exact generateRegularInstPlan_no_label _ _ _ _ _ _ _ _ _ _ hops hjmp hjnz hdjmp hinv hassert hau
+    so hso
 
 /-- `generateEmitOps` for a LOG op emits the single `LOGn` opcode (`opcodeToEvmName LOG = none`, then
     the if-chain reaches the LOG branch). -/
@@ -12871,6 +13835,91 @@ theorem genRegularInstPlan_tload_spilled_sim
   · rw [executePlan_append, List.length_append]; exact runAsm_compose hrunI hrunE
   · rw [executePlan_append, List.length_append, hpcE, hpcI]; omega
 
+/-- **Spilled-operand unary-op instruction sim** (generic pure `f`). The spilled twin of
+    `genRegularInstPlan_unopVar_sim`, and the op-generic twin of `genRegularInstPlan_tload_spilled_sim`:
+    the operand `x` lives in a spill slot, so `emitInputPlan` emits `SORestore off ; DUP1` before the
+    opcode. Covers ISZERO / NOT / SLOAD / EXTCODESIZE / … with a spilled input — previously only the
+    both-live case (`genRegularInstPlan_unopVar_sim`) and the TLOAD-specific spilled case existed. -/
+theorem genRegularInstPlan_unopVar_spilled_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {x out name : String} {base : List Operand} {off : Nat} {w : bytes32}
+    {f : bytes32 → bytes32}
+    (hname : opcodeToEvmName inst.opcode = some name)
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hops : inst.operands = [Operand.Var x]) (houts : inst.outputs = [out])
+    (hstack0 : ps.stack = base) (hlive : nextLiveness.contains out = true)
+    (hspill : alookup' ps.spilled (Operand.Var x) = some off) (hlivex : nextLiveness.contains x = true)
+    (hval : operandVal vs lo (Operand.Var x) = some w)
+    (hfresh : ¬ (Operand.Var out) ∈ base) (houtx : out ≠ x)
+    (hspill_out : alookup' ps.spilled (Operand.Var out) = none)
+    (hspillWf : ∀ o off, alookup' ps.spilled o = some off →
+        32 ∣ off ∧ off + 32 ≤ as.memory.size ∧ off < 2 ^ 256)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp name →
+          asmStep offsetToPc prog s = asmUnop f s)
+    (hoptnoop : optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+        { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+          stack := base ++ [Operand.Var x, Operand.Var out] }
+      = ([], { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+              stack := base ++ [Operand.Var x, Operand.Var out] }))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    ∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).1).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+             nextIsTerminator curBbLabel ps).2 (updateVar out (f w) vs) as' ∧
+           as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+             nextLiveness false nextIsTerminator curBbLabel ps).1).length := by
+  have hrev : inst.operands.reverse = [Operand.Var x] := by rw [hops]; rfl
+  rw [genRegularInstPlan_unopVar_spilled_eq hname hnjmp hcompute hops houts hstack0 hlive hspill hlivex,
+      hoptnoop, hrev] at hblock ⊢
+  simp only [List.append_nil] at hblock ⊢
+  set ps1 := (emitInputPlan inst.opcode [Operand.Var x] nextLiveness ps).2 with hps1def
+  have hemitshape : emitInputPlan inst.opcode [Operand.Var x] nextLiveness ps
+      = ([StackOp.SORestore off, StackOp.SODup 1],
+         { ps with stack := ps.stack ++ [Operand.Var x, Operand.Var x],
+                   spilled := aremove ps.spilled (Operand.Var x), alloc := freeSpillSlot off ps.alloc }) := by
+    unfold emitInputPlan
+    simp only [List.foldl_cons, List.foldl_nil, List.nil_append, emitOneInput_var_spilled_eq hspill hlivex]
+  have hps1stack : ps1.stack = base ++ [Operand.Var x, Operand.Var x] := by
+    rw [hps1def, hemitshape, hstack0]
+  have hps1spill : alookup' ps1.spilled (Operand.Var out) = none := by
+    rw [hps1def, hemitshape]
+    exact aremove_lookup_none ps.spilled (Operand.Var x) (Operand.Var out) hspill_out
+  rw [executePlan_append] at hblock
+  obtain ⟨hbI, hbE⟩ := asmBlockAt_append hblock
+  obtain ⟨as1, hrunI, hrelI, hpcI⟩ :=
+    emitInputPlan_single_var_sim_spilled (offsetToPc := offsetToPc) hspill hlivex hrel hspillWf hbI
+  have hps1stack'' : ps1.stack = (base ++ [Operand.Var x]) ++ [Operand.Var x] := by rw [hps1stack]; simp
+  have hstacktop : as1.stack = w :: as1.stack.drop 1 :=
+    venomAsmRel_asmStack_top1_var hrelI hps1stack'' hval
+  have hfresh1 : ¬ (Operand.Var out) ∈ ps1.stack := by
+    rw [hps1stack]; simp only [List.mem_append, List.mem_cons, List.not_mem_nil, or_false]
+    rintro (h | h | h)
+    · exact hfresh h
+    · exact houtx (by injection h)
+    · exact houtx (by injection h)
+  have hbE' : asmBlockAt prog as1.pc (executePlan [StackOp.SOEmit name]) := by rw [hpcI]; exact hbE
+  obtain ⟨as2, hrunE, hrelE, hpcE⟩ :=
+    emit_unop_sim hrelI hstacktop hfresh1 hps1spill hbE' (fun h hg => hdisp as1 h hg)
+  have hps6 : ({ ps1 with stack := stackPush (Operand.Var out) (stackPop 1 ps1.stack) } : PlanState)
+      = { ps1 with stack := base ++ [Operand.Var x, Operand.Var out] } := by
+    congr 1
+    rw [hps1stack, show base ++ [Operand.Var x, Operand.Var x] = (base ++ [Operand.Var x]) ++ [Operand.Var x] from by simp,
+        stackPop_1_append_single]
+    simp [stackPush, List.append_assoc]
+  rw [hps6] at hrelE
+  have hrelR := releaseDeadSpills_sim (nextLiveness := nextLiveness) hrelE
+  refine ⟨as2, ?_, hrelR, ?_⟩
+  · rw [executePlan_append, List.length_append]; exact runAsm_compose hrunI hrunE
+  · rw [executePlan_append, List.length_append, hpcE, hpcI]; omega
+
+
 /-- **CALLDATALOAD instruction sim** — the calldata-word read over the real plan; the calldata twin of
     `genRegularInstPlan_tload_sim` (same generic 1-input plan; `emit_calldataload_sim` reconciles). -/
 theorem genRegularInstPlan_calldataload_sim
@@ -16696,5 +17745,536 @@ theorem genRegularInstPlan_commBinopVar_bothspilled_sim
   · rw [hlenEq]; exact runAsm_compose hrunI (runAsm_compose hrun2 (runAsm_compose hrun3 hrun4))
   · rw [hlenEq, hpc4, hpc3, hpc2, hpcI]; omega
 
+
+/-- **`popmanyPlan`'s per-item step, discharged** — the `hpopstep` residual that
+    `popmanyPlan_sim` has carried undischarged since it was stated (which is why it had no callers).
+
+    `gpop p v` locates `v` on the plan stack, swaps it to the top if it isn't already there, and pops
+    it. So the asm is `doSwap dist` followed by a single `POP`, and the two halves are already proved:
+    `doSwap_sim` moves the value to TOS keeping `venomAsmRel`, and `emit_pop1_sim` drops it. The Venom
+    state is untouched throughout — `popmanyPlan` only ever discards variables that are *dead*, and
+    Venom keeps every variable in `vars` regardless of whether it is on the operand stack, which is
+    exactly the slack `planStackRel` allows.
+
+    `hbig` is `doSwap_sim`'s own big-swap side condition (only bites at depth > 16, where the swap goes
+    through the temp spill region); at depth ≤ 16 it is vacuous. -/
+theorem gpop_sim {p v lo vs as prog}
+    (hrel : venomAsmRel lo p vs as)
+    (hblock : asmBlockAt prog as.pc (executePlan (gpop p v).1))
+    (hbig : ∀ dist, stackGetDepth v p.stack = some dist → dist > 16 →
+      (SpillAllocWf p.alloc ∧
+       p.alloc.freeSlots = [] ∧
+       p.alloc.nextOffset + 32 * (dist + 1) < 2 ^ 256 ∧
+       p.alloc.nextOffset + 32 * (dist + 1) ≤ as.memory.size ∧
+       (∀ o off', alookup' p.spilled o = some off' → off' + 32 ≤ p.alloc.nextOffset))) :
+    ∃ as', runAsm (executePlan (gpop p v).1).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+           venomAsmRel lo (gpop p v).2 vs as' ∧
+           as'.pc = as.pc + (executePlan (gpop p v).1).length := by
+  cases hd : stackGetDepth v p.stack with
+  | none =>
+    -- `v` is not on the stack: nothing to pop
+    have hgp : gpop p v = ([], p) := by unfold gpop; rw [hd]
+    rw [hgp]
+    exact ⟨as, rfl, hrel, by rw [show executePlan ([] : List StackOp) = [] from rfl]; simp⟩
+  | some dist =>
+    have hlt : dist < p.stack.length := stackGetDepth_lt_length hd
+    rcases hsw : (if dist = 0 then (([], p) : List StackOp × PlanState) else doSwap dist p)
+      with ⟨swapOps, ps'⟩
+    have hgp : gpop p v
+        = (swapOps ++ [StackOp.SOPop 1], { ps' with stack := stackPop 1 ps'.stack }) := by
+      unfold gpop; rw [hd]; simp only []; rw [hsw]
+    rw [hgp] at hblock ⊢
+    rw [executePlan_append] at hblock
+    obtain ⟨hb1, hb2⟩ := asmBlockAt_append hblock
+    -- the swap half (a no-op when `v` is already on top)
+    have hswap : ∃ as1, runAsm (executePlan swapOps).length offsetToPc prog as = AsmResult.AsmOK as1 ∧
+        venomAsmRel lo ps' vs as1 ∧ as1.pc = as.pc + (executePlan swapOps).length ∧
+        ps'.stack.length = p.stack.length := by
+      by_cases h0 : dist = 0
+      · rw [if_pos h0] at hsw
+        obtain ⟨rfl, rfl⟩ : swapOps = [] ∧ ps' = p :=
+          ⟨(congrArg Prod.fst hsw).symm, (congrArg Prod.snd hsw).symm⟩
+        exact ⟨as, rfl, hrel,
+          by rw [show executePlan ([] : List StackOp) = [] from rfl]; simp, rfl⟩
+      · rw [if_neg h0] at hsw
+        obtain ⟨as1, hrun1, hrel1, hpc1⟩ :=
+          doSwap_sim hsw hrel hlt hb1 (fun hb => by
+            have := hbig dist hd hb; exact this)
+        refine ⟨as1, hrun1, hrel1, hpc1, ?_⟩
+        have := doSwap_length (dist := dist) (ps := p) hlt
+        rw [hsw] at this; exact this
+    obtain ⟨as1, hrun1, hrel1, hpc1, hlen'⟩ := hswap
+    -- the pop half
+    have haslen : 0 < as1.stack.length := by
+      have hps := planStackRel_length hrel1.1
+      omega
+    obtain ⟨a, rest, hstk⟩ : ∃ a rest, as1.stack = a :: rest := by
+      cases hs : as1.stack with
+      | nil => rw [hs] at haslen; simp at haslen
+      | cons a r => exact ⟨a, r, rfl⟩
+    have hb2' : asmBlockAt prog as1.pc (executePlan [StackOp.SOPop 1]) := by rw [hpc1]; exact hb2
+    obtain ⟨as2, hrun2, hrel2, hpc2⟩ := emit_pop1_sim hrel1 hstk hb2'
+    refine ⟨as2, ?_, hrel2, ?_⟩
+    · rw [executePlan_append, List.length_append]; exact runAsm_compose hrun1 hrun2
+    · rw [executePlan_append, List.length_append, hpc2, hpc1]; omega
+
+
+/-- Popping 1 then `n` more is popping `n+1` (`stackPop k = take (length - k)`). -/
+theorem stackPop_succ (n : Nat) (stk : List Operand) :
+    stackPop n (stackPop 1 stk) = stackPop (n + 1) stk := by
+  unfold stackPop
+  rw [List.length_take, List.take_take]
+  congr 1
+  omega
+
+/-- **The `n`-fold `POP` runner** — `SOPop n` lowers to `n` copies of `AsmOp "POP"`, and running them
+    drops the top `n` of the asm stack while the plan side does `stackPop n`. The Venom state is
+    untouched (`planStackRel_popN`: Venom keeps every variable in `vars` whether or not it is on the
+    operand stack). This is the atom the contiguous-top branch of `popmanyPlan` bottoms out in — the
+    `hcontig` residual — the `n`-ary companion of `emit_pop1_sim`. -/
+theorem emit_popN_sim {lo : AssocList String Nat} {vs : VenomState} {prog : List AsmInst} :
+    ∀ (n : Nat) (ps : PlanState) (as : AsmState),
+      venomAsmRel lo ps vs as →
+      n ≤ ps.stack.length →
+      asmBlockAt prog as.pc (executePlan [StackOp.SOPop n]) →
+      ∃ as', runAsm (executePlan [StackOp.SOPop n]).length offsetToPc prog as
+               = AsmResult.AsmOK as' ∧
+             venomAsmRel lo { ps with stack := stackPop n ps.stack } vs as' ∧
+             as'.pc = as.pc + (executePlan [StackOp.SOPop n]).length := by
+  intro n
+  induction n with
+  | zero =>
+    intro ps as hrel _ _
+    refine ⟨as, rfl, ?_, by simp [executePlan, execStackOp]⟩
+    rw [stackPop_zero]
+    exact hrel
+  | succ k ih =>
+    intro ps as hrel hn hblock
+    have hpn : ∀ m : Nat, executePlan [StackOp.SOPop m] = List.replicate m (AsmInst.AsmOp "POP") := by
+      intro m; simp [executePlan, execStackOp]
+    have hep : executePlan [StackOp.SOPop (k + 1)]
+        = AsmInst.AsmOp "POP" :: executePlan [StackOp.SOPop k] := by
+      rw [hpn, hpn, List.replicate_succ]
+    rw [hep] at hblock
+    -- one POP …
+    have hb1 : asmBlockAt prog as.pc (executePlan [StackOp.SOPop 1]) := by
+      obtain ⟨hget, _⟩ := asmBlockAt_cons_drop hblock
+      refine ⟨?_, ?_⟩
+      · rcases hblock with ⟨hlen, _⟩
+        show as.pc + 1 ≤ prog.length
+        simp only [hep, List.length_cons] at hlen
+        omega
+      · intro j hj
+        have hj1 : j < 1 := by rw [hpn] at hj; simpa using hj
+        interval_cases j
+        rw [hpn]; simpa using hget
+    have haslen : 0 < as.stack.length := by
+      have := planStackRel_length hrel.1; omega
+    obtain ⟨a, rest, hstk⟩ : ∃ a rest, as.stack = a :: rest := by
+      cases hs : as.stack with
+      | nil => rw [hs] at haslen; simp at haslen
+      | cons a r => exact ⟨a, r, rfl⟩
+    obtain ⟨as1, hrun1, hrel1, hpc1⟩ := emit_pop1_sim hrel hstk hb1
+    -- … then `k` more
+    have hlen1 : (stackPop 1 ps.stack).length = ps.stack.length - 1 := by
+      unfold stackPop; rw [List.length_take]; omega
+    have hk : k ≤ ({ ps with stack := stackPop 1 ps.stack } : PlanState).stack.length := by
+      show k ≤ (stackPop 1 ps.stack).length; rw [hlen1]; omega
+    have hb2 : asmBlockAt prog as1.pc (executePlan [StackOp.SOPop k]) := by
+      obtain ⟨_, hrest⟩ := asmBlockAt_cons_drop hblock
+      have hp1 : as1.pc = as.pc + 1 := by rw [hpc1, hpn]; simp
+      rw [hp1]; exact hrest
+    obtain ⟨as2, hrun2, hrel2, hpc2⟩ := ih { ps with stack := stackPop 1 ps.stack } as1 hrel1 hk hb2
+    refine ⟨as2, ?_, ?_, ?_⟩
+    · rw [hep, List.length_cons]
+      have h1 : (executePlan [StackOp.SOPop 1]).length = 1 := by rw [hpn]; simp
+      have := runAsm_compose hrun1 hrun2
+      rw [h1] at this
+      rw [show (executePlan [StackOp.SOPop k]).length + 1
+            = 1 + (executePlan [StackOp.SOPop k]).length from by omega]
+      exact this
+    · have : ({ { ps with stack := stackPop 1 ps.stack } with
+                stack := stackPop k (stackPop 1 ps.stack) } : PlanState)
+             = { ps with stack := stackPop (k + 1) ps.stack } := by
+        rw [stackPop_succ]
+      rw [← this]; exact hrel2
+    · rw [hep, List.length_cons, hpc2, hpc1, hpn]
+      simp
+      omega
+
+
+
+
+
+
+/-- `gpop` never grows the plan stack (it pops one, after an optional length-preserving swap). -/
+theorem gpop_stack_length_le (p : PlanState) (v : Operand) :
+    (gpop p v).2.stack.length ≤ p.stack.length := by
+  cases hd : stackGetDepth v p.stack with
+  | none => have hgp : gpop p v = ([], p) := by unfold gpop; rw [hd]
+            rw [hgp]
+  | some dist =>
+    have hlt : dist < p.stack.length := stackGetDepth_lt_length hd
+    rcases hsw : (if dist = 0 then (([], p) : List StackOp × PlanState) else doSwap dist p)
+      with ⟨swapOps, ps'⟩
+    have hgp : gpop p v
+        = (swapOps ++ [StackOp.SOPop 1], { ps' with stack := stackPop 1 ps'.stack }) := by
+      unfold gpop; rw [hd]; simp only []; rw [hsw]
+    have hlen : ps'.stack.length = p.stack.length := by
+      by_cases h0 : dist = 0
+      · rw [if_pos h0] at hsw
+        have : ps' = p := (congrArg Prod.snd hsw).symm
+        rw [this]
+      · rw [if_neg h0] at hsw
+        have := doSwap_length (dist := dist) (ps := p) hlt
+        rw [hsw] at this; exact this
+    rw [hgp]
+    show (stackPop 1 ps'.stack).length ≤ p.stack.length
+    unfold stackPop; rw [List.length_take]; omega
+
+/-- **`popmanyPlan`'s per-item fold branch, discharged under a shallow-stack invariant.**
+
+    The other half of `popmanyPlan_sim`'s undischarged residual. Its `hpopstep` was quantified over
+    *every* plan state, which cannot be supplied: at an unbounded stack depth `doSwap` may exceed
+    `SWAP16` and route through the temp spill region, dragging in `doSwap_sim`'s big-swap side
+    condition. `foldl_ops_sim_inv` is the harness built for exactly this — the per-step sim need only
+    hold on states satisfying an invariant it preserves.
+
+    The invariant here is `stack.length ≤ 17`: any depth found is `< length ≤ 17`, hence `≤ 16`, so the
+    big-swap condition is **vacuous** at every step; and `gpop` only ever shrinks the stack
+    (`gpop_stack_length_le`), so the invariant is preserved for free. Together with
+    `popmanyPlan_sim_closed` this closes both of `popmanyPlan`'s branches. -/
+theorem popmany_fold_sim {lo : AssocList String Nat} {vs : VenomState} {prog : List AsmInst} :
+    ∀ (l : List Operand) (ps0 : PlanState) (as0 : AsmState),
+      ps0.stack.length ≤ 17 →
+      venomAsmRel lo ps0 vs as0 →
+      asmBlockAt prog as0.pc
+        (executePlan (l.foldl (fun acc v => (acc.1 ++ (gpop acc.2 v).1, (gpop acc.2 v).2))
+          ([], ps0)).1) →
+      ∃ as', runAsm
+              (executePlan (l.foldl (fun acc v => (acc.1 ++ (gpop acc.2 v).1, (gpop acc.2 v).2))
+                ([], ps0)).1).length offsetToPc prog as0 = AsmResult.AsmOK as' ∧
+             venomAsmRel lo
+              (l.foldl (fun acc v => (acc.1 ++ (gpop acc.2 v).1, (gpop acc.2 v).2)) ([], ps0)).2
+              vs as' ∧
+             as'.pc = as0.pc +
+              (executePlan (l.foldl (fun acc v => (acc.1 ++ (gpop acc.2 v).1, (gpop acc.2 v).2))
+                ([], ps0)).1).length := by
+  intro l ps0 as0 hInv0 hrel0 hblock
+  exact foldl_ops_sim_inv lo vs prog offsetToPc gpop
+    (fun p => p.stack.length ≤ 17)
+    (fun v p hp => le_trans (gpop_stack_length_le p v) hp)
+    (fun v p sA hp hrelp hbp =>
+      gpop_sim hrelp hbp
+        (fun dist hd hgt => absurd hgt (by
+          have := stackGetDepth_lt_length hd; omega)))
+    l ps0 as0 hInv0 hrel0 hblock
+
+
+
+/-- **`popmanyPlan` simulates — closed, no residuals.** The replacement for `popmanyPlan_sim`, whose
+    two ∀-quantified residual hypotheses (`hpopstep`, `hcontig`) were never discharged and which
+    consequently had no callers.
+
+    `popmanyPlan` has two real branches and both are now proved:
+      * doomed variables at contiguous depths → one `doSwap n` + one `SOPop n`
+        (`isContiguousTop` itself forces `n ≤ 16`, so no big swap);
+      * otherwise → a per-item swap-and-pop fold (`popmany_fold_sim`, via `popmany_step_eq`), closed
+        under the shallow-stack invariant that makes every swap distance `≤ 16`.
+
+    `hshallow` (`stack.length ≤ 17`) is what keeps every `doSwap` inside `SWAP16` and so out of the
+    temp spill region — the honest cost of avoiding the big-swap side condition at each fold step.
+    `hlen` says you cannot pop more than you have; it is only used by the contiguous branch.
+
+    The Venom state is unchanged throughout: `popmanyPlan` discards only *dead* variables, and Venom
+    keeps every variable in `vars` whether or not it is on the operand stack. -/
+theorem popmanyPlan_sim_closed {toPop : List Operand} {ps ps' : PlanState} {ops : List StackOp}
+    {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    (hpop : popmanyPlan toPop ps = (ops, ps'))
+    (hrel : venomAsmRel lo ps vs as)
+    (hshallow : ps.stack.length ≤ 17)
+    (hlen : toPop.length < ps.stack.length)
+    (hblock : asmBlockAt prog as.pc (executePlan ops)) :
+    ∃ as', runAsm (executePlan ops).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+           venomAsmRel lo ps' vs as' ∧
+           as'.pc = as.pc + (executePlan ops).length := by
+  -- the shallow stack bounds every swap distance by 16, so no swap spills
+  have hn16 : toPop.length ≤ 16 := by omega
+  refine popmanyPlan_sim_inv (fun p => p.stack.length ≤ 17)
+    (fun v p hp => le_trans (gpop_stack_length_le p v) hp) hshallow hpop hrel hblock
+    (fun v p sA hp hrelp hbp =>
+      gpop_sim hrelp hbp
+        (fun dist hd hgt => absurd hgt (by have := stackGetDepth_lt_length hd; omega)))
+    ?_
+  -- the contiguous branch: one `doSwap n`, then one `SOPop n`
+  intro hbc
+  rw [executePlan_append] at hbc ⊢
+  obtain ⟨hb1, hb2⟩ := asmBlockAt_append hbc
+  have hsw : doSwap toPop.length ps
+      = ((doSwap toPop.length ps).1, (doSwap toPop.length ps).2) := rfl
+  obtain ⟨as1, hrun1, hrel1, hpc1⟩ :=
+    doSwap_sim hsw hrel hlen hb1 (fun hb => absurd hb (by omega))
+  have hlenA : (doSwap toPop.length ps).2.stack.length = ps.stack.length :=
+    doSwap_length (dist := toPop.length) (ps := ps) hlen
+  have hnle : toPop.length ≤ (doSwap toPop.length ps).2.stack.length := by rw [hlenA]; omega
+  have hb2' : asmBlockAt prog as1.pc (executePlan [StackOp.SOPop toPop.length]) := by
+    rw [hpc1]; exact hb2
+  obtain ⟨as2, hrun2, hrel2, hpc2⟩ :=
+    emit_popN_sim toPop.length (doSwap toPop.length ps).2 as1 hrel1 hnle hb2'
+  refine ⟨as2, ?_, hrel2, ?_⟩
+  · rw [List.length_append]; exact runAsm_compose hrun1 hrun2
+  · rw [List.length_append, hpc2, hpc1]; omega
+
+
+
+/-- **Block-prologue simulation: the leading label plus the clean-stack pops.**
+
+    This is the brick the `toPop ≠ []` join was missing. A block's plan is
+    `SOLabel :: cleanOps ++ bodyOps ++ termOps` (`generateBlockPlan_split_term_clean`), and the
+    clean-stack prologue is non-empty exactly at a join that genuinely drops values: one predecessor,
+    that predecessor branches, and some variable live at its exit is not an input here. Every existing
+    layout lemma assumed the prologue away (`CleanTrivial`) and so started the body at `as0.pc + 1` and
+    the body fold at the block's *entry* plan state.
+
+    Here the prologue is executed: `soLabel_sim` steps over the `JUMPDEST`, then
+    `popmanyPlan_sim_closed` runs the pops, landing the body at
+    `as0.pc + 1 + (executePlan cleanOps).length` in plan state `ps2` — the state *after* the pops,
+    which is exactly where the body fold begins. The Venom state is unchanged across the whole
+    prologue, since only dead variables are discarded.
+
+    Specialising `cleanOps = []` / `ps2 = ps` gives back the old hand-off at `as0.pc + 1`. -/
+theorem blockPrologue_sim {L : DfState (List String)} {C : CfgAnalysis} {fn : IrFunction}
+    {bb : BasicBlock} {ps ps2 : PlanState} {cleanOps : List StackOp}
+    {lo : AssocList String Nat} {vs : VenomState} {as0 : AsmState} {prog : List AsmInst}
+    {predLbl : String} {predBb : BasicBlock}
+    (hpreds : C.predsOf bb.label = [predLbl])
+    (hbranch : ¬ (C.succsOf predLbl).length ≤ 1)
+    (hpfind : fn.blocks.find? (·.label == predLbl) = some predBb)
+    (hclean : cleanStackPlan L C fn bb ps = (cleanOps, ps2))
+    (hrel : venomAsmRel lo ps vs as0)
+    (hshallow : ps.stack.length ≤ 17)
+    (hlen : ((liveVarsAt L predLbl predBb.instructions.length).filter
+              (fun v => ¬ (inputVarsFrom predLbl bb.instructions
+                (liveVarsAt L bb.label 0)).contains v)).length < ps.stack.length)
+    (hblock : asmBlockAt prog as0.pc (executePlan ([StackOp.SOLabel bb.label] ++ cleanOps))) :
+    ∃ asMid, runAsm (executePlan ([StackOp.SOLabel bb.label] ++ cleanOps)).length
+               offsetToPc prog as0 = AsmResult.AsmOK asMid ∧
+             venomAsmRel lo ps2 vs asMid ∧
+             asMid.pc = as0.pc + (executePlan ([StackOp.SOLabel bb.label] ++ cleanOps)).length := by
+  -- the clean-stack prologue *is* a `popmanyPlan` over the dropped variables
+  have hpop : popmanyPlan
+      (((liveVarsAt L predLbl predBb.instructions.length).filter
+        (fun v => ¬ (inputVarsFrom predLbl bb.instructions
+          (liveVarsAt L bb.label 0)).contains v)).map Operand.Var) ps
+      = (cleanOps, ps2) := by
+    rw [← hclean]
+    unfold cleanStackPlan
+    rw [hpreds]
+    simp only [if_neg hbranch, hpfind]
+  rw [executePlan_append] at hblock ⊢
+  obtain ⟨hb1, hb2⟩ := asmBlockAt_append hblock
+  -- the JUMPDEST
+  obtain ⟨as1, hrun1, hrel1, hpc1⟩ := soLabel_sim lo ps vs as0 prog bb.label hrel hb1
+  -- the pops
+  have hb2' : asmBlockAt prog as1.pc (executePlan cleanOps) := by rw [hpc1]; exact hb2
+  have hlen' : (((liveVarsAt L predLbl predBb.instructions.length).filter
+      (fun v => ¬ (inputVarsFrom predLbl bb.instructions
+        (liveVarsAt L bb.label 0)).contains v)).map Operand.Var).length < ps.stack.length := by
+    rw [List.length_map]; exact hlen
+  obtain ⟨as2, hrun2, hrel2, hpc2⟩ :=
+    popmanyPlan_sim_closed hpop hrel1 hshallow hlen' hb2'
+  refine ⟨as2, ?_, hrel2, ?_⟩
+  · rw [List.length_append]; exact runAsm_compose hrun1 hrun2
+  · rw [List.length_append, hpc2, hpc1]; omega
+
+
+
+/-- **The block prologue as a plain asm segment**: JUMPDEST then the clean-stack pops. The
+    `popmanyPlan`-level core of `blockPrologue_sim` (which reads `toPop` off the CFG); this form is what
+    the block simulations compose with. Venom state untouched — only dead variables are discarded. -/
+theorem blockPrologue_prefix_sim {lo : AssocList String Nat} {vs : VenomState} {prog : List AsmInst}
+    {ps0 ps2 : PlanState} {cleanOps : List StackOp} {toPop : List Operand}
+    {as0 : AsmState} {l : String}
+    (hrel : venomAsmRel lo ps0 vs as0)
+    (hpop : popmanyPlan toPop ps0 = (cleanOps, ps2))
+    (hshallow : ps0.stack.length ≤ 17)
+    (hlen : toPop.length < ps0.stack.length)
+    (hblock : asmBlockAt prog as0.pc (executePlan ([StackOp.SOLabel l] ++ cleanOps))) :
+    ∃ asMid, runAsm (executePlan ([StackOp.SOLabel l] ++ cleanOps)).length offsetToPc prog as0
+               = AsmResult.AsmOK asMid ∧
+             venomAsmRel lo ps2 vs asMid ∧
+             asMid.pc = as0.pc + (executePlan ([StackOp.SOLabel l] ++ cleanOps)).length := by
+  rw [executePlan_append] at hblock ⊢
+  obtain ⟨hb1, hb2⟩ := asmBlockAt_append hblock
+  obtain ⟨as1, hrun1, hrel1, hpc1⟩ := soLabel_sim lo ps0 vs as0 prog l hrel hb1
+  have hb2' : asmBlockAt prog as1.pc (executePlan cleanOps) := by rw [hpc1]; exact hb2
+  obtain ⟨as2, hrun2, hrel2, hpc2⟩ := popmanyPlan_sim_closed hpop hrel1 hshallow hlen hb2'
+  refine ⟨as2, ?_, hrel2, ?_⟩
+  · rw [List.length_append]; exact runAsm_compose hrun1 hrun2
+  · rw [List.length_append, hpc2, hpc1]; omega
+
+
+
+/-- **The join bridge: the phi's hypothesis is *derived*, not assumed.**
+
+`planStackRel_phi_poke_offSlot` needs to know that the phi binds its output to the value sitting in
+that asm slot. That has been an input up to now. Here it is *earned*, from the only relation that is
+actually true on arrival: the one with respect to the **arriving** predecessor's exit layout — which is
+exactly what that predecessor's own block simulation hands you.
+
+Off the phi slot the two layouts agree, so the relation transfers verbatim (the phi's output is fresh,
+so `updateVar` disturbs nothing there). *At* the phi slot the arriving layout names that edge's own
+source `src`; the relation therefore says the asm slot holds `src`'s value, and the phi binds `out` to
+precisely that. So the recorded layout — which names some *other* edge's source there — is repaired.
+
+This is the step an `hstep` for a genuine join consumes: relation-on-arrival in, relation-against-the-
+recorded-plan out. -/
+theorem planStackRel_phi_join_bridge {lo : AssocList String Nat} {vs : VenomState}
+    {psArr psRec : List Operand} {asmStack : List bytes32} {d : Nat} {src out : String} {v : bytes32}
+    (hrel : planStackRel lo vs psArr asmStack)
+    (hlen : psRec.length = psArr.length)
+    (hd : d < psRec.length)
+    (hoff : ∀ i, i < psRec.length → i ≠ d → psRec.reverse[i]! = psArr.reverse[i]!)
+    (hsrc : psArr.reverse[d]! = Operand.Var src)
+    (hval : lookupVar src vs = some v)
+    (hfresh : ∀ i, i < psRec.length → i ≠ d → psRec.reverse[i]! ≠ Operand.Var out) :
+    planStackRel lo (updateVar out v vs) (stackPoke d (Operand.Var out) psRec) asmStack := by
+  obtain ⟨hlenA, hcorr⟩ := hrel
+  refine planStackRel_phi_poke_offSlot (by rw [hlen]; exact hlenA) hd ?_ ?_
+  · -- off the phi slot: the layouts agree and `out` is fresh, so the relation transfers
+    intro i hi hne
+    rw [hoff i hi hne, operandVal_updateVar_ne _ _ _ _ _ (by rw [← hoff i hi hne]; exact hfresh i hi hne)]
+    exact hcorr i (by omega)
+  · -- at the phi slot: the asm value IS `src`'s value, and the phi binds `out` to it
+    have hdA : d < psArr.length := by omega
+    have hthis := hcorr d hdA
+    rw [hsrc] at hthis
+    have hlk : lookupVar src vs = some (asmStack[d]!) := hthis
+    have hv : v = asmStack[d]! := by
+      rw [hval] at hlk
+      exact Option.some.inj hlk
+    rw [hv]
+    exact lookupVar_updateVar_self vs out _
+
+
+
+/-- Bind a whole batch of phi outputs. -/
+def updateVars : List (String × bytes32) → VenomState → VenomState
+  | [], vs => vs
+  | (o, v) :: rest, vs => updateVars rest (updateVar o v vs)
+
+/-- A variable none of the phis defines is untouched by the batch. -/
+theorem lookupVar_updateVars_notMem :
+    ∀ (l : List (String × bytes32)) (vs : VenomState) (w : String),
+      w ∉ l.map Prod.fst → lookupVar w (updateVars l vs) = lookupVar w vs := by
+  intro l
+  induction l with
+  | nil => intro vs w _; rfl
+  | cons x rest ih =>
+    intro vs w hw
+    simp only [List.map_cons, List.mem_cons, not_or] at hw
+    unfold updateVars
+    rw [ih _ w hw.2]
+    exact lookupVar_updateVar_ne vs x.1 w x.2 hw.1
+
+/-- Each phi output really does read back its own value (outputs are distinct). -/
+theorem lookupVar_updateVars_mem :
+    ∀ (l : List (String × bytes32)) (vs : VenomState) (o : String) (v : bytes32),
+      (l.map Prod.fst).Nodup → (o, v) ∈ l →
+      lookupVar o (updateVars l vs) = some v := by
+  intro l
+  induction l with
+  | nil => intro _ _ _ _ hm; simp at hm
+  | cons x rest ih =>
+    intro vs o v hnd hm
+    simp only [List.map_cons, List.nodup_cons] at hnd
+    unfold updateVars
+    rcases List.mem_cons.mp hm with rfl | hr
+    · rw [lookupVar_updateVars_notMem rest _ o hnd.1]
+      exact lookupVar_updateVar_self vs o v
+    · exact ih _ o v hnd.2 hr
+
+
+
+/-- A join's phi prologue, as data: for each phi, the stack depth it owns, the source arriving on
+*this* edge, the output it defines, and the value that source carries. -/
+abbrev PhiEdge := Nat × String × String × bytes32
+
+abbrev PhiEdge.depth (x : PhiEdge) : Nat := x.1
+abbrev PhiEdge.src   (x : PhiEdge) : String := x.2.1
+abbrev PhiEdge.out   (x : PhiEdge) : String := x.2.2.1
+abbrev PhiEdge.val   (x : PhiEdge) : bytes32 := x.2.2.2
+
+/-- **The join bridge, for a whole phi prologue.**
+
+`planStackRel_phi_join_bridge` earns the phi's hypothesis for *one* phi. It cannot simply be iterated:
+after repairing one slot the relation against the recorded layout is still false at every *other* phi
+slot, so its "relation holds off the slot" hypothesis fails at the second phi. The phis have to be taken
+together — the same shape the plan side and the poke side both forced.
+
+Input: the relation against the **arriving** predecessor's exit layout, which is what that predecessor's
+block simulation gives you and is true on every edge. Output: the relation against the **recorded** plan
+stack, which is what the block was compiled for. In between, every phi's slot is repaired at once. -/
+theorem planStackRel_phi_join_bridge_multi {lo : AssocList String Nat} {vs vs' : VenomState}
+    {psArr psRec : List Operand} {asmStack : List bytes32} (l : List PhiEdge)
+    (hrel : planStackRel lo vs psArr asmStack)
+    (hlen : psRec.length = psArr.length)
+    (hd : ∀ x ∈ l, x.depth < psRec.length)
+    -- off *all* the phi slots the two layouts agree
+    (hoff : ∀ i, i < psRec.length → (∀ x ∈ l, i ≠ x.depth) → psRec.reverse[i]! = psArr.reverse[i]!)
+    -- at its own slot, the arriving layout names *this* edge's source, carrying its value
+    (hsrc : ∀ x ∈ l, psArr.reverse[x.depth]! = Operand.Var x.src)
+    (hval : ∀ x ∈ l, lookupVar x.src vs = some x.val)
+    -- the phi outputs are fresh on the recorded stack
+    (hfresh : ∀ i, i < psRec.length → (∀ x ∈ l, i ≠ x.depth) →
+        ∀ x ∈ l, psRec.reverse[i]! ≠ Operand.Var x.out)
+    -- the post-state: each phi output holds its value, and nothing else moved. Stated by *behaviour*,
+    -- not by construction — `evalPhis` builds it in its own order, and the bridge must not care.
+    (hout : ∀ x ∈ l, lookupVar x.out vs' = some x.val)
+    (hpres : ∀ w, w ∉ l.map PhiEdge.out → lookupVar w vs' = lookupVar w vs) :
+    planStackRel lo vs'
+      (l.foldl (fun st x => stackPoke x.depth (Operand.Var x.out) st) psRec) asmStack := by
+  obtain ⟨hlenA, hcorr⟩ := hrel
+  have hfold : l.foldl (fun st x => stackPoke x.depth (Operand.Var x.out) st) psRec
+      = (l.map (fun x => (x.depth, x.out))).foldl
+          (fun s (dp : Nat × String) => stackPoke dp.1 (Operand.Var dp.2) s) psRec := by
+    rw [List.foldl_map]
+  rw [hfold]
+  refine planStackRel_phi_pokes (l.map (fun x => (x.depth, x.out))) psRec
+      (by rw [hlen]; exact hlenA) ?_ ?_ ?_
+  · intro dp hdp
+    obtain ⟨x, hx, rfl⟩ := List.mem_map.mp hdp
+    exact hd x hx
+  · -- off every phi slot: layouts agree, no phi output sits there, so nothing the phis wrote is read
+    intro i hi hne
+    have hne' : ∀ x ∈ l, i ≠ x.depth := by
+      intro x hx
+      exact hne (x.depth, x.out) (List.mem_map_of_mem hx)
+    rw [hoff i hi hne']
+    have hnv : ∀ x ∈ l, psArr.reverse[i]! ≠ Operand.Var x.out := by
+      intro x hx; rw [← hoff i hi hne']; exact hfresh i hi hne' x hx
+    have hstep : operandVal vs' lo (psArr.reverse[i]!) = operandVal vs lo (psArr.reverse[i]!) := by
+      cases hop : psArr.reverse[i]! with
+      | Lit w => rfl
+      | Label m => rfl
+      | Var w =>
+        show lookupVar w vs' = lookupVar w vs
+        refine hpres w ?_
+        intro hmem
+        obtain ⟨x, hx, hxw⟩ := List.mem_map.mp hmem
+        exact hnv x hx (by rw [hop]; exact congrArg Operand.Var hxw.symm)
+    rw [hstep]
+    exact hcorr i (by omega)
+  · -- at each phi slot: the asm value IS this edge's source value, and the phi bound `out` to it
+    intro dp hdp
+    obtain ⟨x, hx, rfl⟩ := List.mem_map.mp hdp
+    have hdA : x.depth < psArr.length := by have := hd x hx; omega
+    have harr := hcorr x.depth hdA
+    rw [hsrc x hx] at harr
+    have hlk : lookupVar x.src vs = some (asmStack[x.depth]!) := harr
+    have hv : x.val = asmStack[x.depth]! := by
+      rw [hval x hx] at hlk; exact Option.some.inj hlk
+    show lookupVar x.out vs' = some (asmStack[x.depth]!)
+    rw [hout x hx, hv]
 
 end EvmYul.Venom.Hol.Codegen

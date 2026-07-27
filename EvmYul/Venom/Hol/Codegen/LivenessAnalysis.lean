@@ -29,9 +29,20 @@ def instDefs (inst : Instruction) : List String := inst.outputs
 /-- `inst_uses`. -/
 def instUses (inst : Instruction) : List String := operandVars inst.operands
 
-/-- `liveness_transfer` (the context — the block list — is unused by the transfer). -/
+/-- `liveness_transfer` (the context — the block list — is unused by the transfer).
+
+A `PHI` contributes neither defs nor uses *here*: its definition happens on the incoming edge, and
+its operands are uses of the **edge**, not of the join. Running the ordinary transfer on it would
+kill the phi output and make every source live at the join — which both leaves each source live in
+predecessors that never define it, and (because `inputVarsFrom` rewrites phi *outputs*) leaves
+`livenessEdgeTransfer` with nothing to rewrite, collapsing it to the identity. Both predecessors
+would then be handed the same, unbuildable entry layout and would exit in *different* ones, so the
+join's single `SOPoke` would read the wrong slot from all but one of them. Leaving the output live
+is what lets `livenessEdgeTransfer` substitute the matching source per edge, which is what puts the
+incoming value at the same depth on every edge. -/
 def livenessTransfer (_bbs : List BasicBlock) (inst : Instruction) (live : List String) : List String :=
-  liveUpdate (instDefs inst) (instUses inst) live
+  if inst.opcode = Opcode.PHI then live
+  else liveUpdate (instDefs inst) (instUses inst) live
 
 /-- `liveness_edge_transfer`: live-in across a CFG edge (with phi substitution). -/
 def livenessEdgeTransfer (bbs : List BasicBlock) (succLbl curLbl : String) (live : List String)
@@ -93,20 +104,38 @@ theorem liveUpdate_mem_elim {defs uses live : List String} {v : String}
   · rw [List.mem_filter] at h
     exact Or.inl h.1
 
+/-- **A `PHI` is transparent to the intra-block transfer.** Its def happens on the incoming edge and
+    its operands are uses of that edge, so neither is accounted for here; `livenessEdgeTransfer`
+    substitutes the matching source per predecessor instead. -/
+@[simp] theorem livenessTransfer_phi {bbs : List BasicBlock} {inst : Instruction}
+    {live : List String} (hphi : inst.opcode = Opcode.PHI) :
+    livenessTransfer bbs inst live = live := by
+  unfold livenessTransfer; simp [hphi]
+
 /-- **Instruction-level liveness soundness: every operand var is live-in.** The var-operands used by
-    `inst` all appear in the transferred live-in set. -/
+    `inst` all appear in the transferred live-in set.
+
+    A `PHI` is excluded, and must be: its operands are uses of the incoming *edge*, not of the join,
+    so they are *not* live-in there. Accounting for them here is exactly the bug that made the
+    generated code read the wrong stack slot at a join — see `phi_join_agreement` in
+    `GenBlockSimExample`. -/
 theorem livenessTransfer_mem_of_use {bbs : List BasicBlock} {inst : Instruction} {live : List String}
-    {v : String} (h : v ∈ operandVars inst.operands) :
+    {v : String} (hphi : inst.opcode ≠ Opcode.PHI) (h : v ∈ operandVars inst.operands) :
     v ∈ livenessTransfer bbs inst live := by
   unfold livenessTransfer instUses
+  simp only [if_neg hphi]
   exact liveUpdate_mem_of_use h
 
-/-- **Instruction-level liveness framing: a live-through var not defined by `inst` stays live-in.** -/
+/-- **Instruction-level liveness framing: a live-through var not defined by `inst` stays live-in.**
+    Holds for a `PHI` too, where the transfer is the identity. -/
 theorem livenessTransfer_mem_of_live {bbs : List BasicBlock} {inst : Instruction} {live : List String}
     {v : String} (hlive : v ∈ live) (hdef : ¬ inst.outputs.contains v = true) :
     v ∈ livenessTransfer bbs inst live := by
   unfold livenessTransfer instDefs
-  exact liveUpdate_mem_of_live hlive hdef
+  by_cases hphi : inst.opcode = Opcode.PHI
+  · simpa [hphi] using hlive
+  · simp only [if_neg hphi]
+    exact liveUpdate_mem_of_live hlive hdef
 
 /-! ## Dataflow fixpoint correctness — the intra-block transfer equation
 
@@ -180,10 +209,14 @@ theorem dfFoldBackward_lookup_head {α} (transfer : Instruction → α → α) (
 
 /-- **Intra-block liveness soundness.** Every operand var used by the instruction at position `k`
     of a block is live-in at `(lbl, idx0 + k)` in the backward transfer fold — a use is live before
-    the instruction that uses it, by construction of `dfFoldBackward` (fixpoint-independent). -/
+    the instruction that uses it, by construction of `dfFoldBackward` (fixpoint-independent).
+
+    `PHI` is excluded: its operands are uses of the incoming *edge*, so they are not live-in at the
+    join (`livenessEdgeTransfer` accounts for them per predecessor instead). -/
 theorem dfFoldBackward_use_mem {ctx : List BasicBlock} (lbl : String) (instrs : List Instruction)
     (idx0 : Nat) (acc0 : List String) (m0 : AssocList (String × Nat) (List String))
     (k : Nat) (hk : k < instrs.length) {v : String}
+    (hphi : (instrs.get ⟨k, hk⟩).opcode ≠ Opcode.PHI)
     (hv : v ∈ operandVars (instrs.get ⟨k, hk⟩).operands) :
     ∃ L, AssocList.lookup (String × Nat) (List String)
       (dfFoldBackward (livenessTransfer ctx) lbl instrs idx0 acc0 m0).2 (lbl, idx0 + k) = some L
@@ -195,12 +228,12 @@ theorem dfFoldBackward_use_mem {ctx : List BasicBlock} (lbl : String) (instrs : 
     | zero =>
       refine ⟨_, by rw [Nat.add_zero]; exact dfFoldBackward_lookup_head _ _ _ _ _ _, ?_⟩
       show v ∈ livenessTransfer ctx i _
-      exact livenessTransfer_mem_of_use hv
+      exact livenessTransfer_mem_of_use hphi hv
     | succ k' =>
       have hk' : k' < rest.length := by simpa using hk
       have hkey : (lbl, idx0 + (k' + 1)) ≠ (lbl, idx0) := by
         intro he; exact absurd (Prod.ext_iff.1 he).2 (by omega)
-      obtain ⟨L, hL, hvL⟩ := ih (idx0 + 1) k' hk' (by simpa using hv)
+      obtain ⟨L, hL, hvL⟩ := ih (idx0 + 1) k' hk' (by simpa using hphi) (by simpa using hv)
       refine ⟨L, ?_, hvL⟩
       show AssocList.lookup _ _
         (AssocList.insert _ _ (dfFoldBackward (livenessTransfer ctx) lbl rest (idx0 + 1) acc0 m0).2
@@ -275,6 +308,7 @@ theorem dfFoldBackward_use_live_earlier {ctx : List BasicBlock} (lbl : String)
     (instrs : List Instruction) (idx0 : Nat) (acc0 : List String)
     (m0 : AssocList (String × Nat) (List String)) {v : String} :
     ∀ (gap i k : Nat) (hk : k < instrs.length), k = i + gap →
+      (instrs.get ⟨k, hk⟩).opcode ≠ Opcode.PHI →
       v ∈ operandVars (instrs.get ⟨k, hk⟩).operands →
       (∀ m (hm : m < instrs.length), i ≤ m → m < k → v ∉ (instrs.get ⟨m, hm⟩).outputs) →
       ∃ L, AssocList.lookup (String × Nat) (List String)
@@ -282,13 +316,13 @@ theorem dfFoldBackward_use_live_earlier {ctx : List BasicBlock} (lbl : String)
   intro gap
   induction gap with
   | zero =>
-    intro i k hk hik hv _
-    obtain ⟨L, hLk, hvL⟩ := dfFoldBackward_use_mem lbl instrs idx0 acc0 m0 k hk hv
+    intro i k hk hik hphi hv _
+    obtain ⟨L, hLk, hvL⟩ := dfFoldBackward_use_mem lbl instrs idx0 acc0 m0 k hk hphi hv
     exact ⟨L, by rw [show idx0 + i = idx0 + k from by omega]; exact hLk, hvL⟩
   | succ g ih =>
-    intro i k hk hik hv hnodef
+    intro i k hk hik hphi hv hnodef
     have hik1 : k = (i + 1) + g := by omega
-    obtain ⟨L, hL, hvL⟩ := ih (i + 1) k hk hik1 hv
+    obtain ⟨L, hL, hvL⟩ := ih (i + 1) k hk hik1 hphi hv
       (fun m hm h1 h2 => hnodef m hm (by omega) h2)
     have hk1 : i + 1 < instrs.length := by omega
     have hnodef_i : v ∉ (instrs.get ⟨i, by omega⟩).outputs := hnodef i (by omega) (le_refl _) (by omega)
@@ -383,13 +417,17 @@ theorem foldl_prepend_lookup_some {β} {g : String → AssocList (String × Nat)
     lifts the intra-block transfer equation (`dfFoldBackward_use_mem`) through the `dfPopulateInst`
     storage map (`dfPopulateInst_inst_eq` + `foldl_prepend_lookup_some`, with cross-block key
     disjointness `dfFoldBackward_lookup_diff_label`). Fixpoint-convergence-independent: a use is live
-    before its instruction by construction of the backward transfer, whatever the block-exit seed. -/
+    before its instruction by construction of the backward transfer, whatever the block-exit seed.
+
+    `PHI` is excluded: a phi's operands are uses of the incoming *edge*, so they are not live-in at
+    the join — `livenessEdgeTransfer` substitutes the matching source per predecessor instead. -/
 theorem livenessAnalyzeFuel_use_live {fuel : Nat} {fn : IrFunction} {lbl0 : String}
     {bb : BasicBlock} {idx : Nat} {v : String}
     (hnd : (fn.blocks.map (·.label)).Nodup)
     (hfind : findBlock lbl0 fn.blocks = some bb)
     (hlbl : lbl0 ∈ fn.blocks.map (·.label))
     (hidx : idx < bb.instructions.length)
+    (hphi : (bb.instructions.get ⟨idx, hidx⟩).opcode ≠ Opcode.PHI)
     (hv : v ∈ operandVars (bb.instructions.get ⟨idx, hidx⟩).operands) :
     v ∈ liveVarsAt (livenessAnalyzeFuel fuel fn) lbl0 idx := by
   set boundaryResult := (wlIterateFuel fuel
@@ -405,7 +443,7 @@ theorem livenessAnalyzeFuel_use_live {fuel : Nat} {fn : IrFunction} {lbl0 : Stri
         (cfgAnalyze fn) boundaryResult lbl)).2 with hg
   obtain ⟨L, hL, hvL⟩ := dfFoldBackward_use_mem (ctx := fn.blocks) lbl0 bb.instructions 0
     (dfJoinedVal Direction.Backward [] listUnion livenessEdgeTransfer fn.blocks none
-      (cfgAnalyze fn) boundaryResult lbl0) [] idx hidx hv
+      (cfgAnalyze fn) boundaryResult lbl0) [] idx hidx hphi hv
   have hsome : AssocList.lookup _ _ (g lbl0) (lbl0, idx) = some L := by
     rw [hg]; simp only [hfind]
     show AssocList.lookup _ _ (dfFoldBackward (livenessTransfer fn.blocks) lbl0 bb.instructions 0 _ []).2
@@ -442,6 +480,7 @@ theorem livenessAnalyzeFuel_live_earlier {fuel : Nat} {fn : IrFunction} {lbl0 : 
     (hlbl : lbl0 ∈ fn.blocks.map (·.label))
     (hidx : idx < bb.instructions.length)
     (hile : i ≤ idx)
+    (hphi : (bb.instructions.get ⟨idx, hidx⟩).opcode ≠ Opcode.PHI)
     (hv : v ∈ operandVars (bb.instructions.get ⟨idx, hidx⟩).operands)
     (hnodef : ∀ m (hm : m < bb.instructions.length), i ≤ m → m < idx →
         v ∉ (bb.instructions.get ⟨m, hm⟩).outputs) :
@@ -459,7 +498,7 @@ theorem livenessAnalyzeFuel_live_earlier {fuel : Nat} {fn : IrFunction} {lbl0 : 
         (cfgAnalyze fn) boundaryResult lbl)).2 with hg
   obtain ⟨L, hL, hvL⟩ := dfFoldBackward_use_live_earlier (ctx := fn.blocks) lbl0 bb.instructions 0
     (dfJoinedVal Direction.Backward [] listUnion livenessEdgeTransfer fn.blocks none
-      (cfgAnalyze fn) boundaryResult lbl0) [] (idx - i) i idx hidx (by omega) hv hnodef
+      (cfgAnalyze fn) boundaryResult lbl0) [] (idx - i) i idx hidx (by omega) hphi hv hnodef
   have hsome : AssocList.lookup _ _ (g lbl0) (lbl0, i) = some L := by
     rw [hg]; simp only [hfind]
     show AssocList.lookup _ _ (dfFoldBackward (livenessTransfer fn.blocks) lbl0 bb.instructions 0 _ []).2
@@ -488,10 +527,11 @@ theorem liveVarsAt_contains_of_use {fuel fn lbl0 bb idx v}
     (hfind : findBlock lbl0 fn.blocks = some bb)
     (hlbl : lbl0 ∈ fn.blocks.map (·.label))
     (hidx : idx < bb.instructions.length)
+    (hphi : (bb.instructions.get ⟨idx, hidx⟩).opcode ≠ Opcode.PHI)
     (hv : v ∈ operandVars (bb.instructions.get ⟨idx, hidx⟩).operands) :
     (liveVarsAt (livenessAnalyzeFuel fuel fn) lbl0 idx).contains v = true := by
   rw [List.contains_eq_mem]
-  simpa using livenessAnalyzeFuel_use_live hnd hfind hlbl hidx hv
+  simpa using livenessAnalyzeFuel_use_live hnd hfind hlbl hidx hphi hv
 
 /-- **`.contains` form of `livenessAnalyzeFuel_live_earlier`** — directly discharges a classifier's
     `nextLiveness.contains x = true` for an operand reused later in the block. -/
@@ -501,11 +541,12 @@ theorem liveVarsAt_contains_of_use_later {fuel fn lbl0 bb} {i idx v}
     (hlbl : lbl0 ∈ fn.blocks.map (·.label))
     (hidx : idx < bb.instructions.length)
     (hile : i ≤ idx)
+    (hphi : (bb.instructions.get ⟨idx, hidx⟩).opcode ≠ Opcode.PHI)
     (hv : v ∈ operandVars (bb.instructions.get ⟨idx, hidx⟩).operands)
     (hnodef : ∀ m (hm : m < bb.instructions.length), i ≤ m → m < idx →
         v ∉ (bb.instructions.get ⟨m, hm⟩).outputs) :
     (liveVarsAt (livenessAnalyzeFuel fuel fn) lbl0 i).contains v = true := by
   rw [List.contains_eq_mem]
-  simpa using livenessAnalyzeFuel_live_earlier hnd hfind hlbl hidx hile hv hnodef
+  simpa using livenessAnalyzeFuel_live_earlier hnd hfind hlbl hidx hile hphi hv hnodef
 
 end EvmYul.Venom.Hol.Codegen

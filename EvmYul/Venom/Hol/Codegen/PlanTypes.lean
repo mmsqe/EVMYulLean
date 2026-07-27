@@ -19,7 +19,7 @@ structure SpillAlloc where
   freeSlots   : List Nat
   nextOffset  : Nat
   fnEom       : Nat
-  deriving Inhabited
+  deriving Inhabited, DecidableEq
 
 /- ===== Plan Generator State ===== -/
 
@@ -31,7 +31,7 @@ structure PlanState where
   spilled       : SpilledMap
   alloc         : SpillAlloc
   labelCounter  : Nat
-  deriving Inhabited
+  deriving Inhabited, DecidableEq
 
 /- ===== Spill Slot Management ===== -/
 

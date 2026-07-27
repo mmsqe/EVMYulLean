@@ -259,6 +259,73 @@ def jmpEntryBB : BasicBlock := { label := "entry", instructions := [jmpInst] }
 def stopNextBB : BasicBlock := { label := "next", instructions := [stopInst] }
 def jmpStopFn : IrFunction := { name := "main", blocks := [jmpEntryBB, stopNextBB] }
 
+/-- **Concrete asm-layout via the new ③ bridge machinery.** `entry_aligned_jmp_layout` applied to the
+    real function `jmpStopFn` (entry `JMP "next"` → `next: STOP`): the resolved program has the entry
+    block's `hblock` at pc 0 and the resolved push-label (`AsmPushLabel "next"`) + `JUMP` right after —
+    exactly the ③ asm-layout facts `hstep_regularHSVP_jmp` needs, produced end-to-end **from the function
+    definition** by the new lemmas (`generateFnPlanFuel_first_succ_segment` → `generateBlockPlan_aligned_jmp`
+    → `entry_aligned_jmp_prog_asm` → `aligned_jmp_tail_resolved`/`asmBlockAt_resolved_of_middle_no_label`).
+    Validates the whole asm-layout chain on a real function; all obligations discharged by `rfl`/`decide`. -/
+theorem jmpStopFn_entry_aligned_layout :
+    ∃ (ops : List StackOp) (ps : PlanState) (bodyOps : List StackOp),
+      generateFnPlanFuel (fnPlanFuel jmpStopFn) jmpStopFn 0 0 = some (ops, ps) ∧
+      asmBlockAt (asmResolve (executePlan ops)).1 0
+        (executePlan ([StackOp.SOLabel "entry"] ++ bodyOps)) ∧
+      (∃ h : (executePlan ([StackOp.SOLabel "entry"] ++ bodyOps)).length < (asmResolve (executePlan ops)).1.length,
+        (asmResolve (executePlan ops)).1[(executePlan ([StackOp.SOLabel "entry"] ++ bodyOps)).length]'h
+          = resolveInst (computeLabelOffsets (executePlan ops)).2 (AsmInst.AsmPushLabel "next")) ∧
+      (∃ h : (executePlan ([StackOp.SOLabel "entry"] ++ bodyOps)).length + 1 < (asmResolve (executePlan ops)).1.length,
+        (asmResolve (executePlan ops)).1[(executePlan ([StackOp.SOLabel "entry"] ++ bodyOps)).length + 1]'h
+          = AsmInst.AsmOp "JUMP") := by
+  have hfnready : ∀ bb ∈ jmpStopFn.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst := by
+    intro bb hbb inst hinst
+    simp only [jmpStopFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    rcases hbb with rfl | rfl
+    · simp only [jmpEntryBB, List.mem_singleton] at hinst; subst hinst; unfold codegenReadyInst; decide
+    · simp only [stopNextBB, List.mem_singleton] at hinst; subst hinst; unfold codegenReadyInst; decide
+  obtain ⟨⟨ops, ps⟩, hgen⟩ : ∃ r, generateFnPlanFuel (fnPlanFuel jmpStopFn) jmpStopFn 0 0 = some r := ⟨_, rfl⟩
+  obtain ⟨bodyOps, ps_body, _hbody, hblk, hpush, hjump⟩ :=
+    entry_aligned_jmp_layout (fuel := fnPlanFuel jmpStopFn) (fn := jmpStopFn) (entry := jmpEntryBB)
+      (succBB := stopNextBB) (succ := "next") (succRest := []) (front := []) (term := jmpInst)
+      (target := "next") (fnEom := 0) (lblCtr := 0) (ops := ops) (ps := ps)
+      (by decide) rfl rfl (by decide) rfl hfnready hgen (cleanTrivial_of_multi (by decide)) rfl rfl rfl rfl
+      (by intro tb h; simp only [show jmpStopFn.blocks.find? (·.label == "next") = some stopNextBB from rfl,
+            Option.some.injEq] at h; subst h; rfl)
+      (by intro e h; simp only [show jmpStopFn.blocks.head? = some jmpEntryBB from rfl,
+            Option.some.injEq] at h; subst h; rfl)
+      (by intro bo pb h; simp only [List.zipIdx_nil, List.foldl_nil, Option.some.injEq, Prod.mk.injEq] at h;
+          obtain ⟨_, hpb⟩ := h; rw [← hpb]; rfl)
+      (by intro bo pb h; simp only [List.zipIdx_nil, List.foldl_nil, Option.some.injEq, Prod.mk.injEq] at h;
+          obtain ⟨hbo, _⟩ := h; subst hbo; intro a ha; simp [executePlan, execStackOp] at ha; subst ha
+          exact ⟨by simp, by simp⟩)
+  exact ⟨ops, ps, bodyOps, hgen, hblk, hpush, hjump⟩
+
+/-- **Concrete residual (psOf-side) validation via the new ③ bridge.** `psOfFn_succ_eq_bodyfold_jmp`
+    applied to `jmpStopFn`: the successor `"next"`'s entry plan state in the real DFS table equals the
+    entry block's body-fold output (here `initPlanState`, the empty body). The residual companion of
+    `jmpStopFn_entry_aligned_layout` — both sides of the ③ JMP bridge now validated on a real function,
+    all DFS/plan obligations by `rfl`/`decide`. -/
+theorem jmpStopFn_psOfFn_succ_residual :
+    psOfFn (fnPlanFuel jmpStopFn) jmpStopFn 0 0 "next" = { initPlanState 0 with labelCounter := 0 } := by
+  obtain ⟨⟨blockOps, ps'⟩, hbp⟩ : ∃ r, generateBlockPlan (livenessAnalyzeFuel (22 + 3) jmpStopFn)
+      (DfgAnalysis.buildFunction jmpStopFn) (cfgAnalyze jmpStopFn) jmpStopFn jmpEntryBB
+      { initPlanState 0 with labelCounter := 0 } = some r := ⟨_, rfl⟩
+  obtain ⟨result, hdfs⟩ : ∃ r, dfsEntriesAux (22 + 3) (livenessAnalyzeFuel (22 + 3) jmpStopFn)
+      (DfgAnalysis.buildFunction jmpStopFn) (cfgAnalyze jmpStopFn) jmpStopFn [jmpEntryBB.label] [] []
+      { initPlanState 0 with labelCounter := 0 } = some r := ⟨_, rfl⟩
+  have h := psOfFn_succ_eq_bodyfold_jmp 22 0 0 jmpStopFn jmpEntryBB jmpEntryBB blockOps ps' "next" []
+    stopNextBB result [] jmpInst "next"
+    rfl rfl hbp rfl (by decide) rfl hdfs
+    (by intro e he; simp only [show jmpStopFn.blocks.head? = some jmpEntryBB from rfl, Option.some.injEq] at he;
+        subst he; rfl)
+    (cleanTrivial_of_multi (by decide)) rfl rfl rfl rfl
+    (by intro tb hh; simp only [show jmpStopFn.blocks.find? (·.label == "next") = some stopNextBB from rfl,
+          Option.some.injEq] at hh; subst hh; rfl)
+    (by intro x hx; simp at hx)
+    rfl
+  rw [show fnPlanFuel jmpStopFn = 22 + 3 from by decide, h]
+  rfl
+
 theorem hfsim_jmp_stop_example
     {fuel : Nat} {ctx : VenomContext} {lo : AssocList String Nat}
     {vs : VenomState} {as : AsmState} {ps : PlanState}
@@ -738,10 +805,9 @@ theorem revert_runAsm_core
 /-- **Asm-side INVALID block sim** (`AsmFault`). The `AsmFault` companion of
     `stop_runAsm_core` (AsmHalt) and `revert_runAsm_core` (AsmRevert), completing the
     trio of terminal asm results: `[JUMPDEST; INVALID]` runs 2 steps from `pc 0` to
-    `AsmFault`. `INVALID` faults directly (`AsmFault (asmNext s)`), like `STOP` halts —
-    so the run is `asmStep_label_ok` then the direct fault dispatch. Terminal relation
-    is dropped (the Venom-side exceptional-halt reverts state, so the abort state's
-    observable fields need the revert semantics — left as follow-up). -/
+    `AsmFault`. `INVALID` faults directly (`AsmFault { asmNext s with returndata := empty }`,
+    clearing returndata to mirror the Venom exceptional-halt `setReturndata empty`), like
+    `STOP` halts — so the run is `asmStep_label_ok` then the direct fault dispatch. -/
 theorem invalid_runAsm_core
     {offsetToPc : AssocList Nat Nat} {as : AsmState}
     (haspc : as.pc = 0) :
@@ -759,11 +825,12 @@ theorem invalid_runAsm_core
     rw [show (⟨(asmNext as).pc, hpc1⟩ : Fin _) = ⟨1, by decide⟩ from
           Fin.ext (by show as.pc + 1 = 1; rw [haspc])]; rfl
   have hstep1 : asmStep offsetToPc [AsmInst.AsmLabel "entry", AsmInst.AsmOp "INVALID"] (asmNext as)
-      = AsmResult.AsmFault (asmNext (asmNext as)) := by
+      = AsmResult.AsmFault { asmNext (asmNext as) with returndata := ByteArray.empty } := by
     unfold asmStep; rw [dif_pos hpc1, hget1]; rfl
-  refine ⟨asmNext (asmNext as), ?_⟩
+  refine ⟨{ asmNext (asmNext as) with returndata := ByteArray.empty }, ?_⟩
   rw [show (2 : Nat) = 1 + 1 from rfl, runAsm_succ_ok hpc0 (asmStep_label_ok hpc0 hget0)]
-  show runAsm 1 offsetToPc _ (asmNext as) = AsmResult.AsmFault (asmNext (asmNext as))
+  show runAsm 1 offsetToPc _ (asmNext as)
+    = AsmResult.AsmFault { asmNext (asmNext as) with returndata := ByteArray.empty }
   unfold runAsm; rw [hstep1]
 
 /-! ## Non-vacuous codegen correctness for a concrete function
@@ -1755,7 +1822,8 @@ theorem hfsim_regularHN_jmp_stop
 
 /-- **Generic two-block linear-chain `hfsim`, faulting tail** (gap A): as
     `hfsim_regularHN_jmp_stop` but the terminal block carries a G-fold regular body ending in
-    INVALID (Venom fault clears returndata, hence `hrdEmpty`). Composes `hasm_regularHN_jmp` with
+    INVALID (both Venom and asm clear returndata on the fault, so the terminal match is
+    unconditional). Composes `hasm_regularHN_jmp` with
     `hasm_regularInvalid` through `hfsim_jmp_then_fault`. -/
 theorem hfsim_regularHN_jmp_invalid
     {fuel : Nat} {ctx : VenomContext} {fn : IrFunction}
@@ -1815,7 +1883,6 @@ theorem hfsim_regularHN_jmp_invalid
     (htthread : execBodyThread tfront 0 { sMid with instIdx := 0 } = some tsEnd)
     (htterm_step : stepInstBase tterm tsEnd
       = ExecResult.Abort AbortType.ExHaltAbort (haltState (setReturndata ByteArray.empty tsEnd)))
-    (hrdEmpty : tsEnd.returndata = ByteArray.empty)
     -- halting block: asm side, at the THREADED plan state eps1 (linear-chain identity
     -- reconciliation) and the successor pc idx
     (htbody : RegularBodyG labelOffsets tnl offsetToPc prog tfront tS0)
@@ -1864,7 +1931,7 @@ theorem hfsim_regularHN_jmp_invalid
   have hasmN := hasm_regularInvalid (liveness := liveness) (dfg := dfg) (cfg := cfg) (fn := fn)
     (l := tlab) (curBbLabel := curBbLabel2) (vs := sMid) (asm := asMid) (sEnd := tsEnd)
     (budget := prog.length - (ebodyLen + 2))
-    htbody htsd0 htsv0 (hrelTransport asMid hrelMid1) htthread hrdEmpty htblock' htbodyLenEqF htlt'
+    htbody htsd0 htsv0 (hrelTransport asMid hrelMid1) htthread htblock' htbodyLenEqF htlt'
     htget' (by omega)
   exact hfsim_jmp_then_fault hlk1 hebb hecons hephi henonterm hethread heterm_step heisterm henohalt
     hrunE (by omega) hlk2 htbb htcons htphi htnonterm htthread htterm_step hasmN
@@ -4639,6 +4706,36 @@ theorem runContext_calldatacopy_correct
     (vs := { vs0 with prevBb := none, currentBb := "entry", instIdx := 0 })
     rfl hvshalt hadef hbdef hcdef hrel haspc hmemsafe
 
+/-- **Unconditional top-level `codegen_correct` conclusion for a BRANCHING function.**
+The 3-block conditional function `jnzStopFnR` (entry `JNZ` → then/else), run from the
+context entry via `runContext`, corresponds to its resolved program `jnzProg` — `hbsim`
+fully discharged. Extends the de-vacuified top-level from linear (JMP) and body-carrying
+(CALLDATACOPY) instances to a genuine *branch-and-join* CFG, the shape that exercises
+Step 2's conditional-edge threading. Via the bridge `runContext_correct_of_hfsim` applied
+to `hfsim_jnz_stop_example` at the entry-reset state (control-flow fields transport by
+defeq). No side conditions beyond the entry-lookup facts. -/
+theorem runContext_jnz_correct
+    {fuel : Nat} {ctx : VenomContext} {lo : AssocList String Nat}
+    {vs0 : VenomState} {as : AsmState} {entryName : String}
+    (hent : ctx.entry = some entryName)
+    (hlk : lookupFunction entryName ctx.functions = some jnzStopFnR)
+    (hlbl : fnEntryLabel jnzStopFnR = some "entry")
+    (hvshalt : vs0.halted = false)
+    (hrel : venomAsmRel lo (initPlanState 0) vs0 as)
+    (haspc : as.pc = 0) :
+    (match runContext fuel ctx vs0 with
+     | ExecResult.Halt vs' => ∃ as', runAsm jnzProg.length ([(11, 6), (13, 8)] : AssocList Nat Nat)
+         jnzProg as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm jnzProg.length
+         ([(11, 6), (13, 8)] : AssocList Nat Nat) jnzProg as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm jnzProg.length
+         ([(11, 6), (13, 8)] : AssocList Nat Nat) jnzProg as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  refine runContext_correct_of_hfsim (entryLbl := "entry") hent hlk hlbl ?_
+  exact hfsim_jnz_stop_example (ctx := ctx)
+    (vs := { vs0 with prevBb := none, currentBb := "entry", instIdx := 0 })
+    rfl hvshalt hrel haspc
+
 /-! ## Concrete genuine (non-identity) join reorder — a transposition
 
 Every JMP example above (`hfsim_jmp_sstore_example`, `hfsim_jmp_calldatacopy_example`) is a *linear*
@@ -6736,5 +6833,15529 @@ theorem runContext_bareRet {s : VenomState} :
     runBlocks_intret_of_block (by rfl) hrb
   refine runContext_intret (entryName := "main") (entryFn := retFn) rfl rfl ?_
   exact runFunction_intret (lbl := "entry") rfl hrbs
+
+/-! ### Discharging the JNZ not-taken tree-edge condition on a real CFG
+
+`hstep_regularHSVP_jnz_nottaken_canonical` asks for `hnr : ¬ CfgReach (cfgAnalyze fn) ifNz ifZ` — the
+fall-through target must not be discoverable from inside the taken branch's DFS subtree (otherwise `ifZ`
+is not a tree edge and its entry is recorded elsewhere, with a different plan state). The point of
+`not_CfgReach_of_closed` is that this is a *decidable* CFG fact: exhibit a successor-closed list
+containing `ifNz` and missing `ifZ`. Here `then` STOPs, so `{then}` is already closed. -/
+theorem jnzStopFnR_then_not_reach_else :
+    ¬ CfgReach (cfgAnalyze Example.jnzStopFnR) "then" "else" :=
+  not_CfgReach_of_closed ["then"] (by decide) (by decide) (by decide)
+
+/-- The symmetric fact (the `else` branch cannot reach `then`) — so either successor may play the role
+    of the taken branch. -/
+theorem jnzStopFnR_else_not_reach_then :
+    ¬ CfgReach (cfgAnalyze Example.jnzStopFnR) "else" "then" :=
+  not_CfgReach_of_closed ["else"] (by decide) (by decide) (by decide)
+
+/-- **The JNZ successor order, on a real CFG.** `bbSuccs` is `(getSuccessors …).reverse`, so for a JNZ
+    with operands `[c, ifNz, ifZ]` the CFG successors come out `ifZ :: ifNz` — the FALL-THROUGH first,
+    the TAKEN target second. `jnzInstR`'s labels are `then` (= ifNz) and `else` (= ifZ), and indeed:
+
+    This is the shape both JNZ canonical `hstep`s now ask for (`hpsucc`). Before this was checked they
+    asked for `ifNz :: …`, which no function can ever satisfy — their residual discharge was vacuous. -/
+theorem jnzStopFnR_entry_succs :
+    (cfgAnalyze Example.jnzStopFnR).succsOf "entry" = ["else", "then"] := by decide
+
+/-! ### The `CleanTrivial` weakening buys real coverage
+
+Every canonical per-block `hstep` used to require `(predsOf bb.label).length ≠ 1`, which is FALSE for
+any block reached by a JMP from a single predecessor — i.e. for every intermediate block of a JMP chain,
+which is exactly what `JmpChainTo` produces. `cleanStackPlan` only does work at a *branch join* (single
+pred that BRANCHES), so the right condition is `CleanTrivial`, and the chain blocks satisfy it. -/
+
+/-- `next` is reached by a JMP from `entry`, so it has exactly one predecessor — the OLD hypothesis
+    `(predsOf …).length ≠ 1` was false for it, and no canonical `hstep` could apply. -/
+theorem jmpStopFn_next_single_pred :
+    ((cfgAnalyze Example.jmpStopFn).predsOf "next").length = 1 := by decide
+
+/-- …but its single predecessor doesn't branch, so `CleanTrivial` holds and the machinery now applies. -/
+theorem jmpStopFn_next_cleanTrivial (L : DfState (List String)) :
+    CleanTrivial L (cfgAnalyze Example.jmpStopFn) Example.jmpStopFn Example.stopNextBB :=
+  cleanTrivial_of_jmp_pred (p := "entry") (by decide) (by decide)
+
+/-- **A JNZ branch target IS now covered** (when nothing is dead at the join). `then` has exactly one
+    predecessor, and that predecessor BRANCHES — so the old `(predsOf …).length ≠ 1` was false for it, and
+    so is the "non-branching pred" case. But `cleanStackPlan` only emits a `popmany` for the values the
+    predecessor's exit layout carries and this block does NOT want; here that set is empty, so the plan is
+    the identity and `cleanTrivial_of_no_dead` applies.
+
+    So the semantic `CleanTrivial` reaches JNZ branch targets too — no clean-stack prefix has to be
+    threaded through the block layout. What remains uncovered is only the case where the join really does
+    drop values (`toPop ≠ []`). -/
+theorem jnzStopFnR_then_cleanTrivial (L : DfState (List String))
+    (hdead : (liveVarsAt L "entry" Example.jnzEntryR.instructions.length).filter
+        (fun v => ¬ (inputVarsFrom "entry" Example.thenBB.instructions
+          (liveVarsAt L "then" 0)).contains v) = []) :
+    CleanTrivial L (cfgAnalyze Example.jnzStopFnR) Example.jnzStopFnR Example.thenBB :=
+  cleanTrivial_of_no_dead (p := "entry") (predBb := Example.jnzEntryR) (by decide) rfl hdead
+
+/-- …and for `jnzStopFnR` the join really does drop nothing, so the branch target is covered
+    UNCONDITIONALLY. A JNZ branch target — previously outside every canonical per-block `hstep` — now
+    satisfies the per-block precondition. -/
+theorem jnzStopFnR_then_cleanTrivial_concrete :
+    CleanTrivial (livenessAnalyzeFuel (fnPlanFuel Example.jnzStopFnR) Example.jnzStopFnR)
+      (cfgAnalyze Example.jnzStopFnR) Example.jnzStopFnR Example.thenBB :=
+  jnzStopFnR_then_cleanTrivial _ rfl
+
+/-! ### `hpreuniq` is dischargeable — by computation
+
+`hpreuniq` (the plan-prefix label-uniqueness obligation) is an input to all seven canonical per-block
+`hstep`s and had never been discharged anywhere, which — after the JNZ successor-order incident — is
+exactly the shape of thing worth checking rather than assuming. `hpreuniq_of_asmLabelCount_one` reduces it
+to "the whole plan emits this block's label exactly once", and THAT computes. Here it is, discharged for a
+real function, including for a NON-entry block whose plan prefix is genuinely non-empty. -/
+
+theorem jmpStopFn_next_labelCount {ops : List StackOp} {ps : PlanState}
+    (hgen : generateFnPlanFuel (fnPlanFuel Example.jmpStopFn) Example.jmpStopFn 0 0 = some (ops, ps)) :
+    asmLabelCount "next" (executePlan ops) = 1 := by
+  have h : (generateFnPlanFuel (fnPlanFuel Example.jmpStopFn) Example.jmpStopFn 0 0).map
+      (fun r => asmLabelCount "next" (executePlan r.1)) = some 1 := by rfl
+  rw [hgen] at h
+  simpa using h
+
+/-- `hpreuniq` for `jmpStopFn`'s `next` block — a non-entry block, so its plan prefix is non-empty and the
+    obligation has real content. Discharged entirely by computation. -/
+theorem jmpStopFn_next_hpreuniq {ops : List StackOp} {ps : PlanState} {rest : List StackOp}
+    (hgen : generateFnPlanFuel (fnPlanFuel Example.jmpStopFn) Example.jmpStopFn 0 0 = some (ops, ps))
+    {blockOps : List StackOp} (hblk : blockOps = StackOp.SOLabel "next" :: rest) :
+    ∀ preOps tailOps, ops = preOps ++ blockOps ++ tailOps →
+      ∀ a ∈ executePlan preOps, a ≠ AsmInst.AsmLabel "next" :=
+  hpreuniq_of_asmLabelCount_one hblk (jmpStopFn_next_labelCount hgen).le
+
+/-- Same for the branching function's fall-through target. -/
+theorem jnzStopFnR_else_labelCount {ops : List StackOp} {ps : PlanState}
+    (hgen : generateFnPlanFuel (fnPlanFuel Example.jnzStopFnR) Example.jnzStopFnR 0 0 = some (ops, ps)) :
+    asmLabelCount "else" (executePlan ops) = 1 := by
+  have h : (generateFnPlanFuel (fnPlanFuel Example.jnzStopFnR) Example.jnzStopFnR 0 0).map
+      (fun r => asmLabelCount "else" (executePlan r.1)) = some 1 := by rfl
+  rw [hgen] at h
+  simpa using h
+
+theorem jnzStopFnR_else_hpreuniq {ops : List StackOp} {ps : PlanState} {rest : List StackOp}
+    (hgen : generateFnPlanFuel (fnPlanFuel Example.jnzStopFnR) Example.jnzStopFnR 0 0 = some (ops, ps))
+    {blockOps : List StackOp} (hblk : blockOps = StackOp.SOLabel "else" :: rest) :
+    ∀ preOps tailOps, ops = preOps ++ blockOps ++ tailOps →
+      ∀ a ∈ executePlan preOps, a ≠ AsmInst.AsmLabel "else" :=
+  hpreuniq_of_asmLabelCount_one hblk (jnzStopFnR_else_labelCount hgen).le
+
+/-! ### `hpreuniq` discharged GENERICALLY on a real function
+
+Earlier this was discharged by computing the label count for each specific function. It is now a theorem
+(`hpreuniq_generic`): the DFS plans a block only when unvisited, so the plan emits each label at most once.
+The only side condition is that no instruction be one of the three fresh-label minters — which is a
+decidable property of the function. Here it is, end to end. -/
+
+theorem jmpStopFn_no_label_minters :
+    ∀ b ∈ Example.jmpStopFn.blocks, ∀ inst ∈ nonParamInsts b,
+      inst.opcode ≠ Opcode.INVOKE ∧ inst.opcode ≠ Opcode.ASSERT_UNREACHABLE ∧
+      inst.opcode ≠ Opcode.DJMP := by decide
+
+theorem jnzStopFnR_no_label_minters :
+    ∀ b ∈ Example.jnzStopFnR.blocks, ∀ inst ∈ nonParamInsts b,
+      inst.opcode ≠ Opcode.INVOKE ∧ inst.opcode ≠ Opcode.ASSERT_UNREACHABLE ∧
+      inst.opcode ≠ Opcode.DJMP := by decide
+
+/-- `hpreuniq` for ANY block of `jmpStopFn`, straight from its block plan — no per-function computation. -/
+theorem jmpStopFn_hpreuniq_generic {fuel fnEom lblCtr : Nat} {ops blockOps : List StackOp}
+    {ps psB ps' : PlanState} {bb : BasicBlock}
+    {L : DfState (List String)} {D : DfgAnalysis} {C : CfgAnalysis}
+    (hgen : generateFnPlanFuel fuel Example.jmpStopFn fnEom lblCtr = some (ops, ps))
+    (hbp : generateBlockPlan L D C Example.jmpStopFn bb psB = some (blockOps, ps')) :
+    ∀ preOps tailOps, ops = preOps ++ blockOps ++ tailOps →
+      ∀ a ∈ executePlan preOps, a ≠ AsmInst.AsmLabel bb.label :=
+  hpreuniq_of_blockPlan jmpStopFn_no_label_minters hgen hbp
+
+/-- Same for the branching function. -/
+theorem jnzStopFnR_hpreuniq_generic {fuel fnEom lblCtr : Nat} {ops blockOps : List StackOp}
+    {ps psB ps' : PlanState} {bb : BasicBlock}
+    {L : DfState (List String)} {D : DfgAnalysis} {C : CfgAnalysis}
+    (hgen : generateFnPlanFuel fuel Example.jnzStopFnR fnEom lblCtr = some (ops, ps))
+    (hbp : generateBlockPlan L D C Example.jnzStopFnR bb psB = some (blockOps, ps')) :
+    ∀ preOps tailOps, ops = preOps ++ blockOps ++ tailOps →
+      ∀ a ∈ executePlan preOps, a ≠ AsmInst.AsmLabel bb.label :=
+  hpreuniq_of_blockPlan jnzStopFnR_no_label_minters hgen hbp
+
+/-! ### `hlblfree_of_bodyfold`'s side condition is SATISFIABLE
+
+`hlblfree_of_bodyfold` discharges `hlblfree` given a per-instruction condition (`hcond`) on the body. For
+an EMPTY body that condition is vacuous, which proves nothing — and after the JNZ successor-order incident
+(where an hstep's hypothesis turned out to be unsatisfiable, making its conclusion vacuous) an unvalidated
+side condition is exactly what must not be left standing. So: check it on REAL body instructions. -/
+
+theorem addVarInst_satisfies_hcond :
+    ∀ x ∈ ([Example.addVarInst].zipIdx 0),
+      (∀ op ∈ computeOperands x.1, ∀ l, op ≠ Operand.Label l) ∧
+      (¬ isPreCodegenOpcode x.1.opcode ∧ x.1.opcode ≠ Opcode.PHI ∧ x.1.opcode ≠ Opcode.OFFSET ∧
+        x.1.opcode ≠ Opcode.PARAM ∧ x.1.opcode ≠ Opcode.NOP) ∧
+      x.1.opcode ≠ Opcode.JMP ∧ x.1.opcode ≠ Opcode.JNZ ∧ x.1.opcode ≠ Opcode.DJMP ∧
+      x.1.opcode ≠ Opcode.INVOKE ∧ x.1.opcode ≠ Opcode.ASSERT ∧
+      x.1.opcode ≠ Opcode.ASSERT_UNREACHABLE := by
+  rintro ⟨i, n⟩ hx
+  have hi : i = Example.addVarInst := by
+    have h := List.fst_mem_of_mem_zipIdx hx
+    simpa using h
+  subst hi
+  simp only []
+  refine ⟨?_, by decide, by decide, by decide, by decide, by decide, by decide, by decide⟩
+  intro op hop l
+  simp [computeOperands, Example.addVarInst] at hop
+  rcases hop with rfl | rfl <;> simp
+
+/-- A two-instruction body (ADD then MUL over vars) also satisfies it — so the condition is not an
+    artifact of a single instruction. -/
+theorem addMulBody_satisfies_hcond :
+    ∀ x ∈ ([Example.addXYInst, Example.mulXYInst].zipIdx 0),
+      (∀ op ∈ computeOperands x.1, ∀ l, op ≠ Operand.Label l) ∧
+      (¬ isPreCodegenOpcode x.1.opcode ∧ x.1.opcode ≠ Opcode.PHI ∧ x.1.opcode ≠ Opcode.OFFSET ∧
+        x.1.opcode ≠ Opcode.PARAM ∧ x.1.opcode ≠ Opcode.NOP) ∧
+      x.1.opcode ≠ Opcode.JMP ∧ x.1.opcode ≠ Opcode.JNZ ∧ x.1.opcode ≠ Opcode.DJMP ∧
+      x.1.opcode ≠ Opcode.INVOKE ∧ x.1.opcode ≠ Opcode.ASSERT ∧
+      x.1.opcode ≠ Opcode.ASSERT_UNREACHABLE := by
+  rintro ⟨i, n⟩ hx
+  have hi : i = Example.addXYInst ∨ i = Example.mulXYInst := by
+    have h := List.fst_mem_of_mem_zipIdx hx
+    simpa using h
+  rcases hi with rfl | rfl <;>
+    (simp only []
+     refine ⟨?_, by decide, by decide, by decide, by decide, by decide, by decide, by decide⟩
+     intro op hop l
+     simp [computeOperands, Example.addXYInst, Example.mulXYInst] at hop
+     rcases hop with rfl | rfl <;> simp)
+
+/-! ### `dfs_segment_gbp` reaches blocks no JMP chain can — non-vacuity on a real `JNZ` CFG
+
+`chain_segment_gbp` needs `JmpChainTo`, i.e. every intermediate block on the path from the entry has
+*exactly one* successor. `jnzStopFnR`'s entry is a `JNZ` (two successors), so neither `then` nor `else`
+is reachable by any such chain and no `hstep` could ever be instantiated for them. The DFS, however,
+visits all three blocks — so `dfs_segment_gbp`'s `hvis` is satisfied and the segment exists.
+
+This is the concrete check that the generalization is real and not vacuous. -/
+
+/-- The real compiler's plan DFS visits all three blocks of the `JNZ` function — including the two
+    branch targets, which lie on no single-successor chain from the entry. -/
+theorem jnzStopFnR_dfs_visits_all :
+    (generateFnPlanAux (fnPlanFuel Example.jnzStopFnR)
+        (livenessAnalyzeFuel (fnPlanFuel Example.jnzStopFnR) Example.jnzStopFnR)
+        (DfgAnalysis.buildFunction Example.jnzStopFnR) (cfgAnalyze Example.jnzStopFnR)
+        Example.jnzStopFnR ["entry"] [] { initPlanState 0 with labelCounter := 0 }).map
+      (fun r => r.2.1) = some ["then", "else", "entry"] := by rfl
+
+/-- **Non-vacuity of `dfs_segment_gbp` on a `JNZ` branch target.** `then` is a successor of a
+    two-successor block, so `JmpChainTo` — and hence `chain_segment_gbp` — can never reach it. The
+    universal DFS segment does: `then`'s block plan, computed from its canonical entry state
+    `psOfFn … "then"`, sits as a segment of the whole-function ops. -/
+theorem jnzStopFnR_then_segment
+    {ops : List StackOp} {vF : List String} {psF : PlanState}
+    (hgenAux : generateFnPlanAux (fnPlanFuel Example.jnzStopFnR)
+        (livenessAnalyzeFuel (fnPlanFuel Example.jnzStopFnR) Example.jnzStopFnR)
+        (DfgAnalysis.buildFunction Example.jnzStopFnR) (cfgAnalyze Example.jnzStopFnR)
+        Example.jnzStopFnR ["entry"] [] { initPlanState 0 with labelCounter := 0 }
+      = some (ops, vF, psF)) :
+    ∃ preOps blockOps tailOps ps',
+      ops = preOps ++ blockOps ++ tailOps ∧
+      generateBlockPlan (livenessAnalyzeFuel (fnPlanFuel Example.jnzStopFnR) Example.jnzStopFnR)
+        (DfgAnalysis.buildFunction Example.jnzStopFnR) (cfgAnalyze Example.jnzStopFnR)
+        Example.jnzStopFnR Example.thenBB
+        (psOfFn (fnPlanFuel Example.jnzStopFnR) Example.jnzStopFnR 0 0 Example.thenBB.label)
+      = some (blockOps, ps') := by
+  -- the DFS's visited output is pinned by `hgenAux`, so `then` really is visited
+  have hvproj := jnzStopFnR_dfs_visits_all
+  rw [hgenAux] at hvproj
+  have hvF : vF = ["then", "else", "entry"] := by
+    simpa using congrArg (fun o => o.getD []) hvproj
+  refine dfs_segment_gbp (entry := Example.jnzEntryR) ?_ rfl hgenAux (by rw [hvF]; decide) rfl
+  intro bb hbb inst hinst
+  simp only [Example.jnzStopFnR, List.mem_cons, List.not_mem_nil, or_false] at hbb
+  rcases hbb with rfl | rfl | rfl
+  · simp only [Example.jnzEntryR, List.mem_singleton] at hinst
+    subst hinst; unfold codegenReadyInst; decide
+  · simp only [Example.thenBB, List.mem_singleton] at hinst
+    subst hinst; unfold codegenReadyInst; decide
+  · simp only [Example.elseBB, List.mem_singleton] at hinst
+    subst hinst; unfold codegenReadyInst; decide
+
+/-- The DFS on the `JNZ` function really is closed under CFG successors — it did not truncate. This
+    is `reach_segment_gbp`'s only side condition beyond reachability, and it is decidable. -/
+theorem jnzStopFnR_dfs_closed :
+    DfsClosed (fnPlanFuel Example.jnzStopFnR) Example.jnzStopFnR 0 0 := by decide
+
+/-- The entry heads the DFS worklist, so it is visited. -/
+theorem jnzStopFnR_entry_visited :
+    (dfsVisited (fnPlanFuel Example.jnzStopFnR) Example.jnzStopFnR 0 0).contains "entry" = true := by
+  decide
+
+/-- `then` is CFG-reachable from the entry across the `JNZ`'s (second) edge. -/
+theorem jnzStopFnR_then_reach :
+    CfgReach (cfgAnalyze Example.jnzStopFnR) "entry" "then" :=
+  CfgReach.step CfgReach.base (by decide)
+
+/-- **The caller-facing path, end to end.** From a plain CFG-reachability proof — no `JmpChainTo`, no
+    single-successor restriction — the branch target `then` gets its block plan located as a segment of
+    the whole-function ops, at its canonical entry state. This is the layout fact a per-block `hstep`
+    needs, now available at a block that `chain_segment_gbp` structurally could not reach. -/
+theorem jnzStopFnR_then_segment_of_reach
+    {ops : List StackOp} {vF : List String} {psF : PlanState}
+    (hgenAux : generateFnPlanAux (fnPlanFuel Example.jnzStopFnR)
+        (livenessAnalyzeFuel (fnPlanFuel Example.jnzStopFnR) Example.jnzStopFnR)
+        (DfgAnalysis.buildFunction Example.jnzStopFnR) (cfgAnalyze Example.jnzStopFnR)
+        Example.jnzStopFnR ["entry"] [] { initPlanState 0 with labelCounter := 0 }
+      = some (ops, vF, psF)) :
+    ∃ preOps blockOps tailOps ps',
+      ops = preOps ++ blockOps ++ tailOps ∧
+      generateBlockPlan (livenessAnalyzeFuel (fnPlanFuel Example.jnzStopFnR) Example.jnzStopFnR)
+        (DfgAnalysis.buildFunction Example.jnzStopFnR) (cfgAnalyze Example.jnzStopFnR)
+        Example.jnzStopFnR Example.thenBB
+        (psOfFn (fnPlanFuel Example.jnzStopFnR) Example.jnzStopFnR 0 0 Example.thenBB.label)
+      = some (blockOps, ps') := by
+  refine reach_segment_gbp (entry := Example.jnzEntryR) ?_ rfl hgenAux
+    jnzStopFnR_dfs_closed jnzStopFnR_entry_visited jnzStopFnR_then_reach rfl
+  intro bb hbb inst hinst
+  simp only [Example.jnzStopFnR, List.mem_cons, List.not_mem_nil, or_false] at hbb
+  rcases hbb with rfl | rfl | rfl
+  · simp only [Example.jnzEntryR, List.mem_singleton] at hinst
+    subst hinst; unfold codegenReadyInst; decide
+  · simp only [Example.thenBB, List.mem_singleton] at hinst
+    subst hinst; unfold codegenReadyInst; decide
+  · simp only [Example.elseBB, List.mem_singleton] at hinst
+    subst hinst; unfold codegenReadyInst; decide
+
+
+/-! ### A real loop, and why the ranked walk cannot take its back-edge
+
+`loopFn` is a genuine cyclic CFG: `entry` branches to `body` or `exit`, and `body` jumps *back* to
+`entry`. The edge `body → entry` is a back-edge — its target is laid out before it in the program.
+
+`ranked_walk_no_back_edge` says the ranked driver (`codegen_correct_sched`, whose rank is
+`wOf l = prog.length - pcOfLabel prog l`) cannot cross such an edge: `pcOfLabel entry ≤ pcOfLabel body`
+forces `wOf entry ≥ wOf body`, so its required decrease `wOf entry + blockLen ≤ wOf body` collapses to
+`blockLen = 0`, contradicting the fact that a block emits at least its own JUMPDEST.
+
+Below, the CFG facts are read off the *real* compiler, so this is not a hypothetical: it is the
+concrete obstruction that `runBlocks_walk_fuel` / `codegen_correct_fuel` exist to remove, by taking
+the decrease from the Venom fuel instead of the program layout. -/
+
+namespace Example
+
+def loopJnz : Instruction :=
+  { id := 0, opcode := Opcode.JNZ,
+    operands := [Operand.Lit (UInt256.ofNat 1), Operand.Label "body", Operand.Label "exit"],
+    outputs := [] }
+def loopBack : Instruction :=
+  { id := 1, opcode := Opcode.JMP, operands := [Operand.Label "entry"], outputs := [] }
+
+def loopEntryBB : BasicBlock := { label := "entry", instructions := [loopJnz] }
+def loopBodyBB  : BasicBlock := { label := "body",  instructions := [loopBack] }
+def loopExitBB  : BasicBlock := { label := "exit",  instructions := [stopInst] }
+
+/-- `entry ⇄ body`, `entry → exit`: a genuinely cyclic CFG. -/
+def loopFn : IrFunction :=
+  { name := "main", blocks := [loopEntryBB, loopBodyBB, loopExitBB] }
+
+
+
+/-! ### ✅ The pinned capstone is PROVED (`codegen_correct_tFn_recipeW`) — history of the diagnosis
+
+**Done — `codegen_correct_tFn_recipeW` is proved.** This note is kept for the reasoning, which took three
+wrong turns worth remembering: it first called the capstone "fill-in-the-blanks", then "BLOCKED by the
+driver's `∀ s`", then "blocked, but the fix is local". The last was right:
+`codegen_correct_ofBlocks_recipeW_inv` carries a caller-chosen invariant, and the capstone went through.
+The diagnosis below is retained because it explains WHY an invariant driver is the right shape.
+
+`codegen_correct_ofBlocks_recipeW`'s obligation is `hsupply : ∀ bb ∈ fn.blocks, ∀ (s : VenomState) …,
+CanonEntryWH … s asm N → …` — **`s` is universally quantified**, and `CanonEntryWH = CanonEntry ∧
+wOf s.currentBb ≤ N ∧ s.halted = false` carries **no bound on the VALUES of `s`'s vars**. But a RETURN/REVERT
+recipe needs `hbelow : off.toNat + sz.toNat ≤ ps'.alloc.fnEom`, and `initPlanState 0` sets `fnEom = 0`
+(`PlanTypes.lean:50-55`), so `hbelow` forces `off = sz = 0`. For an arbitrary `s` that is simply false — and a
+`callvalue = 0` precondition on the capstone's `vs` does NOT reach the driver's internal `s`, which the driver
+quantifies over independently of how the function actually reaches that block.
+
+Nor does the error arm rescue it: RETURN's Venom semantics read memory rather than erroring on a large
+offset, so `runBlock` succeeds and a recipe is genuinely required.
+
+**⇒ No RETURN/REVERT capstone is possible through this driver AS INSTANTIATED, for any function, regardless
+of which slice is used** (`_HSVP`, `…Dead`, or `…Reorder` alike). The slices are sound and their statements
+stand; they lack a consumer. Same shape as `reorderPlan_sim`'s `∀ p` `hstep` (fact 5) one level up: a `∀` over
+states the caller cannot constrain.
+
+**But the fix is LOCAL, not a redesign — checked.** `codegen_correct_ofBlocks_recipeW` is a thin wrapper over
+`codegen_correct_ofBlocks_HbsimMatch`, and that lemma takes **`Entry` as a free parameter**
+(`Entry : VenomState → AsmState → Nat → Prop`, with `hstep : ∀ … Entry s asm N → …` and
+`hentry : Entry …`). So the `∀ s` already ranges only over states satisfying `Entry`, whatever `Entry` is —
+the weakness is the INSTANCE (`CanonEntryWH`, which bounds no values), not the architecture. Concretely:
+
+1. instantiate `Entry := fun s asm N => CanonEntryWH fn lo pcOf psOf wOf s asm N ∧ Inv s` for a caller-chosen
+   `Inv : VenomState → Prop` — `hsupply` then receives `Inv s` for free, which is exactly what `hbelow` needs;
+2. the only thing hardcoding `CanonEntryWH` is `HbsimMatch_dispatchW`, so it needs an `Inv`-threading variant:
+   its OK-continuing arms must establish `Inv s'` for the successor (the preservation obligation), which is
+   where the caller proves the invariant is maintained across a block;
+3. the driver passes `hentry : Inv vs` alongside the existing entry facts.
+
+For `tFn` the invariant is small (`lookupVar "s"/"o" s` are `0`), vacuous at entry and established by the
+entry block's own step. **That driver now exists** (`codegen_correct_ofBlocks_recipeW_inv`), and it needed no
+`Inv`-threading dispatcher at all: `HbsimMatch` mentions `Entry` in exactly ONE arm, so `HbsimMatch_and_inv`
+conjoins the invariant onto the existing `HbsimMatch_dispatchW` result wholesale.
+
+**⇒ PROVED.** The pieces, for reference:
+`tInv s := s.halted = false ∧ s.callCtx.callvalue = 0 ∧ (s.currentBb = "next" → lookupVar "s"/"o" s = some 0)`
+— conditioning on `currentBb` is what makes it vacuous at entry, so `hinv0` needs only `callvalue = 0`;
+`hpres` for `tEntry` follows from `runBlock_body_jmp` (fuel `< 3` gives `Error`; at `2+(j+1)` the result is
+`jumpTo "next"` of the two-CALLVALUE state, whose `s`/`o` ARE the zero call value), and for `tNext` it is
+vacuous (RETURN never yields `OK`). `hsupply` at `tNext` then reads `s`/`o` `= 0` straight out of `tInv`,
+discharging RETURN's `hbelow` (`0 + 0 ≤ 0`) and giving `hcov0` its left disjunct.
+
+**The tactic lesson (it cost five dead ends): CHARACTERISE, NEVER REDUCE.** `simp` will not reduce
+`runBlock`'s nested matches — `simp`/`cases`/`noConfusion`/`absurd`, and bridging the `instIdx` wrapper, all
+failed on `hrun : … = OK s'`. Every branch that closes does so by rewriting with a characterisation lemma:
+`runBlock_body_jmp` (entry), `runBlock_body_return` (both operands defined), `runBlock_error` (either operand
+undefined). The last one already existed — one grep away the whole time.
+
+What survives below: the layout facts are all still correct and worth keeping, and they would be exactly what
+a driver carrying such an invariant would consume. -/
+
+/-! ### (retained) the verified layout inputs — now consumed by `codegen_correct_tFn_recipeW`
+
+`tFn` below (`entry: %s = CALLVALUE ; %o = CALLVALUE ; JMP next` / `next: RETURN %s %o`) is the target for a
+capstone consuming `hsupplyW_regularJmp` (2-instruction body) and `hsupplyW_emptyReturnReorder` (a genuine
+`SWAP1`). Every input is checked on the real generator, so the assembly is fill-in-the-blanks:
+
+* **program** `[L entry(0); CALLVALUE(1); CALLVALUE(2); PUSH(3); JUMP(4); L next(5); SWAP1(6); RETURN(7)]`,
+  length 8; `pcOf entry = 0`, `pcOf next = 5`; `wOf entry = 8`, `wOf next = 3`.
+* **entry** via `hsupplyW_regularJmp`: `front = [tS, tO]`, body plan `[CALLVALUE, CALLVALUE]` (length 2), so
+  the `PUSH` sits at `0+1+2 = 3` and the `JUMP` at `4`; `off = 7` (`offsets = [("next",7),("entry",0)]`),
+  `o2pc : 7 ↦ 5 = pcOf next`; `hreg = tBody_regularBodyH`; `hps` (`bodyPlanRIP … = psOf "next"`) is `rfl`;
+  `hw : 3 + ((1+2)+2) = 8 ≤ 8`.
+* **next** via `hsupplyW_emptyReturnReorder` at `asm.pc = 5`: `offv = "s"`, `szv = "o"` (so
+  `targetOps = [Var szv, Var offv] = [Var o, Var s]`); `psOf "next" .stack = [Var s, Var o]` ⇒ `base = []`,
+  `perm = [Var s, Var o]`, and `hperm` is the two-element swap; `hbound : 2 ≤ 17`; `hnospill` from the empty
+  `spilled`; `hreorder` is `rfl`-shaped and emits ONE op, so the `RETURN` lands at `5+1+1 = 7`;
+  `hw : 1+1+1 = 3 ≤ 3`. `join_bounded` then hands back `ps'.stack = [] ++ [Var o, Var s]`, which is exactly
+  what `venomAsmRel_asmStack_top2_var` consumes.
+* **the one honest precondition**: `vs.callCtx.callvalue = 0`, which discharges `hbelow` (`fnEom = 0`, see
+  above) and gives `hcov0` its left disjunct.
+
+Both `hw` bounds are TIGHT, so the layout admits no slack — a capstone that builds is evidence the whole
+chain's arithmetic agrees with the compiler. -/
+
+end Example
+
+/-- The real compiler sees the back-edge: `body`'s only successor is `entry`. -/
+theorem loopFn_back_edge :
+    (cfgAnalyze Example.loopFn).succsOf "body" = ["entry"] := by decide
+
+/-- And `entry` really is reachable again from itself — the CFG has a cycle. -/
+theorem loopFn_cyclic : CfgReach (cfgAnalyze Example.loopFn) "entry" "entry" :=
+  CfgReach.base
+
+/-- `body` is reachable, and from it the walk returns to `entry` — the back-edge is live. -/
+theorem loopFn_reaches_body_then_entry :
+    CfgReach (cfgAnalyze Example.loopFn) "entry" "body" ∧
+    "entry" ∈ (cfgAnalyze Example.loopFn).succsOf "body" :=
+  ⟨CfgReach.step CfgReach.base (by decide), by decide⟩
+
+/-- **The ranked walk provably cannot compile this loop.** `entry` is laid out at or before `body`, so
+    the back-edge `body → entry` makes `codegen_correct_sched`'s required rank decrease
+    (`wOf entry + blockLen ≤ wOf body`) unsatisfiable for any block of nonzero length. This is the
+    concrete obstruction; `codegen_correct_fuel` removes it by ranking with the Venom fuel instead. -/
+theorem loopFn_ranked_walk_impossible
+    {prog : List AsmInst} {blockLen : Nat}
+    (hlayout : pcOfLabel prog "entry" ≤ pcOfLabel prog "body")
+    (hin : pcOfLabel prog "body" ≤ prog.length)
+    (hpos : 1 ≤ blockLen)
+    (hdec : (prog.length - pcOfLabel prog "entry") + blockLen
+              ≤ (prog.length - pcOfLabel prog "body")) :
+    False :=
+  ranked_walk_no_back_edge hlayout hin hpos hdec
+
+
+
+/-- The real compiler does compile the cyclic function — the plan exists. -/
+theorem loopFn_plan_exists : (generateFnPlan Example.loopFn 0 0).isSome = true := by rfl
+
+/-- **The obstruction, on the actually-compiled program.** For the real resolved program of `loopFn`,
+    `entry` sits at pc 0 and `body` at pc 8, so the canonical ranks are `wOf entry = 11` and
+    `wOf body = 3`. The ranked driver's required decrease across the back-edge `body → entry` is
+    therefore `11 + blockLen ≤ 3` — false for every block. Not a hypothetical: this is the compiler's
+    own output, and it is exactly what `codegen_correct_fuel` sidesteps by ranking with Venom fuel. -/
+theorem loopFn_real_ranked_impossible {blockLen : Nat} (hpos : 1 ≤ blockLen)
+    (hdec : ((asmResolve (executePlan (generateFnPlan Example.loopFn 0 0).get!.1)).1.length
+              - pcOfLabel (asmResolve (executePlan (generateFnPlan Example.loopFn 0 0).get!.1)).1 "entry")
+            + blockLen
+          ≤ ((asmResolve (executePlan (generateFnPlan Example.loopFn 0 0).get!.1)).1.length
+              - pcOfLabel (asmResolve (executePlan (generateFnPlan Example.loopFn 0 0).get!.1)).1 "body")) :
+    False :=
+  loopFn_ranked_walk_impossible (by decide) (by decide) hpos hdec
+
+
+/-! ### The join-agreement invariant, and the phi-liveness bug that used to break it
+
+Every `hstep` in this development takes the block's *incoming* `PlanState` as compiled by the plan
+DFS. At a **genuine join** (≥ 2 predecessors) that state is whichever predecessor the DFS happened to
+reach first — `cleanStackPlan` fires only when `predsOf` is a singleton, so a real join gets no
+reconciliation at all (`no_reconciliation_at_join`). Correctness therefore rests on a *join-agreement
+invariant*: **the join must compile to the same code whichever predecessor it is compiled against.**
+
+That invariant used to be **false**, and this diamond is the witness that found it:
+
+    entry: c = calldataload 0 ; d = calldataload 32 ; jnz c, then, else
+    then:  a = c + 1          ; jmp join
+    else:  b = c + 2          ; jmp join
+    join:  p = phi(then→a, else→b) ; sstore d, p ; stop
+
+The cause was `livenessTransfer`, which had no `PHI` case: it ran `liveUpdate (instDefs inst)
+(instUses inst)` on a phi like any other instruction, *killing* the output `p` and *using* both
+sources `a`,`b`. The join's live-in came out `["d","a","b"]` — sources present, output absent.
+
+That defeated the very mechanism meant to prevent it. `livenessEdgeTransfer` calls `inputVarsFrom`,
+whose job is to rewrite a phi *output* into the source matching the incoming edge; with `p` absent
+there was nothing to rewrite, so it collapsed to the identity and handed *both* predecessors the same
+target layout `["d","a","b"]` — which neither can build, since `then` never defines `b` and `else`
+never defines `a`. They reordered as far as they could and landed in *different* layouts (the TOS is
+the *last* element, `stackPush = stk ++ [op]`): `else` exited `["d","b"]` with the phi source at depth
+0, `then` exited `["a","d"]` with it at depth **1**. The DFS compiles `join` against `else` (its first
+successor — `bbSuccs` reverses), planning the phi as a single `SOPoke 0`. Arriving from `then`, depth
+0 held `d`, so the join bound `p := d` — a value the phi never mentions.
+
+`livenessTransfer` now has that `PHI` case (no defs, no uses — a phi's def happens on the edge and its
+operands are *edge* uses), so the output stays live at the join and `inputVarsFrom` substitutes the
+matching source per edge, as designed. The theorems below pin the repaired behaviour on the same
+diamond: each predecessor now gets a target layout it can actually build, both put the incoming value
+at the **same depth**, and the join compiles to the **same plan** from either one
+(`phi_join_agreement`) — which is exactly the invariant the genuine-join `hstep` needs.
+
+Kept as a regression test: it is the third miscompile this development caught by evaluating a
+hypothesis against the real compiler rather than assuming it, after the non-commutative binop operand
+order and the LOG operand order. -/
+
+namespace Example
+
+def phiC : Instruction :=
+  { id := 0, opcode := Opcode.CALLDATALOAD, operands := [Operand.Lit (UInt256.ofNat 0)],
+    outputs := ["c"] }
+def phiD : Instruction :=
+  { id := 1, opcode := Opcode.CALLDATALOAD, operands := [Operand.Lit (UInt256.ofNat 32)],
+    outputs := ["d"] }
+def phiJnz : Instruction :=
+  { id := 2, opcode := Opcode.JNZ,
+    operands := [Operand.Var "c", Operand.Label "then", Operand.Label "else"], outputs := [] }
+def phiThenAdd : Instruction :=
+  { id := 3, opcode := Opcode.ADD,
+    operands := [Operand.Var "c", Operand.Lit (UInt256.ofNat 1)], outputs := ["a"] }
+def phiThenJmp : Instruction :=
+  { id := 4, opcode := Opcode.JMP, operands := [Operand.Label "join"], outputs := [] }
+def phiElseAdd : Instruction :=
+  { id := 5, opcode := Opcode.ADD,
+    operands := [Operand.Var "c", Operand.Lit (UInt256.ofNat 2)], outputs := ["b"] }
+def phiElseJmp : Instruction :=
+  { id := 6, opcode := Opcode.JMP, operands := [Operand.Label "join"], outputs := [] }
+def phiPhi : Instruction :=
+  { id := 7, opcode := Opcode.PHI,
+    operands := [Operand.Label "then", Operand.Var "a", Operand.Label "else", Operand.Var "b"],
+    outputs := ["p"] }
+def phiSstore : Instruction :=
+  { id := 8, opcode := Opcode.SSTORE, operands := [Operand.Var "d", Operand.Var "p"], outputs := [] }
+def phiStop : Instruction := { id := 9, opcode := Opcode.STOP, operands := [], outputs := [] }
+
+def phiEntryBB : BasicBlock := { label := "entry", instructions := [phiC, phiD, phiJnz] }
+def phiThenBB  : BasicBlock := { label := "then",  instructions := [phiThenAdd, phiThenJmp] }
+def phiElseBB  : BasicBlock := { label := "else",  instructions := [phiElseAdd, phiElseJmp] }
+def phiJoinBB  : BasicBlock := { label := "join",  instructions := [phiPhi, phiSstore, phiStop] }
+
+/-- A diamond whose join carries a phi — the shape the join-agreement invariant fails on. -/
+def phiFn : IrFunction :=
+  { name := "main", blocks := [phiEntryBB, phiThenBB, phiElseBB, phiJoinBB] }
+
+def phiLive : DfState (List String) := livenessAnalyzeFuel (fnPlanFuel phiFn) phiFn
+def phiCfg  : CfgAnalysis := cfgAnalyze phiFn
+def phiDfg  : DfgAnalysis := DfgAnalysis.buildFunction phiFn
+
+/-- The exit `PlanState` stack of `bb`, threaded from `entry` exactly as the plan DFS threads it. -/
+def phiExitStack (bb : BasicBlock) : Option (List String) :=
+  ((generateBlockPlan phiLive phiDfg phiCfg phiFn phiEntryBB (initPlanState 0)).map (·.2)).bind
+    (fun ps => (generateBlockPlan phiLive phiDfg phiCfg phiFn bb ps).map
+      (fun r => r.2.stack.map operandToString))
+
+def pokeDepths (ops : List StackOp) : List Nat :=
+  ops.filterMap (fun o => match o with | StackOp.SOPoke d _ => some d | _ => none)
+
+/-- The join's own plan, compiled — as the DFS threads it — against `predBB`'s exit state. -/
+def phiJoinPlanFrom (predBB : BasicBlock) : Option (List StackOp) :=
+  ((generateBlockPlan phiLive phiDfg phiCfg phiFn phiEntryBB (initPlanState 0)).map (·.2)).bind
+    (fun ps => ((generateBlockPlan phiLive phiDfg phiCfg phiFn predBB ps).map (·.2)).bind
+      (fun ps' => (generateBlockPlan phiLive phiDfg phiCfg phiFn phiJoinBB ps').map (·.1)))
+
+def phiJoinPokeDepths (predBB : BasicBlock) : Option (List Nat) :=
+  (phiJoinPlanFrom predBB).map pokeDepths
+
+end Example
+
+/-- `join` is a **genuine** join: two predecessors, so `cleanStackPlan` contributes nothing
+(`no_reconciliation_at_join`) and the block is compiled against whichever predecessor the DFS
+reached first. Everything below is about making that choice not matter. -/
+theorem phiFn_genuine_join : Example.phiCfg.predsOf "join" = ["else", "then"] := by decide
+
+/-- **The transfer is phi-aware.** The join's live-in holds the phi *output* `p` — not its sources
+`a`,`b`, which are uses of the incoming *edge*. (Before the `PHI` case in `livenessTransfer` this was
+`["d","a","b"]`: sources present, output absent — the root of the miscompile.) -/
+theorem phi_liveness_is_phi_aware :
+    liveVarsAt Example.phiLive "join" 0 = ["d", "p"] := by decide
+
+/-- **So `inputVarsFrom` does its job.** With the output live, it rewrites `p` into the source
+matching each incoming edge, giving each predecessor a target layout it can actually build — and, in
+particular, *different* ones. (Before the fix both got the same, unbuildable `["d","a","b"]`.) -/
+theorem phi_inputVarsFrom_then :
+    inputVarsFrom "then" Example.phiJoinBB.instructions (liveVarsAt Example.phiLive "join" 0)
+      = ["d", "a"] := by decide
+
+theorem phi_inputVarsFrom_else :
+    inputVarsFrom "else" Example.phiJoinBB.instructions (liveVarsAt Example.phiLive "join" 0)
+      = ["d", "b"] := by decide
+
+/-- **Each predecessor now delivers its phi source at the same depth.** TOS is the last element, so
+both exits carry the incoming value at depth 0 and `d` at depth 1; they differ only in *which*
+variable occupies the phi slot, which is precisely what the phi is there to reconcile. (Before the
+fix: `else` exited `["d","b"]` but `then` exited `["a","d"]` — depth 0 versus depth 1.) -/
+theorem phi_else_exit : Example.phiExitStack Example.phiElseBB = some ["d", "b"] := by decide
+
+theorem phi_then_exit : Example.phiExitStack Example.phiThenBB = some ["d", "a"] := by decide
+
+/-- The join plans the phi as a single rename of the TOS — and that is now right for **both**
+predecessors, not just the one it was compiled against. -/
+theorem phi_join_pokes_depth0_from_else :
+    Example.phiJoinPokeDepths Example.phiElseBB = some [0] := by decide
+
+theorem phi_join_pokes_depth0_from_then :
+    Example.phiJoinPokeDepths Example.phiThenBB = some [0] := by decide
+
+/-- **The join-agreement invariant, on the shape that used to break it.** The join compiles to the
+*same plan* whichever predecessor's exit state it is compiled against — so it does not matter which
+one the DFS reached first, and the genuine-join `hstep` has the property it needs.
+
+This is the statement `phi_join_agreement_fails` used to refute. -/
+theorem phi_join_agreement :
+    Example.phiJoinPlanFrom Example.phiElseBB = Example.phiJoinPlanFrom Example.phiThenBB := by
+  decide
+
+/-! #### …and the same agreement, from the *generic* lemma rather than by computation
+
+`phi_join_agreement` above is a `decide` on one function. The general statement lives in `Liveness`:
+`inputVarsFrom_slot_agree` says any two predecessors of any join get target layouts that agree
+position by position, differing only at phi slots — where each names its own edge's source, which is
+exactly the slot the join's `SOPoke` renames. Its one hypothesis is that every phi covers both
+predecessors. Here that hypothesis is discharged against the real compiler, so the generic lemma is
+shown to apply to real generator output rather than to a hypothetical. -/
+
+/-- The diamond's phi really does cover **both** predecessors. -/
+theorem phiFn_covers_both :
+    ∀ i, (AssocList.lookup Nat String
+            (buildPhiMaps "then" (collectPhis Example.phiJoinBB.instructions)).2 i).isSome
+       = (AssocList.lookup Nat String
+            (buildPhiMaps "else" (collectPhis Example.phiJoinBB.instructions)).2 i).isSome := by
+  intro i
+  cases i with
+  | zero => decide
+  | succ n =>
+    simp [buildPhiMaps, collectPhis, Example.phiJoinBB, Example.phiPhi, Example.phiSstore,
+          Example.phiStop, phiPairs, AssocList.lookup, AssocList.insert]
+
+/-- So the **generic** slot agreement applies to this function: the two edges' target layouts agree
+slot by slot, each phi slot holding that edge's own source. -/
+theorem phiFn_slot_agree :
+    List.Forall₂
+      (fun v1 v2 => v1 = v2 ∨ ∃ i,
+          AssocList.lookup Nat String
+            (buildPhiMaps "then" (collectPhis Example.phiJoinBB.instructions)).2 i = some v1 ∧
+          AssocList.lookup Nat String
+            (buildPhiMaps "else" (collectPhis Example.phiJoinBB.instructions)).2 i = some v2)
+      (inputVarsFrom "then" Example.phiJoinBB.instructions (liveVarsAt Example.phiLive "join" 0))
+      (inputVarsFrom "else" Example.phiJoinBB.instructions (liveVarsAt Example.phiLive "join" 0)) :=
+  inputVarsFrom_slot_agree "then" "else" Example.phiJoinBB.instructions
+    (liveVarsAt Example.phiLive "join" 0) phiFn_covers_both
+
+/-- And every predecessor is asked for a layout of the same depth — the join's incoming stack shape
+does not depend on which edge you arrive by. -/
+theorem phiFn_layouts_same_length :
+    (inputVarsFrom "then" Example.phiJoinBB.instructions
+        (liveVarsAt Example.phiLive "join" 0)).length
+      = (inputVarsFrom "else" Example.phiJoinBB.instructions
+        (liveVarsAt Example.phiLive "join" 0)).length :=
+  inputVarsFrom_length_eq "then" "else" Example.phiJoinBB.instructions
+    (liveVarsAt Example.phiLive "join" 0) phiFn_covers_both
+
+/-! #### The hypotheses of `generatePhiPlan_congr`, on real compiler output
+
+`generatePhiPlan_congr` (in `CodegenGenProps`) says the join's phi plan emits the same code from
+either predecessor and equalises the two plan states. Its hypotheses are checked here against the
+actual generator, so the congruence is known to fire on real input. -/
+
+namespace Example
+
+/-- Each predecessor's exit `PlanState`, threaded from `entry` exactly as the plan DFS threads it. -/
+def phiExitPS (bb : BasicBlock) : Option PlanState :=
+  ((generateBlockPlan phiLive phiDfg phiCfg phiFn phiEntryBB (initPlanState 0)).map (·.2)).bind
+    (fun ps => (generateBlockPlan phiLive phiDfg phiCfg phiFn bb ps).map (·.2))
+
+/-- The phi's source operands — what `generatePhiPlan` searches the stack for. -/
+def phiSrcs : List Operand := phiPhi.operands.filter isVarOperand
+
+end Example
+
+/-- **The phi's source sits at the same depth on both edges** — the conclusion of
+`stackGetPhiDepth_congr`, confirmed on the real generator. The *names* differ (`b` from `else`, `a`
+from `then`); the *depth* does not, so the single positional `SOPoke` is right for both. -/
+theorem phiFn_phi_depth_agrees :
+    (Example.phiExitPS Example.phiElseBB).map
+        (fun p => stackGetPhiDepth Example.phiSrcs p.stack)
+      = (Example.phiExitPS Example.phiThenBB).map
+        (fun p => stackGetPhiDepth Example.phiSrcs p.stack) := by decide
+
+theorem phiFn_phi_depth_is_zero :
+    (Example.phiExitPS Example.phiElseBB).map
+        (fun p => stackGetPhiDepth Example.phiSrcs p.stack) = some (some 0) := by decide
+
+/-- **The incoming source is dead past the phi, on both edges** — the `hnl` hypotheses of
+`generatePhiPlan_congr`. This is a consequence of the phi-aware transfer: a phi's operands are uses of
+the *edge*, not of the join, so they do not survive it. Before the fix they did, and the plan took the
+other branch. -/
+theorem phiFn_phi_src_dead_after :
+    ((Example.phiExitPS Example.phiElseBB).map (fun p =>
+        (liveVarsAt Example.phiLive "join" 1).contains (operandToString (stackPeek 0 p.stack)))
+      = some false)
+    ∧ ((Example.phiExitPS Example.phiThenBB).map (fun p =>
+        (liveVarsAt Example.phiLive "join" 1).contains (operandToString (stackPeek 0 p.stack)))
+      = some false) := by
+  constructor <;> decide
+
+/-! #### The plan-generator capstone, fired on real compiler output
+
+`generateBlockPlan_congr_at_join` says a genuine join's plan does not depend on which predecessor the
+DFS compiled it against. A generic theorem nobody can instantiate is barely better than a vacuous one,
+so its hypotheses are discharged here against the actual generator.
+
+The two predecessors' exit states are pinned as literals first (`phiFn_psElse` / `phiFn_psThen` show
+the generator really produces them). That split matters: asking `decide` to re-derive those states
+*inside* the congruence proof does not terminate, because it drags the whole liveness fixpoint and both
+predecessors' block plans through kernel reduction. Pinned first, the remaining check is small. -/
+
+namespace Example
+
+/-- The exit `PlanState`s the generator produces for the two predecessors. -/
+def psElse : PlanState :=
+  { stack := [Operand.Var "d", Operand.Var "b"], spilled := [],
+    alloc := ⟨[], 0, 0⟩, labelCounter := 0 }
+
+def psThen : PlanState :=
+  { stack := [Operand.Var "d", Operand.Var "a"], spilled := [],
+    alloc := ⟨[], 0, 0⟩, labelCounter := 0 }
+
+/-- The leading phis of the join, each with the liveness the block fold hands it. -/
+def joinPhiPairs : List (Instruction × List String) :=
+  ((nonParamInsts phiJoinBB).zipIdx.take 1).map (fun it =>
+    (it.1, if it.2 + 1 < (nonParamInsts phiJoinBB).length
+           then liveVarsAt phiLive phiJoinBB.label
+                  (it.2 + (getParams phiJoinBB.instructions).length + 1)
+           else liveVarsAt phiLive phiJoinBB.label phiJoinBB.instructions.length))
+
+end Example
+
+/-- The literals above really are the generator's output. -/
+theorem phiFn_psElse : Example.phiExitPS Example.phiElseBB = some Example.psElse := by decide
+
+theorem phiFn_psThen : Example.phiExitPS Example.phiThenBB = some Example.psThen := by decide
+
+/-- **The phi prologue leaves the two predecessors' states identical** — the capstone's hypothesis, on
+the states the compiler actually produces. -/
+theorem phiFn_prefix_congr :
+    phiPrefixPlan Example.joinPhiPairs Example.psElse
+      = phiPrefixPlan Example.joinPhiPairs Example.psThen := by decide
+
+/-- **The capstone, fired.** Every hypothesis of `generateBlockPlan_congr_at_join` is discharged
+against the real generator, so on this function the join's block plan provably does not depend on which
+predecessor the plan DFS compiled it against — the property whose failure was the miscompile. -/
+theorem phiFn_join_plan_pred_independent :
+    generateBlockPlan Example.phiLive Example.phiDfg Example.phiCfg Example.phiFn
+        Example.phiJoinBB Example.psElse
+      = generateBlockPlan Example.phiLive Example.phiDfg Example.phiCfg Example.phiFn
+        Example.phiJoinBB Example.psThen :=
+  generateBlockPlan_congr_at_join (k := 1) (by decide) (by decide) (by decide) phiFn_prefix_congr
+
+/-! #### …and the semantic side, on the same arrival
+
+The plan-generator results say the join compiles the same way from either predecessor. The claim they
+rest on is semantic and, stated plainly, surprising: entering the join from the predecessor it was *not*
+compiled against, `planStackRel` genuinely **fails**, and the phi is what repairs it.
+
+Both halves of that are witnessed below on the real function — the relation is refuted before the phi,
+and `planStackRel_phi_poke_offSlot` establishes it afterwards. -/
+
+namespace Example
+
+def dv : bytes32 := UInt256.ofNat 7
+def av : bytes32 := UInt256.ofNat 8
+
+/-- Arriving at `join` from `then` — the predecessor the DFS did *not* compile the join against. `a` is
+defined on this path; `b` never was. -/
+def vsFromThen : VenomState :=
+  { (default : VenomState) with
+    vars := [("c", UInt256.ofNat 1), ("d", dv), ("a", av)],
+    prevBb := some "then", currentBb := "join" }
+
+/-- …and the state after the join's phi binds `p` to the value *this* edge delivered. -/
+def vsAfterPhi : VenomState := updateVar "p" av vsFromThen
+
+/-- The asm stack on that arrival: TOS first, so `a`'s value on top and `d`'s below — exactly `then`'s
+exit layout. The asm side is untouched by the phi, which emits no code. -/
+def asmFromThen : List bytes32 := [av, dv]
+
+end Example
+
+/-- **The relation genuinely fails before the phi.** The join was compiled against `else`, so its
+recorded TOS slot names `b` — and on this path `b` was never assigned, so `operandVal` there is `none`,
+not the value in the asm slot. This is why the single-predecessor phi lemma in `GenBlockSimComp`, which
+*assumes* the relation beforehand, cannot cover the other edges. -/
+theorem phiFn_rel_fails_before_phi :
+    ¬ planStackRel [] Example.vsFromThen Example.psElse.stack Example.asmFromThen := by
+  intro h
+  have h0 := h.2 0 (by decide)
+  exact absurd h0 (by decide)
+
+/-- **…and the phi's poke establishes it** — by the generic lemma, with every hypothesis discharged
+against these concrete states. The asm stack never moved; the phi bound `p` to the value already
+sitting in that slot. -/
+theorem phiFn_rel_holds_after_phi :
+    planStackRel [] Example.vsAfterPhi
+      (stackPoke 0 (Operand.Var "p") Example.psElse.stack) Example.asmFromThen :=
+  planStackRel_phi_poke_offSlot (by decide) (by decide) (by decide) (by decide)
+
+/-- The relation that really *does* hold on arrival from `then`: against **`then`'s own** exit layout.
+This is what `then`'s block simulation hands you, and it is the input `phi_join_step` takes — the whole
+point being that it, unlike the relation against the recorded layout, is true on every edge. -/
+theorem phiFn_rel_on_arrival :
+    planStackRel [] Example.vsFromThen Example.psThen.stack Example.asmFromThen := by
+  refine ⟨by decide, ?_⟩
+  intro i hi
+  have hi2 : i < 2 := by simpa [Example.psThen] using hi
+  interval_cases i <;> decide
+
+/-- **`phi_join_step`, fired on a real arrival.** Entering `join` from `then` — the predecessor the DFS
+did *not* compile it against — the Venom phi executes, the asm stack does not move, and the relation
+against the **recorded** plan stack is restored. Every hypothesis is discharged against the real
+function, so the step a genuine-join `hstep` consumes is known to be usable, not merely provable. -/
+theorem phiFn_join_phi_step :
+    evalPhis Example.vsFromThen [Example.phiPhi]
+        = ExecResult.OK (updateVar "p" Example.av Example.vsFromThen)
+    ∧ planStackRel [] (updateVar "p" Example.av Example.vsFromThen)
+        (stackPoke 0 (Operand.Var "p") Example.psElse.stack) Example.asmFromThen :=
+  phi_join_step (prev := "then") (src := "a") (out := "p") (d := 0)
+    (by decide) (by decide) (by decide) (by decide) (by decide)
+    phiFn_rel_on_arrival (by decide) (by decide) (by decide) (by decide) (by decide)
+
+
+
+/-! ### A genuine **two-phi** join — the multi-phi machinery, exercised
+
+Everything above fires on `phiFn`, whose join carries a single phi. On such a function the multi-phi
+results are indistinguishable from their single-phi cases, so their real content — that a lemma about
+one phi slot *cannot* be iterated across a prologue — is never exercised.
+
+This join carries two. The plan emits two pokes, at depths 1 and 0, and the recorded layout disagrees
+with the arriving one at *both* slots at once, which is exactly the situation the single-slot lemmas
+cannot handle. The block plan still comes out independent of which predecessor the DFS compiled it
+against. -/
+
+namespace Two
+
+def iC  : Instruction :=
+  { id := 0, opcode := Opcode.CALLDATALOAD, operands := [Operand.Lit (UInt256.ofNat 0)], outputs := ["c"] }
+def iJnz : Instruction :=
+  { id := 1, opcode := Opcode.JNZ,
+    operands := [Operand.Var "c", Operand.Label "then", Operand.Label "else"], outputs := [] }
+def tA1 : Instruction :=
+  { id := 2, opcode := Opcode.ADD, operands := [Operand.Var "c", Operand.Lit (UInt256.ofNat 1)],
+    outputs := ["a1"] }
+def tA2 : Instruction :=
+  { id := 3, opcode := Opcode.ADD, operands := [Operand.Var "c", Operand.Lit (UInt256.ofNat 2)],
+    outputs := ["a2"] }
+def tJmp : Instruction :=
+  { id := 4, opcode := Opcode.JMP, operands := [Operand.Label "join"], outputs := [] }
+def eB1 : Instruction :=
+  { id := 5, opcode := Opcode.ADD, operands := [Operand.Var "c", Operand.Lit (UInt256.ofNat 3)],
+    outputs := ["b1"] }
+def eB2 : Instruction :=
+  { id := 6, opcode := Opcode.ADD, operands := [Operand.Var "c", Operand.Lit (UInt256.ofNat 4)],
+    outputs := ["b2"] }
+def eJmp : Instruction :=
+  { id := 7, opcode := Opcode.JMP, operands := [Operand.Label "join"], outputs := [] }
+def pP : Instruction :=
+  { id := 8, opcode := Opcode.PHI,
+    operands := [Operand.Label "then", Operand.Var "a1", Operand.Label "else", Operand.Var "b1"],
+    outputs := ["p"] }
+def pQ : Instruction :=
+  { id := 9, opcode := Opcode.PHI,
+    operands := [Operand.Label "then", Operand.Var "a2", Operand.Label "else", Operand.Var "b2"],
+    outputs := ["q"] }
+def iSt : Instruction :=
+  { id := 10, opcode := Opcode.SSTORE, operands := [Operand.Var "p", Operand.Var "q"], outputs := [] }
+def iStop : Instruction := { id := 11, opcode := Opcode.STOP, operands := [], outputs := [] }
+
+def bEntry : BasicBlock := { label := "entry", instructions := [iC, iJnz] }
+def bThen  : BasicBlock := { label := "then",  instructions := [tA1, tA2, tJmp] }
+def bElse  : BasicBlock := { label := "else",  instructions := [eB1, eB2, eJmp] }
+def bJoin  : BasicBlock := { label := "join",  instructions := [pP, pQ, iSt, iStop] }
+
+/-- A diamond whose join carries **two** phis. -/
+def fn2 : IrFunction := { name := "main", blocks := [bEntry, bThen, bElse, bJoin] }
+
+def L2 : DfState (List String) := livenessAnalyzeFuel (fnPlanFuel fn2) fn2
+def C2 : CfgAnalysis := cfgAnalyze fn2
+def D2 : DfgAnalysis := DfgAnalysis.buildFunction fn2
+
+def exitPS (bb : BasicBlock) : Option PlanState :=
+  ((generateBlockPlan L2 D2 C2 fn2 bEntry (initPlanState 0)).map (·.2)).bind
+    (fun ps => (generateBlockPlan L2 D2 C2 fn2 bb ps).map (·.2))
+
+def psElse2 : PlanState :=
+  { stack := [Operand.Var "b1", Operand.Var "b2"], spilled := [],
+    alloc := ⟨[], 0, 0⟩, labelCounter := 0 }
+def psThen2 : PlanState :=
+  { stack := [Operand.Var "a1", Operand.Var "a2"], spilled := [],
+    alloc := ⟨[], 0, 0⟩, labelCounter := 0 }
+
+/-- **Both** leading phis, each with the liveness the block fold hands it. -/
+def joinPhiPairs2 : List (Instruction × List String) :=
+  ((nonParamInsts bJoin).zipIdx.take 2).map (fun it =>
+    (it.1, if it.2 + 1 < (nonParamInsts bJoin).length
+           then liveVarsAt L2 bJoin.label
+                  (it.2 + (EvmYul.Venom.Hol.Codegen.getParams bJoin.instructions).length + 1)
+           else liveVarsAt L2 bJoin.label bJoin.instructions.length))
+
+end Two
+
+/-- A genuine join, and the liveness is phi-aware: the join's live-in holds the phi *outputs*. -/
+theorem fn2_genuine_join : Two.C2.predsOf "join" = ["else", "then"] := by decide
+
+theorem fn2_liveness_is_phi_aware : liveVarsAt Two.L2 "join" 0 = ["p", "q"] := by decide
+
+/-- Each predecessor gets a target layout it can actually build, and they differ. -/
+theorem fn2_inputVarsFrom_then :
+    inputVarsFrom "then" Two.bJoin.instructions (liveVarsAt Two.L2 "join" 0) = ["a1", "a2"] := by decide
+
+theorem fn2_inputVarsFrom_else :
+    inputVarsFrom "else" Two.bJoin.instructions (liveVarsAt Two.L2 "join" 0) = ["b1", "b2"] := by decide
+
+/-- The generator really produces these exit states. -/
+theorem fn2_psElse : Two.exitPS Two.bElse = some Two.psElse2 := by decide
+
+theorem fn2_psThen : Two.exitPS Two.bThen = some Two.psThen2 := by decide
+
+/-- **The whole two-phi prologue leaves the two states identical.** Both phis are processed — this is
+the multi-phi content, not the single-phi case wearing a disguise. -/
+theorem fn2_prefix_congr :
+    phiPrefixPlan Two.joinPhiPairs2 Two.psElse2 = phiPrefixPlan Two.joinPhiPairs2 Two.psThen2 := by
+  decide
+
+/-- **The capstone on a genuine two-phi join.** The recorded layout disagrees with the arriving one at
+*both* phi slots at once — the case no single-slot lemma can reach — and the block plan still does not
+depend on which predecessor the DFS compiled it against. -/
+theorem fn2_join_plan_pred_independent :
+    generateBlockPlan Two.L2 Two.D2 Two.C2 Two.fn2 Two.bJoin Two.psElse2
+      = generateBlockPlan Two.L2 Two.D2 Two.C2 Two.fn2 Two.bJoin Two.psThen2 :=
+  generateBlockPlan_congr_at_join (k := 2) (by decide) (by decide) (by decide) fn2_prefix_congr
+
+
+
+/-! #### The semantic side of the two-phi join — where the whole-prologue lemmas actually bite
+
+Both phi slots disagree with the recorded layout at once, so no single-slot lemma applies here at all.
+`phi_join_steps` does: both phis run on the Venom side, the asm stack does not move, and the relation
+against the **recorded** (`else`-shaped) plan stack comes out of the relation against the **arriving**
+one. -/
+
+namespace Two
+
+def a1v : bytes32 := UInt256.ofNat 11
+def a2v : bytes32 := UInt256.ofNat 12
+
+/-- Arriving from `then` — the predecessor the DFS did *not* compile the join against. `a1`,`a2` are
+defined on this path; `b1`,`b2` never were. -/
+def vsFromThen2 : VenomState :=
+  { (default : VenomState) with
+    vars := [("c", UInt256.ofNat 1), ("a1", a1v), ("a2", a2v)],
+    prevBb := some "then", currentBb := "join" }
+
+/-- The asm stack on that arrival, TOS first (`then` exits `["a1","a2"]` bottom-first). -/
+def asmFromThen2 : List bytes32 := [a2v, a1v]
+
+/-- Both phis, with what each does on *this* edge. -/
+def runs : List PhiRun := [(pP, "p", "a1", a1v), (pQ, "q", "a2", a2v)]
+
+/-- The slot each phi owns. -/
+def dep2 : PhiRun → Nat := fun x => if x.out = "p" then 1 else 0
+
+end Two
+
+/-- The relation that really holds on arrival: against **`then`'s own** exit layout — what `then`'s
+block simulation hands you. -/
+theorem fn2_rel_on_arrival :
+    planStackRel [] Two.vsFromThen2 Two.psThen2.stack Two.asmFromThen2 := by
+  refine ⟨by decide, ?_⟩
+  intro i hi
+  have hi2 : i < 2 := by simpa [Two.psThen2] using hi
+  interval_cases i <;> decide
+
+/-- **`phi_join_steps`, fired on a genuine two-phi arrival.** Every hypothesis discharged against the
+real function. This is the case the single-slot lemmas cannot reach — both recorded slots name
+variables (`b1`,`b2`) that this path never assigned — and the whole-prologue step repairs both at once. -/
+theorem fn2_join_phi_steps :
+    ∃ vs', evalPhis Two.vsFromThen2 (Two.runs.map PhiRun.inst) = ExecResult.OK vs'
+      ∧ planStackRel [] vs'
+          ((Two.runs.map (fun x => (Two.dep2 x, x.src, x.out, x.val))).foldl
+            (fun st (y : PhiEdge) => stackPoke y.depth (Operand.Var y.out) st) Two.psElse2.stack)
+          Two.asmFromThen2 :=
+  phi_join_steps (prev := "then") Two.runs Two.dep2
+    (by decide) (by decide) (by decide) (by decide) (by decide) (by decide)
+    fn2_rel_on_arrival (by decide) (by decide) (by decide) (by decide) (by decide)
+
+
+
+/-- **`join_entry_reduces`, fired on the two-phi join.** Arriving from `then` — the predecessor the DFS
+did *not* compile the join against — the whole block execution reduces to `execBlock` over a phi-free
+block, starting from a state related to the asm against the join's **own recorded** plan stack.
+
+Every hypothesis is discharged against the real function. This is the arc's claim, made concrete: a
+join may be compiled against one predecessor and entered from another, because the phis absorb the
+difference and everything after them is an ordinary block. -/
+theorem fn2_join_entry_reduces (fuel : Nat) (ctx : VenomContext) :
+    ∃ vs', runBlock fuel ctx Two.bJoin Two.vsFromThen2
+             = execBlock fuel ctx Two.bJoin
+                 { vs' with instIdx := phiPrefixLength Two.bJoin.instructions }
+      ∧ planStackRel [] vs'
+          ((Two.runs.map (fun x => (Two.dep2 x, x.src, x.out, x.val))).foldl
+            (fun st (y : PhiEdge) => stackPoke y.depth (Operand.Var y.out) st) Two.psElse2.stack)
+          Two.asmFromThen2 :=
+  join_entry_reduces (lo := []) (psArr := Two.psThen2.stack) (psRec := Two.psElse2.stack)
+    (asmStack := Two.asmFromThen2) (prev := "then") Two.runs Two.dep2
+    (by rfl) (by decide) (by decide) (by decide) (by decide) (by decide) (by decide)
+    fn2_rel_on_arrival (by decide) (by decide) (by decide) (by decide) (by decide) (by decide)
+
+
+
+/-! #### The reduction, fired — with its last input discharged
+
+`join_runBlock_eq_residual` needs `stepInstBase` to respect `sameUpToIdx` on the residual's
+instructions. Here that is *discharged* (`SSTORE`, `STOP`, via `sstore_respects` / `stop_respects`),
+not assumed — so the whole chain runs on a real function with nothing left hanging. -/
+
+namespace Two
+
+/-- The two-phi join's phi-free residual: everything after its two phis. -/
+def bJoinRes : BasicBlock := { label := "join", instructions := [iSt, iStop] }
+
+end Two
+
+/-- Every instruction of the residual respects `sameUpToIdx` — discharged, not assumed. -/
+theorem fn2_residual_steps_respect :
+    ∀ inst ∈ Two.bJoinRes.instructions, ∀ t1 t2, sameUpToIdx t1 t2 →
+      ResSameUpToIdx (stepInstBase inst t1) (stepInstBase inst t2) := by
+  intro inst hi t1 t2 h
+  simp only [Two.bJoinRes, List.mem_cons, List.not_mem_nil, or_false] at hi
+  rcases hi with rfl | rfl
+  · exact sstore_respects (by decide) t1 t2 h
+  · exact stop_respects (by decide) t1 t2 h
+
+/-- **The two-phi join's `evalPhis` really does succeed**, and binds both outputs to the values arriving
+on *this* edge. Phis are parallel: both read the original state, and the updates are applied
+outermost-first — so `p`'s wraps `q`'s. Without this, the reduction below would be conditioned on
+something nothing was shown to satisfy. -/
+theorem fn2_evalPhis :
+    evalPhis Two.vsFromThen2 Two.bJoin.instructions
+      = ExecResult.OK (updateVar "p" Two.a1v (updateVar "q" Two.a2v Two.vsFromThen2)) := by
+  show evalPhis Two.vsFromThen2 (Two.pP :: Two.pQ :: [Two.iSt, Two.iStop]) = _
+  unfold evalPhis
+  rw [if_neg (show ¬ (Two.pP.opcode ≠ Opcode.PHI) from fun h => h rfl),
+      evalOnePhi_var (out := "p") (src := "a1") (prev := "then") (v := Two.a1v)
+        (by rfl) (by rfl) (by rfl) (by rfl)]
+  show (match evalPhis Two.vsFromThen2 (Two.pQ :: [Two.iSt, Two.iStop]) with
+        | ExecResult.OK s' => ExecResult.OK (updateVar "p" Two.a1v s') | err => err) = _
+  rw [show evalPhis Two.vsFromThen2 (Two.pQ :: [Two.iSt, Two.iStop])
+        = ExecResult.OK (updateVar "q" Two.a2v Two.vsFromThen2) from by
+    unfold evalPhis
+    rw [if_neg (show ¬ (Two.pQ.opcode ≠ Opcode.PHI) from fun h => h rfl),
+        evalOnePhi_var (out := "q") (src := "a2") (prev := "then") (v := Two.a2v)
+          (by rfl) (by rfl) (by rfl) (by rfl)]
+    show (match evalPhis Two.vsFromThen2 [Two.iSt, Two.iStop] with
+          | ExecResult.OK s' => ExecResult.OK (updateVar "q" Two.a2v s') | err => err) = _
+    rw [show evalPhis Two.vsFromThen2 [Two.iSt, Two.iStop] = ExecResult.OK Two.vsFromThen2 from by
+      unfold evalPhis; rw [if_pos (by decide)]]]
+
+/-- **The two-phi join's `runBlock` IS its phi-free residual's `execBlock`** — up to `instIdx`, on the
+arrival from `then`: the predecessor the DFS did *not* compile the join against.
+
+Now **unconditional**: `fn2_evalPhis` discharges the last hypothesis. A genuine join, entered from the
+wrong predecessor, is an ordinary block — with nothing assumed. -/
+theorem fn2_join_runBlock_eq_residual (fuel : Nat) (ctx : VenomContext) :
+    ResSameUpToIdx (runBlock fuel ctx Two.bJoin Two.vsFromThen2)
+                   (execBlock fuel ctx Two.bJoinRes
+                     { (updateVar "p" Two.a1v (updateVar "q" Two.a2v Two.vsFromThen2)) with
+                       instIdx := 0 }) :=
+  join_runBlock_eq_residual (phis := [Two.pP, Two.pQ])
+    (by rfl) (by decide) (by decide) (by decide) (by decide) fn2_residual_steps_respect
+    fn2_evalPhis
+
+
+
+/-! ### `genBlockSimulation`, on a block whose head is a phi — fired
+
+Everything in the join development has been building to a block the `hstep` family cannot describe: its
+`hphi` hypothesis demands a non-phi head, and a join's head is a `PHI`. Here is such a block, simulated.
+
+The join is `p = phi(then→a, else→b) ; stop`, entered from `then` — the predecessor the plan DFS did
+*not* compile it against. Its residual is a bare `STOP`, which `hasm_stop` already handles; the phi emits
+no code, so the join's program *is* the residual's (`JUMPDEST ; STOP`). `genBlockSimulation_join` carries
+the residual's simulation to the join.
+
+(`p` is dead here, so the compiler emits no poke at all — the poke path is exercised at the plan level by
+the two-phi function above. What this witnesses is the thing that was structurally impossible: a
+simulation for a block whose head is a phi.) -/
+
+namespace Min
+
+def pP : Instruction :=
+  { id := 6, opcode := Opcode.PHI,
+    operands := [Operand.Label "then", Operand.Var "a", Operand.Label "else", Operand.Var "b"],
+    outputs := ["p"] }
+
+def iStop : Instruction :=
+  { id := 7, opcode := Opcode.STOP, operands := [], outputs := [] }
+
+def bJ : BasicBlock :=
+  { label := "join", instructions := [pP, iStop] }
+
+def bJRes : BasicBlock :=
+  { label := "join", instructions := [iStop] }
+
+def ops : List StackOp := [StackOp.SOLabel "join", StackOp.SOEmit "STOP"]
+
+def av : bytes32 := UInt256.ofNat 5
+
+def vs : VenomState :=
+  { (default : VenomState) with
+    vars := [("c", UInt256.ofNat 1), ("a", av)],
+    prevBb := some "then", currentBb := "join" }
+
+def ps : PlanState :=
+  { stack := [], spilled := [], alloc := ⟨[], 0, 0⟩, labelCounter := 0 }
+
+end Min
+
+theorem min_prog : (asmResolve (executePlan Min.ops)).1 = executePlan Min.ops := by rfl
+
+theorem min_proglen : (asmResolve (executePlan Min.ops)).1.length = 2 := by rfl
+
+theorem min_ev : evalPhis Min.vs Min.bJ.instructions
+    = ExecResult.OK (updateVar "p" Min.av Min.vs) := by
+  show evalPhis Min.vs (Min.pP :: [Min.iStop]) = _
+  unfold evalPhis
+  rw [if_neg (show ¬ (Min.pP.opcode ≠ Opcode.PHI) from fun h => h rfl),
+      evalOnePhi_var (out := "p") (src := "a") (prev := "then") (v := Min.av)
+        (by rfl) (by rfl) (by rfl) (by rfl)]
+  show (match evalPhis Min.vs [Min.iStop] with
+        | ExecResult.OK s' => ExecResult.OK (updateVar "p" Min.av s') | err => err) = _
+  rw [show evalPhis Min.vs [Min.iStop] = ExecResult.OK Min.vs from by
+    unfold evalPhis; rw [if_pos (by decide)]]
+
+
+/-- The residual — a bare `STOP` — halts. -/
+theorem min_res_run (f : Nat) (ctx : VenomContext) (w : VenomState) :
+    runBlock (f + 1) ctx Min.bJRes w
+      = ExecResult.Halt (haltState { w with instIdx := 0 }) := by
+  rw [runBlock_of_no_phi (bb := Min.bJRes) (by intro i hi; cases hi; decide)]
+  unfold execBlock
+  rfl
+
+/-- **`genBlockSimulation`, on a block whose head is a phi.**
+
+`genBlockSimulation` itself cannot be instantiated here: its `hphi` hypothesis demands a non-phi head,
+and this block's head is `PHI`. `genBlockSimulation_join` supplies the same conclusion anyway, from the
+*residual* block's simulation — which is a bare `STOP`, and `hasm_stop` proves that. The arrival is from
+`then`: the predecessor the plan DFS did **not** compile the join against.
+
+The asm side never moves across the phi (`SOPoke` emits no code), so the join's program is exactly the
+residual's: `JUMPDEST ; STOP`. -/
+theorem min_join_sim {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat}
+    {asm : AsmState} (f : Nat) (ctx : VenomContext)
+    -- the relation that actually holds **on arrival**, before the phi runs
+    (hrel : venomAsmRel lo Min.ps Min.vs asm)
+    (hpc : asm.pc = 0) :
+    match runBlock (f + 1) ctx Min.bJ Min.vs with
+      | ExecResult.OK w =>
+        ∃ as', runAsm ((asmResolve (executePlan Min.ops)).1.length) offsetToPc
+          (asmResolve (executePlan Min.ops)).1 asm = AsmResult.AsmOK as' ∧
+          venomAsmRel lo Min.ps w as'
+      | ExecResult.Halt w =>
+        ∃ as', runAsm ((asmResolve (executePlan Min.ops)).1.length) offsetToPc
+          (asmResolve (executePlan Min.ops)).1 asm = AsmResult.AsmHalt as' ∧
+          venomAsmTerminalRel w as'
+      | ExecResult.Abort AbortType.RevertAbort w =>
+        ∃ as', runAsm ((asmResolve (executePlan Min.ops)).1.length) offsetToPc
+          (asmResolve (executePlan Min.ops)).1 asm = AsmResult.AsmRevert as' ∧
+          venomAsmTerminalRel w as'
+      | ExecResult.Abort AbortType.ExHaltAbort w =>
+        ∃ as', runAsm ((asmResolve (executePlan Min.ops)).1.length) offsetToPc
+          (asmResolve (executePlan Min.ops)).1 asm = AsmResult.AsmFault as' ∧
+          venomAsmTerminalRel w as'
+      | _ => True := by
+  -- the post-phi relation is *derived*, not assumed: `evalPhis` writes only `vars`, the phi's output
+  -- is fresh, and the plan's poke (here absent) touches only the stack
+  have hpost : venomAsmRel lo Min.ps (updateVar "p" Min.av Min.vs) asm :=
+    venomAsmRel_phi_join' (outs := ["p"]) (phis := Min.bJ.instructions)
+      hrel rfl rfl min_ev
+      (fun w hw => lookupVar_updateVar_ne Min.vs "p" w Min.av (by simpa using hw))
+      (fun op off hlk _ _ => absurd hlk (by simp [Min.ps, AssocList.lookup]))
+      ⟨hrel.1.1, fun i hi => absurd hi (by simp [Min.ps])⟩
+  refine genBlockSimulation_join (bb' := Min.bJRes) (phis := [Min.pP])
+    (vs' := updateVar "p" Min.av Min.vs) (ops := Min.ops) (resOps := Min.ops)
+    (by rfl)
+    (by intro i hi; rw [List.mem_singleton] at hi; subst hi; rfl)
+    (by intro i hi; simp only [Min.bJRes, List.head?_cons, Option.some.injEq] at hi;
+        subst hi; decide)
+    (by intro inst hi; simp only [Min.bJRes, List.mem_singleton] at hi; subst hi; decide)
+    (by intro inst hi; simp only [Min.bJRes, List.mem_singleton] at hi; subst hi; decide)
+    ?_ min_ev rfl ?_
+  · intro inst hi t1 t2 h
+    simp only [Min.bJRes, List.mem_singleton] at hi
+    subst hi
+    exact stop_respects (by decide) t1 t2 h
+  · show BlockSim lo Min.ps offsetToPc (asmResolve (executePlan Min.ops)).1 asm
+      (runBlock (f + 1) ctx Min.bJRes (updateVar "p" Min.av Min.vs))
+    rw [min_res_run f ctx (updateVar "p" Min.av Min.vs)]
+    show ∃ as', runAsm ((asmResolve (executePlan Min.ops)).1.length) offsetToPc
+      (asmResolve (executePlan Min.ops)).1 asm = AsmResult.AsmHalt as' ∧
+      venomAsmTerminalRel (haltState { (updateVar "p" Min.av Min.vs) with instIdx := 0 }) as'
+    refine hasm_stop (l := "join") (ps := Min.ps)
+      (venomAsmRel_congr (a := updateVar "p" Min.av Min.vs) (by unfold sameUpToIdx; rfl) hpost) ?_ ?_
+    · rw [min_prog, hpc]
+      refine ⟨by rfl, ?_⟩
+      intro j hj
+      simp only [Nat.zero_add, Min.ops]
+    · rw [min_proglen]
+
+
+/-! #### …and it is not vacuous
+
+`min_join_sim` is conditioned on the relation holding on arrival. If nothing could satisfy that, the
+simulation would be true and would say nothing. So here is a state that satisfies it, and the simulation
+stated *unconditionally* on a real arrival.
+
+A theorem's hypotheses are part of its content: proving one without ever exhibiting something that meets
+them is not a result, it is a shape. -/
+
+namespace Min
+/-- A concrete asm state on arrival at the join: empty stack, pc at the block's start. -/
+def asm : AsmState := (default : AsmState)
+end Min
+
+/-- **`min_join_sim` is not vacuous.** Its hypothesis — the relation holding on arrival — is
+satisfiable, and here is a state satisfying it. Without this the simulation would be conditioned on
+something nothing can meet, and would say nothing at all. -/
+theorem min_rel_on_arrival : venomAsmRel [] Min.ps Min.vs Min.asm := by
+  refine ⟨⟨rfl, fun i hi => absurd hi (by simp [Min.ps])⟩, ?_, ?_, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  · intro op off hlk
+    exact absurd hlk (by simp [Min.ps, AssocList.lookup])
+  · intro i _
+    rfl
+
+/-- …so the simulation of a phi-headed block holds unconditionally on a real arrival. -/
+theorem min_join_sim_nonvacuous (f : Nat) (ctx : VenomContext) (offsetToPc : AssocList Nat Nat) :
+    match runBlock (f + 1) ctx Min.bJ Min.vs with
+      | ExecResult.OK w =>
+        ∃ as', runAsm ((asmResolve (executePlan Min.ops)).1.length) offsetToPc
+          (asmResolve (executePlan Min.ops)).1 Min.asm = AsmResult.AsmOK as' ∧
+          venomAsmRel [] Min.ps w as'
+      | ExecResult.Halt w =>
+        ∃ as', runAsm ((asmResolve (executePlan Min.ops)).1.length) offsetToPc
+          (asmResolve (executePlan Min.ops)).1 Min.asm = AsmResult.AsmHalt as' ∧
+          venomAsmTerminalRel w as'
+      | ExecResult.Abort AbortType.RevertAbort w =>
+        ∃ as', runAsm ((asmResolve (executePlan Min.ops)).1.length) offsetToPc
+          (asmResolve (executePlan Min.ops)).1 Min.asm = AsmResult.AsmRevert as' ∧
+          venomAsmTerminalRel w as'
+      | ExecResult.Abort AbortType.ExHaltAbort w =>
+        ∃ as', runAsm ((asmResolve (executePlan Min.ops)).1.length) offsetToPc
+          (asmResolve (executePlan Min.ops)).1 Min.asm = AsmResult.AsmFault as' ∧
+          venomAsmTerminalRel w as'
+      | _ => True :=
+  min_join_sim f ctx min_rel_on_arrival rfl
+
+
+
+namespace Two
+/-- The plan state after the join's phi prologue. -/
+def psPost : PlanState := (phiPrefixPlan joinPhiPairs2 psElse2).2
+end Two
+
+/-- **The synthetic residual block does NOT compile to the join's program.**
+
+`generateBlockPlan` looks liveness up *by position within the block*. The residual block drops the phis,
+so every instruction after them shifts index — and the generator reads a different liveness entry, and
+emits different code. Here the join assembles to 4 instructions and the residual, even started from the
+join's own post-phi plan state, to 5.
+
+So `genBlockSimulation` applied to the residual block is **not** a source for `genBlockSimulation_join`'s
+`hres`: the programs would not match, and the `executePlan ops = executePlan resOps` link would be false.
+The simulation must be for the join's *own* body plan — which is what `executePlan_join_eq_residual` is
+about (the same `body` ops, with and without the phi prologue in front).
+
+Pinned here because the natural reading of "give it the residual block's simulation" is wrong, and
+nothing else in the development would have caught it. -/
+theorem residual_block_compiles_differently :
+    ((generateBlockPlan Two.L2 Two.D2 Two.C2 Two.fn2 Two.bJoin Two.psElse2).map
+       (fun r => (executePlan r.1).length) = some 4)
+  ∧ ((generateBlockPlan Two.L2 Two.D2 Two.C2 Two.fn2 Two.bJoinRes Two.psPost).map
+       (fun r => (executePlan r.1).length) = some 5) := by
+  constructor <;> decide
+
+
+
+/-- **The residual-free join reduction, on the two-phi join.** No synthetic block: the join is resumed
+after its own phis, so the plan, the program and the liveness indices are all the block's own — the
+configuration the residual route gets wrong. -/
+theorem fn2_join_self (fuel : Nat) (ctx : VenomContext)
+    {lo : AssocList String Nat} {ps' : PlanState} {offsetToPc : AssocList Nat Nat}
+    {prog : List AsmInst} {as : AsmState}
+    (hres : BlockSim lo ps' offsetToPc prog as
+      (execBlock fuel ctx Two.bJoin
+        { (updateVar "p" Two.a1v (updateVar "q" Two.a2v Two.vsFromThen2)) with
+          instIdx := phiPrefixLength Two.bJoin.instructions })) :
+    BlockSim lo ps' offsetToPc prog as (runBlock fuel ctx Two.bJoin Two.vsFromThen2) :=
+  BlockSim_join_self fn2_evalPhis hres
+
+/-- and the join really does resume at index 2 — after both phis. -/
+theorem fn2_phiPrefixLength : phiPrefixLength Two.bJoin.instructions = 2 := by decide
+
+
+/-! #### The same result, by the residual-free route — and why it is the one to use
+
+`min_join_sim` above goes through a synthetic residual block. This does not: the join is simply resumed
+after its phis, on its own block, plan and program. That removes the synthetic block and the trap that
+comes with it (`residual_block_compiles_differently`).
+
+It does not remove the per-opcode obliviousness work for *generic* joins — see `BlockSim_join_self`. Here
+none is needed only because the block is concrete and `hres` falls out by computation. -/
+
+theorem min_phiPrefixLength : phiPrefixLength Min.bJ.instructions = 1 := by decide
+
+/-- The join, resumed after its phi, halts. -/
+theorem min_self_run (f : Nat) (ctx : VenomContext) (w : VenomState) :
+    execBlock (f + 1) ctx Min.bJ { w with instIdx := 1 }
+      = ExecResult.Halt (haltState { w with instIdx := 1 }) := by
+  unfold execBlock
+  rfl
+
+/-- **`genBlockSimulation` on a phi-headed block, by the residual-free route.**
+
+Same result as `min_join_sim`, but with no synthetic residual block, no instruction-index shift, and no
+per-opcode `_respects` discharger. The join is simply resumed after its phi — same block, same plan, same
+program — and `hasm_stop` finishes it.
+
+The difference is real but narrower than it first looks, and worth stating exactly. *Here* no
+obliviousness is needed, because `hres` is discharged by computation on a concrete block. For a *generic*
+join it would be: a join resumes after its phis, so its body simulation runs at an offset, and that needs
+the body instructions to be instruction-index oblivious — the same content the residual route needs, and
+a requirement the codebase already carries for its `PARAM`-prefix simulations
+(`execBodyThread_instIdx_congr`). What this route removes is the synthetic block and its trap, not the
+per-opcode work. -/
+theorem min_join_sim_self {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat}
+    {asm : AsmState} (f : Nat) (ctx : VenomContext)
+    (hrel : venomAsmRel lo Min.ps Min.vs asm)
+    (hpc : asm.pc = 0) :
+    match runBlock (f + 1) ctx Min.bJ Min.vs with
+      | ExecResult.OK w =>
+        ∃ as', runAsm ((asmResolve (executePlan Min.ops)).1.length) offsetToPc
+          (asmResolve (executePlan Min.ops)).1 asm = AsmResult.AsmOK as' ∧
+          venomAsmRel lo Min.ps w as'
+      | ExecResult.Halt w =>
+        ∃ as', runAsm ((asmResolve (executePlan Min.ops)).1.length) offsetToPc
+          (asmResolve (executePlan Min.ops)).1 asm = AsmResult.AsmHalt as' ∧
+          venomAsmTerminalRel w as'
+      | ExecResult.Abort AbortType.RevertAbort w =>
+        ∃ as', runAsm ((asmResolve (executePlan Min.ops)).1.length) offsetToPc
+          (asmResolve (executePlan Min.ops)).1 asm = AsmResult.AsmRevert as' ∧
+          venomAsmTerminalRel w as'
+      | ExecResult.Abort AbortType.ExHaltAbort w =>
+        ∃ as', runAsm ((asmResolve (executePlan Min.ops)).1.length) offsetToPc
+          (asmResolve (executePlan Min.ops)).1 asm = AsmResult.AsmFault as' ∧
+          venomAsmTerminalRel w as'
+      | _ => True := by
+  have hpost : venomAsmRel lo Min.ps (updateVar "p" Min.av Min.vs) asm :=
+    venomAsmRel_phi_join' (outs := ["p"]) (phis := Min.bJ.instructions)
+      hrel rfl rfl min_ev
+      (fun w hw => lookupVar_updateVar_ne Min.vs "p" w Min.av (by simpa using hw))
+      (fun op off hlk _ _ => absurd hlk (by simp [Min.ps, AssocList.lookup]))
+      ⟨hrel.1.1, fun i hi => absurd hi (by simp [Min.ps])⟩
+  refine genBlockSimulation_join_self (vs' := updateVar "p" Min.av Min.vs) (ops := Min.ops) min_ev ?_
+  rw [min_phiPrefixLength, min_self_run f ctx (updateVar "p" Min.av Min.vs)]
+  show ∃ as', runAsm ((asmResolve (executePlan Min.ops)).1.length) offsetToPc
+    (asmResolve (executePlan Min.ops)).1 asm = AsmResult.AsmHalt as' ∧
+    venomAsmTerminalRel (haltState { (updateVar "p" Min.av Min.vs) with instIdx := 1 }) as'
+  refine hasm_stop (l := "join") (ps := Min.ps)
+    (venomAsmRel_congr (a := updateVar "p" Min.av Min.vs) (by unfold sameUpToIdx; rfl) hpost) ?_ ?_
+  · rw [min_prog, hpc]
+    refine ⟨by rfl, ?_⟩
+    intro j hj
+    simp only [Nat.zero_add, Min.ops]
+  · rw [min_proglen]
+
+
+/-- **The join `hstep` is not vacuous** — and this is the check that matters, because a walk clause with
+an unsatisfiable hypothesis proves nothing. `Min.bJ` is `p = phi …; STOP`, a real phi-headed block on
+real compiler output, and it produces the walk's per-block obligation with **no hypotheses left over**:
+every argument below is a universally quantified parameter, not an assumption. A block whose head is a
+`PHI` is now an ordinary block as far as `codegen_correct`'s walk is concerned. -/
+theorem min_walkstep_join (f : Nat) (ctx : VenomContext) (fn : IrFunction)
+    (pcOf : String → Nat) (psOf : String → PlanState) (wOf : String → Nat)
+    (offsetToPc : AssocList Nat Nat) :
+    WalkStep fn pcOf psOf wOf [] offsetToPc (asmResolve (executePlan Min.ops)).1
+      Min.bJ Min.asm ((asmResolve (executePlan Min.ops)).1.length)
+      (runBlock (f + 1) ctx Min.bJ Min.vs) := by
+  have hbb : Min.bJ.instructions = [Min.pP] ++ [Min.iStop] := rfl
+  have hphis : ∀ i ∈ [Min.pP], i.opcode = Opcode.PHI := by
+    intro i hi; simp only [List.mem_singleton] at hi; subst hi; rfl
+  have hterm : Min.iStop.opcode ≠ Opcode.PHI := by decide
+  set sPhi := updateVar "p" Min.av Min.vs with hsp
+  have hstepT : stepInstBase Min.iStop { sPhi with instIdx := [Min.pP].length }
+      = ExecResult.Halt (haltState { sPhi with instIdx := [Min.pP].length }) := rfl
+  -- the block therefore halts
+  have hrb : runBlock (f + 1) ctx Min.bJ Min.vs
+      = ExecResult.Halt (haltState { sPhi with instIdx := [Min.pP].length }) := by
+    rw [runBlock_join_eq_execBlock_at min_ev hbb hphis hterm]
+    exact execBlock_step_halt f ctx Min.bJ _ _ Min.iStop
+      (by simpa using getInstruction_term Min.bJ [Min.pP] Min.iStop hbb) hstepT
+  -- and the existing non-vacuous block sim supplies the asm halt witness
+  have hw := min_join_sim_nonvacuous f ctx offsetToPc
+  rw [hrb] at hw
+  exact hstep_bareTerm_halt_join pcOf psOf wOf min_ev hbb hphis hterm hstepT hw
+
+
+/-- **The compiler-level join route, fired.** `min_walkstep_join` above builds the walk obligation by
+hand, from the terminator up. This one takes the other road: `min_join_sim_self` is the *compiler's*
+per-block simulation of the phi-headed block, and `WalkStep_of_BlockSim_terminal` carries it into the
+walk. Same conclusion, no hypotheses left over — so the chain
+`genBlockSimulation_join_self → BlockSim → WalkStep` is real end to end, not just typeable. -/
+theorem min_walkstep_join_of_genBlockSim (f : Nat) (ctx : VenomContext) (fn : IrFunction)
+    (pcOf : String → Nat) (psOf : String → PlanState) (wOf : String → Nat)
+    (offsetToPc : AssocList Nat Nat) :
+    WalkStep fn pcOf psOf wOf [] offsetToPc (asmResolve (executePlan Min.ops)).1
+      Min.bJ Min.asm ((asmResolve (executePlan Min.ops)).1.length)
+      (runBlock (f + 1) ctx Min.bJ Min.vs) := by
+  -- the join halts, so no OK arm can arise
+  have hrb : runBlock (f + 1) ctx Min.bJ Min.vs
+      = ExecResult.Halt (haltState { updateVar "p" Min.av Min.vs with instIdx := 1 }) := by
+    rw [runBlock_eq_execBlock_of_phis min_ev, min_phiPrefixLength]
+    exact min_self_run f ctx _
+  have hterm : ∀ w, runBlock (f + 1) ctx Min.bJ Min.vs ≠ ExecResult.OK w := by
+    intro w h; rw [hrb] at h; exact absurd h (by simp)
+  exact WalkStep_of_BlockSim_terminal rfl hterm
+    (min_join_sim_self f ctx min_rel_on_arrival rfl)
+
+/-! ### Are the other join hsteps vacuous?
+
+`min_walkstep_join` fires `hstep_bareTerm_halt_join`. The other five — JMP, both JNZ arms, revert and
+fault — had no consumer, and this branch's own rule says a theorem with no consumer is either dead or
+having its job done by an assumption. So: witnesses for the two that carry real content beyond the halt
+case, on genuine phi-headed blocks.
+
+The JNZ witness is the one that earns its keep. Its branch condition is `p` — the phi's *own output* —
+so it reads a value that does not exist until the prologue has run. A bare-terminator hstep could not
+have expressed that block at all, which is precisely the generality the join forms were added for. -/
+
+namespace JoinShapes
+
+/-- A join whose terminator is a `JMP`: `p = phi(then→a, else→b) ; JMP next`. -/
+def jJmp : Instruction :=
+  { id := 20, opcode := Opcode.JMP, operands := [Operand.Label "next"], outputs := [] }
+def bJmp : BasicBlock := { label := "join", instructions := [Min.pP, jJmp] }
+
+/-- A join whose terminator is a `JNZ`. -/
+def jJnz : Instruction :=
+  { id := 21, opcode := Opcode.JNZ,
+    operands := [Operand.Var "p", Operand.Label "t2", Operand.Label "e2"], outputs := [] }
+def bJnz : BasicBlock := { label := "join", instructions := [Min.pP, jJnz] }
+
+end JoinShapes
+
+/-- `evalPhis` succeeds on the JMP-terminated join. -/
+theorem jmpjoin_ev : evalPhis Min.vs JoinShapes.bJmp.instructions
+    = ExecResult.OK (updateVar "p" Min.av Min.vs) := by
+  show evalPhis Min.vs (Min.pP :: [JoinShapes.jJmp]) = _
+  unfold evalPhis
+  rw [if_neg (show ¬ (Min.pP.opcode ≠ Opcode.PHI) from fun h => h rfl),
+      evalOnePhi_var (out := "p") (src := "a") (prev := "then") (v := Min.av)
+        (by rfl) (by rfl) (by rfl) (by rfl)]
+  show (match evalPhis Min.vs [JoinShapes.jJmp] with
+        | ExecResult.OK s' => ExecResult.OK (updateVar "p" Min.av s') | err => err) = _
+  rw [show evalPhis Min.vs [JoinShapes.jJmp] = ExecResult.OK Min.vs from by
+    unfold evalPhis; rw [if_pos (by decide)]]
+
+/-- **`hstep_jmp_block_join`'s Venom-side hypotheses are satisfiable.** The `execBlock` input it needs —
+the join resumed after its phi, stepping its `JMP` — is discharged here on a real phi-headed block. -/
+theorem jmpjoin_hrb (f : Nat) (ctx : VenomContext) (hnh : Min.vs.halted = false) :
+    execBlock (f + 1) ctx JoinShapes.bJmp
+        { (updateVar "p" Min.av Min.vs) with
+          instIdx := phiPrefixLength JoinShapes.bJmp.instructions }
+      = ExecResult.OK (jumpTo "next"
+          { (updateVar "p" Min.av Min.vs) with instIdx := 1 }) := by
+  have hlen : phiPrefixLength JoinShapes.bJmp.instructions = 1 := by decide
+  rw [hlen]
+  refine execBlock_step_term_ok f ctx JoinShapes.bJmp _ _ JoinShapes.jJmp ?_ ?_ (by decide) ?_
+  · exact (by simpa using getInstruction_term JoinShapes.bJmp [Min.pP] JoinShapes.jJmp rfl)
+  · rfl
+  · rw [jumpTo]; exact hnh
+
+/-- `evalPhis` succeeds on the JNZ-terminated join, and its condition evaluates — the two Venom-side
+inputs `hstep_jnz_taken_join` needs beyond block shape. -/
+theorem jnzjoin_ev : evalPhis Min.vs JoinShapes.bJnz.instructions
+    = ExecResult.OK (updateVar "p" Min.av Min.vs) := by
+  show evalPhis Min.vs (Min.pP :: [JoinShapes.jJnz]) = _
+  unfold evalPhis
+  rw [if_neg (show ¬ (Min.pP.opcode ≠ Opcode.PHI) from fun h => h rfl),
+      evalOnePhi_var (out := "p") (src := "a") (prev := "then") (v := Min.av)
+        (by rfl) (by rfl) (by rfl) (by rfl)]
+  show (match evalPhis Min.vs [JoinShapes.jJnz] with
+        | ExecResult.OK s' => ExecResult.OK (updateVar "p" Min.av s') | err => err) = _
+  rw [show evalPhis Min.vs [JoinShapes.jJnz] = ExecResult.OK Min.vs from by
+    unfold evalPhis; rw [if_pos (by decide)]]
+
+/-- The JNZ join's condition is the phi's *own output* — so it reads a value that only exists after the
+prologue. This is the case a bare-terminator hstep could never have expressed. -/
+theorem jnzjoin_cond :
+    evalOperand (Operand.Var "p")
+      { (updateVar "p" Min.av Min.vs) with instIdx := [Min.pP].length } = some Min.av := by
+  rfl
+
+/-! ### Closing the last vacuity gap: the revert and fault joins
+
+The previous section left these two unexercised and said so. Here they are. `revertjoin_walkstep` and
+`faultjoin_walkstep` discharge *every* Venom-side hypothesis of their hstep on a concrete phi-headed
+block and hand back the walk obligation; only the asm-side witness stays a parameter, which is true of
+every hstep in the family, join or not.
+
+All six join hsteps now have a witness. -/
+
+namespace JoinShapes
+
+/-- A join that reverts: `p = phi(…) ; REVERT 0 0`. -/
+def jRevert : Instruction :=
+  { id := 22, opcode := Opcode.REVERT,
+    operands := [Operand.Lit (UInt256.ofNat 0), Operand.Lit (UInt256.ofNat 0)], outputs := [] }
+def bRevert : BasicBlock := { label := "join", instructions := [Min.pP, jRevert] }
+
+/-- A join that faults: `p = phi(…) ; INVALID`. -/
+def jInvalid : Instruction :=
+  { id := 23, opcode := Opcode.INVALID, operands := [], outputs := [] }
+def bFault : BasicBlock := { label := "join", instructions := [Min.pP, jInvalid] }
+
+end JoinShapes
+
+private theorem ev_of (term : Instruction) (hnp : term.opcode ≠ Opcode.PHI)
+    (bb : BasicBlock) (hbb : bb.instructions = [Min.pP, term]) :
+    evalPhis Min.vs bb.instructions = ExecResult.OK (updateVar "p" Min.av Min.vs) := by
+  rw [hbb]
+  unfold evalPhis
+  rw [if_neg (show ¬ (Min.pP.opcode ≠ Opcode.PHI) from fun h => h rfl),
+      evalOnePhi_var (out := "p") (src := "a") (prev := "then") (v := Min.av)
+        (by rfl) (by rfl) (by rfl) (by rfl)]
+  show (match evalPhis Min.vs [term] with
+        | ExecResult.OK s' => ExecResult.OK (updateVar "p" Min.av s') | err => err) = _
+  rw [show evalPhis Min.vs [term] = ExecResult.OK Min.vs from by
+    unfold evalPhis; rw [if_pos hnp]]
+
+theorem revertjoin_ev : evalPhis Min.vs JoinShapes.bRevert.instructions
+    = ExecResult.OK (updateVar "p" Min.av Min.vs) :=
+  ev_of JoinShapes.jRevert (by decide) _ rfl
+
+theorem faultjoin_ev : evalPhis Min.vs JoinShapes.bFault.instructions
+    = ExecResult.OK (updateVar "p" Min.av Min.vs) :=
+  ev_of JoinShapes.jInvalid (by decide) _ rfl
+
+/-- **`hstep_bareTerm_revert_join`'s Venom-side step, discharged.** -/
+theorem revertjoin_step :
+    stepInstBase JoinShapes.jRevert
+        { (updateVar "p" Min.av Min.vs) with instIdx := [Min.pP].length }
+      = ExecResult.Abort AbortType.RevertAbort
+          (revertState (setReturndata
+            (readMemory 0 0 { (updateVar "p" Min.av Min.vs) with instIdx := [Min.pP].length })
+            { (updateVar "p" Min.av Min.vs) with instIdx := [Min.pP].length })) := rfl
+
+/-- **`hstep_bareTerm_fault_join`'s Venom-side step, discharged.** -/
+theorem faultjoin_step :
+    stepInstBase JoinShapes.jInvalid
+        { (updateVar "p" Min.av Min.vs) with instIdx := [Min.pP].length }
+      = ExecResult.Abort AbortType.ExHaltAbort
+          (haltState (setReturndata ByteArray.empty
+            { (updateVar "p" Min.av Min.vs) with instIdx := [Min.pP].length })) := rfl
+
+/-- **The revert join composes.** Every Venom-side hypothesis of `hstep_bareTerm_revert_join` is
+discharged on this concrete phi-headed block; only the asm-side witness remains a parameter, exactly as
+it is for every other hstep in the family. -/
+theorem revertjoin_walkstep {fn : IrFunction} {ctx : VenomContext}
+    {offsetToPc : AssocList Nat Nat} {prog : List AsmInst} {labelOffsets : AssocList String Nat}
+    (pcOf : String → Nat) (psOf : String → PlanState) (wOf : String → Nat)
+    {asm : AsmState} {N extraFuel : Nat}
+    (hasm : ∃ asm', runAsm N offsetToPc prog asm = AsmResult.AsmRevert asm' ∧
+        venomAsmTerminalRel
+          (revertState (setReturndata
+            (readMemory 0 0 { (updateVar "p" Min.av Min.vs) with instIdx := 1 })
+            { (updateVar "p" Min.av Min.vs) with instIdx := 1 })) asm') :
+    WalkStep fn pcOf psOf wOf labelOffsets offsetToPc prog JoinShapes.bRevert asm N
+      (runBlock (extraFuel + 1) ctx JoinShapes.bRevert Min.vs) :=
+  hstep_bareTerm_revert_join pcOf psOf wOf revertjoin_ev rfl
+    (by intro i hi; simp only [List.mem_singleton] at hi; subst hi; rfl)
+    (by decide) revertjoin_step hasm
+
+/-- **The fault join composes.** -/
+theorem faultjoin_walkstep {fn : IrFunction} {ctx : VenomContext}
+    {offsetToPc : AssocList Nat Nat} {prog : List AsmInst} {labelOffsets : AssocList String Nat}
+    (pcOf : String → Nat) (psOf : String → PlanState) (wOf : String → Nat)
+    {asm : AsmState} {N extraFuel : Nat}
+    (hasm : ∃ asm', runAsm N offsetToPc prog asm = AsmResult.AsmFault asm' ∧
+        venomAsmTerminalRel
+          (haltState (setReturndata ByteArray.empty
+            { (updateVar "p" Min.av Min.vs) with instIdx := 1 })) asm') :
+    WalkStep fn pcOf psOf wOf labelOffsets offsetToPc prog JoinShapes.bFault asm N
+      (runBlock (extraFuel + 1) ctx JoinShapes.bFault Min.vs) :=
+  hstep_bareTerm_fault_join pcOf psOf wOf faultjoin_ev rfl
+    (by intro i hi; simp only [List.mem_singleton] at hi; subst hi; rfl)
+    (by decide) faultjoin_step hasm
+
+/-! ### A whole function containing a phi join
+
+`codegen_correct_sched_ws` wants an `hstep` at *every* block. So here is a four-block diamond whose join
+is phi-headed — `entry: JNZ c then else` / `then: JMP join` / `else: JMP join` /
+`join: p = phi(then→a, else→b); STOP` — and the block dispatcher for it.
+
+Three of the four blocks are ordinary phi-free blocks, and discharging them is the pre-existing
+machinery's job; they stay as hypotheses. The fourth is the one that could not previously be stated at
+all, and it is discharged here.
+
+A first attempt at this dispatcher quantified over an abstract per-block predicate and "proved" the
+whole thing by composing two of its own hypotheses — a tautology in the shape of a theorem. It is
+recorded here only as the reason this version takes the three phi-free obligations *concretely*: a
+dispatcher whose content is a case split must at least be honest about which cases it actually closes. -/
+
+namespace Dia
+
+def dJnz : Instruction :=
+  { id := 30, opcode := Opcode.JNZ,
+    operands := [Operand.Var "c", Operand.Label "then", Operand.Label "else"], outputs := [] }
+def dJmpT : Instruction :=
+  { id := 31, opcode := Opcode.JMP, operands := [Operand.Label "join"], outputs := [] }
+def dJmpE : Instruction :=
+  { id := 32, opcode := Opcode.JMP, operands := [Operand.Label "join"], outputs := [] }
+def dPhi : Instruction :=
+  { id := 33, opcode := Opcode.PHI,
+    operands := [Operand.Label "then", Operand.Var "a", Operand.Label "else", Operand.Var "b"],
+    outputs := ["p"] }
+def dStop : Instruction :=
+  { id := 34, opcode := Opcode.STOP, operands := [], outputs := [] }
+
+/-- `c = CALLVALUE` — **`c` must be defined in the function**, and it must be defined by something the
+kernel can reduce.
+
+Two separate constraints, learned the hard way. First: an earlier version of this diamond left `c` free,
+and the compiler duly emitted `PUSHLBL then; JUMPI` with nothing pushing the condition — `generateFnPlan`
+starts from an empty stack and gives a slot only to variables some instruction *defines*, so a free
+variable (and, it turns out, a `PARAM` too — the plan does not seed params either) gets no push at all.
+Venom reads `c` from `vars`, the EVM pops whatever is lying there, and no `venomAsmRel` can relate them.
+The entry block's `hstep` was undischargeable.
+
+Second: the obvious fix, `c = <literal>`, makes the function correct but the *proofs* impossible.
+`encodeNumBytes` is well-founded recursive, so the kernel cannot unfold it; a plan containing a literal
+`SOPush` becomes `AsmPush (encodeNumBytes …)` in `executePlan`, and `computeLabelOffsets` needs that
+instruction's *size*. So every label offset in the program becomes irreducible, and nothing about the
+compiled output can be pinned by `rfl` or `decide`. (`jmpStopFn` escapes this only because its sole pushes
+are *label* pushes, which stay `AsmPushLabel` — a fixed size — in the unresolved asm.)
+
+`CALLVALUE` satisfies both: it defines `c` and pushes it, with no literal anywhere. -/
+def dC : Instruction :=
+  { id := 29, opcode := Opcode.CALLVALUE, operands := [], outputs := ["c"] }
+
+def bEntry : BasicBlock := { label := "entry", instructions := [dC, dJnz] }
+/-- `a = CALLVALUE` in `then`, `b = CALLER` in `else` — **the phi's sources must actually be defined**.
+
+Without these the join is vacuous, and vacuous in the worst way: `evalPhis` looks its sources up in
+`vars`, finds nothing, and `runBlock` returns an `Error`. `WalkStep`'s catch-all sends `Error` to `True`,
+so the join's obligation would have been *trivially* discharged while the function never reached a
+meaningful join at all. The same failure as the free `c` in the entry block, one level down.
+
+They are dead by the time the phi runs — a `PHI` does not *use* its sources (that is what the liveness
+fix established), so the compiler emits `CALLVALUE ; POP` and `CALLER ; POP` and the exit stacks stay
+empty. Venom still binds them in `vars`, which is exactly why `evalPhis` succeeds and the join is real. -/
+def tA : Instruction :=
+  { id := 35, opcode := Opcode.CALLVALUE, operands := [], outputs := ["a"] }
+def eB : Instruction :=
+  { id := 36, opcode := Opcode.CALLER, operands := [], outputs := ["b"] }
+
+def bThen  : BasicBlock := { label := "then",  instructions := [tA, dJmpT] }
+def bElse  : BasicBlock := { label := "else",  instructions := [eB, dJmpE] }
+/-- The join is **phi-headed**. -/
+def bJoin  : BasicBlock := { label := "join",  instructions := [dPhi, dStop] }
+
+def fn : IrFunction := { name := "main", blocks := [bEntry, bThen, bElse, bJoin] }
+
+/-- The compiler's own output for this diamond. -/
+def ops  : List StackOp := (generateFnPlan fn 0 0).get!.1
+def prog : List AsmInst := (asmResolve (executePlan ops)).1
+def o2pc : AssocList Nat Nat := (asmResolve (executePlan ops)).2
+def lo   : AssocList String Nat := (computeLabelOffsets (executePlan ops)).2
+
+end Dia
+
+/-- The diamond's blocks are exactly the four. -/
+theorem dia_blocks {s : VenomState} {bb : BasicBlock}
+    (hlk : lookupBlock s.currentBb Dia.fn.blocks = some bb) :
+    bb = Dia.bEntry ∨ bb = Dia.bThen ∨ bb = Dia.bElse ∨ bb = Dia.bJoin := by
+  rw [show Dia.fn.blocks = [Dia.bEntry, Dia.bThen, Dia.bElse, Dia.bJoin] from rfl,
+      lookupBlock] at hlk
+  have h := List.mem_of_find?_eq_some hlk
+  simpa using h
+
+/-- **The join slot of a real diamond, discharged.** `Dia.bJoin` is `p = phi(then→a, else→b) ; STOP`,
+the phi-headed block of a four-block diamond. Given that its phis evaluate on the arriving state (which
+is a fact about the *arrival*, not about the join) and the asm halt witness (which every hstep in the
+family takes, join or not), the walk's obligation for it follows. Nothing here is assumed about the
+block's head not being a `PHI` — that hypothesis is gone. -/
+theorem dia_join_hstep {ctx : VenomContext} {lo : AssocList String Nat}
+    {offsetToPc : AssocList Nat Nat} {prog : List AsmInst}
+    (pcOf : String → Nat) (psOf : String → PlanState) (wOf : String → Nat)
+    {s vs' : VenomState} {asm : AsmState} {N extraFuel : Nat}
+    (hev : evalPhis s Dia.bJoin.instructions = ExecResult.OK vs')
+    (hasm : ∃ asm', runAsm N offsetToPc prog asm = AsmResult.AsmHalt asm' ∧
+        venomAsmTerminalRel (haltState { vs' with instIdx := 1 }) asm') :
+    WalkStep Dia.fn pcOf psOf wOf lo offsetToPc prog Dia.bJoin asm N
+      (runBlock (extraFuel + 1) ctx Dia.bJoin s) :=
+  hstep_bareTerm_halt_join (phis := [Dia.dPhi]) (term := Dia.dStop) pcOf psOf wOf hev rfl
+    (by intro i hi; simp only [List.mem_singleton] at hi; subst hi; rfl)
+    (by decide) rfl hasm
+
+/-- **The whole diamond's `hstep`.** The three phi-free blocks are the pre-existing machinery's business
+and stay as hypotheses; the phi-headed join is discharged above. This is the shape
+`codegen_correct_sched_ws` consumes, so a function *containing a phi join* now has a whole-function
+obligation with the join already accounted for. -/
+theorem dia_hstep
+    {ctx : VenomContext} {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat}
+    {prog : List AsmInst} {extraFuel : Nat}
+    (pcOf : String → Nat) (psOf : String → PlanState) (wOf : String → Nat)
+    (hEntry : ∀ s asm N, lookupBlock s.currentBb Dia.fn.blocks = some Dia.bEntry →
+        asm.pc = pcOf Dia.bEntry.label → venomAsmRel lo (psOf Dia.bEntry.label) s asm →
+        wOf Dia.bEntry.label ≤ N → s.halted = false →
+        WalkStep Dia.fn pcOf psOf wOf lo offsetToPc prog Dia.bEntry asm N
+          (runBlock (extraFuel + 1) ctx Dia.bEntry s))
+    (hThen : ∀ s asm N, lookupBlock s.currentBb Dia.fn.blocks = some Dia.bThen →
+        asm.pc = pcOf Dia.bThen.label → venomAsmRel lo (psOf Dia.bThen.label) s asm →
+        wOf Dia.bThen.label ≤ N → s.halted = false →
+        WalkStep Dia.fn pcOf psOf wOf lo offsetToPc prog Dia.bThen asm N
+          (runBlock (extraFuel + 1) ctx Dia.bThen s))
+    (hElse : ∀ s asm N, lookupBlock s.currentBb Dia.fn.blocks = some Dia.bElse →
+        asm.pc = pcOf Dia.bElse.label → venomAsmRel lo (psOf Dia.bElse.label) s asm →
+        wOf Dia.bElse.label ≤ N → s.halted = false →
+        WalkStep Dia.fn pcOf psOf wOf lo offsetToPc prog Dia.bElse asm N
+          (runBlock (extraFuel + 1) ctx Dia.bElse s))
+    (hJoinEv : ∀ s, lookupBlock s.currentBb Dia.fn.blocks = some Dia.bJoin →
+        ∃ vs', evalPhis s Dia.bJoin.instructions = ExecResult.OK vs')
+    (hJoinAsm : ∀ s asm N vs', evalPhis s Dia.bJoin.instructions = ExecResult.OK vs' →
+        asm.pc = pcOf Dia.bJoin.label → wOf Dia.bJoin.label ≤ N →
+        ∃ asm', runAsm N offsetToPc prog asm = AsmResult.AsmHalt asm' ∧
+          venomAsmTerminalRel (haltState { vs' with instIdx := 1 }) asm') :
+    ∀ (bb : BasicBlock) (s : VenomState) (asm : AsmState) (N : Nat),
+      lookupBlock s.currentBb Dia.fn.blocks = some bb →
+      asm.pc = pcOf bb.label →
+      venomAsmRel lo (psOf bb.label) s asm →
+      wOf bb.label ≤ N →
+      s.halted = false →
+      WalkStep Dia.fn pcOf psOf wOf lo offsetToPc prog bb asm N
+        (runBlock (extraFuel + 1) ctx bb s) := by
+  intro bb s asm N hlk hpc hrel hw hnh
+  rcases dia_blocks hlk with rfl | rfl | rfl | rfl
+  · exact hEntry s asm N hlk hpc hrel hw hnh
+  · exact hThen s asm N hlk hpc hrel hw hnh
+  · exact hElse s asm N hlk hpc hrel hw hnh
+  · obtain ⟨vs', hev⟩ := hJoinEv s hlk
+    exact dia_join_hstep pcOf psOf wOf hev (hJoinAsm s asm N vs' hev hpc hw)
+
+/-! ### A join with a body — one that reads its own phi
+
+Every join witnessed so far has been `phis ++ [term]`: the phi prologue and then straight out. That is
+the easy half. The real shape a compiler produces is a join with a *body*, and — the part that matters —
+a body that **consumes the phi's output**. `p = phi(then→a, else→b) ; SSTORE d p ; STOP` is that block:
+the store reads `p`, a value that does not exist until the prologue has run.
+
+No `hphi`-carrying hstep can describe this block, and neither can the bare-terminator join hsteps, whose
+`hbb` insists the block is `phis ++ [term]`. The general `hstep_join_halt` handles it, and the Venom side
+is fully discharged below. -/
+
+namespace JoinBody
+
+/-- `SSTORE d, p` — the body **reads the phi's output** `p`. -/
+def bSst : Instruction :=
+  { id := 40, opcode := Opcode.SSTORE,
+    operands := [Operand.Var "d", Operand.Var "p"], outputs := [] }
+def bStop : Instruction :=
+  { id := 41, opcode := Opcode.STOP, operands := [], outputs := [] }
+
+/-- A join **with a body**: `p = phi(then→a, else→b) ; SSTORE d p ; STOP`. -/
+def bb : BasicBlock := { label := "join", instructions := [Min.pP, bSst, bStop] }
+
+def dv : bytes32 := UInt256.ofNat 9
+
+/-- The arriving state binds `d` and the phi's `then`-source `a`. -/
+def vs : VenomState :=
+  { (default : VenomState) with
+    vars := [("d", dv), ("a", Min.av)],
+    prevBb := some "then", currentBb := "join" }
+
+end JoinBody
+
+theorem joinbody_ev : evalPhis JoinBody.vs JoinBody.bb.instructions
+    = ExecResult.OK (updateVar "p" Min.av JoinBody.vs) := by
+  show evalPhis JoinBody.vs (Min.pP :: [JoinBody.bSst, JoinBody.bStop]) = _
+  unfold evalPhis
+  rw [if_neg (show ¬ (Min.pP.opcode ≠ Opcode.PHI) from fun h => h rfl),
+      evalOnePhi_var (out := "p") (src := "a") (prev := "then") (v := Min.av)
+        (by rfl) (by rfl) (by rfl) (by rfl)]
+  show (match evalPhis JoinBody.vs [JoinBody.bSst, JoinBody.bStop] with
+        | ExecResult.OK s' => ExecResult.OK (updateVar "p" Min.av s') | err => err) = _
+  rw [show evalPhis JoinBody.vs [JoinBody.bSst, JoinBody.bStop] = ExecResult.OK JoinBody.vs from by
+    unfold evalPhis; rw [if_pos (by decide)]]
+
+theorem joinbody_phiPrefixLength : phiPrefixLength JoinBody.bb.instructions = 1 := by decide
+
+/-- The state the join resumes at: phi output `p` bound, index at the body. -/
+def JoinBody.sPhi1 : VenomState :=
+  { (updateVar "p" Min.av JoinBody.vs) with instIdx := 1 }
+
+/-- **The body runs, and it reads the phi's output.** Resumed at index 1, the join executes
+`SSTORE d p` — storing `p`, the value the phi just bound — and then halts. This is the case a
+bare-terminator join hstep cannot express: there is a body, and the body *consumes the phi*. -/
+theorem joinbody_res (f : Nat) (ctx : VenomContext) :
+    execBlock (f + 1 + 1) ctx JoinBody.bb JoinBody.sPhi1
+      = ExecResult.Halt (haltState
+          { (sstore JoinBody.dv Min.av JoinBody.sPhi1) with instIdx := 2 }) := by
+  rw [execBlock_step_nonterm (f + 1) ctx JoinBody.bb JoinBody.sPhi1
+        (sstore JoinBody.dv Min.av JoinBody.sPhi1) JoinBody.bSst
+        (by rfl) (by rfl) (by decide)]
+  exact execBlock_step_halt f ctx JoinBody.bb _ _ JoinBody.bStop (by rfl) (by rfl)
+
+/-- **A join WITH A BODY produces the walk's obligation.** Every Venom-side input is discharged: the
+phis evaluate on arrival (`joinbody_ev`), and the post-phi body runs to a halt (`joinbody_res`). Only the
+asm witness stays a parameter, as it does for every hstep. The block is
+`p = phi(then→a, else→b) ; SSTORE d p ; STOP` — its body *consumes the phi's output*, so neither a
+bare-terminator join hstep nor any `hphi`-carrying hstep could have described it. -/
+theorem joinbody_walkstep {fn : IrFunction} {ctx : VenomContext}
+    {offsetToPc : AssocList Nat Nat} {prog : List AsmInst} {labelOffsets : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {asm : AsmState} {N f : Nat}
+    (hasm : ∃ asm', runAsm N offsetToPc prog asm = AsmResult.AsmHalt asm' ∧
+        venomAsmTerminalRel
+          (haltState { (sstore JoinBody.dv Min.av JoinBody.sPhi1) with instIdx := 2 }) asm') :
+    WalkStep fn pcOf psOf wOf labelOffsets offsetToPc prog JoinBody.bb asm N
+      (runBlock (f + 1 + 1) ctx JoinBody.bb JoinBody.vs) :=
+  hstep_join_halt joinbody_ev
+    (by rw [joinbody_phiPrefixLength]; exact joinbody_res f ctx) hasm
+
+/-! ### Does the diamond actually compile?
+
+`dia_hstep` hands its three phi-free blocks back as hypotheses. A hypothesis nothing can satisfy makes a
+theorem vacuous exactly where it claims to be useful, so this is not rhetorical — and twice already the
+answer was no. Once because `c` was free (no push for the condition); once because the phi's sources `a`
+and `b` were free (`evalPhis` failed, `runBlock` errored, and `WalkStep`'s catch-all sent `Error` to
+`True`). Both are fixed above, and the theorems below check the consequences on the compiler's actual
+output rather than asserting them. -/
+
+/-- The diamond compiles. -/
+theorem dia_compiles : (generateFnPlan Dia.fn 0 0).isSome = true := by rfl
+
+/-- Its resolved program is 18 instructions. -/
+theorem dia_prog_length : Dia.prog.length = 18 := by rfl
+
+/-- **The entry block pushes the condition**: `JUMPDEST entry ; CALLVALUE ; PUSH then ; JUMPI`. -/
+theorem dia_entry_shape :
+    Dia.prog[0]! = AsmInst.AsmLabel "entry" ∧
+    Dia.prog[1]! = AsmInst.AsmOp "CALLVALUE" ∧
+    Dia.prog[3]! = AsmInst.AsmOp "JUMPI" ∧
+    Dia.prog[5]! = AsmInst.AsmOp "JUMP" := ⟨rfl, rfl, rfl, rfl⟩
+
+/-- **The successor blocks mint the phi's sources and drop them.** `a` and `b` are dead by the time the
+phi runs — a `PHI` does not use its sources — so the compiler emits the definition and pops it, leaving
+the stacks empty. Venom keeps them in `vars`, which is what makes `evalPhis` succeed at the join. -/
+theorem dia_prog_shape :
+    Dia.prog[6]! = AsmInst.AsmLabel "else" ∧
+    Dia.prog[7]! = AsmInst.AsmOp "CALLER" ∧
+    Dia.prog[8]! = AsmInst.AsmOp "POP" ∧
+    Dia.prog[10]! = AsmInst.AsmOp "JUMP" ∧
+    Dia.prog[11]! = AsmInst.AsmLabel "join" ∧
+    Dia.prog[12]! = AsmInst.AsmOp "STOP" ∧
+    Dia.prog[13]! = AsmInst.AsmLabel "then" ∧
+    Dia.prog[14]! = AsmInst.AsmOp "CALLVALUE" ∧
+    Dia.prog[15]! = AsmInst.AsmOp "POP" ∧
+    Dia.prog[17]! = AsmInst.AsmOp "JUMP" :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- The label layout, from the compiler. -/
+theorem dia_o2pc_then : AssocList.lookup Nat Nat Dia.o2pc 19 = some 13 := by rfl
+theorem dia_o2pc_join : AssocList.lookup Nat Nat Dia.o2pc 17 = some 11 := by rfl
+theorem dia_o2pc_else : AssocList.lookup Nat Nat Dia.o2pc 10 = some 6 := by rfl
+theorem dia_lo_then : AssocList.lookup String Nat Dia.lo "then" = some 19 := by rfl
+theorem dia_lo_join : AssocList.lookup String Nat Dia.lo "join" = some 17 := by rfl
+theorem dia_lo_else : AssocList.lookup String Nat Dia.lo "else" = some 10 := by rfl
+
+/-! ### The diamond's asm, block by block
+
+Every one of these runs the compiler's own program — `Dia.prog`, pinned above — and every index into it
+is checked by `rfl` against what the compiler emitted.
+
+The entry block splits, because `CALLVALUE` may be zero and the compiler must handle both: taken jumps
+straight to `then`, not-taken falls through the `JUMPI` into `[PUSH else ; JUMP]`. Four steps versus six,
+which is why the entry block's rank has to dominate both successors and not just the near one. -/
+
+set_option maxRecDepth 8000
+
+/-- One asm step. -/
+private theorem runAsm_one {o2pc prog s s'} (hpc : s.pc < prog.length)
+    (hstep : asmStep o2pc prog s = AsmResult.AsmOK s') :
+    runAsm 1 o2pc prog s = AsmResult.AsmOK s' := by
+  rw [show (1 : Nat) = 0 + 1 from rfl, runAsm_succ_ok hpc hstep]; rfl
+
+/-- `then: a = CALLVALUE ; JMP join` — `JUMPDEST ; CALLVALUE ; POP ; PUSH join ; JUMP`: five asm steps
+from pc 13 to `join` (pc 11). The `POP` is the compiler discarding `a`, which is dead the moment it is
+defined — a `PHI` does not use its sources. -/
+theorem dia_hasm_then {asm : AsmState} (hpc : asm.pc = 13) (hstk : asm.stack = []) :
+    runAsm 5 Dia.o2pc Dia.prog asm = AsmResult.AsmOK { asm with pc := 11 } := by
+  have h1 : asm.pc < Dia.prog.length := by rw [hpc]; decide
+  have hg1 : Dia.prog.get ⟨asm.pc, h1⟩ = AsmInst.AsmLabel "then" := by
+    conv_lhs => rw [show (⟨asm.pc, h1⟩ : Fin Dia.prog.length) = ⟨13, by decide⟩ from Fin.ext hpc]
+    rfl
+  have s1 := runAsm_one (o2pc := Dia.o2pc) h1 (asmStep_label_ok (offsetToPc := Dia.o2pc) h1 hg1)
+  set a1 : AsmState := asmNext asm with ha1
+  have hpc1 : a1.pc = 14 := by show asm.pc + 1 = 14; rw [hpc]
+  have h2 : a1.pc < Dia.prog.length := by rw [hpc1]; decide
+  have hg2 : Dia.prog.get ⟨a1.pc, h2⟩ = AsmInst.AsmOp "CALLVALUE" := by
+    conv_lhs => rw [show (⟨a1.pc, h2⟩ : Fin Dia.prog.length) = ⟨14, by decide⟩ from Fin.ext hpc1]
+    rfl
+  have s2 := runAsm_one (o2pc := Dia.o2pc) h2 (by rw [asmStep_callvalue_ok h2 hg2]; rfl :
+    asmStep Dia.o2pc Dia.prog a1
+      = AsmResult.AsmOK { asmNext a1 with stack := a1.callCtx.callvalue :: a1.stack })
+  set a2 : AsmState := { asmNext a1 with stack := a1.callCtx.callvalue :: a1.stack } with ha2
+  have hpc2 : a2.pc = 15 := by show a1.pc + 1 = 15; rw [hpc1]
+  have h3 : a2.pc < Dia.prog.length := by rw [hpc2]; decide
+  have hg3 : Dia.prog.get ⟨a2.pc, h3⟩ = AsmInst.AsmOp "POP" := by
+    conv_lhs => rw [show (⟨a2.pc, h3⟩ : Fin Dia.prog.length) = ⟨15, by decide⟩ from Fin.ext hpc2]
+    rfl
+  have s3 := runAsm_one (o2pc := Dia.o2pc) h3 (by
+    unfold asmStep; rw [dif_pos h3, hg3]; show asmPop a2 = _; rfl :
+    asmStep Dia.o2pc Dia.prog a2 = AsmResult.AsmOK { asmNext a2 with stack := a1.stack })
+  set a3 : AsmState := { asmNext a2 with stack := a1.stack } with ha3
+  have hpc3 : a3.pc = 16 := by show a2.pc + 1 = 16; rw [hpc2]
+  have h4 : a3.pc < Dia.prog.length := by rw [hpc3]; decide
+  have hg4 : Dia.prog.get ⟨a3.pc, h4⟩ = resolveInst Dia.lo (AsmInst.AsmPushLabel "join") := by
+    conv_lhs => rw [show (⟨a3.pc, h4⟩ : Fin Dia.prog.length) = ⟨16, by decide⟩ from Fin.ext hpc3]
+    rfl
+  have h5 : a3.pc + 1 < Dia.prog.length := by rw [hpc3]; decide
+  have hg5 : Dia.prog.get ⟨a3.pc + 1, h5⟩ = AsmInst.AsmOp "JUMP" := by
+    conv_lhs => rw [show (⟨a3.pc + 1, h5⟩ : Fin Dia.prog.length) = ⟨17, by decide⟩ from
+      Fin.ext (by show a3.pc + 1 = 17; rw [hpc3])]
+    rfl
+  have s4 := resolved_jump_sim h4 hg4 dia_lo_join (by decide) h5 hg5 dia_o2pc_join
+  rw [show (5 : Nat) = 1 + (1 + (1 + 2)) from rfl, runAsm_append_ok s1, runAsm_append_ok s2,
+      runAsm_append_ok s3, s4]
+  cases asm with | _ => simp_all [asmNext, a1, a2, a3]
+
+/-- `else: b = CALLER ; JMP join` — the same shape, five steps from pc 6 to `join` (pc 11). -/
+theorem dia_hasm_else {asm : AsmState} (hpc : asm.pc = 6) (hstk : asm.stack = []) :
+    runAsm 5 Dia.o2pc Dia.prog asm = AsmResult.AsmOK { asm with pc := 11 } := by
+  have h1 : asm.pc < Dia.prog.length := by rw [hpc]; decide
+  have hg1 : Dia.prog.get ⟨asm.pc, h1⟩ = AsmInst.AsmLabel "else" := by
+    conv_lhs => rw [show (⟨asm.pc, h1⟩ : Fin Dia.prog.length) = ⟨6, by decide⟩ from Fin.ext hpc]
+    rfl
+  have s1 := runAsm_one (o2pc := Dia.o2pc) h1 (asmStep_label_ok (offsetToPc := Dia.o2pc) h1 hg1)
+  set a1 : AsmState := asmNext asm with ha1
+  have hpc1 : a1.pc = 7 := by show asm.pc + 1 = 7; rw [hpc]
+  have h2 : a1.pc < Dia.prog.length := by rw [hpc1]; decide
+  have hg2 : Dia.prog.get ⟨a1.pc, h2⟩ = AsmInst.AsmOp "CALLER" := by
+    conv_lhs => rw [show (⟨a1.pc, h2⟩ : Fin Dia.prog.length) = ⟨7, by decide⟩ from Fin.ext hpc1]
+    rfl
+  have s2 := runAsm_one (o2pc := Dia.o2pc) h2 (by rw [asmStep_caller_ok h2 hg2]; rfl :
+    asmStep Dia.o2pc Dia.prog a1
+      = AsmResult.AsmOK { asmNext a1 with stack := addressToWord a1.callCtx.caller :: a1.stack })
+  set a2 : AsmState :=
+    { asmNext a1 with stack := addressToWord a1.callCtx.caller :: a1.stack } with ha2
+  have hpc2 : a2.pc = 8 := by show a1.pc + 1 = 8; rw [hpc1]
+  have h3 : a2.pc < Dia.prog.length := by rw [hpc2]; decide
+  have hg3 : Dia.prog.get ⟨a2.pc, h3⟩ = AsmInst.AsmOp "POP" := by
+    conv_lhs => rw [show (⟨a2.pc, h3⟩ : Fin Dia.prog.length) = ⟨8, by decide⟩ from Fin.ext hpc2]
+    rfl
+  have s3 := runAsm_one (o2pc := Dia.o2pc) h3 (by
+    unfold asmStep; rw [dif_pos h3, hg3]; show asmPop a2 = _; rfl :
+    asmStep Dia.o2pc Dia.prog a2 = AsmResult.AsmOK { asmNext a2 with stack := a1.stack })
+  set a3 : AsmState := { asmNext a2 with stack := a1.stack } with ha3
+  have hpc3 : a3.pc = 9 := by show a2.pc + 1 = 9; rw [hpc2]
+  have h4 : a3.pc < Dia.prog.length := by rw [hpc3]; decide
+  have hg4 : Dia.prog.get ⟨a3.pc, h4⟩ = resolveInst Dia.lo (AsmInst.AsmPushLabel "join") := by
+    conv_lhs => rw [show (⟨a3.pc, h4⟩ : Fin Dia.prog.length) = ⟨9, by decide⟩ from Fin.ext hpc3]
+    rfl
+  have h5 : a3.pc + 1 < Dia.prog.length := by rw [hpc3]; decide
+  have hg5 : Dia.prog.get ⟨a3.pc + 1, h5⟩ = AsmInst.AsmOp "JUMP" := by
+    conv_lhs => rw [show (⟨a3.pc + 1, h5⟩ : Fin Dia.prog.length) = ⟨10, by decide⟩ from
+      Fin.ext (by show a3.pc + 1 = 10; rw [hpc3])]
+    rfl
+  have s4 := resolved_jump_sim h4 hg4 dia_lo_join (by decide) h5 hg5 dia_o2pc_join
+  rw [show (5 : Nat) = 1 + (1 + (1 + 2)) from rfl, runAsm_append_ok s1, runAsm_append_ok s2,
+      runAsm_append_ok s3, s4]
+  cases asm with | _ => simp_all [asmNext, a1, a2, a3]
+
+/-- `join: p = phi(…) ; STOP` — `JUMPDEST join ; STOP` at pc 11. Halts. -/
+theorem dia_hasm_join {asm : AsmState} (hpc : asm.pc = 11) :
+    runAsm 2 Dia.o2pc Dia.prog asm = AsmResult.AsmHalt (asmNext (asmNext asm)) := by
+  have h1 : asm.pc < Dia.prog.length := by rw [hpc]; decide
+  have hg1 : Dia.prog.get ⟨asm.pc, h1⟩ = AsmInst.AsmLabel "join" := by
+    conv_lhs => rw [show (⟨asm.pc, h1⟩ : Fin Dia.prog.length) = ⟨11, by decide⟩ from Fin.ext hpc]
+    rfl
+  rw [show (2 : Nat) = 1 + 1 from rfl, runAsm_succ_ok h1 (asmStep_label_ok h1 hg1)]
+  have h2 : (asmNext asm).pc < Dia.prog.length := by show asm.pc + 1 < _; rw [hpc]; decide
+  have hg2 : Dia.prog.get ⟨(asmNext asm).pc, h2⟩ = AsmInst.AsmOp "STOP" := by
+    conv_lhs => rw [show (⟨(asmNext asm).pc, h2⟩ : Fin Dia.prog.length) = ⟨12, by decide⟩ from
+      Fin.ext (by show asm.pc + 1 = 12; rw [hpc])]
+    rfl
+  exact runAsm_stop 0 h2 hg2
+
+/-- The entry block's prefix: `JUMPDEST entry ; CALLVALUE` at pc 0, pushing the condition. -/
+theorem dia_entry_prefix {asm : AsmState} (hpc : asm.pc = 0) :
+    runAsm 2 Dia.o2pc Dia.prog asm = AsmResult.AsmOK
+      { asm with pc := 2, stack := asm.callCtx.callvalue :: asm.stack } := by
+  have h1 : asm.pc < Dia.prog.length := by rw [hpc]; decide
+  have hg1 : Dia.prog.get ⟨asm.pc, h1⟩ = AsmInst.AsmLabel "entry" := by
+    conv_lhs => rw [show (⟨asm.pc, h1⟩ : Fin Dia.prog.length) = ⟨0, by decide⟩ from Fin.ext hpc]
+    rfl
+  rw [show (2 : Nat) = 1 + 1 from rfl, runAsm_succ_ok h1 (asmStep_label_ok h1 hg1)]
+  have h2 : (asmNext asm).pc < Dia.prog.length := by show asm.pc + 1 < _; rw [hpc]; decide
+  have hg2 : Dia.prog.get ⟨(asmNext asm).pc, h2⟩ = AsmInst.AsmOp "CALLVALUE" := by
+    conv_lhs => rw [show (⟨(asmNext asm).pc, h2⟩ : Fin Dia.prog.length) = ⟨1, by decide⟩ from
+      Fin.ext (by show asm.pc + 1 = 1; rw [hpc])]
+    rfl
+  rw [show (1 : Nat) = 0 + 1 from rfl, runAsm_succ_ok h2 (by
+    rw [asmStep_callvalue_ok h2 hg2]; rfl)]
+  show AsmResult.AsmOK _ = _
+  congr 1
+  cases asm; simp [asmNext] at hpc ⊢; omega
+
+section
+variable {asm : AsmState} {stk : List bytes32}
+
+private theorem pc2_push (h : asm.pc = 2) :
+    Dia.prog.get ⟨asm.pc, by rw [h]; decide⟩
+      = resolveInst Dia.lo (AsmInst.AsmPushLabel "then") := by
+  conv_lhs => rw [show (⟨asm.pc, by rw [h]; decide⟩ : Fin Dia.prog.length) = ⟨2, by decide⟩ from
+    Fin.ext h]
+  rfl
+
+private theorem pc3_jumpi (h : asm.pc = 2) :
+    Dia.prog.get ⟨asm.pc + 1, by rw [h]; decide⟩ = AsmInst.AsmOp "JUMPI" := by
+  conv_lhs => rw [show (⟨asm.pc + 1, by rw [h]; decide⟩ : Fin Dia.prog.length) = ⟨3, by decide⟩ from
+    Fin.ext (by show asm.pc + 1 = 3; rw [h])]
+  rfl
+
+/-- **Entry, JNZ taken** (`CALLVALUE ≠ 0`): from pc 2 the `[PUSH then ; JUMPI]` jumps to `then` (pc 13). -/
+theorem dia_hasm_entry_taken {cond : bytes32}
+    (hpc : asm.pc = 2) (hstack : asm.stack = cond :: stk)
+    (hcond : cond ≠ EvmYul.UInt256.ofNat 0) :
+    runAsm 2 Dia.o2pc Dia.prog asm
+      = AsmResult.AsmOK { asm with stack := stk, pc := 13 } :=
+  resolved_jumpi_taken_sim hstack hcond (by rw [hpc]; decide) (pc2_push hpc)
+    dia_lo_then (by decide) (by rw [hpc]; decide) (pc3_jumpi hpc) dia_o2pc_then
+
+/-- **Entry, JNZ not taken** (`CALLVALUE = 0`): falls through into `[PUSH else ; JUMP]`, landing at
+`else` (pc 6). Four asm steps from pc 2. -/
+theorem dia_hasm_entry_nottaken
+    (hpc : asm.pc = 2) (hstack : asm.stack = EvmYul.UInt256.ofNat 0 :: stk) :
+    runAsm 4 Dia.o2pc Dia.prog asm
+      = AsmResult.AsmOK { asm with stack := stk, pc := 6 } := by
+  have hfall : runAsm 2 Dia.o2pc Dia.prog asm
+      = AsmResult.AsmOK { asm with stack := stk, pc := asm.pc + 2 } :=
+    resolved_jumpi_nottaken_sim hstack (by rw [hpc]; decide) (pc2_push hpc)
+      dia_lo_then (by decide) (by rw [hpc]; decide) (pc3_jumpi hpc)
+  rw [show (4 : Nat) = 2 + 2 from rfl, runAsm_append_ok hfall]
+  set s4 : AsmState := { asm with stack := stk, pc := asm.pc + 2 } with hs4
+  have hs4pc : s4.pc = 4 := by rw [hs4]; show asm.pc + 2 = 4; rw [hpc]
+  have h1 : s4.pc < Dia.prog.length := by rw [hs4pc]; decide
+  have hgp : Dia.prog.get ⟨s4.pc, h1⟩ = resolveInst Dia.lo (AsmInst.AsmPushLabel "else") := by
+    conv_lhs => rw [show (⟨s4.pc, h1⟩ : Fin Dia.prog.length) = ⟨4, by decide⟩ from Fin.ext hs4pc]
+    rfl
+  have h2 : s4.pc + 1 < Dia.prog.length := by rw [hs4pc]; decide
+  have hgj : Dia.prog.get ⟨s4.pc + 1, h2⟩ = AsmInst.AsmOp "JUMP" := by
+    conv_lhs => rw [show (⟨s4.pc + 1, h2⟩ : Fin Dia.prog.length) = ⟨5, by decide⟩ from
+      Fin.ext (by show s4.pc + 1 = 5; rw [hs4pc])]
+    rfl
+  rw [resolved_jump_sim h1 hgp dia_lo_else (by decide) h2 hgj dia_o2pc_else]
+
+end
+
+/-- **The entry block's whole asm run, taken arm.** Four steps, pc 0 to `then` (pc 13). -/
+theorem dia_hasm_entry_taken_full {asm : AsmState}
+    (hpc : asm.pc = 0) (hcond : asm.callCtx.callvalue ≠ EvmYul.UInt256.ofNat 0) :
+    runAsm 4 Dia.o2pc Dia.prog asm = AsmResult.AsmOK { asm with pc := 13 } := by
+  rw [show (4 : Nat) = 2 + 2 from rfl, runAsm_append_ok (dia_entry_prefix hpc)]
+  rw [dia_hasm_entry_taken (stk := asm.stack) (cond := asm.callCtx.callvalue) rfl rfl hcond]
+
+/-- **The entry block's whole asm run, not-taken arm.** Six steps, pc 0 to `else` (pc 6). -/
+theorem dia_hasm_entry_nottaken_full {asm : AsmState}
+    (hpc : asm.pc = 0) (hcond : asm.callCtx.callvalue = EvmYul.UInt256.ofNat 0) :
+    runAsm 6 Dia.o2pc Dia.prog asm = AsmResult.AsmOK { asm with pc := 6 } := by
+  rw [show (6 : Nat) = 2 + 4 from rfl, runAsm_append_ok (dia_entry_prefix hpc)]
+  rw [dia_hasm_entry_nottaken (stk := asm.stack) rfl (by rw [hcond])]
+
+/-! ### The Venom side, and what the relation collapses to
+
+Every plan stack in this function is empty and nothing spills, so `venomAsmRel` collapses to something
+small: an empty asm stack, byte-equal memories, and the ten shared fields. Worth proving as an iff rather
+than unfolding it four times — `memoryRel` with a zero allocator is *not* vacuous, it demands the memories
+agree at every byte, which is easy to miss when the allocator looks empty.
+
+`dia_join_ev_from_then` is the one that matters. It says the join's `evalPhis` **succeeds** on the state
+that actually arrives from `then`. The previous diamond could not have stated it: with `a` undefined,
+`evalPhis` returned `none`, `runBlock` errored, and `WalkStep`'s `Error => True` catch-all discharged the
+join's obligation without the function ever reaching a join. -/
+theorem venomAsmRel_init0_iff {lo : AssocList String Nat} {vs : VenomState} {asm : AsmState} :
+    venomAsmRel lo (initPlanState 0) vs asm ↔
+      (asm.stack = [] ∧ (∀ i, readByte i vs.memory = readByte i asm.memory) ∧
+       asm.accounts = vs.accounts ∧ asm.transient = vs.transient ∧
+       asm.returndata = vs.returndata ∧ asm.logs = vs.logs ∧
+       asm.callCtx = vs.callCtx ∧ asm.txCtx = vs.txCtx ∧ asm.blockCtx = vs.blockCtx ∧
+       asm.code = vs.code ∧ asm.prevHashes = vs.prevHashes) := by
+  constructor
+  · rintro ⟨⟨hlen, _⟩, _, hmem, ha, ht, hr, hl, hc, hx, hb, hcode, hph⟩
+    refine ⟨?_, ?_, ha, ht, hr, hl, hc, hx, hb, hcode, hph⟩
+    · have h0 : asm.stack.length = 0 := by simpa [initPlanState] using hlen.symm
+      exact List.length_eq_zero_iff.mp h0
+    · intro i
+      exact hmem i (by simp [initPlanState, initSpillAlloc])
+  · rintro ⟨hstk, hmem, ha, ht, hr, hl, hc, hx, hb, hcode, hph⟩
+    refine ⟨⟨by simp [initPlanState, hstk], ?_⟩, ?_, ?_, ha, ht, hr, hl, hc, hx, hb, hcode, hph⟩
+    · intro i hi; simp [initPlanState] at hi
+    · intro op off hlk; simp [initPlanState, AssocList.lookup] at hlk
+    · intro i _; exact hmem i
+
+/-- The state after entry's `CALLVALUE`, at the `JNZ`. -/
+def Dia.afterCV (s : VenomState) : VenomState :=
+  { updateVar "c" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 }
+
+theorem dia_entry_run_taken (f : Nat) (ctx : VenomContext) {s : VenomState}
+    (hnh : s.halted = false) (hc : s.callCtx.callvalue ≠ EvmYul.UInt256.ofNat 0) :
+    runBlock (f + 1 + 1) ctx Dia.bEntry s = ExecResult.OK (jumpTo "then" (Dia.afterCV s)) := by
+  rw [runBlock_of_no_phi (by decide)]
+  rw [execBlock_step_nonterm (f + 1) ctx Dia.bEntry { s with instIdx := 0 }
+        (updateVar "c" s.callCtx.callvalue { s with instIdx := 0 }) Dia.dC
+        (by rfl) (by rfl) (by decide)]
+  refine execBlock_step_term_ok f ctx Dia.bEntry (Dia.afterCV s) _ Dia.dJnz (by rfl) ?_
+    (by decide) (by rw [jumpTo]; exact hnh)
+  show stepInstBase Dia.dJnz (Dia.afterCV s) = _
+  unfold stepInstBase
+  simp only [show Dia.dJnz.opcode = Opcode.JNZ from rfl,
+             show Dia.dJnz.operands = [Operand.Var "c", Operand.Label "then", Operand.Label "else"]
+               from rfl]
+  have hcv : evalOperand (Operand.Var "c") (Dia.afterCV s) = some s.callCtx.callvalue := rfl
+  simp only [hcv]
+  split
+  · rfl
+  · rename_i h; exact absurd (bne_iff_ne.mpr hc) h
+
+theorem dia_entry_run_nottaken (f : Nat) (ctx : VenomContext) {s : VenomState}
+    (hnh : s.halted = false) (hc : s.callCtx.callvalue = EvmYul.UInt256.ofNat 0) :
+    runBlock (f + 1 + 1) ctx Dia.bEntry s = ExecResult.OK (jumpTo "else" (Dia.afterCV s)) := by
+  rw [runBlock_of_no_phi (by decide)]
+  rw [execBlock_step_nonterm (f + 1) ctx Dia.bEntry { s with instIdx := 0 }
+        (updateVar "c" s.callCtx.callvalue { s with instIdx := 0 }) Dia.dC
+        (by rfl) (by rfl) (by decide)]
+  refine execBlock_step_term_ok f ctx Dia.bEntry (Dia.afterCV s) _ Dia.dJnz (by rfl) ?_
+    (by decide) (by rw [jumpTo]; exact hnh)
+  show stepInstBase Dia.dJnz (Dia.afterCV s) = _
+  unfold stepInstBase
+  simp only [show Dia.dJnz.opcode = Opcode.JNZ from rfl,
+             show Dia.dJnz.operands = [Operand.Var "c", Operand.Label "then", Operand.Label "else"]
+               from rfl]
+  have hcv : evalOperand (Operand.Var "c") (Dia.afterCV s) = some s.callCtx.callvalue := rfl
+  simp only [hcv]
+  split
+  · rename_i h; exact absurd hc (bne_iff_ne.mp h)
+  · rfl
+
+/-- `then` binds `a`, then jumps. -/
+def Dia.afterA (s : VenomState) : VenomState :=
+  { updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 }
+/-- `else` binds `b`, then jumps. -/
+def Dia.afterB (s : VenomState) : VenomState :=
+  { updateVar "b" (addressToWord s.callCtx.caller) { s with instIdx := 0 } with instIdx := 1 }
+
+theorem dia_then_run (f : Nat) (ctx : VenomContext) {s : VenomState} (hnh : s.halted = false) :
+    runBlock (f + 1 + 1) ctx Dia.bThen s = ExecResult.OK (jumpTo "join" (Dia.afterA s)) := by
+  rw [runBlock_of_no_phi (by decide)]
+  rw [execBlock_step_nonterm (f + 1) ctx Dia.bThen { s with instIdx := 0 }
+        (updateVar "a" s.callCtx.callvalue { s with instIdx := 0 }) Dia.tA
+        (by rfl) (by rfl) (by decide)]
+  exact execBlock_step_term_ok f ctx Dia.bThen (Dia.afterA s) _ Dia.dJmpT (by rfl) (by rfl)
+    (by decide) (by rw [jumpTo]; exact hnh)
+
+theorem dia_else_run (f : Nat) (ctx : VenomContext) {s : VenomState} (hnh : s.halted = false) :
+    runBlock (f + 1 + 1) ctx Dia.bElse s = ExecResult.OK (jumpTo "join" (Dia.afterB s)) := by
+  rw [runBlock_of_no_phi (by decide)]
+  rw [execBlock_step_nonterm (f + 1) ctx Dia.bElse { s with instIdx := 0 }
+        (updateVar "b" (addressToWord s.callCtx.caller) { s with instIdx := 0 }) Dia.eB
+        (by rfl) (by rfl) (by decide)]
+  exact execBlock_step_term_ok f ctx Dia.bElse (Dia.afterB s) _ Dia.dJmpE (by rfl) (by rfl)
+    (by decide) (by rw [jumpTo]; exact hnh)
+
+/-- **The join's `evalPhis` SUCCEEDS on the state that actually arrives from `then`.** This is the
+theorem the previous version of the diamond could not have stated: with `a` undefined, `evalPhis`
+returned `none`, `runBlock` errored, and the join's obligation was discharged by `WalkStep`'s
+`Error => True` catch-all without the function ever reaching a join. -/
+theorem dia_join_ev_from_then {s : VenomState} (hprev : s.prevBb = some "then")
+    (hv : lookupVar "a" s = some s.callCtx.callvalue) :
+    evalPhis s Dia.bJoin.instructions
+      = ExecResult.OK (updateVar "p" s.callCtx.callvalue s) := by
+  show evalPhis s (Dia.dPhi :: [Dia.dStop]) = _
+  unfold evalPhis
+  rw [if_neg (show ¬ (Dia.dPhi.opcode ≠ Opcode.PHI) from fun h => h rfl),
+      evalOnePhi_var (out := "p") (src := "a") (prev := "then") (v := s.callCtx.callvalue)
+        (by rfl) hprev (by rfl) hv]
+  show (match evalPhis s [Dia.dStop] with
+        | ExecResult.OK s' => ExecResult.OK (updateVar "p" s.callCtx.callvalue s') | err => err) = _
+  rw [show evalPhis s [Dia.dStop] = ExecResult.OK s from by
+    unfold evalPhis; rw [if_pos (by decide)]]
+
+/-- **The relation survives any state change this function makes.** No block touches memory, and every
+block is stack-neutral, so the collapsed relation transfers field by field. -/
+theorem dia_rel_transfer {lo : AssocList String Nat} {vs vs' : VenomState} {asm asm' : AsmState}
+    (hrel : venomAsmRel lo (initPlanState 0) vs asm)
+    (hstk : asm'.stack = [])
+    (hamem : asm'.memory = asm.memory)
+    (hvmem : vs'.memory = vs.memory)
+    (hacc : vs'.accounts = vs.accounts) (htr : vs'.transient = vs.transient)
+    (hrd : vs'.returndata = vs.returndata) (hlg : vs'.logs = vs.logs)
+    (hcc : vs'.callCtx = vs.callCtx) (htx : vs'.txCtx = vs.txCtx)
+    (hbc : vs'.blockCtx = vs.blockCtx) (hcd : vs'.code = vs.code)
+    (hph : vs'.prevHashes = vs.prevHashes)
+    (haacc : asm'.accounts = asm.accounts) (hatr : asm'.transient = asm.transient)
+    (hard : asm'.returndata = asm.returndata) (halg : asm'.logs = asm.logs)
+    (hacc2 : asm'.callCtx = asm.callCtx) (hatx : asm'.txCtx = asm.txCtx)
+    (habc : asm'.blockCtx = asm.blockCtx) (hacd : asm'.code = asm.code)
+    (haph : asm'.prevHashes = asm.prevHashes) :
+    venomAsmRel lo (initPlanState 0) vs' asm' := by
+  rw [venomAsmRel_init0_iff] at hrel ⊢
+  obtain ⟨_, hm, ha, ht, hr, hl, hc, hx, hb, hcode, hp⟩ := hrel
+  refine ⟨hstk, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · intro i; rw [hvmem, hamem]; exact hm i
+  · rw [haacc, hacc, ha]
+  · rw [hatr, htr, ht]
+  · rw [hard, hrd, hr]
+  · rw [halg, hlg, hl]
+  · rw [hacc2, hcc, hc]
+  · rw [hatx, htx, hx]
+  · rw [habc, hbc, hb]
+  · rw [hacd, hcd, hcode]
+  · rw [haph, hph, hp]
+
+/-! ### The diamond's five hsteps
+
+`pcOf`, `psOf` and `wOf` are read off the compiler's own layout, not chosen to make the proofs work:
+`pcOf` is where each label lands, `psOf` is `initPlanState 0` because every exit stack is empty, and `wOf`
+is forced by the asm lengths. The entry block's rank has to be 13 rather than 11 precisely because the
+not-taken arm is six asm steps and the taken arm is four — a rank that only accounted for the near
+successor would not have survived `hwdec`.
+
+`dia_hstep_join` is the one that could not have been written before this arc. It is a **phi-headed block,
+in a real function, at the real program**, producing the walk's per-block obligation — and its `evalPhis`
+input is discharged, not assumed. -/
+namespace Dia
+def ctx : VenomContext := { functions := [fn], entry := some "main" }
+def pcOf : String → Nat := fun l =>
+  if l = "then" then 13 else if l = "join" then 11 else if l = "else" then 6 else 0
+def psOf : String → PlanState := fun _ => initPlanState 0
+def wOf : String → Nat := fun l =>
+  if l = "join" then 2 else if l = "then" then 7 else if l = "else" then 7 else 13
+end Dia
+
+/-- The join halts at any budget the walk can hand it. -/
+theorem dia_hasm_join_gen {asm : AsmState} {N : Nat} (hpc : asm.pc = 11) (hN : 2 ≤ N) :
+    runAsm N Dia.o2pc Dia.prog asm = AsmResult.AsmHalt (asmNext (asmNext asm)) := by
+  obtain ⟨k, rfl⟩ : ∃ k, N = k + 2 := ⟨N - 2, by omega⟩
+  have h1 : asm.pc < Dia.prog.length := by rw [hpc]; decide
+  have hg1 : Dia.prog.get ⟨asm.pc, h1⟩ = AsmInst.AsmLabel "join" := by
+    conv_lhs => rw [show (⟨asm.pc, h1⟩ : Fin Dia.prog.length) = ⟨11, by decide⟩ from Fin.ext hpc]
+    rfl
+  rw [show (k + 2 : Nat) = (k + 1) + 1 from rfl,
+      runAsm_succ_ok h1 (asmStep_label_ok (offsetToPc := Dia.o2pc) h1 hg1)]
+  have h2 : (asmNext asm).pc < Dia.prog.length := by show asm.pc + 1 < _; rw [hpc]; decide
+  have hg2 : Dia.prog.get ⟨(asmNext asm).pc, h2⟩ = AsmInst.AsmOp "STOP" := by
+    conv_lhs => rw [show (⟨(asmNext asm).pc, h2⟩ : Fin Dia.prog.length) = ⟨12, by decide⟩ from
+      Fin.ext (by show asm.pc + 1 = 12; rw [hpc])]
+    rfl
+  exact runAsm_stop k h2 hg2
+
+/-- **The join's hstep** — a phi-headed block, in a real function, at the real program. -/
+theorem dia_hstep_join {s : VenomState} {asm : AsmState} {N f : Nat}
+    (hpc : asm.pc = Dia.pcOf Dia.bJoin.label)
+    (hrel : venomAsmRel Dia.lo (Dia.psOf Dia.bJoin.label) s asm)
+    (hw : Dia.wOf Dia.bJoin.label ≤ N)
+    (hprev : s.prevBb = some "then")
+    (hv : lookupVar "a" s = some s.callCtx.callvalue) :
+    WalkStep Dia.fn Dia.pcOf Dia.psOf Dia.wOf Dia.lo Dia.o2pc Dia.prog Dia.bJoin asm N
+      (runBlock (f + 1) Dia.ctx Dia.bJoin s) := by
+  have hN : 2 ≤ N := by have : Dia.wOf Dia.bJoin.label = 2 := rfl; omega
+  obtain ⟨_, hm, ha, ht, hr, hl, hc, hx, hb, hcd, hph⟩ := venomAsmRel_init0_iff.mp hrel
+  refine hstep_bareTerm_halt_join (phis := [Dia.dPhi]) (term := Dia.dStop)
+    Dia.pcOf Dia.psOf Dia.wOf (dia_join_ev_from_then hprev hv) rfl
+    (by intro i hi; simp only [List.mem_singleton] at hi; subst hi; rfl) (by decide) rfl
+    ⟨asmNext (asmNext asm), dia_hasm_join_gen (hpc := hpc) hN, ?_⟩
+  exact ⟨ha, ht, hr, hl⟩
+
+private theorem stk_nil {s asm} (hrel : venomAsmRel Dia.lo (initPlanState 0) s asm) :
+    asm.stack = [] := (venomAsmRel_init0_iff.mp hrel).1
+
+/-- **`then`'s hstep**: `a = CALLVALUE ; JMP join`, five asm steps, rank 7 → 2. -/
+theorem dia_hstep_then {s : VenomState} {asm : AsmState} {N f : Nat}
+    (hpc : asm.pc = Dia.pcOf Dia.bThen.label)
+    (hrel : venomAsmRel Dia.lo (Dia.psOf Dia.bThen.label) s asm)
+    (hw : Dia.wOf Dia.bThen.label ≤ N) (hnh : s.halted = false) :
+    WalkStep Dia.fn Dia.pcOf Dia.psOf Dia.wOf Dia.lo Dia.o2pc Dia.prog Dia.bThen asm N
+      (runBlock (f + 1 + 1) Dia.ctx Dia.bThen s) :=
+  hstep_jmp_block_ws Dia.pcOf Dia.psOf Dia.wOf (bb' := Dia.bJoin) (blockLen := 5) (idx := 11)
+    (hrb := dia_then_run f Dia.ctx hnh)
+    (hnh := by rw [jumpTo]; exact hnh)
+    (hrun := dia_hasm_then hpc (stk_nil hrel))
+    (hrel := dia_rel_transfer (vs := s) (asm := asm) hrel (stk_nil hrel)
+      rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl)
+    (hstk := rfl) (hsp := rfl) (hfe := rfl) (hno := le_refl _)
+    (hpcidx := rfl) (hle := by have : Dia.wOf Dia.bThen.label = 7 := rfl; omega)
+    (hidx := rfl) (hlk' := rfl) (hwdec := by decide)
+
+/-- **`else`'s hstep**: `b = CALLER ; JMP join`, five asm steps, rank 7 → 2. -/
+theorem dia_hstep_else {s : VenomState} {asm : AsmState} {N f : Nat}
+    (hpc : asm.pc = Dia.pcOf Dia.bElse.label)
+    (hrel : venomAsmRel Dia.lo (Dia.psOf Dia.bElse.label) s asm)
+    (hw : Dia.wOf Dia.bElse.label ≤ N) (hnh : s.halted = false) :
+    WalkStep Dia.fn Dia.pcOf Dia.psOf Dia.wOf Dia.lo Dia.o2pc Dia.prog Dia.bElse asm N
+      (runBlock (f + 1 + 1) Dia.ctx Dia.bElse s) :=
+  hstep_jmp_block_ws Dia.pcOf Dia.psOf Dia.wOf (bb' := Dia.bJoin) (blockLen := 5) (idx := 11)
+    (hrb := dia_else_run f Dia.ctx hnh)
+    (hnh := by rw [jumpTo]; exact hnh)
+    (hrun := dia_hasm_else hpc (stk_nil hrel))
+    (hrel := dia_rel_transfer (vs := s) (asm := asm) hrel (stk_nil hrel)
+      rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl)
+    (hstk := rfl) (hsp := rfl) (hfe := rfl) (hno := le_refl _)
+    (hpcidx := rfl) (hle := by have : Dia.wOf Dia.bElse.label = 7 := rfl; omega)
+    (hidx := rfl) (hlk' := rfl) (hwdec := by decide)
+
+/-- **entry's hstep, taken arm** (`CALLVALUE ≠ 0`): four asm steps, rank 13 → 7. -/
+theorem dia_hstep_entry_taken {s : VenomState} {asm : AsmState} {N f : Nat}
+    (hpc : asm.pc = Dia.pcOf Dia.bEntry.label)
+    (hrel : venomAsmRel Dia.lo (Dia.psOf Dia.bEntry.label) s asm)
+    (hw : Dia.wOf Dia.bEntry.label ≤ N) (hnh : s.halted = false)
+    (hc : s.callCtx.callvalue ≠ EvmYul.UInt256.ofNat 0) :
+    WalkStep Dia.fn Dia.pcOf Dia.psOf Dia.wOf Dia.lo Dia.o2pc Dia.prog Dia.bEntry asm N
+      (runBlock (f + 1 + 1) Dia.ctx Dia.bEntry s) :=
+  hstep_jmp_block_ws Dia.pcOf Dia.psOf Dia.wOf (bb' := Dia.bThen) (blockLen := 4) (idx := 13)
+    (hrb := dia_entry_run_taken f Dia.ctx hnh hc)
+    (hnh := by rw [jumpTo]; exact hnh)
+    (hrun := dia_hasm_entry_taken_full hpc
+      (by rw [(venomAsmRel_init0_iff.mp hrel).2.2.2.2.2.2.1]; exact hc))
+    (hrel := dia_rel_transfer (vs := s) (asm := asm) hrel (stk_nil hrel)
+      rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl)
+    (hstk := rfl) (hsp := rfl) (hfe := rfl) (hno := le_refl _)
+    (hpcidx := rfl) (hle := by have : Dia.wOf Dia.bEntry.label = 13 := rfl; omega)
+    (hidx := rfl) (hlk' := rfl) (hwdec := by decide)
+
+/-- **entry's hstep, not-taken arm** (`CALLVALUE = 0`): SIX asm steps, rank 13 → 7. The longer arm is
+what forces `wOf entry = 13`: the near successor alone would have allowed 11. -/
+theorem dia_hstep_entry_nottaken {s : VenomState} {asm : AsmState} {N f : Nat}
+    (hpc : asm.pc = Dia.pcOf Dia.bEntry.label)
+    (hrel : venomAsmRel Dia.lo (Dia.psOf Dia.bEntry.label) s asm)
+    (hw : Dia.wOf Dia.bEntry.label ≤ N) (hnh : s.halted = false)
+    (hc : s.callCtx.callvalue = EvmYul.UInt256.ofNat 0) :
+    WalkStep Dia.fn Dia.pcOf Dia.psOf Dia.wOf Dia.lo Dia.o2pc Dia.prog Dia.bEntry asm N
+      (runBlock (f + 1 + 1) Dia.ctx Dia.bEntry s) :=
+  hstep_jmp_block_ws Dia.pcOf Dia.psOf Dia.wOf (bb' := Dia.bElse) (blockLen := 6) (idx := 6)
+    (hrb := dia_entry_run_nottaken f Dia.ctx hnh hc)
+    (hnh := by rw [jumpTo]; exact hnh)
+    (hrun := dia_hasm_entry_nottaken_full hpc
+      (by rw [(venomAsmRel_init0_iff.mp hrel).2.2.2.2.2.2.1]; exact hc))
+    (hrel := dia_rel_transfer (vs := s) (asm := asm) hrel (stk_nil hrel)
+      rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl)
+    (hstk := rfl) (hsp := rfl) (hfe := rfl) (hno := le_refl _)
+    (hpcidx := rfl) (hle := by have : Dia.wOf Dia.bEntry.label = 13 := rfl; omega)
+    (hidx := rfl) (hlk' := rfl) (hwdec := by decide)
+
+/-! ### The whole function
+
+The driver needs an invariant, because `venomAsmRel` cannot carry what the join needs. `Dia.Inv` is that
+invariant: at the join — and only there — it records which predecessor the walk arrived from and that
+that predecessor's phi source is bound. The compiler popped those variables, so the stack has no witness
+for them; this is the fact the relation deliberately forgets. -/
+/-- `WalkStep` upgrades to `WalkStepInv` once the invariant holds at the successor. -/
+theorem WalkStepInv_of_WalkStep {Inv fn pcOf psOf wOf lo o2pc prog bb asm N} {r : ExecResult}
+    (h : WalkStep fn pcOf psOf wOf lo o2pc prog bb asm N r)
+    (hinv : ∀ s', r = ExecResult.OK s' → Inv s') :
+    WalkStepInv Inv fn pcOf psOf wOf lo o2pc prog bb asm N r := by
+  cases r with
+  | OK s' =>
+    by_cases hh : s'.halted
+    · simpa only [WalkStep, WalkStepInv, hh, if_true] using h
+    · simp only [WalkStep, hh, Bool.false_eq_true, if_false] at h
+      simp only [WalkStepInv, hh, Bool.false_eq_true, if_false]
+      obtain ⟨bb'', asm'', bl, h1, h2, h3, h4, h5, h6⟩ := h
+      exact ⟨bb'', asm'', bl, h1, h2, h3, h4, h5, h6, hinv s' rfl⟩
+  | Halt _ => exact h
+  | Abort a _ => cases a <;> exact h
+  | IntRet _ _ => trivial
+  | Error _ => trivial
+
+/-- The join's `evalPhis` on the arrival from `else`. -/
+theorem dia_join_ev_from_else {s : VenomState} (hprev : s.prevBb = some "else")
+    (hv : lookupVar "b" s = some (addressToWord s.callCtx.caller)) :
+    evalPhis s Dia.bJoin.instructions
+      = ExecResult.OK (updateVar "p" (addressToWord s.callCtx.caller) s) := by
+  show evalPhis s (Dia.dPhi :: [Dia.dStop]) = _
+  unfold evalPhis
+  rw [if_neg (show ¬ (Dia.dPhi.opcode ≠ Opcode.PHI) from fun h => h rfl),
+      evalOnePhi_var (out := "p") (src := "b") (prev := "else")
+        (v := addressToWord s.callCtx.caller) (by rfl) hprev (by rfl) hv]
+  show (match evalPhis s [Dia.dStop] with
+        | ExecResult.OK s' =>
+            ExecResult.OK (updateVar "p" (addressToWord s.callCtx.caller) s') | err => err) = _
+  rw [show evalPhis s [Dia.dStop] = ExecResult.OK s from by
+    unfold evalPhis; rw [if_pos (by decide)]]
+
+/-- **The walk invariant.** At the join — and only there — it records which predecessor the walk arrived
+from and that that predecessor's phi source is bound. This is the fact `venomAsmRel` cannot carry: the
+compiler popped the variable, so the stack has no witness for it. -/
+def Dia.Inv (s : VenomState) : Prop :=
+  s.currentBb = "join" →
+    (s.prevBb = some "then" ∧ lookupVar "a" s = some s.callCtx.callvalue) ∨
+    (s.prevBb = some "else" ∧ lookupVar "b" s = some (addressToWord s.callCtx.caller))
+
+/-- The join's hstep, given *any* successful `evalPhis` whose result shares the observable fields. -/
+theorem dia_hstep_join_gen {s vs' : VenomState} {asm : AsmState} {N f : Nat}
+    (hpc : asm.pc = Dia.pcOf Dia.bJoin.label)
+    (hrel : venomAsmRel Dia.lo (Dia.psOf Dia.bJoin.label) s asm)
+    (hw : Dia.wOf Dia.bJoin.label ≤ N)
+    (hev : evalPhis s Dia.bJoin.instructions = ExecResult.OK vs')
+    (hacc : vs'.accounts = s.accounts) (htr : vs'.transient = s.transient)
+    (hrd : vs'.returndata = s.returndata) (hlg : vs'.logs = s.logs) :
+    WalkStep Dia.fn Dia.pcOf Dia.psOf Dia.wOf Dia.lo Dia.o2pc Dia.prog Dia.bJoin asm N
+      (runBlock (f + 1) Dia.ctx Dia.bJoin s) := by
+  have hN : 2 ≤ N := by have : Dia.wOf Dia.bJoin.label = 2 := rfl; omega
+  obtain ⟨_, _, ha, ht, hr, hl, _, _, _, _, _⟩ := venomAsmRel_init0_iff.mp hrel
+  refine hstep_bareTerm_halt_join (phis := [Dia.dPhi]) (term := Dia.dStop)
+    Dia.pcOf Dia.psOf Dia.wOf hev rfl
+    (by intro i hi; simp only [List.mem_singleton] at hi; subst hi; rfl) (by decide) rfl
+    ⟨asmNext (asmNext asm), dia_hasm_join_gen (hpc := hpc) hN, ?_⟩
+  exact ⟨by show asm.accounts = _; rw [hacc]; exact ha,
+         by show asm.transient = _; rw [htr]; exact ht,
+         by show asm.returndata = _; rw [hrd]; exact hr,
+         by show asm.logs = _; rw [hlg]; exact hl⟩
+
+/-- **The join's hstep, from the invariant** — either predecessor. -/
+theorem dia_hstep_join_inv {s : VenomState} {asm : AsmState} {N f : Nat}
+    (hpc : asm.pc = Dia.pcOf Dia.bJoin.label)
+    (hrel : venomAsmRel Dia.lo (Dia.psOf Dia.bJoin.label) s asm)
+    (hw : Dia.wOf Dia.bJoin.label ≤ N)
+    (hcur : s.currentBb = "join") (hinv : Dia.Inv s) :
+    WalkStep Dia.fn Dia.pcOf Dia.psOf Dia.wOf Dia.lo Dia.o2pc Dia.prog Dia.bJoin asm N
+      (runBlock (f + 1) Dia.ctx Dia.bJoin s) := by
+  rcases hinv hcur with ⟨hprev, hv⟩ | ⟨hprev, hv⟩
+  · exact dia_hstep_join_gen hpc hrel hw (dia_join_ev_from_then hprev hv) rfl rfl rfl rfl
+  · exact dia_hstep_join_gen hpc hrel hw (dia_join_ev_from_else hprev hv) rfl rfl rfl rfl
+
+/-- **`then` re-establishes the invariant at the join**: it binds `a`, and the jump records `then` as the
+predecessor. -/
+theorem dia_inv_then {s : VenomState} (hcur : s.currentBb = "then") :
+    Dia.Inv (jumpTo "join" (Dia.afterA s)) := by
+  intro _
+  left
+  refine ⟨?_, rfl⟩
+  show some (Dia.afterA s).currentBb = some "then"
+  rw [show (Dia.afterA s).currentBb = s.currentBb from rfl, hcur]
+
+/-- **`else` re-establishes it too**, via `b`. -/
+theorem dia_inv_else {s : VenomState} (hcur : s.currentBb = "else") :
+    Dia.Inv (jumpTo "join" (Dia.afterB s)) := by
+  intro _
+  right
+  refine ⟨?_, rfl⟩
+  show some (Dia.afterB s).currentBb = some "else"
+  rw [show (Dia.afterB s).currentBb = s.currentBb from rfl, hcur]
+
+/-- Entry's successors are `then` and `else`, never the join, so the invariant is vacuous there. -/
+theorem dia_inv_entry_taken {s : VenomState} : Dia.Inv (jumpTo "then" (Dia.afterCV s)) := by
+  intro h
+  exact absurd (show "then" = "join" from h) (by decide)
+theorem dia_inv_entry_nottaken {s : VenomState} : Dia.Inv (jumpTo "else" (Dia.afterCV s)) := by
+  intro h
+  exact absurd (show "else" = "join" from h) (by decide)
+
+/-- Blocks of the diamond, by label. -/
+theorem dia_lookup {s : VenomState} {bb : BasicBlock}
+    (hlk : lookupBlock s.currentBb Dia.fn.blocks = some bb) :
+    (s.currentBb = "entry" ∧ bb = Dia.bEntry) ∨ (s.currentBb = "then" ∧ bb = Dia.bThen) ∨
+    (s.currentBb = "else" ∧ bb = Dia.bElse) ∨ (s.currentBb = "join" ∧ bb = Dia.bJoin) := by
+  rw [show Dia.fn.blocks = [Dia.bEntry, Dia.bThen, Dia.bElse, Dia.bJoin] from rfl,
+      lookupBlock] at hlk
+  have hmem := List.mem_of_find?_eq_some hlk
+  have hlab := List.find?_some hlk
+  simp only [List.mem_cons, List.not_mem_nil, or_false] at hmem
+  rcases hmem with rfl | rfl | rfl | rfl
+  · exact Or.inl ⟨(eq_of_beq hlab).symm, rfl⟩
+  · exact Or.inr (Or.inl ⟨(eq_of_beq hlab).symm, rfl⟩)
+  · exact Or.inr (Or.inr (Or.inl ⟨(eq_of_beq hlab).symm, rfl⟩))
+  · exact Or.inr (Or.inr (Or.inr ⟨(eq_of_beq hlab).symm, rfl⟩))
+
+/-- Out of fuel on a phi-free block: `execBlock 0` errors, and `WalkStepInv` sends `Error` to `True`. -/
+private theorem wsi_zero_nophi {Inv bb s asm N}
+    (h : ∀ i, bb.instructions.head? = some i → i.opcode ≠ Opcode.PHI) :
+    WalkStepInv Inv Dia.fn Dia.pcOf Dia.psOf Dia.wOf Dia.lo Dia.o2pc Dia.prog bb asm N
+      (runBlock 0 Dia.ctx bb s) := by
+  rw [runBlock_of_no_phi h]
+  simp only [WalkStepInv, execBlock]
+
+/-- Out of fuel at a join whose phis do evaluate. -/
+private theorem wsi_zero_join {Inv s asm N vs'}
+    (hev : evalPhis s Dia.bJoin.instructions = ExecResult.OK vs') :
+    WalkStepInv Inv Dia.fn Dia.pcOf Dia.psOf Dia.wOf Dia.lo Dia.o2pc Dia.prog Dia.bJoin asm N
+      (runBlock 0 Dia.ctx Dia.bJoin s) := by
+  rw [runBlock_eq_execBlock_of_phis hev]
+  simp only [WalkStepInv, execBlock]
+
+/-- **The diamond's `hstep`, for every block.** -/
+theorem dia_hstep_all :
+    ∀ (bb : BasicBlock) (s : VenomState) (asm : AsmState) (N f' : Nat),
+      lookupBlock s.currentBb Dia.fn.blocks = some bb →
+      asm.pc = Dia.pcOf bb.label →
+      venomAsmRel Dia.lo (Dia.psOf bb.label) s asm →
+      Dia.wOf bb.label ≤ N →
+      s.halted = false →
+      Dia.Inv s →
+      WalkStepInv Dia.Inv Dia.fn Dia.pcOf Dia.psOf Dia.wOf Dia.lo Dia.o2pc Dia.prog bb asm N
+        (runBlock f' Dia.ctx bb s) := by
+  intro bb s asm N f' hlk hpc hrel hw hnh hinv
+  rcases dia_lookup hlk with ⟨hcur, rfl⟩ | ⟨hcur, rfl⟩ | ⟨hcur, rfl⟩ | ⟨hcur, rfl⟩
+  -- entry
+  · match f' with
+    | 0 => exact wsi_zero_nophi (by decide)
+    | 1 =>
+      rw [runBlock_of_no_phi (by decide)]
+      simp only [WalkStepInv, execBlock]
+      trivial
+    | (k + 1 + 1) =>
+      by_cases hc : s.callCtx.callvalue = EvmYul.UInt256.ofNat 0
+      · refine WalkStepInv_of_WalkStep (dia_hstep_entry_nottaken hpc hrel hw hnh hc) ?_
+        intro s' hs'
+        rw [dia_entry_run_nottaken k Dia.ctx hnh hc] at hs'
+        injection hs' with h; subst h
+        exact dia_inv_entry_nottaken
+      · refine WalkStepInv_of_WalkStep (dia_hstep_entry_taken hpc hrel hw hnh hc) ?_
+        intro s' hs'
+        rw [dia_entry_run_taken k Dia.ctx hnh hc] at hs'
+        injection hs' with h; subst h
+        exact dia_inv_entry_taken
+  -- then
+  · match f' with
+    | 0 => exact wsi_zero_nophi (by decide)
+    | 1 =>
+      rw [runBlock_of_no_phi (by decide)]
+      simp only [WalkStepInv, execBlock]
+      trivial
+    | (k + 1 + 1) =>
+      refine WalkStepInv_of_WalkStep (dia_hstep_then hpc hrel hw hnh) ?_
+      intro s' hs'
+      rw [dia_then_run k Dia.ctx hnh] at hs'
+      injection hs' with h; subst h
+      exact dia_inv_then hcur
+  -- else
+  · match f' with
+    | 0 => exact wsi_zero_nophi (by decide)
+    | 1 =>
+      rw [runBlock_of_no_phi (by decide)]
+      simp only [WalkStepInv, execBlock]
+      trivial
+    | (k + 1 + 1) =>
+      refine WalkStepInv_of_WalkStep (dia_hstep_else hpc hrel hw hnh) ?_
+      intro s' hs'
+      rw [dia_else_run k Dia.ctx hnh] at hs'
+      injection hs' with h; subst h
+      exact dia_inv_else hcur
+  -- join
+  · match f' with
+    | 0 =>
+      rcases hinv hcur with ⟨hprev, hv⟩ | ⟨hprev, hv⟩
+      · exact wsi_zero_join (dia_join_ev_from_then hprev hv)
+      · exact wsi_zero_join (dia_join_ev_from_else hprev hv)
+    | (k + 1) =>
+      refine WalkStepInv_of_WalkStep (dia_hstep_join_inv hpc hrel hw hcur hinv) ?_
+      intro s' hs'
+      exfalso
+      rcases hinv hcur with ⟨hprev, hv⟩ | ⟨hprev, hv⟩
+      · rw [runBlock_join_eq_execBlock_at (phis := [Dia.dPhi]) (term := Dia.dStop)
+              (dia_join_ev_from_then hprev hv) rfl
+              (by intro i hi; simp only [List.mem_singleton] at hi; subst hi; rfl) (by decide),
+            execBlock_step_halt k Dia.ctx Dia.bJoin _ _ Dia.dStop (by rfl) rfl] at hs'
+        exact absurd hs' (by simp)
+      · rw [runBlock_join_eq_execBlock_at (phis := [Dia.dPhi]) (term := Dia.dStop)
+              (dia_join_ev_from_else hprev hv) rfl
+              (by intro i hi; simp only [List.mem_singleton] at hi; subst hi; rfl) (by decide),
+            execBlock_step_halt k Dia.ctx Dia.bJoin _ _ Dia.dStop (by rfl) rfl] at hs'
+        exact absurd hs' (by simp)
+
+/-- **CAPSTONE — codegen correctness for a function containing a phi join.**
+
+`Dia.fn` compiles to the eighteen instructions pinned above, and this says that running it as Venom and
+running that program as EVM agree: halt for halt, revert for revert, fault for fault, with
+`finalStateRel` on the observable state.
+
+Every input is discharged. `dia_hstep_all` covers all four blocks — entry on both `CALLVALUE` arms, the
+two `JMP join` blocks, and the join whose head is a `PHI` — at every fuel, against the real compiled
+program. The join's `evalPhis` is *proved* to succeed from either predecessor, which is the thing that
+was vacuous two turns ago and structurally unstatable before that. The only hypotheses left are about the
+starting configuration: the machine has not halted, the pc is at the entry, and the relation holds.
+
+The invariant is the interesting hypothesis, and it is not a technicality. `venomAsmRel` cannot tell you
+which predecessor a join was entered from, nor that the phi's source is bound — the compiler pops those
+variables, because a phi does not *use* its sources. So the walk has to carry that fact itself, and
+`Dia.Inv` is exactly the fact the stack refuses to carry. -/
+theorem dia_codegen_correct {fuel : Nat} {vs : VenomState} {as : AsmState}
+    (hvshalt : vs.halted = false)
+    (hpc0 : as.pc = 0)
+    (hrel : venomAsmRel Dia.lo (initPlanState 0)
+        { vs with prevBb := none, currentBb := "entry", instIdx := 0 } as) :
+    (match runContext fuel Dia.ctx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm Dia.prog.length Dia.o2pc Dia.prog as
+         = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm Dia.prog.length Dia.o2pc Dia.prog as
+         = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm Dia.prog.length Dia.o2pc Dia.prog as
+         = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) :=
+  codegen_correct_sched_inv (fuel := fuel) (ctx := Dia.ctx) (fn := Dia.fn)
+    (fnEom := 0) (lblCtr := 0) (ops := Dia.ops) (psFinal := (generateFnPlan Dia.fn 0 0).get!.2)
+    (entryName := "main") (entryLbl := "entry") (lo := Dia.lo)
+    Dia.Inv rfl rfl rfl rfl Dia.pcOf Dia.psOf Dia.wOf dia_hstep_all
+    Dia.bEntry rfl hpc0 (by decide) hvshalt hrel
+    (by intro h; exact absurd (show "entry" = "join" from h) (by decide))
+
+/-! ### Is the capstone vacuous?
+
+`dia_codegen_correct`'s conclusion is a match on `runContext`, and its last arm is `_ => True`. So if the
+function never actually ran — if it errored out, or never reached the join — the theorem would be
+perfectly true and say nothing whatsoever. This branch has already shipped three witnesses that were
+vacuous in exactly that way, so the question gets an answer rather than an assumption.
+
+It runs. From `CALLVALUE = 7` it takes the `JNZ`, passes through `then`, enters the join *from* `then`,
+the phi binds `p` to the 7 that `a` carried, and it halts. `runContext` does not reduce in the kernel
+(`execBlock` is well-founded), so `dia_runs` proves the three-block walk step by step from the block
+lemmas rather than computing it. -/
+namespace Dia
+/-- A concrete start: `CALLVALUE = 7`, so the `JNZ` is taken and the join is entered from `then`. -/
+def vs0 : VenomState := { (default : VenomState) with
+  callCtx := { (default : CallContext) with callvalue := EvmYul.UInt256.ofNat 7 } }
+def as0 : AsmState := { (default : AsmState) with
+  callCtx := { (default : CallContext) with callvalue := EvmYul.UInt256.ofNat 7 } }
+/-- The state the walk starts from. -/
+def s0 : VenomState := { vs0 with prevBb := none, currentBb := "entry", instIdx := 0 }
+end Dia
+
+/-- **The function really runs, and really goes through the phi.** Three blocks, then a halt at the
+join — entered from `then`, with the phi's output `p` bound to the value `a` carried. -/
+theorem dia_runs :
+    runContext 20 Dia.ctx Dia.vs0
+      = ExecResult.Halt (haltState
+          { (updateVar "p" (EvmYul.UInt256.ofNat 7)
+              (jumpTo "join" (Dia.afterA (jumpTo "then" (Dia.afterCV Dia.s0))))) with instIdx := 1 }) := by
+  show runFunction 20 Dia.ctx Dia.fn { Dia.vs0 with prevBb := none } = _
+  rw [runFunction]
+  show runBlocks 20 Dia.ctx Dia.fn Dia.s0 = _
+  -- entry block: CALLVALUE = 7 ≠ 0, so the JNZ is taken
+  set s1 : VenomState := jumpTo "then" (Dia.afterCV Dia.s0) with hs1
+  have he : runBlock 19 Dia.ctx Dia.bEntry Dia.s0 = ExecResult.OK s1 :=
+    dia_entry_run_taken 17 Dia.ctx (by rfl) (by decide)
+  rw [runBlocks, show lookupBlock Dia.s0.currentBb Dia.fn.blocks = some Dia.bEntry from rfl]
+  dsimp only
+  rw [he]
+  dsimp only
+  rw [if_neg (by rw [hs1]; exact (by decide : ¬ (jumpTo "then" (Dia.afterCV Dia.s0)).halted = true))]
+  -- then block: binds a, jumps to join
+  set s2 : VenomState := jumpTo "join" (Dia.afterA s1) with hs2
+  have ht : runBlock 18 Dia.ctx Dia.bThen s1 = ExecResult.OK s2 :=
+    dia_then_run 16 Dia.ctx (by rw [hs1]; rfl)
+  rw [runBlocks, show lookupBlock s1.currentBb Dia.fn.blocks = some Dia.bThen from rfl]
+  dsimp only
+  rw [ht]
+  dsimp only
+  rw [if_neg (by rw [hs2]; exact (by decide : ¬ (jumpTo "join" (Dia.afterA s1)).halted = true))]
+  -- join block: the phi binds p, then STOP
+  have hev : evalPhis s2 Dia.bJoin.instructions
+      = ExecResult.OK (updateVar "p" (EvmYul.UInt256.ofNat 7) s2) :=
+    dia_join_ev_from_then (by rw [hs2]; rfl) (by rw [hs2]; rfl)
+  have hj : runBlock 17 Dia.ctx Dia.bJoin s2
+      = ExecResult.Halt (haltState
+          { (updateVar "p" (EvmYul.UInt256.ofNat 7) s2) with instIdx := 1 }) := by
+    rw [runBlock_join_eq_execBlock_at (phis := [Dia.dPhi]) (term := Dia.dStop) hev rfl
+          (by intro i hi; simp only [List.mem_singleton] at hi; subst hi; rfl) (by decide)]
+    exact execBlock_step_halt 16 Dia.ctx Dia.bJoin _ _ Dia.dStop (by rfl) rfl
+  rw [runBlocks, show lookupBlock s2.currentBb Dia.fn.blocks = some Dia.bJoin from rfl]
+  dsimp only
+  rw [hj]
+
+/-- The relation holds at the start: empty stacks, empty memories, matching contexts. -/
+theorem dia_rel0 : venomAsmRel Dia.lo (initPlanState 0) Dia.s0 Dia.as0 := by
+  rw [venomAsmRel_init0_iff]
+  refine ⟨rfl, ?_, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  intro i; rfl
+
+/-- **The capstone is not vacuous.** `dia_codegen_correct`'s conclusion is a match on `runContext`, so it
+would say nothing at all if the function never ran. It runs: from `CALLVALUE = 7` it takes the `JNZ`,
+passes through `then`, enters the join from `then`, binds the phi, and halts. Feeding that to the capstone
+yields a *concrete* EVM halt, related to the Venom halt state.
+
+Every hypothesis of `dia_codegen_correct` is discharged here — nothing is left assumed. -/
+theorem dia_codegen_correct_fires :
+    ∃ as', runAsm Dia.prog.length Dia.o2pc Dia.prog Dia.as0 = AsmResult.AsmHalt as' ∧
+      finalStateRel (haltState
+        { (updateVar "p" (EvmYul.UInt256.ofNat 7)
+            (jumpTo "join" (Dia.afterA (jumpTo "then" (Dia.afterCV Dia.s0))))) with instIdx := 1 }) as' := by
+  have h := dia_codegen_correct (fuel := 20) (vs := Dia.vs0) (as := Dia.as0)
+    (by rfl) (by rfl) dia_rel0
+  rw [dia_runs] at h
+  exact h
+
+/-! ## A terminating loop whose header is a phi
+
+`Example.loopFn` exhibits the rank obstruction, but it never halts — its `JNZ` is on the literal `1`, so
+a top-level correctness statement about it would be discharged by the out-of-fuel arm and say nothing.
+A loop worth proving correct has to *stop*.
+
+`Lp.fn` stops. `p` starts as `CALLVALUE`; the body sets `d = ISZERO p` and jumps back, so a nonzero call
+value runs the body exactly once and then leaves. The CFG is genuinely cyclic — `body`'s only successor
+is the header — and the back-edge is actually traversed at run time, which `lp_runs` proves rather than
+asserts.
+
+Two design constraints, both learned the hard way earlier on this branch. No literal appears anywhere,
+because a literal push puts `encodeNumBytes` (well-founded) into the label offsets and makes the whole
+compiled layout irreducible. And the phi's sources are real definitions, because a phi whose sources are
+free makes `evalPhis` fail and the obligation vacuous.
+
+Unlike the diamond, the plan stacks here are *not* empty: the compiler keeps the loop-carried value on
+the EVM stack across the back-edge (`DUP1` at the header, `POP` at the exit). That is the new work the
+per-block obligations will need. -/
+set_option maxRecDepth 40000
+
+
+namespace Lp
+def iC : Instruction := { id := 50, opcode := Opcode.CALLVALUE, operands := [], outputs := ["c"] }
+def jHead : Instruction :=
+  { id := 51, opcode := Opcode.JMP, operands := [Operand.Label "head"], outputs := [] }
+def pP : Instruction :=
+  { id := 52, opcode := Opcode.PHI,
+    operands := [Operand.Label "entry", Operand.Var "c", Operand.Label "body", Operand.Var "d"],
+    outputs := ["p"] }
+def jnz : Instruction :=
+  { id := 53, opcode := Opcode.JNZ,
+    operands := [Operand.Var "p", Operand.Label "body", Operand.Label "exit"], outputs := [] }
+def iD : Instruction :=
+  { id := 54, opcode := Opcode.ISZERO, operands := [Operand.Var "p"], outputs := ["d"] }
+def jBack : Instruction :=
+  { id := 55, opcode := Opcode.JMP, operands := [Operand.Label "head"], outputs := [] }
+def iStop : Instruction := { id := 56, opcode := Opcode.STOP, operands := [], outputs := [] }
+
+def bEntry : BasicBlock := { label := "entry", instructions := [iC, jHead] }
+/-- The loop header carries a **phi**, and it is a genuine join: `entry` and the back-edge from `body`. -/
+def bHead  : BasicBlock := { label := "head",  instructions := [pP, jnz] }
+def bBody  : BasicBlock := { label := "body",  instructions := [iD, jBack] }
+def bExit  : BasicBlock := { label := "exit",  instructions := [iStop] }
+
+/-- **A terminating loop whose header is a phi.** `p` starts as `CALLVALUE`; the body sets
+`d = ISZERO p` and jumps back, so a nonzero call value runs the body exactly once and then exits. No
+literal appears anywhere — deliberately, since a literal push would make the label offsets irreducible. -/
+def fn : IrFunction := { name := "main", blocks := [bEntry, bHead, bBody, bExit] }
+def ctx : VenomContext := { functions := [fn], entry := some "main" }
+
+def ops  : List StackOp := (generateFnPlan fn 0 0).get!.1
+def prog : List AsmInst := (asmResolve (executePlan ops)).1
+def o2pc : AssocList Nat Nat := (asmResolve (executePlan ops)).2
+def lo   : AssocList String Nat := (computeLabelOffsets (executePlan ops)).2
+end Lp
+
+theorem lp_compiles : (generateFnPlan Lp.fn 0 0).isSome = true := by rfl
+theorem lp_prog_len : Lp.prog.length = 17 := by rfl
+
+/-- **The compiler keeps the phi's value on the EVM stack across the back-edge.** `DUP1` at the header
+copies it for the `JUMPI`, `POP` at the exit discards it. Unlike the diamond, the plan stacks here are
+*not* empty — the loop-carried value is live. -/
+theorem lp_prog_shape :
+    Lp.prog[1]! = AsmInst.AsmOp "CALLVALUE" ∧
+    Lp.prog[4]! = AsmInst.AsmLabel "head" ∧
+    Lp.prog[5]! = AsmInst.AsmOp "DUP1" ∧
+    Lp.prog[7]! = AsmInst.AsmOp "JUMPI" ∧
+    Lp.prog[10]! = AsmInst.AsmLabel "exit" ∧
+    Lp.prog[11]! = AsmInst.AsmOp "POP" ∧
+    Lp.prog[12]! = AsmInst.AsmOp "STOP" ∧
+    Lp.prog[13]! = AsmInst.AsmLabel "body" ∧
+    Lp.prog[14]! = AsmInst.AsmOp "ISZERO" ∧
+    Lp.prog[16]! = AsmInst.AsmOp "JUMP" :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- No literals, so the label offsets reduce — the whole layout is pinnable. -/
+theorem lp_o2pc_head : AssocList.lookup Nat Nat Lp.o2pc 6 = some 4 := by rfl
+theorem lp_o2pc_body : AssocList.lookup Nat Nat Lp.o2pc 19 = some 13 := by rfl
+theorem lp_o2pc_exit : AssocList.lookup Nat Nat Lp.o2pc 16 = some 10 := by rfl
+
+/-- **The CFG really is cyclic**: `body`'s only successor is the header. -/
+theorem lp_back_edge : (cfgAnalyze Lp.fn).succsOf "body" = ["head"] := by decide
+
+/-- And the header is reachable from itself — a genuine cycle, not a diamond. -/
+theorem lp_cyclic : CfgReach (cfgAnalyze Lp.fn) "head" "head" := CfgReach.base
+
+/-! ### Does the loop actually loop, and actually stop? -/
+
+namespace Lp
+def vs0 : VenomState := { (default : VenomState) with
+  callCtx := { (default : CallContext) with callvalue := EvmYul.UInt256.ofNat 7 } }
+def s0 : VenomState := { vs0 with prevBb := none, currentBb := "entry", instIdx := 0 }
+/-- After `entry`: `c` bound, at the `JMP`. -/
+def afterC (s : VenomState) : VenomState :=
+  { updateVar "c" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 }
+/-- After the body's `ISZERO`: `d` bound, at the `JMP`. -/
+def afterD (s : VenomState) (v : bytes32) : VenomState :=
+  { updateVar "d" (EvmYul.UInt256.isZero v) { s with instIdx := 0 } with instIdx := 1 }
+end Lp
+
+/-- `entry` binds `c = CALLVALUE` and jumps to the header. -/
+theorem lp_entry_run (f : Nat) (ctx : VenomContext) {s : VenomState} (hnh : s.halted = false) :
+    runBlock (f + 1 + 1) ctx Lp.bEntry s = ExecResult.OK (jumpTo "head" (Lp.afterC s)) := by
+  rw [runBlock_of_no_phi (by decide)]
+  rw [execBlock_step_nonterm (f + 1) ctx Lp.bEntry { s with instIdx := 0 }
+        (updateVar "c" s.callCtx.callvalue { s with instIdx := 0 }) Lp.iC
+        (by rfl) (by rfl) (by decide)]
+  exact execBlock_step_term_ok f ctx Lp.bEntry (Lp.afterC s) _ Lp.jHead (by rfl) (by rfl)
+    (by decide) (by rw [jumpTo]; exact hnh)
+
+/-- **The whole run.** `CALLVALUE = 7`: the header takes the loop, the body flips the condition to zero,
+the header is re-entered **across the back-edge**, and the second visit exits. It halts. -/
+theorem lp_runs :
+    (match runContext 30 Lp.ctx Lp.vs0 with
+     | ExecResult.Halt w => w.currentBb = "exit" ∧ w.prevBb = some "head"
+     | _ => False) := by
+  show (match runFunction 30 Lp.ctx Lp.fn { Lp.vs0 with prevBb := none } with
+        | ExecResult.Halt w => w.currentBb = "exit" ∧ w.prevBb = some "head" | _ => False)
+  rw [runFunction]
+  show (match runBlocks 30 Lp.ctx Lp.fn Lp.s0 with
+        | ExecResult.Halt w => w.currentBb = "exit" ∧ w.prevBb = some "head" | _ => False)
+  -- entry
+  set s1 : VenomState := jumpTo "head" (Lp.afterC Lp.s0) with hs1
+  have he : runBlock 29 Lp.ctx Lp.bEntry Lp.s0 = ExecResult.OK s1 :=
+    lp_entry_run 27 Lp.ctx (by rfl)
+  rw [runBlocks, show lookupBlock Lp.s0.currentBb Lp.fn.blocks = some Lp.bEntry from rfl]
+  dsimp only
+  rw [he]
+  dsimp only
+  rw [if_neg (by rw [hs1]; exact (by decide : ¬ (jumpTo "head" (Lp.afterC Lp.s0)).halted = true))]
+  -- header, visit 1: the phi takes `c` from `entry`; p = 7 ≠ 0, so the loop is entered
+  have hev1 : evalPhis s1 Lp.bHead.instructions
+      = ExecResult.OK (updateVar "p" (EvmYul.UInt256.ofNat 7) s1) := by
+    show evalPhis s1 (Lp.pP :: [Lp.jnz]) = _
+    unfold evalPhis
+    rw [if_neg (show ¬ (Lp.pP.opcode ≠ Opcode.PHI) from fun h => h rfl),
+        evalOnePhi_var (out := "p") (src := "c") (prev := "entry")
+          (v := EvmYul.UInt256.ofNat 7) (by rfl) (by rfl) (by rfl) (by rfl)]
+    show (match evalPhis s1 [Lp.jnz] with
+          | ExecResult.OK s' => ExecResult.OK (updateVar "p" (EvmYul.UInt256.ofNat 7) s') | err => err) = _
+    rw [show evalPhis s1 [Lp.jnz] = ExecResult.OK s1 from by unfold evalPhis; rw [if_pos (by decide)]]
+  set h1 : VenomState := updateVar "p" (EvmYul.UInt256.ofNat 7) s1 with hh1
+  set s2 : VenomState := jumpTo "body" { h1 with instIdx := 1 } with hs2
+  have hhd1 : runBlock 28 Lp.ctx Lp.bHead s1 = ExecResult.OK s2 := by
+    rw [runBlock_join_eq_execBlock_at (phis := [Lp.pP]) (term := Lp.jnz) hev1 rfl
+          (by intro i hi; simp only [List.mem_singleton] at hi; subst hi; rfl) (by decide)]
+    exact execBlock_step_term_ok 27 Lp.ctx Lp.bHead _ _ Lp.jnz (by rfl) (by rfl) (by decide) (by rfl)
+  rw [runBlocks, show lookupBlock s1.currentBb Lp.fn.blocks = some Lp.bHead from rfl]
+  dsimp only
+  rw [hhd1]
+  dsimp only
+  rw [if_neg (by decide : ¬ s2.halted = true)]
+  -- body: ISZERO flips the condition, then the BACK-EDGE to the header
+  set s3 : VenomState := jumpTo "head" (Lp.afterD s2 (EvmYul.UInt256.ofNat 7)) with hs3
+  have hbd : runBlock 27 Lp.ctx Lp.bBody s2 = ExecResult.OK s3 := by
+    rw [runBlock_of_no_phi (by decide)]
+    rw [execBlock_step_nonterm 26 Lp.ctx Lp.bBody { s2 with instIdx := 0 }
+          (updateVar "d" (EvmYul.UInt256.isZero (EvmYul.UInt256.ofNat 7)) { s2 with instIdx := 0 })
+          Lp.iD (by rfl) (by rfl) (by decide)]
+    exact execBlock_step_term_ok 25 Lp.ctx Lp.bBody _ _ Lp.jBack (by rfl) (by rfl) (by decide) (by rfl)
+  rw [runBlocks, show lookupBlock s2.currentBb Lp.fn.blocks = some Lp.bBody from rfl]
+  dsimp only
+  rw [hbd]
+  dsimp only
+  rw [if_neg (by decide : ¬ s3.halted = true)]
+  -- header, visit 2 — entered ACROSS THE BACK-EDGE. The phi now takes `d` from `body`; p = 0, so exit.
+  have hev2 : evalPhis s3 Lp.bHead.instructions
+      = ExecResult.OK (updateVar "p" (EvmYul.UInt256.ofNat 0) s3) := by
+    show evalPhis s3 (Lp.pP :: [Lp.jnz]) = _
+    unfold evalPhis
+    rw [if_neg (show ¬ (Lp.pP.opcode ≠ Opcode.PHI) from fun h => h rfl),
+        evalOnePhi_var (out := "p") (src := "d") (prev := "body")
+          (v := EvmYul.UInt256.ofNat 0) (by rfl) (by rfl) (by rfl) (by rfl)]
+    show (match evalPhis s3 [Lp.jnz] with
+          | ExecResult.OK s' => ExecResult.OK (updateVar "p" (EvmYul.UInt256.ofNat 0) s') | err => err) = _
+    rw [show evalPhis s3 [Lp.jnz] = ExecResult.OK s3 from by unfold evalPhis; rw [if_pos (by decide)]]
+  set h2 : VenomState := updateVar "p" (EvmYul.UInt256.ofNat 0) s3 with hh2
+  set s4 : VenomState := jumpTo "exit" { h2 with instIdx := 1 } with hs4
+  have hhd2 : runBlock 26 Lp.ctx Lp.bHead s3 = ExecResult.OK s4 := by
+    rw [runBlock_join_eq_execBlock_at (phis := [Lp.pP]) (term := Lp.jnz) hev2 rfl
+          (by intro i hi; simp only [List.mem_singleton] at hi; subst hi; rfl) (by decide)]
+    exact execBlock_step_term_ok 25 Lp.ctx Lp.bHead _ _ Lp.jnz (by rfl) (by rfl) (by decide) (by rfl)
+  rw [runBlocks, show lookupBlock s3.currentBb Lp.fn.blocks = some Lp.bHead from rfl]
+  dsimp only
+  rw [hhd2]
+  dsimp only
+  rw [if_neg (by decide : ¬ s4.halted = true)]
+  -- exit
+  have hex : runBlock 25 Lp.ctx Lp.bExit s4
+      = ExecResult.Halt (haltState { s4 with instIdx := 0 }) := by
+    rw [runBlock_of_no_phi (by decide)]
+    exact execBlock_step_halt 24 Lp.ctx Lp.bExit _ _ Lp.iStop (by rfl) rfl
+  rw [runBlocks, show lookupBlock s4.currentBb Lp.fn.blocks = some Lp.bExit from rfl]
+  dsimp only
+  rw [hex]
+  exact ⟨rfl, rfl⟩
+
+/-! ### `psOf : String → PlanState` cannot describe a phi-headed loop header
+
+The diamond needed an invariant because `venomAsmRel` could not carry a fact about `vars`. The loop needs
+one for a sharper reason: the *plan stack itself* depends on which predecessor the walk arrived from, and
+the scheduled drivers fix it per label.
+
+`entry` hands the header a stack holding `c`. The back-edge hands it a stack holding `d`. The *shape*
+agrees — one slot, which is exactly what the join-agreement invariant guarantees — but the *name* does
+not, and it is not supposed to. That difference is what the phi exists to reconcile.
+
+`planStackRel` reads the plan stack's names out of the Venom state, so a per-label `psOf head = ["c"]`
+demands that the asm stack top equal `c`'s value. Across the back-edge the stack carries `d`'s value, and
+`c` is still bound to something else entirely. Below, 7 and 0.
+
+So this is not a proof that has not been found. It is a proposition that is *false*, and no amount of work
+on the per-block obligations would repair it. `codegen_correct_fuel` takes `Entry` as a free parameter,
+which is where the header's layout has to live. -/
+set_option maxRecDepth 40000
+
+namespace Lp
+def live : DfState (List String) := livenessAnalyzeFuel (fnPlanFuel fn) fn
+def cfg  : CfgAnalysis := cfgAnalyze fn
+def dfg  : DfgAnalysis := DfgAnalysis.buildFunction fn
+/-- The plan state the DFS hands to `head` — i.e. `entry`'s exit. -/
+def psAtHeadFromEntry : Option (List String) :=
+  (generateBlockPlan live dfg cfg fn bEntry (initPlanState 0)).map
+    (fun r => r.2.stack.map operandToString)
+/-- The plan state the back-edge hands to `head` — i.e. `body`'s exit. -/
+def psAtHeadFromBody : Option (List String) :=
+  ((generateBlockPlan live dfg cfg fn bEntry (initPlanState 0)).bind
+    (fun r => (generateBlockPlan live dfg cfg fn bHead r.2).bind
+      (fun r2 => generateBlockPlan live dfg cfg fn bBody r2.2))).map
+    (fun r => r.2.stack.map operandToString)
+end Lp
+
+/-- **The loop header is entered with a different variable in the same stack slot.** From `entry` the
+slot holds `c`; across the back-edge it holds `d`. The *shape* agrees — one slot, which is what the
+join-agreement invariant guarantees — but the *name* does not, and it is not supposed to: that is exactly
+what the phi is for. -/
+theorem lp_head_incoming_differs :
+    Lp.psAtHeadFromEntry = some ["c"] ∧ Lp.psAtHeadFromBody = some ["d"] := ⟨rfl, rfl⟩
+
+/-- **So a single `psOf head` cannot state the header's entry relation.** `planStackRel` reads the plan
+stack's names out of the *Venom* state, so with `psOf head = ["c"]` it demands the asm stack top equal
+`c`'s value. Across the back-edge the asm stack top is `d`'s value — and `c` is still bound, to something
+else. Here they are 7 and 0. The relation is false on arrival, for the compiler's own plan.
+
+This is the `Entry`-too-weak gap again, one level deeper: the diamond needed a fact about `vars` that the
+stack had dropped; the loop needs the *plan stack itself* to depend on the predecessor. `psOf : String →
+PlanState` cannot. `codegen_correct_fuel` takes `Entry` as a free parameter and can. -/
+theorem lp_psOf_by_label_impossible
+    (psOf : String → PlanState)
+    (hentry : (psOf "head").stack = [Operand.Var "c"])
+    (hbody  : (psOf "head").stack = [Operand.Var "d"]) : False := by
+  rw [hentry] at hbody
+  exact absurd hbody (by decide)
+
+/-- The Venom state arriving at the header **across the back-edge**: `c` is still 7 (it was never killed),
+and `d` — the value the EVM stack actually carries — is 0. -/
+def Lp.fromBody : VenomState :=
+  { (default : VenomState) with
+    vars := [("d", EvmYul.UInt256.ofNat 0), ("c", EvmYul.UInt256.ofNat 7)],
+    prevBb := some "body", currentBb := "head" }
+
+/-- **The refutation, on concrete values.** The compiler's plan for `head` says slot 0 is `c`. Across the
+back-edge the EVM stack carries `d = 0`, while `c` is still 7. `planStackRel` therefore demands `7 = 0`.
+
+So this is not a proof that has not been found — it is a proposition that is false. A per-label `psOf`
+cannot be the header's entry layout, and no amount of work on the per-block obligations would fix it. -/
+theorem lp_planStackRel_false_on_backedge :
+    ¬ planStackRel Lp.lo Lp.fromBody [Operand.Var "c"] [EvmYul.UInt256.ofNat 0] := by
+  rintro ⟨-, h⟩
+  have h0 := h 0 (by decide)
+  exact absurd h0 (by decide)
+
+/-- …while it does hold with the layout the back-edge actually delivers. -/
+theorem lp_planStackRel_true_with_d :
+    planStackRel Lp.lo Lp.fromBody [Operand.Var "d"] [EvmYul.UInt256.ofNat 0] := by
+  refine ⟨rfl, ?_⟩
+  intro i hi
+  have : i = 0 := by simpa using hi
+  subst this
+  rfl
+
+/-! ### The loop's asm, block by block
+
+Against the compiler's own program, every index checked by `rfl`. The shapes differ from the diamond's in
+the way that matters: the stack is never empty. `DUP1` at the header copies the loop-carried value so the
+`JUMPI` can consume one and leave one behind, `ISZERO` in the body rewrites it in place and takes the
+back-edge, and `POP` at the exit finally discards it.
+
+The longest block is the header's not-taken arm at six steps, which is what fixes the per-block bound
+`B = 6` that `codegen_correct_fuel` multiplies by the Venom fuel. -/
+
+set_option maxRecDepth 8000
+
+set_option maxRecDepth 8000
+
+/-- `DUP1` on a nonempty stack. -/
+theorem asmDup_one {s : AsmState} {x : bytes32} {stk : List bytes32} (h : s.stack = x :: stk) :
+    asmDup 0 s = AsmResult.AsmOK { asmNext s with stack := x :: x :: stk } := by
+  unfold asmDup
+  simp [h]
+
+private theorem runAsm_one' {o2pc prog s s'} (hpc : s.pc < prog.length)
+    (hstep : asmStep o2pc prog s = AsmResult.AsmOK s') :
+    runAsm 1 o2pc prog s = AsmResult.AsmOK s' := by
+  rw [show (1 : Nat) = 0 + 1 from rfl, runAsm_succ_ok hpc hstep]; rfl
+
+theorem lp_lo_head : AssocList.lookup String Nat Lp.lo "head" = some 6 := by rfl
+theorem lp_lo_body : AssocList.lookup String Nat Lp.lo "body" = some 19 := by rfl
+theorem lp_lo_exit : AssocList.lookup String Nat Lp.lo "exit" = some 16 := by rfl
+
+/-- `entry`: `JUMPDEST ; CALLVALUE ; PUSH head ; JUMP` — four steps, pc 0 → 4, pushing `c`. -/
+theorem lp_hasm_entry {asm : AsmState} (hpc : asm.pc = 0) :
+    runAsm 4 Lp.o2pc Lp.prog asm
+      = AsmResult.AsmOK { asm with pc := 4, stack := asm.callCtx.callvalue :: asm.stack } := by
+  have h1 : asm.pc < Lp.prog.length := by rw [hpc]; decide
+  have hg1 : Lp.prog.get ⟨asm.pc, h1⟩ = AsmInst.AsmLabel "entry" := by
+    conv_lhs => rw [show (⟨asm.pc, h1⟩ : Fin Lp.prog.length) = ⟨0, by decide⟩ from Fin.ext hpc]
+    rfl
+  have s1 := runAsm_one' (o2pc := Lp.o2pc) h1 (asmStep_label_ok (offsetToPc := Lp.o2pc) h1 hg1)
+  set a1 : AsmState := asmNext asm with ha1
+  have hpc1 : a1.pc = 1 := by show asm.pc + 1 = 1; rw [hpc]
+  have h2 : a1.pc < Lp.prog.length := by rw [hpc1]; decide
+  have hg2 : Lp.prog.get ⟨a1.pc, h2⟩ = AsmInst.AsmOp "CALLVALUE" := by
+    conv_lhs => rw [show (⟨a1.pc, h2⟩ : Fin Lp.prog.length) = ⟨1, by decide⟩ from Fin.ext hpc1]
+    rfl
+  have s2 := runAsm_one' (o2pc := Lp.o2pc) h2 (by rw [asmStep_callvalue_ok h2 hg2]; rfl :
+    asmStep Lp.o2pc Lp.prog a1
+      = AsmResult.AsmOK { asmNext a1 with stack := a1.callCtx.callvalue :: a1.stack })
+  set a2 : AsmState := { asmNext a1 with stack := a1.callCtx.callvalue :: a1.stack } with ha2
+  have hpc2 : a2.pc = 2 := by show a1.pc + 1 = 2; rw [hpc1]
+  have h3 : a2.pc < Lp.prog.length := by rw [hpc2]; decide
+  have hg3 : Lp.prog.get ⟨a2.pc, h3⟩ = resolveInst Lp.lo (AsmInst.AsmPushLabel "head") := by
+    conv_lhs => rw [show (⟨a2.pc, h3⟩ : Fin Lp.prog.length) = ⟨2, by decide⟩ from Fin.ext hpc2]
+    rfl
+  have h4 : a2.pc + 1 < Lp.prog.length := by rw [hpc2]; decide
+  have hg4 : Lp.prog.get ⟨a2.pc + 1, h4⟩ = AsmInst.AsmOp "JUMP" := by
+    conv_lhs => rw [show (⟨a2.pc + 1, h4⟩ : Fin Lp.prog.length) = ⟨3, by decide⟩ from
+      Fin.ext (by show a2.pc + 1 = 3; rw [hpc2])]
+    rfl
+  have s3 := resolved_jump_sim h3 hg3 lp_lo_head (by decide) h4 hg4 lp_o2pc_head
+  rw [show (4 : Nat) = 1 + (1 + 2) from rfl, runAsm_append_ok s1, runAsm_append_ok s2, s3]
+  cases asm with | _ => simp_all [asmNext, a1, a2]
+
+/-- The header's prefix: `JUMPDEST head ; DUP1` at pc 4 — the `DUP1` copies the loop-carried value so
+the `JUMPI` can consume one and leave one behind. -/
+theorem lp_head_prefix {asm : AsmState} {x : bytes32} {stk : List bytes32}
+    (hpc : asm.pc = 4) (hstk : asm.stack = x :: stk) :
+    runAsm 2 Lp.o2pc Lp.prog asm
+      = AsmResult.AsmOK { asm with pc := 6, stack := x :: x :: stk } := by
+  have h1 : asm.pc < Lp.prog.length := by rw [hpc]; decide
+  have hg1 : Lp.prog.get ⟨asm.pc, h1⟩ = AsmInst.AsmLabel "head" := by
+    conv_lhs => rw [show (⟨asm.pc, h1⟩ : Fin Lp.prog.length) = ⟨4, by decide⟩ from Fin.ext hpc]
+    rfl
+  have s1 := runAsm_one' (o2pc := Lp.o2pc) h1 (asmStep_label_ok (offsetToPc := Lp.o2pc) h1 hg1)
+  set a1 : AsmState := asmNext asm with ha1
+  have hpc1 : a1.pc = 5 := by show asm.pc + 1 = 5; rw [hpc]
+  have h2 : a1.pc < Lp.prog.length := by rw [hpc1]; decide
+  have hg2 : Lp.prog.get ⟨a1.pc, h2⟩ = AsmInst.AsmOp (dupName 1) := by
+    conv_lhs => rw [show (⟨a1.pc, h2⟩ : Fin Lp.prog.length) = ⟨5, by decide⟩ from Fin.ext hpc1]
+    rfl
+  have ha1stk : a1.stack = x :: stk := hstk
+  have hdup : asmStep Lp.o2pc Lp.prog a1
+      = AsmResult.AsmOK { asmNext a1 with stack := x :: x :: stk } := by
+    rw [asmStep_dup_ok h2 hg2 (by decide) (by decide)]
+    exact asmDup_one ha1stk
+  have s2 := runAsm_one' (o2pc := Lp.o2pc) h2 hdup
+  rw [show (2 : Nat) = 1 + 1 from rfl, runAsm_append_ok s1, s2]
+  cases asm with | _ => simp_all [asmNext, a1]
+
+/-- **Header, loop taken** (`x ≠ 0`): from pc 6 the `[PUSH body ; JUMPI]` jumps to `body` (pc 13),
+consuming the duplicate and leaving the value on the stack. -/
+theorem lp_hasm_head_taken {asm : AsmState} {x : bytes32} {stk : List bytes32}
+    (hpc : asm.pc = 4) (hstk : asm.stack = x :: stk) (hx : x ≠ EvmYul.UInt256.ofNat 0) :
+    runAsm 4 Lp.o2pc Lp.prog asm
+      = AsmResult.AsmOK { asm with pc := 13, stack := x :: stk } := by
+  rw [show (4 : Nat) = 2 + 2 from rfl, runAsm_append_ok (lp_head_prefix hpc hstk)]
+  set a : AsmState := { asm with pc := 6, stack := x :: x :: stk } with ha
+  have hapc : a.pc = 6 := rfl
+  have h1 : a.pc < Lp.prog.length := by rw [hapc]; decide
+  have hg1 : Lp.prog.get ⟨a.pc, h1⟩ = resolveInst Lp.lo (AsmInst.AsmPushLabel "body") := by
+    conv_lhs => rw [show (⟨a.pc, h1⟩ : Fin Lp.prog.length) = ⟨6, by decide⟩ from Fin.ext hapc]
+    rfl
+  have h2 : a.pc + 1 < Lp.prog.length := by rw [hapc]; decide
+  have hg2 : Lp.prog.get ⟨a.pc + 1, h2⟩ = AsmInst.AsmOp "JUMPI" := by
+    conv_lhs => rw [show (⟨a.pc + 1, h2⟩ : Fin Lp.prog.length) = ⟨7, by decide⟩ from
+      Fin.ext (by show a.pc + 1 = 7; rw [hapc])]
+    rfl
+  rw [resolved_jumpi_taken_sim (stk := x :: stk) (by rw [ha]) hx h1 hg1 lp_lo_body (by decide)
+        h2 hg2 lp_o2pc_body]
+
+/-- **Header, loop exited** (`x = 0`): the `JUMPI` falls through into `[PUSH exit ; JUMP]` and lands at
+`exit` (pc 10). Six steps — the longer arm, which is what fixes the block bound `B`. -/
+theorem lp_hasm_head_nottaken {asm : AsmState} {stk : List bytes32}
+    (hpc : asm.pc = 4) (hstk : asm.stack = EvmYul.UInt256.ofNat 0 :: stk) :
+    runAsm 6 Lp.o2pc Lp.prog asm
+      = AsmResult.AsmOK { asm with pc := 10, stack := EvmYul.UInt256.ofNat 0 :: stk } := by
+  rw [show (6 : Nat) = 2 + 4 from rfl, runAsm_append_ok (lp_head_prefix hpc hstk)]
+  set z : bytes32 := EvmYul.UInt256.ofNat 0 with hz
+  set a : AsmState := { asm with pc := 6, stack := z :: z :: stk } with ha
+  have hapc : a.pc = 6 := rfl
+  have h1 : a.pc < Lp.prog.length := by rw [hapc]; decide
+  have hg1 : Lp.prog.get ⟨a.pc, h1⟩ = resolveInst Lp.lo (AsmInst.AsmPushLabel "body") := by
+    conv_lhs => rw [show (⟨a.pc, h1⟩ : Fin Lp.prog.length) = ⟨6, by decide⟩ from Fin.ext hapc]
+    rfl
+  have h2 : a.pc + 1 < Lp.prog.length := by rw [hapc]; decide
+  have hg2 : Lp.prog.get ⟨a.pc + 1, h2⟩ = AsmInst.AsmOp "JUMPI" := by
+    conv_lhs => rw [show (⟨a.pc + 1, h2⟩ : Fin Lp.prog.length) = ⟨7, by decide⟩ from
+      Fin.ext (by show a.pc + 1 = 7; rw [hapc])]
+    rfl
+  have hfall := resolved_jumpi_nottaken_sim (offsetToPc := Lp.o2pc) (stk := z :: stk)
+    (by rw [ha]) h1 hg1 lp_lo_body (by decide) h2 hg2
+  rw [show (4 : Nat) = 2 + 2 from rfl, runAsm_append_ok hfall]
+  set b : AsmState := { a with stack := z :: stk, pc := a.pc + 2 } with hb
+  have hbpc : b.pc = 8 := rfl
+  have h3 : b.pc < Lp.prog.length := by rw [hbpc]; decide
+  have hg3 : Lp.prog.get ⟨b.pc, h3⟩ = resolveInst Lp.lo (AsmInst.AsmPushLabel "exit") := by
+    conv_lhs => rw [show (⟨b.pc, h3⟩ : Fin Lp.prog.length) = ⟨8, by decide⟩ from Fin.ext hbpc]
+    rfl
+  have h4 : b.pc + 1 < Lp.prog.length := by rw [hbpc]; decide
+  have hg4 : Lp.prog.get ⟨b.pc + 1, h4⟩ = AsmInst.AsmOp "JUMP" := by
+    conv_lhs => rw [show (⟨b.pc + 1, h4⟩ : Fin Lp.prog.length) = ⟨9, by decide⟩ from
+      Fin.ext (by show b.pc + 1 = 9; rw [hbpc])]
+    rfl
+  rw [resolved_jump_sim h3 hg3 lp_lo_exit (by decide) h4 hg4 lp_o2pc_exit]
+
+/-- `body`: `JUMPDEST ; ISZERO ; PUSH head ; JUMP` — four steps, pc 13 → 4, flipping the loop-carried
+value in place. This is the **back-edge**. -/
+theorem lp_hasm_body {asm : AsmState} {x : bytes32} {stk : List bytes32}
+    (hpc : asm.pc = 13) (hstk : asm.stack = x :: stk) :
+    runAsm 4 Lp.o2pc Lp.prog asm
+      = AsmResult.AsmOK { asm with pc := 4, stack := EvmYul.UInt256.isZero x :: stk } := by
+  have h1 : asm.pc < Lp.prog.length := by rw [hpc]; decide
+  have hg1 : Lp.prog.get ⟨asm.pc, h1⟩ = AsmInst.AsmLabel "body" := by
+    conv_lhs => rw [show (⟨asm.pc, h1⟩ : Fin Lp.prog.length) = ⟨13, by decide⟩ from Fin.ext hpc]
+    rfl
+  have s1 := runAsm_one' (o2pc := Lp.o2pc) h1 (asmStep_label_ok (offsetToPc := Lp.o2pc) h1 hg1)
+  set a1 : AsmState := asmNext asm with ha1
+  have hpc1 : a1.pc = 14 := by show asm.pc + 1 = 14; rw [hpc]
+  have ha1stk : a1.stack = x :: stk := hstk
+  have h2 : a1.pc < Lp.prog.length := by rw [hpc1]; decide
+  have hg2 : Lp.prog.get ⟨a1.pc, h2⟩ = AsmInst.AsmOp "ISZERO" := by
+    conv_lhs => rw [show (⟨a1.pc, h2⟩ : Fin Lp.prog.length) = ⟨14, by decide⟩ from Fin.ext hpc1]
+    rfl
+  have hiz : asmStep Lp.o2pc Lp.prog a1
+      = AsmResult.AsmOK { asmNext a1 with stack := EvmYul.UInt256.isZero x :: stk } := by
+    rw [asmStep_iszero_ok h2 hg2]
+    unfold asmUnop
+    rw [ha1stk]
+  have s2 := runAsm_one' (o2pc := Lp.o2pc) h2 hiz
+  set a2 : AsmState := { asmNext a1 with stack := EvmYul.UInt256.isZero x :: stk } with ha2
+  have hpc2 : a2.pc = 15 := by show a1.pc + 1 = 15; rw [hpc1]
+  have h3 : a2.pc < Lp.prog.length := by rw [hpc2]; decide
+  have hg3 : Lp.prog.get ⟨a2.pc, h3⟩ = resolveInst Lp.lo (AsmInst.AsmPushLabel "head") := by
+    conv_lhs => rw [show (⟨a2.pc, h3⟩ : Fin Lp.prog.length) = ⟨15, by decide⟩ from Fin.ext hpc2]
+    rfl
+  have h4 : a2.pc + 1 < Lp.prog.length := by rw [hpc2]; decide
+  have hg4 : Lp.prog.get ⟨a2.pc + 1, h4⟩ = AsmInst.AsmOp "JUMP" := by
+    conv_lhs => rw [show (⟨a2.pc + 1, h4⟩ : Fin Lp.prog.length) = ⟨16, by decide⟩ from
+      Fin.ext (by show a2.pc + 1 = 16; rw [hpc2])]
+    rfl
+  have s3 := resolved_jump_sim h3 hg3 lp_lo_head (by decide) h4 hg4 lp_o2pc_head
+  rw [show (4 : Nat) = 1 + (1 + 2) from rfl, runAsm_append_ok s1, runAsm_append_ok s2, s3]
+  cases asm with | _ => simp_all [asmNext, a1, a2]
+
+/-- `exit`: `JUMPDEST ; POP ; STOP` — three steps, discarding the loop-carried value, then halting. -/
+theorem lp_hasm_exit {asm : AsmState} {x : bytes32} {stk : List bytes32} {N : Nat}
+    (hpc : asm.pc = 10) (hstk : asm.stack = x :: stk) (hN : 3 ≤ N) :
+    ∃ as', runAsm N Lp.o2pc Lp.prog asm = AsmResult.AsmHalt as' ∧
+      as'.accounts = asm.accounts ∧ as'.transient = asm.transient ∧
+      as'.returndata = asm.returndata ∧ as'.logs = asm.logs := by
+  obtain ⟨k, rfl⟩ : ∃ k, N = k + 3 := ⟨N - 3, by omega⟩
+  have h1 : asm.pc < Lp.prog.length := by rw [hpc]; decide
+  have hg1 : Lp.prog.get ⟨asm.pc, h1⟩ = AsmInst.AsmLabel "exit" := by
+    conv_lhs => rw [show (⟨asm.pc, h1⟩ : Fin Lp.prog.length) = ⟨10, by decide⟩ from Fin.ext hpc]
+    rfl
+  have s1 := runAsm_one' (o2pc := Lp.o2pc) h1 (asmStep_label_ok (offsetToPc := Lp.o2pc) h1 hg1)
+  set a1 : AsmState := asmNext asm with ha1
+  have hpc1 : a1.pc = 11 := by show asm.pc + 1 = 11; rw [hpc]
+  have ha1stk : a1.stack = x :: stk := hstk
+  have h2 : a1.pc < Lp.prog.length := by rw [hpc1]; decide
+  have hg2 : Lp.prog.get ⟨a1.pc, h2⟩ = AsmInst.AsmOp "POP" := by
+    conv_lhs => rw [show (⟨a1.pc, h2⟩ : Fin Lp.prog.length) = ⟨11, by decide⟩ from Fin.ext hpc1]
+    rfl
+  have hpop : asmStep Lp.o2pc Lp.prog a1
+      = AsmResult.AsmOK { asmNext a1 with stack := stk } := by
+    unfold asmStep; rw [dif_pos h2, hg2]
+    show asmPop a1 = _
+    unfold asmPop
+    rw [ha1stk]
+  have s2 := runAsm_one' (o2pc := Lp.o2pc) h2 hpop
+  set a2 : AsmState := { asmNext a1 with stack := stk } with ha2
+  have hpc2 : a2.pc = 12 := by show a1.pc + 1 = 12; rw [hpc1]
+  have h3 : a2.pc < Lp.prog.length := by rw [hpc2]; decide
+  have hg3 : Lp.prog.get ⟨a2.pc, h3⟩ = AsmInst.AsmOp "STOP" := by
+    conv_lhs => rw [show (⟨a2.pc, h3⟩ : Fin Lp.prog.length) = ⟨12, by decide⟩ from Fin.ext hpc2]
+    rfl
+  refine ⟨asmNext a2, ?_, rfl, rfl, rfl, rfl⟩
+  rw [show (k + 3 : Nat) = 1 + (1 + (k + 1)) from by omega,
+      runAsm_append_ok s1, runAsm_append_ok s2]
+  exact runAsm_stop k h3 hg3
+
+/-! ### The loop's Venom side, and what the relation collapses to on a one-slot stack
+
+`venomAsmRel_ps1_iff` is the loop's counterpart of the diamond's `venomAsmRel_init0_iff`, and the shape of
+the difference is the whole point: where the diamond's plan stack was empty and the relation collapsed to
+"empty asm stack plus equal fields", the loop's is one slot deep and the relation says *the asm stack holds
+exactly the value that variable is bound to*. That is the loop-carried value, and it is what the `DUP1`
+copies and the `POP` eventually drops.
+
+The two `evalPhis` lemmas are stated per predecessor — `p` takes `c` from `entry` and `d` across the
+back-edge — because that is genuinely what the phi does, and because a single layout for the header does
+not exist (proved above). -/
+/-- A plan state whose stack is exactly one variable — the loop's shape at every block but `entry`. -/
+def ps1 (v : String) : PlanState :=
+  { stack := [Operand.Var v], spilled := [], alloc := initSpillAlloc 0, labelCounter := 0 }
+
+/-- **What `venomAsmRel` collapses to on a one-slot stack.** -/
+theorem venomAsmRel_ps1_iff {lo : AssocList String Nat} {v : String}
+    {s : VenomState} {asm : AsmState} :
+    venomAsmRel lo (ps1 v) s asm ↔
+      ((∃ w, asm.stack = [w] ∧ lookupVar v s = some w) ∧
+       (∀ i, readByte i s.memory = readByte i asm.memory) ∧
+       asm.accounts = s.accounts ∧ asm.transient = s.transient ∧
+       asm.returndata = s.returndata ∧ asm.logs = s.logs ∧
+       asm.callCtx = s.callCtx ∧ asm.txCtx = s.txCtx ∧ asm.blockCtx = s.blockCtx ∧
+       asm.code = s.code ∧ asm.prevHashes = s.prevHashes) := by
+  constructor
+  · rintro ⟨⟨hlen, hval⟩, -, hmem, ha, ht, hr, hl, hc, hx, hb, hcd, hph⟩
+    refine ⟨?_, ?_, ha, ht, hr, hl, hc, hx, hb, hcd, hph⟩
+    · have h1 : asm.stack.length = 1 := by simpa [ps1] using hlen.symm
+      obtain ⟨w, hw⟩ : ∃ w, asm.stack = [w] := by
+        match hst : asm.stack, h1 with
+        | [w], _ => exact ⟨w, rfl⟩
+      refine ⟨w, hw, ?_⟩
+      have := hval 0 (by simp [ps1])
+      simpa [ps1, hw, operandVal] using this
+    · intro i; exact hmem i (by simp [ps1, initSpillAlloc])
+  · rintro ⟨⟨w, hw, hv⟩, hmem, ha, ht, hr, hl, hc, hx, hb, hcd, hph⟩
+    refine ⟨⟨by simp [ps1, hw], ?_⟩, ?_, ?_, ha, ht, hr, hl, hc, hx, hb, hcd, hph⟩
+    · intro i hi
+      simp only [ps1, List.length_singleton] at hi
+      have : i = 0 := by omega
+      subst this
+      simpa [ps1, hw, operandVal] using hv
+    · intro op off hlk; simp [ps1, AssocList.lookup] at hlk
+    · intro i _; exact hmem i
+
+/-! ### The loop's Venom side, generic in the arriving state -/
+
+/-- The header's phis, arriving from `entry`: `p` takes `c`. -/
+theorem lp_ev_from_entry {s : VenomState} {w : bytes32}
+    (hprev : s.prevBb = some "entry") (hc : lookupVar "c" s = some w) :
+    evalPhis s Lp.bHead.instructions = ExecResult.OK (updateVar "p" w s) := by
+  show evalPhis s (Lp.pP :: [Lp.jnz]) = _
+  unfold evalPhis
+  rw [if_neg (show ¬ (Lp.pP.opcode ≠ Opcode.PHI) from fun h => h rfl),
+      evalOnePhi_var (out := "p") (src := "c") (prev := "entry") (v := w)
+        (by rfl) hprev (by rfl) hc]
+  show (match evalPhis s [Lp.jnz] with
+        | ExecResult.OK s' => ExecResult.OK (updateVar "p" w s') | err => err) = _
+  rw [show evalPhis s [Lp.jnz] = ExecResult.OK s from by unfold evalPhis; rw [if_pos (by decide)]]
+
+/-- The header's phis, arriving **across the back-edge**: `p` takes `d`. -/
+theorem lp_ev_from_body {s : VenomState} {w : bytes32}
+    (hprev : s.prevBb = some "body") (hd : lookupVar "d" s = some w) :
+    evalPhis s Lp.bHead.instructions = ExecResult.OK (updateVar "p" w s) := by
+  show evalPhis s (Lp.pP :: [Lp.jnz]) = _
+  unfold evalPhis
+  rw [if_neg (show ¬ (Lp.pP.opcode ≠ Opcode.PHI) from fun h => h rfl),
+      evalOnePhi_var (out := "p") (src := "d") (prev := "body") (v := w)
+        (by rfl) hprev (by rfl) hd]
+  show (match evalPhis s [Lp.jnz] with
+        | ExecResult.OK s' => ExecResult.OK (updateVar "p" w s') | err => err) = _
+  rw [show evalPhis s [Lp.jnz] = ExecResult.OK s from by unfold evalPhis; rw [if_pos (by decide)]]
+
+/-- The header, loop taken. -/
+theorem lp_head_run_taken (f : Nat) (ctx : VenomContext) {s : VenomState} {w : bytes32}
+    (hnh : s.halted = false)
+    (hev : evalPhis s Lp.bHead.instructions = ExecResult.OK (updateVar "p" w s))
+    (hw : w ≠ EvmYul.UInt256.ofNat 0) :
+    runBlock (f + 1) ctx Lp.bHead s
+      = ExecResult.OK (jumpTo "body" { updateVar "p" w s with instIdx := 1 }) := by
+  rw [runBlock_join_eq_execBlock_at (phis := [Lp.pP]) (term := Lp.jnz) hev rfl
+        (by intro i hi; simp only [List.mem_singleton] at hi; subst hi; rfl) (by decide)]
+  refine execBlock_step_term_ok f ctx Lp.bHead _ _ Lp.jnz (by rfl) ?_ (by decide)
+    (by rw [jumpTo]; exact hnh)
+  show stepInstBase Lp.jnz { updateVar "p" w s with instIdx := 1 } = _
+  unfold stepInstBase
+  simp only [show Lp.jnz.opcode = Opcode.JNZ from rfl,
+             show Lp.jnz.operands = [Operand.Var "p", Operand.Label "body", Operand.Label "exit"]
+               from rfl]
+  have hp : evalOperand (Operand.Var "p") { updateVar "p" w s with instIdx := 1 } = some w := by
+    show lookupVar "p" { updateVar "p" w s with instIdx := 1 } = some w
+    exact lookupVar_updateVar_self s "p" w
+  simp only [hp]
+  split
+  · rfl
+  · rename_i h; exact absurd (bne_iff_ne.mpr hw) h
+
+/-- The header, loop exited. -/
+theorem lp_head_run_exit (f : Nat) (ctx : VenomContext) {s : VenomState}
+    (hnh : s.halted = false)
+    (hev : evalPhis s Lp.bHead.instructions
+      = ExecResult.OK (updateVar "p" (EvmYul.UInt256.ofNat 0) s)) :
+    runBlock (f + 1) ctx Lp.bHead s
+      = ExecResult.OK (jumpTo "exit"
+          { updateVar "p" (EvmYul.UInt256.ofNat 0) s with instIdx := 1 }) := by
+  rw [runBlock_join_eq_execBlock_at (phis := [Lp.pP]) (term := Lp.jnz) hev rfl
+        (by intro i hi; simp only [List.mem_singleton] at hi; subst hi; rfl) (by decide)]
+  refine execBlock_step_term_ok f ctx Lp.bHead _ _ Lp.jnz (by rfl) ?_ (by decide)
+    (by rw [jumpTo]; exact hnh)
+  show stepInstBase Lp.jnz { updateVar "p" (EvmYul.UInt256.ofNat 0) s with instIdx := 1 } = _
+  unfold stepInstBase
+  simp only [show Lp.jnz.opcode = Opcode.JNZ from rfl,
+             show Lp.jnz.operands = [Operand.Var "p", Operand.Label "body", Operand.Label "exit"]
+               from rfl]
+  have hp : evalOperand (Operand.Var "p")
+      { updateVar "p" (EvmYul.UInt256.ofNat 0) s with instIdx := 1 }
+      = some (EvmYul.UInt256.ofNat 0) :=
+    lookupVar_updateVar_self s "p" (EvmYul.UInt256.ofNat 0)
+  simp only [hp]
+  split
+  · rename_i h; exact absurd rfl (bne_iff_ne.mp h)
+  · rfl
+
+/-- The body: `ISZERO` flips the loop-carried value, then the back-edge. -/
+theorem lp_body_run (f : Nat) (ctx : VenomContext) {s : VenomState} {w : bytes32}
+    (hnh : s.halted = false) (hp : lookupVar "p" s = some w) :
+    runBlock (f + 1 + 1) ctx Lp.bBody s
+      = ExecResult.OK (jumpTo "head"
+          { updateVar "d" (EvmYul.UInt256.isZero w) { s with instIdx := 0 } with instIdx := 1 }) := by
+  rw [runBlock_of_no_phi (by decide)]
+  rw [execBlock_step_nonterm (f + 1) ctx Lp.bBody { s with instIdx := 0 }
+        (updateVar "d" (EvmYul.UInt256.isZero w) { s with instIdx := 0 }) Lp.iD
+        (by rfl) (by
+          show stepInstBase Lp.iD { s with instIdx := 0 } = _
+          unfold stepInstBase
+          simp only [show Lp.iD.opcode = Opcode.ISZERO from rfl]
+          unfold execPure1
+          simp only [show Lp.iD.operands = [Operand.Var "p"] from rfl,
+                     show Lp.iD.outputs = ["d"] from rfl]
+          rw [show evalOperand (Operand.Var "p") { s with instIdx := 0 } = some w from hp]) (by decide)]
+  exact execBlock_step_term_ok f ctx Lp.bBody _ _ Lp.jBack (by rfl) (by rfl) (by decide)
+    (by rw [jumpTo]; exact hnh)
+
+/-- The exit: `STOP`. -/
+theorem lp_exit_run (f : Nat) (ctx : VenomContext) {s : VenomState} :
+    runBlock (f + 1) ctx Lp.bExit s
+      = ExecResult.Halt (haltState { s with instIdx := 0 }) := by
+  rw [runBlock_of_no_phi (by decide)]
+  exact execBlock_step_halt f ctx Lp.bExit _ _ Lp.iStop (by rfl) rfl
+
+/-! ### The walk invariant for a loop, and why it is an `Entry` rather than a `psOf` -/
+namespace Lp
+/-- **The walk invariant — and the reason it cannot be a `psOf`.** At the header the plan layout depends
+on which predecessor we arrived from: `c` from `entry`, `d` across the back-edge. `Entry` is a free
+parameter of `codegen_correct_fuel`, so it can say that; `psOf : String → PlanState` cannot. -/
+def Entry (s : VenomState) (asm : AsmState) : Prop :=
+  s.halted = false ∧
+  ((s.currentBb = "entry" ∧ asm.pc = 0 ∧ venomAsmRel lo (initPlanState 0) s asm) ∨
+   (s.currentBb = "head" ∧ asm.pc = 4 ∧
+      ((s.prevBb = some "entry" ∧ venomAsmRel lo (ps1 "c") s asm) ∨
+       (s.prevBb = some "body" ∧ venomAsmRel lo (ps1 "d") s asm))) ∨
+   (s.currentBb = "body" ∧ asm.pc = 13 ∧ venomAsmRel lo (ps1 "p") s asm) ∨
+   (s.currentBb = "exit" ∧ asm.pc = 10 ∧ venomAsmRel lo (ps1 "p") s asm))
+end Lp
+
+/-- The loop's four blocks, by label. -/
+theorem lp_lookup {s : VenomState} {bb : BasicBlock}
+    (hlk : lookupBlock s.currentBb Lp.fn.blocks = some bb) :
+    (s.currentBb = "entry" ∧ bb = Lp.bEntry) ∨ (s.currentBb = "head" ∧ bb = Lp.bHead) ∨
+    (s.currentBb = "body" ∧ bb = Lp.bBody) ∨ (s.currentBb = "exit" ∧ bb = Lp.bExit) := by
+  rw [show Lp.fn.blocks = [Lp.bEntry, Lp.bHead, Lp.bBody, Lp.bExit] from rfl, lookupBlock] at hlk
+  have hmem := List.mem_of_find?_eq_some hlk
+  have hlab := List.find?_some hlk
+  simp only [List.mem_cons, List.not_mem_nil, or_false] at hmem
+  rcases hmem with rfl | rfl | rfl | rfl
+  · exact Or.inl ⟨(eq_of_beq hlab).symm, rfl⟩
+  · exact Or.inr (Or.inl ⟨(eq_of_beq hlab).symm, rfl⟩)
+  · exact Or.inr (Or.inr (Or.inl ⟨(eq_of_beq hlab).symm, rfl⟩))
+  · exact Or.inr (Or.inr (Or.inr ⟨(eq_of_beq hlab).symm, rfl⟩))
+
+/-- The observable core of the relation: memories and the ten shared fields. Every block of this function
+preserves it, since none of them touches memory. -/
+def LpCore (s : VenomState) (asm : AsmState) : Prop :=
+  (∀ i, readByte i s.memory = readByte i asm.memory) ∧
+  asm.accounts = s.accounts ∧ asm.transient = s.transient ∧
+  asm.returndata = s.returndata ∧ asm.logs = s.logs ∧
+  asm.callCtx = s.callCtx ∧ asm.txCtx = s.txCtx ∧ asm.blockCtx = s.blockCtx ∧
+  asm.code = s.code ∧ asm.prevHashes = s.prevHashes
+
+theorem core_of_init0 {s asm} (h : venomAsmRel Lp.lo (initPlanState 0) s asm) :
+    asm.stack = [] ∧ LpCore s asm := by
+  obtain ⟨h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11⟩ := venomAsmRel_init0_iff.mp h
+  exact ⟨h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11⟩
+
+theorem core_of_ps1 {v s asm} (h : venomAsmRel Lp.lo (ps1 v) s asm) :
+    (∃ w, asm.stack = [w] ∧ lookupVar v s = some w) ∧ LpCore s asm := by
+  obtain ⟨h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11⟩ := venomAsmRel_ps1_iff.mp h
+  exact ⟨h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11⟩
+
+theorem ps1_of_core {v s asm} {w : bytes32} (hstk : asm.stack = [w])
+    (hv : lookupVar v s = some w) (hc : LpCore s asm) :
+    venomAsmRel Lp.lo (ps1 v) s asm := by
+  obtain ⟨h1, h2, h3, h4, h5, h6, h7, h8, h9, h10⟩ := hc
+  exact venomAsmRel_ps1_iff.mpr ⟨⟨w, hstk, hv⟩, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10⟩
+
+/-! ### The loop's four block steps, each re-establishing `Entry`
+
+The header's step is the one to read. It takes the phi's result and handles both arms — loop taken when
+the value is nonzero, exited when it is zero — and re-establishes `Entry` at the successor either way.
+`body`'s step is the back-edge, and it hands the header an arrival carrying **`d`**, not `c`. That is the
+predecessor-dependent layout that no `psOf` could have expressed, now simply a disjunct of `Entry`. -/
+/-- Core survives every step this function makes: no block touches memory, and the asm side only moves
+the pc and the stack. -/
+theorem core_step {s s' : VenomState} {asm asm' : AsmState}
+    (hc : LpCore s asm)
+    (hvm : s'.memory = s.memory) (ham : asm'.memory = asm.memory)
+    (hva : s'.accounts = s.accounts) (hvt : s'.transient = s.transient)
+    (hvr : s'.returndata = s.returndata) (hvl : s'.logs = s.logs)
+    (hvc : s'.callCtx = s.callCtx) (hvx : s'.txCtx = s.txCtx)
+    (hvb : s'.blockCtx = s.blockCtx) (hvd : s'.code = s.code) (hvp : s'.prevHashes = s.prevHashes)
+    (haa : asm'.accounts = asm.accounts) (hat : asm'.transient = asm.transient)
+    (har : asm'.returndata = asm.returndata) (hal : asm'.logs = asm.logs)
+    (hac : asm'.callCtx = asm.callCtx) (hax : asm'.txCtx = asm.txCtx)
+    (hab : asm'.blockCtx = asm.blockCtx) (had : asm'.code = asm.code)
+    (hap : asm'.prevHashes = asm.prevHashes) :
+    LpCore s' asm' := by
+  obtain ⟨hm, ha, ht, hr, hl, hcc, hx, hb, hcd, hph⟩ := hc
+  refine ⟨fun i => by rw [hvm, ham]; exact hm i, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · rw [haa, hva, ha]
+  · rw [hat, hvt, ht]
+  · rw [har, hvr, hr]
+  · rw [hal, hvl, hl]
+  · rw [hac, hvc, hcc]
+  · rw [hax, hvx, hx]
+  · rw [hab, hvb, hb]
+  · rw [had, hvd, hcd]
+  · rw [hap, hvp, hph]
+
+private theorem cs {s s' : VenomState} {asm asm' : AsmState} (hc : LpCore s asm)
+    (hvm : s'.memory = s.memory) (ham : asm'.memory = asm.memory)
+    (hva : s'.accounts = s.accounts) (hvt : s'.transient = s.transient)
+    (hvr : s'.returndata = s.returndata) (hvl : s'.logs = s.logs)
+    (hvc : s'.callCtx = s.callCtx) (hvx : s'.txCtx = s.txCtx)
+    (hvb : s'.blockCtx = s.blockCtx) (hvd : s'.code = s.code) (hvp : s'.prevHashes = s.prevHashes)
+    (haa : asm'.accounts = asm.accounts) (hat : asm'.transient = asm.transient)
+    (har : asm'.returndata = asm.returndata) (hal : asm'.logs = asm.logs)
+    (hac : asm'.callCtx = asm.callCtx) (hax : asm'.txCtx = asm.txCtx)
+    (hab : asm'.blockCtx = asm.blockCtx) (had : asm'.code = asm.code)
+    (hap : asm'.prevHashes = asm.prevHashes) : LpCore s' asm' :=
+  core_step hc hvm ham hva hvt hvr hvl hvc hvx hvb hvd hvp haa hat har hal hac hax hab had hap
+
+/-- **The header's step, from either arrival.** Given the phi's result, both arms are handled: the loop
+is taken when the value is nonzero and exited when it is zero, and the successor's `Entry` is
+re-established either way. -/
+theorem lp_head_step {s : VenomState} {asm : AsmState} {w : bytes32} {k : Nat}
+    (hnh : s.halted = false) (hpc : asm.pc = 4)
+    (hstk : asm.stack = [w]) (hcore : LpCore s asm)
+    (hev : evalPhis s Lp.bHead.instructions = ExecResult.OK (updateVar "p" w s)) :
+    ∃ (asm' : AsmState) (blockLen : Nat),
+      runAsm blockLen Lp.o2pc Lp.prog asm = AsmResult.AsmOK asm' ∧
+      blockLen ≤ 6 ∧ Lp.Entry (
+        match runBlock (k + 1) Lp.ctx Lp.bHead s with
+        | ExecResult.OK s' => s'
+        | _ => s) asm' := by
+  by_cases hw : w = EvmYul.UInt256.ofNat 0
+  · subst hw
+    rw [lp_head_run_exit k Lp.ctx hnh hev]
+    refine ⟨_, 6, lp_hasm_head_nottaken (stk := []) hpc hstk, by decide, hnh, ?_⟩
+    refine Or.inr (Or.inr (Or.inr ⟨rfl, rfl, ?_⟩))
+    refine ps1_of_core (w := EvmYul.UInt256.ofNat 0) rfl
+      (lookupVar_updateVar_self s "p" _) ?_
+    exact cs hcore rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl
+  · rw [lp_head_run_taken k Lp.ctx hnh hev hw]
+    refine ⟨_, 4, lp_hasm_head_taken (stk := []) hpc hstk hw, by decide, hnh, ?_⟩
+    refine Or.inr (Or.inr (Or.inl ⟨rfl, rfl, ?_⟩))
+    refine ps1_of_core (w := w) rfl (lookupVar_updateVar_self s "p" w) ?_
+    exact cs hcore rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl
+
+/-- `entry`'s step: binds `c`, pushes it, and hands the header an arrival from `entry`. -/
+theorem lp_entry_step {s : VenomState} {asm : AsmState} {k : Nat}
+    (hnh : s.halted = false) (hcur : s.currentBb = "entry") (hpc : asm.pc = 0)
+    (hstk : asm.stack = []) (hcore : LpCore s asm) :
+    ∃ (asm' : AsmState) (blockLen : Nat),
+      runAsm blockLen Lp.o2pc Lp.prog asm = AsmResult.AsmOK asm' ∧
+      blockLen ≤ 6 ∧ Lp.Entry (jumpTo "head" (Lp.afterC s)) asm' := by
+  refine ⟨_, 4, lp_hasm_entry hpc, by decide, hnh, ?_⟩
+  refine Or.inr (Or.inl ⟨rfl, rfl, Or.inl ⟨?_, ?_⟩⟩)
+  · show some s.currentBb = some "entry"; rw [hcur]
+  · refine ps1_of_core (w := s.callCtx.callvalue) ?_
+      (lookupVar_updateVar_self s "c" s.callCtx.callvalue) ?_
+    · show asm.callCtx.callvalue :: asm.stack = [s.callCtx.callvalue]
+      rw [hstk, hcore.2.2.2.2.2.1]
+    · exact cs hcore rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl
+
+/-- `body`'s step: `ISZERO` flips the value, and the **back-edge** hands the header an arrival from
+`body` — with `d` in the slot, not `c`. -/
+theorem lp_body_step {s : VenomState} {asm : AsmState} {w : bytes32} {k : Nat}
+    (hnh : s.halted = false) (hcur : s.currentBb = "body") (hpc : asm.pc = 13)
+    (hstk : asm.stack = [w]) (hp : lookupVar "p" s = some w) (hcore : LpCore s asm) :
+    ∃ (asm' : AsmState) (blockLen : Nat),
+      runAsm blockLen Lp.o2pc Lp.prog asm = AsmResult.AsmOK asm' ∧
+      blockLen ≤ 6 ∧ Lp.Entry (jumpTo "head"
+        { updateVar "d" (EvmYul.UInt256.isZero w) { s with instIdx := 0 } with instIdx := 1 }) asm' := by
+  refine ⟨_, 4, lp_hasm_body hpc hstk, by decide, hnh, ?_⟩
+  refine Or.inr (Or.inl ⟨rfl, rfl, Or.inr ⟨?_, ?_⟩⟩)
+  · show some s.currentBb = some "body"; rw [hcur]
+  · refine ps1_of_core (w := EvmYul.UInt256.isZero w) rfl
+      (lookupVar_updateVar_self { s with instIdx := 0 } "d" _) ?_
+    exact cs hcore rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl
+
+/-- `exit`'s step: `POP` then `STOP`. Halts, with the observable state related. -/
+theorem lp_exit_step {s : VenomState} {asm : AsmState} {w : bytes32} {N k : Nat}
+    (hpc : asm.pc = 10) (hstk : asm.stack = [w]) (hcore : LpCore s asm) (hN : 6 ≤ N) :
+    ∃ asm', runAsm N Lp.o2pc Lp.prog asm = AsmResult.AsmHalt asm' ∧
+      venomAsmTerminalRel (haltState { s with instIdx := 0 }) asm' := by
+  obtain ⟨as', hrun, ha, ht, hr, hl⟩ := lp_hasm_exit hpc hstk (by omega : 3 ≤ N)
+  refine ⟨as', hrun, ?_, ?_, ?_, ?_⟩
+  · show as'.accounts = s.accounts; rw [ha]; exact hcore.2.1
+  · show as'.transient = s.transient; rw [ht]; exact hcore.2.2.1
+  · show as'.returndata = s.returndata; rw [hr]; exact hcore.2.2.2.1
+  · show as'.logs = s.logs; rw [hl]; exact hcore.2.2.2.2.1
+
+/-! ### The loop's `hbsim`: every block, both arrivals, every fuel -/
+/-- Out of fuel on a phi-free block. -/
+private theorem lp_zero_nophi {bb s asm N}
+    (h : ∀ i, bb.instructions.head? = some i → i.opcode ≠ Opcode.PHI) :
+    (match runBlock 0 Lp.ctx bb s with
+     | ExecResult.OK s' =>
+         if s'.halted then
+           ∃ asm', runAsm N Lp.o2pc Lp.prog asm = AsmResult.AsmHalt asm' ∧ venomAsmTerminalRel s' asm'
+         else ∃ (asm' : AsmState) (bl : Nat), runAsm bl Lp.o2pc Lp.prog asm = AsmResult.AsmOK asm' ∧
+           bl ≤ 6 ∧ Lp.Entry s' asm'
+     | ExecResult.Halt s' =>
+         ∃ asm', runAsm N Lp.o2pc Lp.prog asm = AsmResult.AsmHalt asm' ∧ venomAsmTerminalRel s' asm'
+     | ExecResult.Abort AbortType.RevertAbort s' =>
+         ∃ asm', runAsm N Lp.o2pc Lp.prog asm = AsmResult.AsmRevert asm' ∧ venomAsmTerminalRel s' asm'
+     | ExecResult.Abort AbortType.ExHaltAbort s' =>
+         ∃ asm', runAsm N Lp.o2pc Lp.prog asm = AsmResult.AsmFault asm' ∧ venomAsmTerminalRel s' asm'
+     | _ => True) := by
+  rw [runBlock_of_no_phi h]
+  simp only [execBlock]
+
+/-- Out of fuel at the header, whose phis do evaluate. -/
+private theorem lp_zero_head {s asm N w}
+    (hev : evalPhis s Lp.bHead.instructions = ExecResult.OK (updateVar "p" w s)) :
+    (match runBlock 0 Lp.ctx Lp.bHead s with
+     | ExecResult.OK s' =>
+         if s'.halted then
+           ∃ asm', runAsm N Lp.o2pc Lp.prog asm = AsmResult.AsmHalt asm' ∧ venomAsmTerminalRel s' asm'
+         else ∃ (asm' : AsmState) (bl : Nat), runAsm bl Lp.o2pc Lp.prog asm = AsmResult.AsmOK asm' ∧
+           bl ≤ 6 ∧ Lp.Entry s' asm'
+     | ExecResult.Halt s' =>
+         ∃ asm', runAsm N Lp.o2pc Lp.prog asm = AsmResult.AsmHalt asm' ∧ venomAsmTerminalRel s' asm'
+     | ExecResult.Abort AbortType.RevertAbort s' =>
+         ∃ asm', runAsm N Lp.o2pc Lp.prog asm = AsmResult.AsmRevert asm' ∧ venomAsmTerminalRel s' asm'
+     | ExecResult.Abort AbortType.ExHaltAbort s' =>
+         ∃ asm', runAsm N Lp.o2pc Lp.prog asm = AsmResult.AsmFault asm' ∧ venomAsmTerminalRel s' asm'
+     | _ => True) := by
+  rw [runBlock_eq_execBlock_of_phis hev]
+  simp only [execBlock]
+
+/-- **The loop's per-block obligation — every block, both arrivals, every fuel.** -/
+theorem lp_hbsim :
+    ∀ (s : VenomState) (asm : AsmState) (N f' : Nat) (bb : BasicBlock),
+      Lp.Entry s asm → lookupBlock s.currentBb Lp.fn.blocks = some bb → 6 ≤ N →
+      (match runBlock f' Lp.ctx bb s with
+       | ExecResult.OK s' =>
+           if s'.halted then
+             ∃ asm', runAsm N Lp.o2pc Lp.prog asm = AsmResult.AsmHalt asm' ∧
+               venomAsmTerminalRel s' asm'
+           else ∃ (asm' : AsmState) (bl : Nat),
+             runAsm bl Lp.o2pc Lp.prog asm = AsmResult.AsmOK asm' ∧ bl ≤ 6 ∧ Lp.Entry s' asm'
+       | ExecResult.Halt s' =>
+           ∃ asm', runAsm N Lp.o2pc Lp.prog asm = AsmResult.AsmHalt asm' ∧ venomAsmTerminalRel s' asm'
+       | ExecResult.Abort AbortType.RevertAbort s' =>
+           ∃ asm', runAsm N Lp.o2pc Lp.prog asm = AsmResult.AsmRevert asm' ∧ venomAsmTerminalRel s' asm'
+       | ExecResult.Abort AbortType.ExHaltAbort s' =>
+           ∃ asm', runAsm N Lp.o2pc Lp.prog asm = AsmResult.AsmFault asm' ∧ venomAsmTerminalRel s' asm'
+       | _ => True) := by
+  intro s asm N f' bb hE hlk hN
+  obtain ⟨hnh, hcase⟩ := hE
+  rcases lp_lookup hlk with ⟨hcur, rfl⟩ | ⟨hcur, rfl⟩ | ⟨hcur, rfl⟩ | ⟨hcur, rfl⟩
+  · -- entry
+    rcases hcase with ⟨-, hpc, hrel⟩ | ⟨h2, -, -⟩ | ⟨h2, -, -⟩ | ⟨h2, -, -⟩
+    · obtain ⟨hstk, hcore⟩ := core_of_init0 hrel
+      match f' with
+      | 0 => exact lp_zero_nophi (by decide)
+      | 1 =>
+        rw [runBlock_of_no_phi (by decide),
+            execBlock_step_nonterm 0 Lp.ctx Lp.bEntry { s with instIdx := 0 }
+              (updateVar "c" s.callCtx.callvalue { s with instIdx := 0 }) Lp.iC
+              (by rfl) (by rfl) (by decide)]
+        simp only [execBlock]
+      | (k + 1 + 1) =>
+        rw [lp_entry_run k Lp.ctx hnh]
+        simp only [show (jumpTo "head" (Lp.afterC s)).halted = false from hnh,
+                   Bool.false_eq_true, if_false]
+        exact lp_entry_step (k := k) hnh hcur hpc hstk hcore
+    · exact absurd (hcur.symm.trans h2) (by decide)
+    · exact absurd (hcur.symm.trans h2) (by decide)
+    · exact absurd (hcur.symm.trans h2) (by decide)
+  · -- head
+    rcases hcase with ⟨h2, -, -⟩ | ⟨-, hpc, hd⟩ | ⟨h2, -, -⟩ | ⟨h2, -, -⟩
+    · exact absurd (hcur.symm.trans h2) (by decide)
+    · have hev : ∃ w, asm.stack = [w] ∧ LpCore s asm ∧
+          evalPhis s Lp.bHead.instructions = ExecResult.OK (updateVar "p" w s) := by
+        rcases hd with ⟨hprev, hrel⟩ | ⟨hprev, hrel⟩
+        · obtain ⟨⟨w, hstk, hv⟩, hcore⟩ := core_of_ps1 hrel
+          exact ⟨w, hstk, hcore, lp_ev_from_entry hprev hv⟩
+        · obtain ⟨⟨w, hstk, hv⟩, hcore⟩ := core_of_ps1 hrel
+          exact ⟨w, hstk, hcore, lp_ev_from_body hprev hv⟩
+      obtain ⟨w, hstk, hcore, hevw⟩ := hev
+      match f' with
+      | 0 => exact lp_zero_head hevw
+      | (k + 1) =>
+        by_cases hw : w = EvmYul.UInt256.ofNat 0
+        · subst hw
+          rw [lp_head_run_exit k Lp.ctx hnh hevw]
+          simp only [show (jumpTo "exit" { updateVar "p" (EvmYul.UInt256.ofNat 0) s
+                       with instIdx := 1 }).halted = false from hnh, Bool.false_eq_true, if_false]
+          have h := lp_head_step (k := k) hnh hpc hstk hcore hevw
+          rwa [lp_head_run_exit k Lp.ctx hnh hevw] at h
+        · rw [lp_head_run_taken k Lp.ctx hnh hevw hw]
+          simp only [show (jumpTo "body" { updateVar "p" w s with instIdx := 1 }).halted = false
+                       from hnh, Bool.false_eq_true, if_false]
+          have h := lp_head_step (k := k) hnh hpc hstk hcore hevw
+          rwa [lp_head_run_taken k Lp.ctx hnh hevw hw] at h
+    · exact absurd (hcur.symm.trans h2) (by decide)
+    · exact absurd (hcur.symm.trans h2) (by decide)
+  · -- body
+    rcases hcase with ⟨h2, -, -⟩ | ⟨h2, -, -⟩ | ⟨-, hpc, hrel⟩ | ⟨h2, -, -⟩
+    · exact absurd (hcur.symm.trans h2) (by decide)
+    · exact absurd (hcur.symm.trans h2) (by decide)
+    · obtain ⟨⟨w, hstk, hv⟩, hcore⟩ := core_of_ps1 hrel
+      match f' with
+      | 0 => exact lp_zero_nophi (by decide)
+      | 1 =>
+        rw [runBlock_of_no_phi (by decide),
+            execBlock_step_nonterm 0 Lp.ctx Lp.bBody { s with instIdx := 0 }
+              (updateVar "d" (EvmYul.UInt256.isZero w) { s with instIdx := 0 }) Lp.iD
+              (by rfl) (by
+                show stepInstBase Lp.iD { s with instIdx := 0 } = _
+                unfold stepInstBase
+                simp only [show Lp.iD.opcode = Opcode.ISZERO from rfl]
+                unfold execPure1
+                simp only [show Lp.iD.operands = [Operand.Var "p"] from rfl,
+                           show Lp.iD.outputs = ["d"] from rfl]
+                rw [show evalOperand (Operand.Var "p") { s with instIdx := 0 } = some w from hv])
+              (by decide)]
+        simp only [execBlock]
+      | (k + 1 + 1) =>
+        rw [lp_body_run k Lp.ctx hnh hv]
+        simp only [show (jumpTo "head" { updateVar "d" (EvmYul.UInt256.isZero w)
+                     { s with instIdx := 0 } with instIdx := 1 }).halted = false from hnh,
+                   Bool.false_eq_true, if_false]
+        exact lp_body_step (k := k) hnh hcur hpc hstk hv hcore
+    · exact absurd (hcur.symm.trans h2) (by decide)
+  · -- exit
+    rcases hcase with ⟨h2, -, -⟩ | ⟨h2, -, -⟩ | ⟨h2, -, -⟩ | ⟨-, hpc, hrel⟩
+    · exact absurd (hcur.symm.trans h2) (by decide)
+    · exact absurd (hcur.symm.trans h2) (by decide)
+    · exact absurd (hcur.symm.trans h2) (by decide)
+    · obtain ⟨⟨w, hstk, hv⟩, hcore⟩ := core_of_ps1 hrel
+      match f' with
+      | 0 => exact lp_zero_nophi (by decide)
+      | (k + 1) =>
+        rw [lp_exit_run k Lp.ctx]
+        exact lp_exit_step (k := k) hpc hstk hcore hN
+
+/-- **CAPSTONE — codegen correctness for a CYCLIC function whose loop header is a phi.**
+
+Venom running `Lp.fn` and the EVM running the seventeen instructions the compiler emits for it agree.
+The asm budget is `fuel * 6` — Venom's own fuel times the longest block's asm length — which is what makes
+a loop expressible at all: a program of seventeen instructions can execute far more than seventeen steps,
+and no `prog.length` budget could have covered that.
+
+Every input is discharged. `lp_hbsim` covers all four blocks, at every fuel, against the real compiled
+program — including the header, whose head is a `PHI` and which is entered from *two* predecessors with
+*different variables in the same stack slot*.
+
+`Lp.Entry` is the load-bearing hypothesis, and it is where the whole loop story lands. It records, at the
+header, which predecessor the walk arrived from and hence which layout the stack has: `c` from `entry`, `d`
+across the back-edge. `lp_psOf_by_label_impossible` proves that a `psOf : String → PlanState` cannot say
+that — the two layouts are distinct and a function of the label alone must pick one. `codegen_correct_fuel`
+takes `Entry` as a free parameter precisely so it can be said. -/
+theorem lp_codegen_correct {fuel : Nat} {vs : VenomState} {as : AsmState}
+    (hvshalt : vs.halted = false)
+    (hpc0 : as.pc = 0)
+    (hrel : venomAsmRel Lp.lo (initPlanState 0)
+        { vs with prevBb := none, currentBb := "entry", instIdx := 0 } as) :
+    (match runContext fuel Lp.ctx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (fuel * 6) Lp.o2pc Lp.prog as
+         = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (fuel * 6) Lp.o2pc Lp.prog as
+         = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (fuel * 6) Lp.o2pc Lp.prog as
+         = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) :=
+  codegen_correct_fuel (fuel := fuel) (ctx := Lp.ctx) (fn := Lp.fn) (fnEom := 0) (lblCtr := 0)
+    (ops := Lp.ops) (psFinal := (generateFnPlan Lp.fn 0 0).get!.2)
+    (entryName := "main") (entryLbl := "entry") 6 Lp.Entry
+    rfl rfl rfl rfl lp_hbsim ⟨hvshalt, Or.inl ⟨rfl, hpc0, hrel⟩⟩
+
+/-! ### Is the loop capstone vacuous?
+
+Same question as for the diamond, and it gets the same treatment rather than the benefit of the doubt:
+`lp_codegen_correct`'s conclusion is a match on `runContext` whose last arm is `_ => True`, so a function
+that errored out or never terminated would satisfy it while saying nothing at all. `Example.loopFn` is
+exactly such a function — it never halts — which is why it was not used here.
+
+`Lp.fn` runs, through the back-edge, and halts. Feeding that to the capstone yields a concrete EVM halt
+related to the Venom halt state, with every hypothesis discharged. -/
+namespace Lp
+def as0 : AsmState := { (default : AsmState) with
+  callCtx := { (default : CallContext) with callvalue := EvmYul.UInt256.ofNat 7 } }
+end Lp
+
+/-- The relation holds at the start: empty stacks, empty memories, matching contexts. -/
+theorem lp_rel0 : venomAsmRel Lp.lo (initPlanState 0) Lp.s0 Lp.as0 := by
+  rw [venomAsmRel_init0_iff]
+  refine ⟨rfl, ?_, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  intro i; rfl
+
+/-- **The loop capstone is not vacuous.** Its conclusion is a match on `runContext` whose last arm is
+`_ => True`, so it would say nothing if the function never ran. It runs — through the back-edge — and
+feeding that to the capstone yields a concrete EVM halt related to the Venom halt state.
+
+Every hypothesis of `lp_codegen_correct` is discharged here. Nothing is assumed. -/
+theorem lp_codegen_correct_fires :
+    ∃ as', runAsm (30 * 6) Lp.o2pc Lp.prog Lp.as0 = AsmResult.AsmHalt as' ∧
+      (∃ w, runContext 30 Lp.ctx Lp.vs0 = ExecResult.Halt w ∧ finalStateRel w as') := by
+  have h := lp_codegen_correct (fuel := 30) (vs := Lp.vs0) (as := Lp.as0)
+    (by rfl) (by rfl) lp_rel0
+  have hr := lp_runs
+  revert h hr
+  cases hrc : runContext 30 Lp.ctx Lp.vs0 with
+  | Halt w =>
+    intro h _
+    obtain ⟨as', hrun, hfin⟩ := h
+    exact ⟨as', hrun, w, rfl, hfin⟩
+  | OK _ => intro _ hr; exact absurd hr (by simp)
+  | Abort a _ => intro _ hr; cases a <;> exact absurd hr (by simp)
+  | IntRet _ _ => intro _ hr; exact absurd hr (by simp)
+  | Error _ => intro _ hr; exact absurd hr (by simp)
+
+/-! ### `DJMP` is excluded for the wrong reason
+
+`codegen_correct_sched_reach`'s docstring justifies excluding `DJMP` by calling it "the one terminator
+that computes its target from a runtime selector rather than a label operand, and so could leave the
+static CFG". That is false, on both halves.
+
+A `DJMP`'s targets *are* label operands — `DJMP sel, l₀, l₁, …` — and the selector only chooses which one.
+`getSuccessors` `filterMap`s the label operands of any terminator, so every label a `DJMP` can reach is
+already in `bbSuccs`. `djmp_target_is_static_succ` proves it. And `CfgReach_of_runBlock`, the lemma that
+actually preserves reachability across a block, carries no `DJMP` exclusion at all — it never needed one.
+
+The exclusion itself is real, and the reason is worth stating correctly because the false one makes `DJMP`
+look unsupportable in principle. `djmpChain` lowers a `DJMP` to a comparison chain plus one *freshly
+labelled* pop-trampoline per target (`freshLabel "djmp_tramp"`). Those fresh labels are what break the
+label-uniqueness counting `hpreuniq` relies on — the same reason `INVOKE` and `ASSERT_UNREACHABLE` are
+excluded, and the reason `hgood` names all three together. That is a bookkeeping obstacle in the codegen,
+not a soundness one in the CFG. -/
+/-! ### What `DJMP` would actually cost
+
+The previous section showed the *stated* reason for excluding `DJMP` is false. This one scopes the real
+one, which turns out to be narrower than the blanket exclusion suggests.
+
+`hpreuniq` counts occurrences of a **block** label in the plan, and `generateFnPlanFuel_planLabelCount`
+proves that count is at most one — under `hgood`, which bans the three opcodes that mint fresh `SOLabel`s.
+But a `DJMP` trampoline is not a block label. It is `freshLabel "djmp_tramp"`, which by construction is
+`"djmp_tramp" ++ "_" ++ <counter>`. It can only interfere with the count of `bb.label` if some block is
+*literally named* `djmp_tramp_<n>`.
+
+So the blanket "no `DJMP`" could be weakened to a per-function side condition — no block is named like a
+trampoline — which every real function satisfies and both of this branch's witnesses satisfy provably.
+What is *not* done here is the rework of `generateFnPlanFuel_planLabelCount` itself, whose induction is
+currently structured around `hgood`. That is the actual remaining cost of `DJMP`, and it is a counting
+argument, not a soundness one. -/
+/-! ### The DJMP rework needs no string-representation injectivity
+
+My first framing of the remaining `DJMP` work was that it hinges on `toString` being injective on `Nat` —
+otherwise two trampolines minted at different counter values could not be shown to have different names.
+That framing is wrong, and it matters, because `Nat`'s `toString` injectivity is not in the library and
+proving it would mean reasoning about digit representations.
+
+`hpreuniq` only ever needs the count of a **block** label. Look at what it concludes: `∀ a ∈ executePlan
+preOps, a ≠ AsmInst.AsmLabel bb.label`. So the trampolines never need to be distinct *from each other* —
+only from `bb.label`. And a trampoline is `freshLabel "djmp_tramp"`, which carries its prefix by
+construction.
+
+`djmpChain_soLabel_is_tramp` proves every `SOLabel` a `DJMP` emits has that shape, and
+`generateDjmpPlan_soLabel_is_tramp` shows the only `SOLabel`s in a `DJMP`'s plan are the trampolines,
+each carrying its prefix by construction. What remains is threading this
+through `generateFnPlanFuel_planLabelCount`'s induction, which is currently structured around `hgood`
+banning the minters rather than around which labels they mint. -/
+/-! ### The exact fact the `planLabelCount` induction needs
+
+`generateBlockPlan_planLabelCount`'s proof turns on one step: *the instruction fold's ops carry no
+`SOLabel`*. That is what `hgood` buys, by banning the three opcodes that could emit one.
+
+The weaker fact that would actually suffice is: *the instruction fold's ops carry no `SOLabel` equal to a
+block label*. The counting argument only ever asks about `bb.label` — `hpreuniq`'s conclusion is
+`a ≠ AsmInst.AsmLabel bb.label` — so a plan may emit all the `SOLabel`s it likes, provided none of them is
+a block's.
+
+For `DJMP` that weaker fact is a theorem, and these three prove it. The comparison chain emits no
+`SOLabel` at all (its label operations are *pushes*, not definitions); the out-of-range default emits
+none; and the trampolines emit exactly one apiece, each carrying the `djmp_tramp` prefix by construction.
+So a `DJMP`'s plan never defines a block's label.
+
+What is still not done is rewriting `generateBlockPlan_planLabelCount` and its callers to take the weaker
+hypothesis. That is a mechanical change to an existing induction, and it is the whole of what `DJMP`
+support now costs. -/
+/-! ### Every `SOLabel` the emitter produces is freshly minted — all three minters, not just `DJMP`
+
+`hgood` bans three opcodes: `INVOKE`, `ASSERT_UNREACHABLE` and `DJMP`. The previous section showed
+`DJMP`'s labels are all trampolines. The same is true of the other two, and for the same reason —
+`freshLabel "return_label"` and `freshLabel "reachable"` carry their prefixes by construction — so the
+generalisation costs nothing extra.
+
+`generateEmitOps_soLabel_is_fresh` is exhaustive over every opcode, and it needs no new case analysis:
+the three minters get their branch extracted, and for everything else `generateEmitOps_no_soLabel` already
+says there is no `SOLabel` to talk about. Which means the blanket `hgood` could be replaced, for *all
+three* opcodes at once, by a single per-function side condition: no block is named like a freshly minted
+label.
+
+The `DJMP` question turned out to be one distinction: a label *push* (`SOPushLabel`) is not a label
+*definition* (`SOLabel`). Every branch of the emitter that looked like it was minting labels was pushing
+them. -/
+/-! ### Lifting "every emitted label is fresh" up to the instruction plan -/
+/-! ### The block-plan count, with `hgood` removed entirely
+
+This is the induction rewrite. `generateBlockPlan_planLabelCount` needs the instruction fold to emit no
+`SOLabel` at all, and buys that by banning the three minters. `generateBlockPlan_planLabelCount_fresh`
+needs only the fact that actually matters: every `SOLabel` the fold emits is *freshly minted*, and `l` is
+not a fresh label.
+
+The hypothesis `¬ IsFreshLabel l` is exactly right for the caller, because the counting argument is only
+ever instantiated at `bb.label` — and a block label is not a freshly minted one. So `INVOKE`,
+`ASSERT_UNREACHABLE` and `DJMP` are all admitted, with no ban and no case analysis about them at the block
+level. -/
+/-! ### `hpreuniq`, for functions containing `DJMP`, `INVOKE` and `ASSERT_UNREACHABLE`
+
+The top of the chain. `hpreuniq_fresh`'s side condition is no longer a ban on three opcodes, but a fact
+about naming: the block's own label is not one a `freshLabel` could have minted. That is the only thing
+the counting argument ever needed, and no real function violates it — every fresh label is at least ten
+characters, and `short_not_fresh` discharges the condition for anything shorter. -/
+theorem dia_labels_not_fresh : ∀ b ∈ Dia.fn.blocks, ¬ IsFreshLabel b.label := by
+  intro b hb
+  simp only [Dia.fn, List.mem_cons, List.not_mem_nil, or_false] at hb
+  rcases hb with rfl | rfl | rfl | rfl <;> exact short_not_fresh (by decide)
+
+theorem lp_labels_not_fresh : ∀ b ∈ Lp.fn.blocks, ¬ IsFreshLabel b.label := by
+  intro b hb
+  simp only [Lp.fn, List.mem_cons, List.not_mem_nil, or_false] at hb
+  rcases hb with rfl | rfl | rfl | rfl <;> exact short_not_fresh (by decide)
+
+/-! ### Every `hgood` consumer now has an `hgood`-free replacement
+
+`hgood` is consumed in exactly three places across the development, and all three are one-liners over the
+label count: `hpreuniq_of_blockPlan` (the `hpreuniq` input), `labelOffset_of_blockPlan` (`hoff_lk`), and
+`jumpTarget_of_blockPlan` (`hoff_lk` + `hidx_lk` + `hidxeq` together). The per-block `hstep` family uses
+`hgood` for nothing else — grep it and every hit is the line `hpreuniq_generic hgood hgen hblkhd`.
+
+So these three drop-ins are the whole interface. A caller with a function containing `DJMP`, `INVOKE` or
+`ASSERT_UNREACHABLE` supplies `¬ IsFreshLabel bb.label` instead of a ban, and everything downstream is
+unchanged. -/
+/-! ## Universal dispatch
+
+A single entry point from a block's simulation to the walk's obligation, so a caller never has to case
+on the terminator. The first attempt at this — `WalkStep_of_BlockSim_any` — was **vacuous on its
+continuing arm** and has been removed; see the retraction below for the refutation, and
+`WalkStep_of_BlockSimAt` for the version that works. What survives here is the terminal transfer, which
+was always sound. -/
+
+/-! ## RETRACTION: `WalkStep_of_BlockSim_any`'s continuing arm was vacuous
+
+The theorem is **deleted**, not merely annotated — a vacuous "universal dispatcher" left lying around is a
+trap, and a docstring warning is not a fix. The refutation below is what replaces it.
+
+`BlockSim` mirrors `genBlockSimulation`, whose `prog` is built from the *block's* plan — so its
+`prog.length` is the block's asm length. `WalkStep`'s `prog` is the *whole function's* program. My bridge
+forced the two to be the same list, which is only true when the function has one block.
+
+Instantiated the way the walk needs it — `prog` = the whole program — `BlockSim`'s continuing arm asserts
+that running `prog.length` asm steps from a block's entry leaves the machine in `AsmOK`. But a continuing
+block does not stop at its own boundary: it runs on into its successor, and in a terminating program it
+halts. `dia_blockSim_ok_false_at_whole_prog` proves the arm is *false* for `then`.
+
+So `WalkStep_of_BlockSim_any` covered only halting blocks, and the witness I first fired it on passed
+because `Min` has exactly one block — the one case where the two programs coincide. The 0-consumer
+heuristic pointed at this; firing it on a halting block hid it; firing it on a *continuing* one is what
+caught it. That is the lesson worth keeping: **fire a theorem on the case that makes it non-trivial**, not
+on whichever case is nearest to hand.
+
+`BlockSimAt` takes the block's asm length as a parameter instead of reading it off the program, which is
+what the `hstep` family does and what makes the continuing arm satisfiable.
+`dia_then_walkstep_universal` fires the repaired dispatcher on `then` — a block that does *not* halt, so
+`hok` is genuinely used rather than discharged by absurdity. -/
+/-- From `then` (pc 13), running the WHOLE program's length of steps does not leave the machine in
+`AsmOK` — it halts. `then` jumps to `join`, and `join` is `JUMPDEST ; STOP`. -/
+theorem dia_then_whole_prog_halts {asm : AsmState} (hpc : asm.pc = 13) (hstk : asm.stack = []) :
+    ∃ as', runAsm Dia.prog.length Dia.o2pc Dia.prog asm = AsmResult.AsmHalt as' := by
+  have h7 : runAsm 7 Dia.o2pc Dia.prog asm
+      = AsmResult.AsmHalt (asmNext (asmNext { asm with pc := 11 })) := by
+    rw [show (7 : Nat) = 5 + 2 from rfl, runAsm_append_ok (dia_hasm_then hpc hstk)]
+    exact dia_hasm_join rfl
+  exact ⟨_, runAsm_le_of_ne_ok (by simp) (by rw [dia_prog_length]; omega) h7⟩
+
+/-- **`BlockSim`'s continuing arm is FALSE for `then` at the whole program.** `BlockSim` states the asm
+run at `prog.length` fuel. With `prog` the *whole* function's program, a continuing block does not stop at
+its own boundary — it runs on into its successor and, here, halts. So no `as'` makes it `AsmOK`. -/
+theorem dia_blockSim_ok_false_at_whole_prog {lo ps' s'} {asm : AsmState}
+    (hpc : asm.pc = 13) (hstk : asm.stack = []) :
+    ¬ BlockSim lo ps' Dia.o2pc Dia.prog asm (ExecResult.OK s') := by
+  rintro ⟨as', hrun, -⟩
+  obtain ⟨w, hw⟩ := dia_then_whole_prog_halts hpc hstk
+  rw [hrun] at hw
+  exact absurd hw (by simp)
+
+/-- A block's simulation **against the whole program**, at the block's own asm length. -/
+def BlockSimAt (blockLen : Nat) (lo : AssocList String Nat) (ps' : PlanState)
+    (offsetToPc : AssocList Nat Nat) (prog : List AsmInst) (as : AsmState) : ExecResult → Prop
+  | ExecResult.OK vs' =>
+      ∃ as', runAsm blockLen offsetToPc prog as = AsmResult.AsmOK as' ∧
+             venomAsmRel lo ps' vs' as'
+  | ExecResult.Halt vs' =>
+      ∃ as', runAsm blockLen offsetToPc prog as = AsmResult.AsmHalt as' ∧
+             venomAsmTerminalRel vs' as'
+  | ExecResult.Abort AbortType.RevertAbort vs' =>
+      ∃ as', runAsm blockLen offsetToPc prog as = AsmResult.AsmRevert as' ∧
+             venomAsmTerminalRel vs' as'
+  | ExecResult.Abort AbortType.ExHaltAbort vs' =>
+      ∃ as', runAsm blockLen offsetToPc prog as = AsmResult.AsmFault as' ∧
+             venomAsmTerminalRel vs' as'
+  | _ => True
+
+/-- **Universal dispatch, repaired.** Same shape as before, but the asm run is the *block's*, not the
+whole program's — which is what makes the continuing arm satisfiable. -/
+theorem WalkStep_of_BlockSimAt {fn : IrFunction} {ctx : VenomContext}
+    {offsetToPc : AssocList Nat Nat} {prog : List AsmInst} {labelOffsets : AssocList String Nat}
+    (pcOf : String → Nat) (psOf : String → PlanState) (wOf : String → Nat)
+    {bb : BasicBlock} {s : VenomState} {asm : AsmState} {ps' : PlanState}
+    {N f' blockLen : Nat}
+    (hle : blockLen ≤ N)
+    (hbs : BlockSimAt blockLen labelOffsets ps' offsetToPc prog asm (runBlock f' ctx bb s))
+    (hok : ∀ s', runBlock f' ctx bb s = ExecResult.OK s' →
+      s'.halted = false ∧
+      ∃ bb', lookupBlock s'.currentBb fn.blocks = some bb' ∧
+        ps'.stack = (psOf bb'.label).stack ∧
+        ps'.spilled = (psOf bb'.label).spilled ∧
+        ps'.alloc.fnEom = (psOf bb'.label).alloc.fnEom ∧
+        ps'.alloc.nextOffset ≤ (psOf bb'.label).alloc.nextOffset ∧
+        (∀ asm', runAsm blockLen offsetToPc prog asm = AsmResult.AsmOK asm' →
+          asm'.pc = pcOf bb'.label) ∧
+        wOf bb'.label + blockLen ≤ wOf bb.label) :
+    WalkStep fn pcOf psOf wOf labelOffsets offsetToPc prog bb asm N
+      (runBlock f' ctx bb s) := by
+  by_cases hcont : ∃ s', runBlock f' ctx bb s = ExecResult.OK s'
+  · obtain ⟨s', hrb⟩ := hcont
+    obtain ⟨hnh, bb', hlk, hstk, hsp, hfe, hno, hpc, hwdec⟩ := hok s' hrb
+    rw [hrb] at hbs
+    obtain ⟨as', hrun, hrel⟩ := hbs
+    exact hstep_jmp_block_ws pcOf psOf wOf hrb hnh hrun hrel hstk hsp hfe hno
+      (hpc as' hrun) hle rfl hlk hwdec
+  · cases hr : runBlock f' ctx bb s with
+    | OK w => exact absurd hr (fun h => hcont ⟨w, h⟩)
+    | Halt w =>
+      rw [hr] at hbs; obtain ⟨as', hrun, hrel⟩ := hbs
+      exact ⟨as', runAsm_le_of_ne_ok (by simp) hle hrun, hrel⟩
+    | Abort a w =>
+      cases a <;> (rw [hr] at hbs; obtain ⟨as', hrun, hrel⟩ := hbs;
+                   exact ⟨as', runAsm_le_of_ne_ok (by simp) hle hrun, hrel⟩)
+    | IntRet _ _ => trivial
+    | Error _ => trivial
+
+/-- **`BlockSimAt`'s continuing arm is satisfiable** — the very thing `BlockSim`'s was not. `then` is a
+`JMP` block: five asm steps land it at `join`, with the relation intact. -/
+theorem dia_then_blockSimAt {s : VenomState} {asm : AsmState} {f : Nat}
+    (hnh : s.halted = false)
+    (hpc : asm.pc = Dia.pcOf Dia.bThen.label)
+    (hrel : venomAsmRel Dia.lo (Dia.psOf Dia.bThen.label) s asm) :
+    BlockSimAt 5 Dia.lo (Dia.psOf Dia.bJoin.label) Dia.o2pc Dia.prog asm
+      (runBlock (f + 1 + 1) Dia.ctx Dia.bThen s) := by
+  rw [dia_then_run f Dia.ctx hnh]
+  refine ⟨_, dia_hasm_then hpc ((venomAsmRel_init0_iff.mp hrel).1), ?_⟩
+  exact dia_rel_transfer (vs := s) (asm := asm) hrel ((venomAsmRel_init0_iff.mp hrel).1)
+    rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl
+
+/-- **The repaired dispatcher, fired on a CONTINUING block.** This is the case that was vacuous before:
+`then` does not halt, so `hok` is genuinely used rather than discharged by absurdity. -/
+theorem dia_then_walkstep_universal {s : VenomState} {asm : AsmState} {N f : Nat}
+    (hnh : s.halted = false)
+    (hpc : asm.pc = Dia.pcOf Dia.bThen.label)
+    (hrel : venomAsmRel Dia.lo (Dia.psOf Dia.bThen.label) s asm)
+    (hN : 5 ≤ N) :
+    WalkStep Dia.fn Dia.pcOf Dia.psOf Dia.wOf Dia.lo Dia.o2pc Dia.prog Dia.bThen asm N
+      (runBlock (f + 1 + 1) Dia.ctx Dia.bThen s) := by
+  refine WalkStep_of_BlockSimAt Dia.pcOf Dia.psOf Dia.wOf hN
+    (dia_then_blockSimAt hnh hpc hrel) ?_
+  intro s' hs'
+  rw [dia_then_run f Dia.ctx hnh] at hs'
+  injection hs' with hs'
+  subst hs'
+  exact ⟨by rw [jumpTo]; exact hnh, Dia.bJoin, rfl, rfl, rfl, rfl, le_refl _,
+         fun asm' h => by rw [dia_hasm_then hpc ((venomAsmRel_init0_iff.mp hrel).1)] at h; injection h with h; subst h; rfl,
+         by decide⟩
+
+/-! ## The discriminating witness: a function that actually contains a `DJMP`
+
+Everything above about `DJMP` was proved on `Dia.fn` and `Lp.fn` — neither of which has one. So the whole
+chain had been fired only on functions where the *old* `hgood` would have worked just as well, which is
+precisely the failure the retraction above is about: a witness that exercises only the easy arm tells you
+nothing.
+
+`Dj.fn` is the discriminating case. `dj_hgood_false` proves the old hypothesis is *unsatisfiable* for it,
+so every lemma that took `hgood` is inapplicable. `dj_plan_has_trampolines` proves the plan really does
+mint `djmp_tramp_1` and `djmp_tramp_2` — this is not a function where `DJMP` happens to emit nothing, and
+the label count was genuinely at risk.
+
+And `hpreuniq` holds anyway. -/
+set_option maxRecDepth 40000
+
+namespace Dj
+def iSel : Instruction :=
+  { id := 60, opcode := Opcode.CALLVALUE, operands := [], outputs := ["sel"] }
+def iDjmp : Instruction :=
+  { id := 61, opcode := Opcode.DJMP,
+    operands := [Operand.Var "sel", Operand.Label "t0", Operand.Label "t1"], outputs := [] }
+def iStop : Instruction := { id := 62, opcode := Opcode.STOP, operands := [], outputs := [] }
+def bEntry : BasicBlock := { label := "entry", instructions := [iSel, iDjmp] }
+def bT0 : BasicBlock := { label := "t0", instructions := [iStop] }
+def bT1 : BasicBlock := { label := "t1", instructions := [iStop] }
+/-- **A function that really contains a `DJMP`** — the case the old `hgood` bans outright. -/
+def fn : IrFunction := { name := "main", blocks := [bEntry, bT0, bT1] }
+def ops : List StackOp := (generateFnPlan fn 0 0).get!.1
+end Dj
+
+theorem dj_compiles : (generateFnPlan Dj.fn 0 0).isSome = true := by rfl
+
+/-- **The old `hgood` is FALSE here.** So every lemma that took it is inapplicable to this function —
+which is exactly what makes this the discriminating witness. -/
+theorem dj_hgood_false :
+    ¬ (∀ b ∈ Dj.fn.blocks, ∀ inst ∈ nonParamInsts b, inst.opcode ≠ Opcode.INVOKE ∧
+        inst.opcode ≠ Opcode.ASSERT_UNREACHABLE ∧ inst.opcode ≠ Opcode.DJMP) := by
+  intro h
+  have hmem : Dj.iDjmp ∈ nonParamInsts Dj.bEntry := by
+    rw [show nonParamInsts Dj.bEntry = [Dj.iSel, Dj.iDjmp] from rfl]
+    exact List.mem_cons_of_mem _ (List.mem_cons_self ..)
+  have hb : Dj.bEntry ∈ Dj.fn.blocks := by
+    rw [show Dj.fn.blocks = [Dj.bEntry, Dj.bT0, Dj.bT1] from rfl]
+    exact List.mem_cons_self ..
+  exact (h Dj.bEntry hb Dj.iDjmp hmem).2.2 rfl
+
+/-- **The plan really does mint trampolines.** So the label count was genuinely at risk — this is not a
+function where `DJMP` happens to emit nothing. -/
+theorem dj_plan_has_trampolines :
+    StackOp.SOLabel "djmp_tramp_1" ∈ Dj.ops ∧ StackOp.SOLabel "djmp_tramp_2" ∈ Dj.ops := by
+  constructor <;> decide
+
+/-- **The new condition holds.** No block is named like a freshly minted label. -/
+theorem dj_labels_not_fresh : ∀ b ∈ Dj.fn.blocks, ¬ IsFreshLabel b.label := by
+  intro b hb
+  simp only [Dj.fn, List.mem_cons, List.not_mem_nil, or_false] at hb
+  rcases hb with rfl | rfl | rfl <;> exact short_not_fresh (by decide)
+
+/-- **`hpreuniq` fires on a function containing a `DJMP`.** This is the theorem the old machinery could
+not state: `dj_hgood_false` shows its hypothesis is unsatisfiable here, and `dj_plan_has_trampolines`
+shows the plan really does mint the labels the ban existed to avoid.
+
+The label count survives anyway, because the minted labels are trampolines and the count only ever asks
+about block labels. -/
+theorem dj_planLabelCount (l : String) (hl : ¬ IsFreshLabel l) :
+    planLabelCount l Dj.ops ≤ 1 :=
+  generateFnPlanFuel_planLabelCount_fresh
+    (fuel := fnPlanFuel Dj.fn) (fnEom := 0) (lblCtr := 0) (fn := Dj.fn) rfl l hl
+
+/-- …and so does the plan-prefix uniqueness obligation every per-block `hstep` takes as an input. -/
+theorem dj_hpreuniq {blockOps rest : List StackOp} {bb : BasicBlock}
+    (hbb : bb ∈ Dj.fn.blocks)
+    (hblk : blockOps = StackOp.SOLabel bb.label :: rest) :
+    ∀ preOps tailOps, Dj.ops = preOps ++ blockOps ++ tailOps →
+      ∀ a ∈ executePlan preOps, a ≠ AsmInst.AsmLabel bb.label :=
+  hpreuniq_fresh (fuel := fnPlanFuel Dj.fn) (fnEom := 0) (lblCtr := 0) (fn := Dj.fn)
+    (dj_labels_not_fresh bb hbb) rfl hblk
+
+/-! ## The `stepObliv` family had zero consumers — here is the use
+
+Eleven `StepObliv` lemmas were proved for the inline body opcodes, and sixty more are one lemma away
+through the combinators. Not one of them was ever *used*. By this branch's own rule that means dead code,
+or a job being done by an assumption somewhere downstream, and the only way to tell is to make something
+consume them.
+
+`execBodyThread_instIdx_congr`'s `hobliv` hypothesis is exactly `∀ inst ∈ body, StepObliv inst`. It is the
+fact a join needs and a phi-free block does not: a join resumes at `instIdx = phiPrefixLength`, not at
+zero, so a body simulation written for `instIdx = 0` transfers only if the body cannot see the index.
+
+The Dia and Lp capstones never needed this — their joins are `phis ++ [term]`, with no body at all. So the
+chain stayed unexercised. Below it is consumed, on a body of two different opcodes so that
+`execBodyThread`'s induction genuinely iterates and `hobliv` has to be dispatched per instruction rather
+than supplied once. -/
+/-- **`hobliv`, discharged for a real join body.** `JoinBody.bb` is `p = phi(…) ; SSTORE d p ; STOP`, and
+its body — the part between the phi prologue and the terminator — is the single `SSTORE`. Dispatching
+over it gives `execBodyThread_instIdx_congr` exactly the hypothesis it wants. -/
+theorem joinbody_hobliv :
+    ∀ inst ∈ [JoinBody.bSst], ∀ (t t' : VenomState) (j : Nat),
+      stepInstBase inst t = ExecResult.OK t' →
+      stepInstBase inst { t with instIdx := j } = ExecResult.OK { t' with instIdx := j } := by
+  intro inst hi
+  simp only [List.mem_singleton] at hi
+  subst hi
+  exact stepObliv_sstore rfl
+
+/-- **The obliviousness chain, consumed.** A join resumes at `instIdx = phiPrefixLength`, not at 0, so a
+body simulation written for `instIdx = 0` only transfers if the body cannot see the index. This says it
+cannot: threading `JoinBody`'s body from the join's resume point and from zero agree, up to the index.
+
+This is what the `stepObliv_*` family was *for*, and until now nothing had used it — every one of those
+eleven lemmas had zero consumers, which by this branch's own rule means dead or assumed. This is the use. -/
+theorem joinbody_thread_offset_congr
+    {s s' sEnd sEnd' : VenomState} {start start' : Nat}
+    (hss : { s with instIdx := 0 } = { s' with instIdx := 0 })
+    (h1 : execBodyThread [JoinBody.bSst] start s = some sEnd)
+    (h2 : execBodyThread [JoinBody.bSst] start' s' = some sEnd') :
+    { sEnd with instIdx := 0 } = { sEnd' with instIdx := 0 } :=
+  execBodyThread_instIdx_congr [JoinBody.bSst] joinbody_hobliv start start' s s' sEnd sEnd'
+    hss h1 h2
+
+/-! ### The discriminating version: a body of two different opcodes
+
+A one-instruction body is degenerate — `execBodyThread`'s induction never iterates, and only one
+discharger is exercised. `JoinBody2` is a join whose body is `q = ISZERO p ; SSTORE d q`: two instructions,
+two *different* opcodes, and the second reads what the first wrote. The thread genuinely iterates, and
+`hobliv` has to be dispatched per instruction rather than supplied once. -/
+
+namespace JoinBody2
+def iQ : Instruction :=
+  { id := 70, opcode := Opcode.ISZERO, operands := [Operand.Var "p"], outputs := ["q"] }
+def iSt : Instruction :=
+  { id := 71, opcode := Opcode.SSTORE,
+    operands := [Operand.Var "d", Operand.Var "q"], outputs := [] }
+def body : List Instruction := [iQ, iSt]
+end JoinBody2
+
+/-- `hobliv` for a two-opcode body: dispatched per instruction, using two different `StepObliv` lemmas. -/
+theorem joinbody2_hobliv :
+    ∀ inst ∈ JoinBody2.body, ∀ (t t' : VenomState) (j : Nat),
+      stepInstBase inst t = ExecResult.OK t' →
+      stepInstBase inst { t with instIdx := j } = ExecResult.OK { t' with instIdx := j } := by
+  intro inst hi
+  simp only [JoinBody2.body, List.mem_cons, List.not_mem_nil, or_false] at hi
+  rcases hi with rfl | rfl
+  · exact stepObliv_iszero rfl
+  · exact stepObliv_sstore rfl
+
+/-- **The obliviousness chain, consumed on a body that actually iterates.** Threading the two-instruction
+body from a join's resume point and from zero agree, up to the index — which is the fact that lets a body
+simulation written at `instIdx = 0` be reused at the offset a join resumes from. -/
+theorem joinbody2_thread_offset_congr
+    {s s' sEnd sEnd' : VenomState} {start start' : Nat}
+    (hss : { s with instIdx := 0 } = { s' with instIdx := 0 })
+    (h1 : execBodyThread JoinBody2.body start s = some sEnd)
+    (h2 : execBodyThread JoinBody2.body start' s' = some sEnd') :
+    { sEnd with instIdx := 0 } = { sEnd' with instIdx := 0 } :=
+  execBodyThread_instIdx_congr JoinBody2.body joinbody2_hobliv start start' s s' sEnd sEnd'
+    hss h1 h2
+
+/-! ## The four join hsteps that had no witness
+
+The systematic sweep found that `hstep_jnz_taken_join`, `hstep_jnz_nottaken_join`, `hstep_join_revert` and
+`hstep_join_fault` had zero consumers. For the two `JNZ` ones I had witnessed only the *inputs* —
+`jnzjoin_ev`, `jnzjoin_cond` — and never composed them into the hstep, which is a weaker thing than I said
+at the time.
+
+These four compose. The `JNZ` pair share a block and differ only in the value the phi delivers: `a = 7`
+takes the branch, `a = 0` does not. That the same block goes both ways depending on the phi is the whole
+reason a `JNZ` join needed its own hstep at all.
+
+The revert and fault pair are joins *with a body* — `p = phi(…) ; SSTORE d p ; REVERT`/`INVALID` — so the
+body consumes the phi's output before the block aborts. That is the shape `hstep_join_{revert,fault}` were
+written for, and nothing had exercised it. -/
+/-- **JNZ-taken join, composed.** `JoinShapes.bJnz` is `p = phi(then→a, else→b) ; JNZ p, t2, e2`, and it
+branches on its *own phi output*. Arriving from `then` with `a = 7`, the branch is taken. -/
+theorem jnzjoin_taken_walkstep {fn : IrFunction} {ctx : VenomContext}
+    {offsetToPc : AssocList Nat Nat} {prog : List AsmInst} {labelOffsets : AssocList String Nat}
+    (pcOf : String → Nat) (psOf : String → PlanState) (wOf : String → Nat)
+    {bb' : BasicBlock} {asm asm' : AsmState} {psPostBody : PlanState}
+    {N extraFuel blockLen idx : Nat}
+    (hrun : runAsm blockLen offsetToPc prog asm = AsmResult.AsmOK asm')
+    (hrel : venomAsmRel labelOffsets psPostBody
+        (jumpTo "t2" { updateVar "p" Min.av Min.vs with instIdx := 1 }) asm')
+    (hstk : psPostBody.stack = (psOf bb'.label).stack)
+    (hsp : psPostBody.spilled = (psOf bb'.label).spilled)
+    (hfe : psPostBody.alloc.fnEom = (psOf bb'.label).alloc.fnEom)
+    (hno : psPostBody.alloc.nextOffset ≤ (psOf bb'.label).alloc.nextOffset)
+    (hpcidx : asm'.pc = idx) (hle : blockLen ≤ N) (hidx : idx = pcOf bb'.label)
+    (hlk' : lookupBlock "t2" fn.blocks = some bb')
+    (hwdec : wOf bb'.label + blockLen ≤ wOf JoinShapes.bJnz.label) :
+    WalkStep fn pcOf psOf wOf labelOffsets offsetToPc prog JoinShapes.bJnz asm N
+      (runBlock (extraFuel + 1) ctx JoinShapes.bJnz Min.vs) :=
+  hstep_jnz_taken_join (phis := [Min.pP]) (jnzInst := JoinShapes.jJnz)
+    (condOp := Operand.Var "p") (ifNz := "t2") (ifZ := "e2") (cond := Min.av)
+    pcOf psOf wOf jnzjoin_ev rfl
+    (by intro i hi; simp only [List.mem_singleton] at hi; subst hi; rfl)
+    rfl rfl jnzjoin_cond (by decide) rfl hrun hrel hstk hsp hfe hno hpcidx hle hidx hlk' hwdec
+
+/-- A state arriving at the JNZ join where the phi's source is **zero**, so the branch is *not* taken.
+Same block; only the incoming value differs — which is the point: the branch depends on the phi. -/
+def JoinShapes.vsZero : VenomState :=
+  { (default : VenomState) with
+    vars := [("a", EvmYul.UInt256.ofNat 0)],
+    prevBb := some "then", currentBb := "join" }
+
+theorem jnzjoin_ev_zero :
+    evalPhis JoinShapes.vsZero JoinShapes.bJnz.instructions
+      = ExecResult.OK (updateVar "p" (EvmYul.UInt256.ofNat 0) JoinShapes.vsZero) := by
+  show evalPhis JoinShapes.vsZero (Min.pP :: [JoinShapes.jJnz]) = _
+  unfold evalPhis
+  rw [if_neg (show ¬ (Min.pP.opcode ≠ Opcode.PHI) from fun h => h rfl),
+      evalOnePhi_var (out := "p") (src := "a") (prev := "then")
+        (v := EvmYul.UInt256.ofNat 0) (by rfl) (by rfl) (by rfl) (by rfl)]
+  show (match evalPhis JoinShapes.vsZero [JoinShapes.jJnz] with
+        | ExecResult.OK s' =>
+            ExecResult.OK (updateVar "p" (EvmYul.UInt256.ofNat 0) s') | err => err) = _
+  rw [show evalPhis JoinShapes.vsZero [JoinShapes.jJnz]
+        = ExecResult.OK JoinShapes.vsZero from by unfold evalPhis; rw [if_pos (by decide)]]
+
+theorem jnzjoin_cond_zero :
+    evalOperand (Operand.Var "p")
+      { (updateVar "p" (EvmYul.UInt256.ofNat 0) JoinShapes.vsZero) with
+        instIdx := [Min.pP].length } = some (EvmYul.UInt256.ofNat 0) := rfl
+
+/-- **JNZ-not-taken join, composed.** The same phi-headed block, entered with a phi source of zero: the
+branch is not taken and control falls to `e2`. -/
+theorem jnzjoin_nottaken_walkstep {fn : IrFunction} {ctx : VenomContext}
+    {offsetToPc : AssocList Nat Nat} {prog : List AsmInst} {labelOffsets : AssocList String Nat}
+    (pcOf : String → Nat) (psOf : String → PlanState) (wOf : String → Nat)
+    {bb' : BasicBlock} {asm asm' : AsmState} {psPostBody : PlanState}
+    {N extraFuel blockLen idx : Nat}
+    (hrun : runAsm blockLen offsetToPc prog asm = AsmResult.AsmOK asm')
+    (hrel : venomAsmRel labelOffsets psPostBody
+        (jumpTo "e2" { updateVar "p" (EvmYul.UInt256.ofNat 0) JoinShapes.vsZero with instIdx := 1 })
+        asm')
+    (hstk : psPostBody.stack = (psOf bb'.label).stack)
+    (hsp : psPostBody.spilled = (psOf bb'.label).spilled)
+    (hfe : psPostBody.alloc.fnEom = (psOf bb'.label).alloc.fnEom)
+    (hno : psPostBody.alloc.nextOffset ≤ (psOf bb'.label).alloc.nextOffset)
+    (hpcidx : asm'.pc = idx) (hle : blockLen ≤ N) (hidx : idx = pcOf bb'.label)
+    (hlk' : lookupBlock "e2" fn.blocks = some bb')
+    (hwdec : wOf bb'.label + blockLen ≤ wOf JoinShapes.bJnz.label) :
+    WalkStep fn pcOf psOf wOf labelOffsets offsetToPc prog JoinShapes.bJnz asm N
+      (runBlock (extraFuel + 1) ctx JoinShapes.bJnz JoinShapes.vsZero) :=
+  hstep_jnz_nottaken_join (phis := [Min.pP]) (jnzInst := JoinShapes.jJnz)
+    (condOp := Operand.Var "p") (ifNz := "t2") (ifZ := "e2")
+    (cond := EvmYul.UInt256.ofNat 0)
+    pcOf psOf wOf jnzjoin_ev_zero rfl
+    (by intro i hi; simp only [List.mem_singleton] at hi; subst hi; rfl)
+    rfl rfl jnzjoin_cond_zero rfl rfl hrun hrel hstk hsp hfe hno hpcidx hle hidx hlk' hwdec
+
+namespace JoinBodyRF
+/-- A join **with a body** that then reverts: `p = phi(…) ; SSTORE d p ; REVERT 0 0`. -/
+def bRev : BasicBlock :=
+  { label := "join", instructions := [Min.pP, JoinBody.bSst, JoinShapes.jRevert] }
+/-- …and one that faults. -/
+def bFlt : BasicBlock :=
+  { label := "join", instructions := [Min.pP, JoinBody.bSst, JoinShapes.jInvalid] }
+end JoinBodyRF
+
+private theorem ev_of_body (term : Instruction) (hnp : term.opcode ≠ Opcode.PHI) (bb : BasicBlock)
+    (hbb : bb.instructions = [Min.pP, JoinBody.bSst, term]) :
+    evalPhis JoinBody.vs bb.instructions
+      = ExecResult.OK (updateVar "p" Min.av JoinBody.vs) := by
+  rw [hbb]
+  unfold evalPhis
+  rw [if_neg (show ¬ (Min.pP.opcode ≠ Opcode.PHI) from fun h => h rfl),
+      evalOnePhi_var (out := "p") (src := "a") (prev := "then") (v := Min.av)
+        (by rfl) (by rfl) (by rfl) (by rfl)]
+  show (match evalPhis JoinBody.vs [JoinBody.bSst, term] with
+        | ExecResult.OK s' => ExecResult.OK (updateVar "p" Min.av s') | err => err) = _
+  rw [show evalPhis JoinBody.vs [JoinBody.bSst, term] = ExecResult.OK JoinBody.vs from by
+    unfold evalPhis; rw [if_pos (by decide)]]
+
+/-- The post-phi body runs (`SSTORE d p` — reading the phi's output) and then the block reverts. -/
+theorem joinrev_res (f : Nat) (ctx : VenomContext) :
+    execBlock (f + 1 + 1) ctx JoinBodyRF.bRev JoinBody.sPhi1
+      = ExecResult.Abort AbortType.RevertAbort
+          (revertState (setReturndata
+            (readMemory 0 0 { (sstore JoinBody.dv Min.av JoinBody.sPhi1) with instIdx := 2 })
+            { (sstore JoinBody.dv Min.av JoinBody.sPhi1) with instIdx := 2 })) := by
+  rw [execBlock_step_nonterm (f + 1) ctx JoinBodyRF.bRev JoinBody.sPhi1
+        (sstore JoinBody.dv Min.av JoinBody.sPhi1) JoinBody.bSst (by rfl) (by rfl) (by decide)]
+  exact execBlock_step_abort f ctx JoinBodyRF.bRev _ _ JoinShapes.jRevert _ (by rfl) rfl
+
+/-- **`hstep_join_revert` composes**, on a join whose body consumes the phi. -/
+theorem joinrev_walkstep {fn : IrFunction} {ctx : VenomContext}
+    {offsetToPc : AssocList Nat Nat} {prog : List AsmInst} {labelOffsets : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {asm : AsmState} {N f : Nat}
+    (hasm : ∃ asm', runAsm N offsetToPc prog asm = AsmResult.AsmRevert asm' ∧
+      venomAsmTerminalRel
+        (revertState (setReturndata
+          (readMemory 0 0 { (sstore JoinBody.dv Min.av JoinBody.sPhi1) with instIdx := 2 })
+          { (sstore JoinBody.dv Min.av JoinBody.sPhi1) with instIdx := 2 })) asm') :
+    WalkStep fn pcOf psOf wOf labelOffsets offsetToPc prog JoinBodyRF.bRev asm N
+      (runBlock (f + 1 + 1) ctx JoinBodyRF.bRev JoinBody.vs) :=
+  hstep_join_revert (ev_of_body JoinShapes.jRevert (by decide) _ rfl)
+    (by rw [show phiPrefixLength JoinBodyRF.bRev.instructions = 1 from by decide]
+        exact joinrev_res f ctx) hasm
+
+/-- The same block, faulting. -/
+theorem joinflt_res (f : Nat) (ctx : VenomContext) :
+    execBlock (f + 1 + 1) ctx JoinBodyRF.bFlt JoinBody.sPhi1
+      = ExecResult.Abort AbortType.ExHaltAbort
+          (haltState (setReturndata ByteArray.empty
+            { (sstore JoinBody.dv Min.av JoinBody.sPhi1) with instIdx := 2 })) := by
+  rw [execBlock_step_nonterm (f + 1) ctx JoinBodyRF.bFlt JoinBody.sPhi1
+        (sstore JoinBody.dv Min.av JoinBody.sPhi1) JoinBody.bSst (by rfl) (by rfl) (by decide)]
+  exact execBlock_step_abort f ctx JoinBodyRF.bFlt _ _ JoinShapes.jInvalid _ (by rfl) rfl
+
+/-- **`hstep_join_fault` composes**, likewise. -/
+theorem joinflt_walkstep {fn : IrFunction} {ctx : VenomContext}
+    {offsetToPc : AssocList Nat Nat} {prog : List AsmInst} {labelOffsets : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {asm : AsmState} {N f : Nat}
+    (hasm : ∃ asm', runAsm N offsetToPc prog asm = AsmResult.AsmFault asm' ∧
+      venomAsmTerminalRel
+        (haltState (setReturndata ByteArray.empty
+          { (sstore JoinBody.dv Min.av JoinBody.sPhi1) with instIdx := 2 })) asm') :
+    WalkStep fn pcOf psOf wOf labelOffsets offsetToPc prog JoinBodyRF.bFlt asm N
+      (runBlock (f + 1 + 1) ctx JoinBodyRF.bFlt JoinBody.vs) :=
+  hstep_join_fault (ev_of_body JoinShapes.jInvalid (by decide) _ rfl)
+    (by rw [show phiPrefixLength JoinBodyRF.bFlt.instructions = 1 from by decide]
+        exact joinflt_res f ctx) hasm
+
+/-! ## The generic `hobliv` discharger — which consumes the whole `stepObliv` family
+
+Consuming the seventeen `StepObliv` lemmas one at a time, on bodies invented to contain them, would be
+theatre: it would clear the 0-consumer flag without making any of them useful.
+
+`stepObliv_of_oblivious` is what a caller actually wants. `ObliviousOpcode` is a decidable predicate, so
+`hobliv` for a concrete body becomes `by decide` — the caller names no lemma at all, and adding an opcode
+to the set extends every existing caller at once. Compare `joinbody2_hobliv` above, which had to dispatch
+by hand.
+
+This consumes all seventeen, and it is the first thing in this development that makes the coverage matrix
+mean something to a user of it rather than to its author. -/
+/-- The opcodes for which instruction-index obliviousness is discharged. Decidable, so a caller checks it
+by `decide` rather than by hand. -/
+def ObliviousOpcode : Opcode → Bool
+  | Opcode.ADD | Opcode.ISZERO | Opcode.ADDMOD | Opcode.SLOAD | Opcode.SSTORE | Opcode.CALLER
+  | Opcode.ASSIGN | Opcode.NOP | Opcode.MCOPY | Opcode.ISTORE | Opcode.ASSERT
+  | Opcode.SHA3 | Opcode.CALLDATACOPY | Opcode.CODECOPY | Opcode.EXTCODECOPY
+  | Opcode.RETURNDATACOPY | Opcode.LOG => true
+  | _ => false
+
+/-- **The generic `hobliv` discharger.** One lemma per opcode is what `StepObliv` needs; this dispatches
+over them, so a caller with a concrete body discharges `hobliv` by `decide` on each instruction's opcode
+instead of naming a lemma. -/
+theorem stepObliv_of_oblivious {inst : Instruction}
+    (h : ObliviousOpcode inst.opcode = true) : StepObliv inst := by
+  cases hop : inst.opcode <;>
+    first
+      | exact stepObliv_add hop
+      | exact stepObliv_iszero hop
+      | exact stepObliv_addmod hop
+      | exact stepObliv_sload hop
+      | exact stepObliv_sstore hop
+      | exact stepObliv_caller hop
+      | exact stepObliv_assign hop
+      | exact stepObliv_nop hop
+      | exact stepObliv_mcopy hop
+      | exact stepObliv_istore hop
+      | exact stepObliv_assert hop
+      | exact stepObliv_sha3 hop
+      | exact stepObliv_calldatacopy hop
+      | exact stepObliv_codecopy hop
+      | exact stepObliv_extcodecopy hop
+      | exact stepObliv_returndatacopy hop
+      | exact stepObliv_log hop
+      | (rw [hop] at h; exact absurd h (by decide))
+
+/-- **`hobliv` for a whole body, by `decide`.** This is the form `execBodyThread_instIdx_congr` wants. -/
+theorem hobliv_of_body {body : List Instruction}
+    (h : body.all (fun i => ObliviousOpcode i.opcode) = true) :
+    ∀ inst ∈ body, ∀ (t t' : VenomState) (j : Nat),
+      stepInstBase inst t = ExecResult.OK t' →
+      stepInstBase inst { t with instIdx := j } = ExecResult.OK { t' with instIdx := j } := by
+  intro inst hi
+  exact stepObliv_of_oblivious (by simpa using List.all_eq_true.mp h inst hi)
+
+/-- **The whole point, in one line.** `hobliv` for `JoinBody2`'s body is now `by decide` — the caller
+names no lemma, and adding an opcode to `ObliviousOpcode` extends every such caller at once. Compare
+`joinbody2_hobliv`, which had to dispatch by hand. -/
+theorem joinbody2_hobliv_by_decide :
+    ∀ inst ∈ JoinBody2.body, ∀ (t t' : VenomState) (j : Nat),
+      stepInstBase inst t = ExecResult.OK t' →
+      stepInstBase inst { t with instIdx := j } = ExecResult.OK { t' with instIdx := j } :=
+  hobliv_of_body (by decide)
+
+/-- And it scales: a body of five different opcodes, all discharged by one `decide`. -/
+def wideBody : List Instruction :=
+  [{ id := 80, opcode := Opcode.SHA3, operands := [], outputs := [] },
+   { id := 81, opcode := Opcode.CALLDATACOPY, operands := [], outputs := [] },
+   { id := 82, opcode := Opcode.MCOPY, operands := [], outputs := [] },
+   { id := 83, opcode := Opcode.LOG, operands := [], outputs := [] },
+   { id := 84, opcode := Opcode.ASSERT, operands := [], outputs := [] }]
+
+theorem wideBody_hobliv :
+    ∀ inst ∈ wideBody, ∀ (t t' : VenomState) (j : Nat),
+      stepInstBase inst t = ExecResult.OK t' →
+      stepInstBase inst { t with instIdx := j } = ExecResult.OK { t' with instIdx := j } :=
+  hobliv_of_body (by decide)
+
+/-! ## The three `hgood`-free drop-ins, consumed on the one function that needs them
+
+The sweep found `hpreuniq_of_blockPlan_fresh`, `labelOffset_of_blockPlan_fresh` and
+`jumpTarget_of_blockPlan_fresh` with no consumers — which for a drop-in is a fair question, since a
+replacement nothing calls has not been shown to replace anything.
+
+They are consumed here, on `Dj.fn`. That is the discriminating case rather than a convenient one: the
+`hgood` forms *cannot* be applied to this function at all, because `dj_hgood_false` proves their hypothesis
+unsatisfiable. So these three are doing a job nothing else in the development can do. -/
+/-- **`hpreuniq` from a block plan, for the `DJMP` function.** The `hgood` form
+(`hpreuniq_of_blockPlan`) *cannot* be applied here — `dj_hgood_false` shows its hypothesis is
+unsatisfiable — so this is the drop-in doing the job nothing else can. -/
+theorem dj_hpreuniq_of_blockPlan {L : DfState (List String)} {D : DfgAnalysis} {C : CfgAnalysis}
+    {blockOps : List StackOp} {psB ps' : PlanState} {bb : BasicBlock}
+    (hbb : bb ∈ Dj.fn.blocks)
+    (hbp : generateBlockPlan L D C Dj.fn bb psB = some (blockOps, ps')) :
+    ∀ preOps tailOps, Dj.ops = preOps ++ blockOps ++ tailOps →
+      ∀ a ∈ executePlan preOps, a ≠ AsmInst.AsmLabel bb.label :=
+  hpreuniq_of_blockPlan_fresh (fuel := fnPlanFuel Dj.fn) (fnEom := 0) (lblCtr := 0)
+    (dj_labels_not_fresh bb hbb) rfl hbp
+
+/-- **The whole jump-target family (`hoff_lk` + `hidx_lk` + `hidxeq`), for the `DJMP` function.** Same
+story: the `hgood` form is inapplicable, and the naming condition carries it through. -/
+theorem dj_jumpTarget_of_blockPlan {L : DfState (List String)} {D : DfgAnalysis} {C : CfgAnalysis}
+    {pre suf blockOps : List StackOp} {psB ps' : PlanState} {bb : BasicBlock}
+    (hbb : bb ∈ Dj.fn.blocks)
+    (hbp : generateBlockPlan L D C Dj.fn bb psB = some (blockOps, ps'))
+    (hseg : Dj.ops = pre ++ blockOps ++ suf) :
+    AssocList.lookup String Nat (computeLabelOffsets (executePlan Dj.ops)).2 bb.label
+        = some (((executePlan pre).map asmInstSize).sum) ∧
+    AssocList.lookup Nat Nat (asmResolve (executePlan Dj.ops)).2
+        (((executePlan pre).map asmInstSize).sum) = some (executePlan pre).length ∧
+    pcOfLabel (asmResolve (executePlan Dj.ops)).1 bb.label = (executePlan pre).length :=
+  jumpTarget_of_blockPlan_fresh (fuel := fnPlanFuel Dj.fn) (fnEom := 0) (lblCtr := 0)
+    (dj_labels_not_fresh bb hbb) rfl hbp hseg
+
+/-- …and `hoff_lk` alone. -/
+theorem dj_labelOffset_of_blockPlan {L : DfState (List String)} {D : DfgAnalysis} {C : CfgAnalysis}
+    {pre suf blockOps : List StackOp} {psB ps' : PlanState} {bb : BasicBlock}
+    (hbb : bb ∈ Dj.fn.blocks)
+    (hbp : generateBlockPlan L D C Dj.fn bb psB = some (blockOps, ps'))
+    (hseg : Dj.ops = pre ++ blockOps ++ suf) :
+    AssocList.lookup String Nat (computeLabelOffsets (executePlan Dj.ops)).2 bb.label
+      = some (((executePlan pre).map asmInstSize).sum) :=
+  labelOffset_of_blockPlan_fresh (fuel := fnPlanFuel Dj.fn) (fnEom := 0) (lblCtr := 0)
+    (dj_labels_not_fresh bb hbb) rfl hbp hseg
+
+/-! ## The compiler-level join route, consumed
+
+`WalkStep_join_of_genBlockSim_terminal` composes `genBlockSimulation_join_self` with the terminal transfer
+in one step, and had no consumer — `min_walkstep_join_of_genBlockSim` reached the same conclusion by doing
+the composition inline, which left the lemma unexercised.
+
+This feeds it `Min`'s `evalPhis` and its post-phi block simulation directly and gets the walk's obligation
+for a phi-headed block, with nothing left assumed. -/
+/-- `Min`'s post-phi block simulation — the `hres` input `genBlockSimulation_join_self` takes. -/
+theorem min_join_hres {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat}
+    {asm : AsmState} (f : Nat) (ctx : VenomContext)
+    (hrel : venomAsmRel lo Min.ps Min.vs asm) (hpc : asm.pc = 0) :
+    BlockSim lo Min.ps offsetToPc (asmResolve (executePlan Min.ops)).1 asm
+      (execBlock (f + 1) ctx Min.bJ
+        { (updateVar "p" Min.av Min.vs) with instIdx := phiPrefixLength Min.bJ.instructions }) := by
+  have hpost : venomAsmRel lo Min.ps (updateVar "p" Min.av Min.vs) asm :=
+    venomAsmRel_phi_join' (outs := ["p"]) (phis := Min.bJ.instructions)
+      hrel rfl rfl min_ev
+      (fun w hw => lookupVar_updateVar_ne Min.vs "p" w Min.av (by simpa using hw))
+      (fun op off hlk _ _ => absurd hlk (by simp [Min.ps, AssocList.lookup]))
+      ⟨hrel.1.1, fun i hi => absurd hi (by simp [Min.ps])⟩
+  rw [min_phiPrefixLength, min_self_run f ctx (updateVar "p" Min.av Min.vs)]
+  show ∃ as', runAsm ((asmResolve (executePlan Min.ops)).1.length) offsetToPc
+    (asmResolve (executePlan Min.ops)).1 asm = AsmResult.AsmHalt as' ∧
+    venomAsmTerminalRel (haltState { (updateVar "p" Min.av Min.vs) with instIdx := 1 }) as'
+  refine hasm_stop (l := "join") (ps := Min.ps)
+    (venomAsmRel_congr (a := updateVar "p" Min.av Min.vs) (by unfold sameUpToIdx; rfl) hpost) ?_ ?_
+  · rw [min_prog, hpc]
+    refine ⟨by rfl, ?_⟩
+    intro j hj
+    simp only [Nat.zero_add, Min.ops]
+  · rw [min_proglen]
+
+/-- **`WalkStep_join_of_genBlockSim_terminal`, consumed.** The lemma composes
+`genBlockSimulation_join_self` with the terminal transfer in one step; this feeds it `Min`'s `evalPhis`
+and post-phi simulation and gets the walk's obligation for a phi-headed block. Nothing left assumed. -/
+theorem min_walkstep_join_via_lemma (f : Nat) (ctx : VenomContext) (fn : IrFunction)
+    (pcOf : String → Nat) (psOf : String → PlanState) (wOf : String → Nat)
+    (offsetToPc : AssocList Nat Nat) :
+    WalkStep fn pcOf psOf wOf [] offsetToPc (asmResolve (executePlan Min.ops)).1
+      Min.bJ Min.asm ((asmResolve (executePlan Min.ops)).1.length)
+      (runBlock (f + 1) ctx Min.bJ Min.vs) := by
+  have hrb : runBlock (f + 1) ctx Min.bJ Min.vs
+      = ExecResult.Halt (haltState { updateVar "p" Min.av Min.vs with instIdx := 1 }) := by
+    rw [runBlock_eq_execBlock_of_phis min_ev, min_phiPrefixLength]
+    exact min_self_run f ctx _
+  exact WalkStep_join_of_genBlockSim_terminal (ops := Min.ops) pcOf psOf wOf rfl
+    (fun w h => by rw [hrb] at h; exact absurd h (by simp))
+    min_ev (min_join_hres f ctx min_rel_on_arrival rfl)
+
+/-! ## What a universal recipe from `genBlockSimulation` still needs
+
+`WalkStep_of_BlockSimAt` takes a block's simulation *against the whole program* and produces the walk's
+obligation with no case analysis. That is the dispatcher. What it does not do — and what a genuinely
+universal recipe would — is *produce* that simulation from `genBlockSimulation`.
+
+The obstacle is concrete, and it is worth stating as a fact rather than as a difficulty.
+`genBlockSimulation` runs the **block's own** resolved program, with pcs starting at zero. The walk runs
+the **function's** program, with the block sitting at some base. The instructions agree —
+`asmBlockAt_same_inst` proves the whole program presents exactly what the block's does at the
+corresponding offset — so a replay is possible in principle.
+
+But the pc shift is **not uniform**. A sequential instruction advances the pc by one, *relative* to where
+it sits, so the two runs differ by `base`. A `JUMP` sets the pc from `offsetToPc`, which is the
+whole-function map, so its target is *absolute* and the two runs coincide. The invariant relating the two
+runs therefore changes shape at the terminator, which is why `runAsm` cannot simply be transported and why
+the `hstep` family takes whole-program asm hypotheses directly instead of lifting them.
+
+`dia_then_pc_shift_is_not_uniform` exhibits it on a real block: `then` sits at pc 13 in the whole program
+and at pc 0 in its own, yet both land at `join`'s absolute index 11, because the `JUMP` reads the same
+`offsetToPc`.
+
+That lemma — a `runAsm` segment lift with a terminator-aware invariant — is the last thing between
+`genBlockSimulation` and a per-block recipe for an arbitrary CFG. It is real work, not assembly, and this
+section says so instead of implying otherwise. -/
+/-- **The core of the segment lift.** At a pc inside a block's segment, the *whole* program presents the
+same instruction the *block's* program does at the corresponding offset. This is what would let a block's
+isolated asm run be replayed inside the function's program. -/
+theorem asmBlockAt_same_inst {prog blk : List AsmInst} {base j : Nat}
+    (hblk : asmBlockAt prog base blk) (hj : j < blk.length) :
+    prog[base + j]? = blk[j]? :=
+  hblk.2 j hj
+
+/-- …and the instruction is really there, as a `get`. -/
+theorem asmBlockAt_get_eq {prog blk : List AsmInst} {base j : Nat}
+    (hblk : asmBlockAt prog base blk) (hj : j < blk.length)
+    (hlt : base + j < prog.length) :
+    prog.get ⟨base + j, hlt⟩ = blk.get ⟨j, hj⟩ := by
+  have h := asmBlockAt_same_inst hblk hj
+  rw [List.getElem?_eq_getElem hlt, List.getElem?_eq_getElem hj] at h
+  simpa using h
+
+/-- **Why the lift is not mechanical, stated as a fact rather than a claim.**
+
+A sequential instruction advances the pc by one — *relative* to where it sits. A `JUMP` sets the pc from
+`offsetToPc`, which is the **whole-function** map, so its target is *absolute* and identical in both
+programs.
+
+So a block's isolated run and its run inside the function agree on every instruction (above) but their pcs
+differ by `base` for the sequential part and coincide after a jump. The shift is therefore **not uniform**,
+which is exactly why `runAsm` cannot simply be transported: the invariant relating the two runs changes
+shape at the terminator.
+
+`Dia.bThen` exhibits it. Inside the whole program the block starts at pc 13; its own asm, taken alone,
+starts at pc 0. Both land at `join`'s absolute index 11, because the `JUMP` reads the same `offsetToPc`. -/
+theorem dia_then_pc_shift_is_not_uniform :
+    -- the block sits at 13 in the whole program
+    Dia.pcOf Dia.bThen.label = 13 ∧
+    -- and the jump lands at join's ABSOLUTE index, the same number either way
+    AssocList.lookup Nat Nat Dia.o2pc 17 = some 11 ∧
+    Dia.pcOf Dia.bJoin.label = 11 :=
+  ⟨rfl, dia_o2pc_join, rfl⟩
+
+/-! ## The asm-side pc-obliviousness the segment lift needs
+
+The previous section said the segment lift is real work and named why: the pc shift is not uniform. This
+section supplies the reusable half of it.
+
+`asmStep` dispatches on the instruction and hands the state to one of 27 helpers. Most of them read the
+state's non-pc fields and put `asmNext s` back — so moving the input pc to `p` moves the output pc to
+`p + 1` and changes nothing else. That is `withPc (p + 1)`, and it is the asm-side counterpart of
+`StepObliv`: the Venom side needed obliviousness because a join resumes at a nonzero `instIdx`; the asm
+side needs it because a block sits at a nonzero base.
+
+**I first wrote "every helper but the jumps" here, and that is FALSE** — see the exceptions below. The
+uniform law is the weaker `sameUpToPc`; `withPc (p+1)` holds only for the helpers that actually call
+`asmNext`, and I did not check all 27 before generalising from the ten I had read.
+
+`asmJump_pc` is the contrast, and it is the one to read. `asmJump` does **not** build its result from
+`asmNext`. It reads its target from `offsetToPc` — the whole-function map — and sets the pc absolutely, so
+moving the input pc changes nothing about the output. That is why the invariant relating a block's isolated
+run to its run inside the function changes shape at the terminator, and it is the whole content of what
+remains. -/
+/-- Overwrite the pc of whatever state an `AsmResult` carries. -/
+def withPc (p : Nat) : AsmResult → AsmResult
+  | AsmResult.AsmOK s     => AsmResult.AsmOK { s with pc := p }
+  | AsmResult.AsmHalt s   => AsmResult.AsmHalt { s with pc := p }
+  | AsmResult.AsmRevert s => AsmResult.AsmRevert { s with pc := p }
+  | AsmResult.AsmFault s  => AsmResult.AsmFault { s with pc := p }
+  | r => r
+
+/-! ### The asm helpers are pc-oblivious except for the increment
+
+Each helper reads the state's non-pc fields and puts `asmNext s` back — so moving the input pc to `p`
+moves the output pc to `p + 1`, and changes nothing else. This is the asm-side counterpart of `StepObliv`,
+and it is what a `runAsm` segment lift needs for every non-jump instruction. -/
+
+theorem asmPushVal_pc (v : bytes32) (s : AsmState) (p : Nat) :
+    asmPushVal v { s with pc := p } = withPc (p + 1) (asmPushVal v s) := rfl
+
+theorem asmPop_pc (s : AsmState) (p : Nat) :
+    asmPop { s with pc := p } = withPc (p + 1) (asmPop s) := by
+  unfold asmPop withPc; cases s.stack <;> rfl
+
+theorem asmBinop_pc (f : bytes32 → bytes32 → bytes32) (s : AsmState) (p : Nat) :
+    asmBinop f { s with pc := p } = withPc (p + 1) (asmBinop f s) := by
+  unfold asmBinop withPc
+  match hs : s.stack with
+  | [] => rfl
+  | [_] => rfl
+  | _ :: _ :: _ => rfl
+
+theorem asmUnop_pc (f : bytes32 → bytes32) (s : AsmState) (p : Nat) :
+    asmUnop f { s with pc := p } = withPc (p + 1) (asmUnop f s) := by
+  unfold asmUnop withPc; cases s.stack <;> rfl
+
+theorem asmTernop_pc (f : bytes32 → bytes32 → bytes32 → bytes32) (s : AsmState) (p : Nat) :
+    asmTernop f { s with pc := p } = withPc (p + 1) (asmTernop f s) := by
+  unfold asmTernop withPc
+  match hs : s.stack with
+  | [] => rfl
+  | [_] => rfl
+  | [_, _] => rfl
+  | _ :: _ :: _ :: _ => rfl
+
+theorem asmDup_pc (n : Nat) (s : AsmState) (p : Nat) :
+    asmDup n { s with pc := p } = withPc (p + 1) (asmDup n s) := by
+  unfold asmDup withPc
+  split_ifs <;> rfl
+
+theorem asmSwap_pc (n : Nat) (s : AsmState) (p : Nat) :
+    asmSwap n { s with pc := p } = withPc (p + 1) (asmSwap n s) := by
+  unfold asmSwap withPc
+  split_ifs <;> rfl
+
+theorem asmMload_pc (s : AsmState) (p : Nat) :
+    asmMload { s with pc := p } = withPc (p + 1) (asmMload s) := by
+  unfold asmMload withPc; cases s.stack <;> rfl
+
+theorem asmMstore_pc (s : AsmState) (p : Nat) :
+    asmMstore { s with pc := p } = withPc (p + 1) (asmMstore s) := by
+  unfold asmMstore withPc
+  match hs : s.stack with
+  | [] => rfl
+  | [_] => rfl
+  | _ :: _ :: _ => rfl
+
+theorem asmSload_pc (s : AsmState) (p : Nat) :
+    asmSload { s with pc := p } = withPc (p + 1) (asmSload s) := by
+  unfold asmSload withPc; cases s.stack <;> rfl
+
+/-! ### …and the jump, which is exactly where the shift breaks
+
+`asmJump` does not build its result from `asmNext`. It reads the target from `offsetToPc` — the
+whole-function map — and sets the pc to it **absolutely**. So it is *not* `withPc (p + 1)` of anything:
+moving the input pc changes nothing about the output pc at all.
+
+That asymmetry is the whole content of the remaining segment-lift lemma. Every non-jump instruction shifts
+with its block; the terminator does not, because it was already speaking in whole-function coordinates. -/
+theorem asmJump_pc (o2pc : AssocList Nat Nat) (s : AsmState) (p : Nat) :
+    asmJump o2pc { s with pc := p } = asmJump o2pc s := by
+  unfold asmJump
+  cases s.stack <;> rfl
+
+/-! ### The rest of the helpers — and the three exceptions -/
+
+
+theorem toVenomState_pc (s : AsmState) (p : Nat) :
+    AsmState.toVenomState { s with pc := p } = s.toVenomState := rfl
+
+theorem withPc_withPc (a b : Nat) (r : AsmResult) :
+    withPc a (withPc b r) = withPc a r := by cases r <;> rfl
+
+theorem asmMstore8_pc (s : AsmState) (p : Nat) :
+    asmMstore8 { s with pc := p } = withPc (p + 1) (asmMstore8 s) := by
+  unfold asmMstore8 withPc
+  match s.stack with
+  | [] => rfl
+  | [_] => rfl
+  | _ :: _ :: _ => rfl
+
+theorem asmSstore_pc (s : AsmState) (p : Nat) :
+    asmSstore { s with pc := p } = withPc (p + 1) (asmSstore s) := by
+  unfold asmSstore withPc
+  match s.stack with
+  | [] => rfl
+  | [_] => rfl
+  | _ :: _ :: _ => rfl
+
+theorem asmSha3_pc (s : AsmState) (p : Nat) :
+    asmSha3 { s with pc := p } = withPc (p + 1) (asmSha3 s) := by
+  unfold asmSha3 withPc
+  match s.stack with
+  | [] => rfl
+  | [_] => rfl
+  | _ :: _ :: _ => rfl
+
+theorem asmMcopy_pc (s : AsmState) (p : Nat) :
+    asmMcopy { s with pc := p } = withPc (p + 1) (asmMcopy s) := by
+  unfold asmMcopy withPc
+  match s.stack with
+  | [] => rfl
+  | [_] => rfl
+  | [_, _] => rfl
+  | _ :: _ :: _ :: _ => rfl
+
+theorem asmCopyToMem_pc (src : List byte) (s : AsmState) (p : Nat) :
+    asmCopyToMem src { s with pc := p } = withPc (p + 1) (asmCopyToMem src s) := by
+  unfold asmCopyToMem withPc
+  match s.stack with
+  | [] => rfl
+  | [_] => rfl
+  | [_, _] => rfl
+  | _ :: _ :: _ :: _ => rfl
+
+/-- RETURN **does not** call `asmNext`: a halt keeps the pc it halted at. So the shift is
+`withPc p`, not `withPc (p+1)`. -/
+theorem asmReturnOp_pc (s : AsmState) (p : Nat) :
+    asmReturnOp { s with pc := p } = withPc p (asmReturnOp s) := by
+  unfold asmReturnOp withPc
+  match s.stack with
+  | [] => rfl
+  | [_] => rfl
+  | _ :: _ :: _ => rfl
+
+/-- Same for REVERT. -/
+theorem asmRevertOp_pc (s : AsmState) (p : Nat) :
+    asmRevertOp { s with pc := p } = withPc p (asmRevertOp s) := by
+  unfold asmRevertOp withPc
+  match s.stack with
+  | [] => rfl
+  | [_] => rfl
+  | _ :: _ :: _ => rfl
+
+/-- RETURNDATACOPY is the mixed case: its OK branch goes through `asmNext` (pc+1) but its
+    **fault** branch does not (pc preserved). So NO single `withPc k` describes it. -/
+theorem asmReturndatacopy_pc_ok (s : AsmState) (p : Nat) (s' : AsmState)
+    (h : asmReturndatacopy { s with pc := p } = AsmResult.AsmOK s') : s'.pc = p + 1 := by
+  revert h; unfold asmReturndatacopy
+  match s.stack with
+  | [] => intro h; cases h
+  | [_] => intro h; cases h
+  | [_, _] => intro h; cases h
+  | a :: b :: c :: _ =>
+    simp only []
+    split
+    · intro h; cases h
+    · intro h; cases h; rfl
+
+theorem asmSelfdestruct_pc (s : AsmState) (p : Nat) :
+    asmSelfdestruct { s with pc := p } = withPc (p + 1) (asmSelfdestruct s) := by
+  unfold asmSelfdestruct withPc
+  match s.stack with
+  | [] => rfl
+  | _ :: _ => rfl
+
+theorem asmExtcodecopy_pc (s : AsmState) (p : Nat) :
+    asmExtcodecopy { s with pc := p } = withPc (p + 1) (asmExtcodecopy s) := by
+  unfold asmExtcodecopy
+  match s.stack with
+  | [] => rfl
+  | a :: r =>
+    show asmCopyToMem _ { { s with stack := r } with pc := p } = _
+    rw [asmCopyToMem_pc]
+
+/-! ### The invariant that IS uniform -/
+
+/-- Two results agree up to the pc. -/
+def sameUpToPc (r₁ r₂ : AsmResult) : Prop := withPc 0 r₁ = withPc 0 r₂
+
+
+theorem asmReturndatacopy_same (s : AsmState) (p : Nat) :
+    sameUpToPc (asmReturndatacopy { s with pc := p }) (asmReturndatacopy s) := by
+  unfold sameUpToPc
+  match hs : s.stack with
+  | [] => simp [asmReturndatacopy, hs]
+  | [_] => simp [asmReturndatacopy, hs]
+  | [_, _] => simp [asmReturndatacopy, hs]
+  | a :: b :: c :: r =>
+    by_cases h : UInt256.toNat b + UInt256.toNat c > s.returndata.size
+    · simp [asmReturndatacopy, hs, h, withPc]
+    · simp [asmReturndatacopy, hs, h, withPc, asmNext]
+
+/-! ### JUMPI is both
+
+A JUMPI's **taken** branch reads its target from `offsetToPc` and sets the pc absolutely, exactly like
+JUMP — so moving the input pc changes nothing. Its **fall-through** branch goes through `asmNext` and is
+an ordinary increment. So JUMPI is not classifiable as "jump" or "non-jump": which of the two shift laws
+applies depends on the *value on the stack*, not on the opcode. -/
+theorem asmJumpi_pc_notTaken (o2pc : AssocList Nat Nat) (s : AsmState) (p : Nat)
+    (dest cond : bytes32) (stk : List bytes32)
+    (hs : s.stack = dest :: cond :: stk) (hc : cond = EvmYul.UInt256.ofNat 0) :
+    asmJumpi o2pc { s with pc := p } = withPc (p + 1) (asmJumpi o2pc s) := by
+  simp [asmJumpi, hs, hc, withPc, asmNext]
+
+theorem asmJumpi_pc_taken (o2pc : AssocList Nat Nat) (s : AsmState) (p : Nat)
+    (dest cond : bytes32) (stk : List bytes32)
+    (hs : s.stack = dest :: cond :: stk) (hc : cond ≠ EvmYul.UInt256.ofNat 0) :
+    asmJumpi o2pc { s with pc := p } = asmJumpi o2pc s := by
+  simp only [asmJumpi, hs, if_neg hc]
+
+/-! ### The call/create family, and the universal congruence
+
+With every helper covered, the statement that is actually uniform can be proved: `asmStep` reads the pc
+**only** to fetch the instruction. Two programs carrying the same instruction at different positions step
+to the same result, up to the pc — over all 81 arms, jumps included. -/
+
+
+theorem asmCall_pc (s : AsmState) (p : Nat) :
+    asmCall { s with pc := p } = withPc (p + 1) (asmCall s) := by
+  unfold asmCall withPc
+  match s.stack with
+  | [] | [_] | [_,_] | [_,_,_] | [_,_,_,_] | [_,_,_,_,_] | [_,_,_,_,_,_] => rfl
+  | _::_::_::_::_::_::_::_ => rfl
+
+theorem asmStaticCall_pc (s : AsmState) (p : Nat) :
+    asmStaticCall { s with pc := p } = withPc (p + 1) (asmStaticCall s) := by
+  unfold asmStaticCall withPc
+  match s.stack with
+  | [] | [_] | [_,_] | [_,_,_] | [_,_,_,_] | [_,_,_,_,_] => rfl
+  | _::_::_::_::_::_::_ => rfl
+
+theorem asmDelegateCall_pc (s : AsmState) (p : Nat) :
+    asmDelegateCall { s with pc := p } = withPc (p + 1) (asmDelegateCall s) := by
+  unfold asmDelegateCall withPc
+  match s.stack with
+  | [] | [_] | [_,_] | [_,_,_] | [_,_,_,_] | [_,_,_,_,_] => rfl
+  | _::_::_::_::_::_::_ => rfl
+
+theorem asmCreate_pc (s : AsmState) (p : Nat) :
+    asmCreate { s with pc := p } = withPc (p + 1) (asmCreate s) := by
+  unfold asmCreate withPc
+  match s.stack with
+  | [] | [_] | [_,_] => rfl
+  | _::_::_::_ => rfl
+
+theorem asmCreate2_pc (s : AsmState) (p : Nat) :
+    asmCreate2 { s with pc := p } = withPc (p + 1) (asmCreate2 s) := by
+  unfold asmCreate2 withPc
+  match s.stack with
+  | [] | [_] | [_,_] | [_,_,_] => rfl
+  | _::_::_::_::_ => rfl
+
+theorem asmLog_pc (n : Nat) (s : AsmState) (p : Nat) :
+    asmLog n { s with pc := p } = withPc (p + 1) (asmLog n s) := by
+  unfold asmLog withPc
+  split_ifs <;> rfl
+
+theorem sameUpToPc_symm (r₁ r₂ : AsmResult) (h : sameUpToPc r₁ r₂) : sameUpToPc r₂ r₁ := h.symm
+
+theorem sameUpToPc_trans (r₁ r₂ r₃ : AsmResult)
+    (h₁ : sameUpToPc r₁ r₂) (h₂ : sameUpToPc r₂ r₃) : sameUpToPc r₁ r₃ := h₁.trans h₂
+
+theorem asmReturndatacopy_same_pq (s : AsmState) (p q : Nat) :
+    sameUpToPc (asmReturndatacopy { s with pc := p }) (asmReturndatacopy { s with pc := q }) :=
+  sameUpToPc_trans _ _ _ (asmReturndatacopy_same s p)
+    (sameUpToPc_symm _ _ (asmReturndatacopy_same s q))
+
+/-- JUMPI's two laws collapse into one `sameUpToPc`: taken, both sides ignore the incoming pc;
+    not-taken, both increment their own. Either way they agree up to the pc. -/
+theorem asmJumpi_same_pq (o2pc : AssocList Nat Nat) (s : AsmState) (p q : Nat) :
+    sameUpToPc (asmJumpi o2pc { s with pc := p }) (asmJumpi o2pc { s with pc := q }) := by
+  unfold sameUpToPc
+  match hs : s.stack with
+  | [] => simp [asmJumpi, hs]
+  | [_] => simp [asmJumpi, hs]
+  | dest :: cond :: stk =>
+    by_cases hc : cond = EvmYul.UInt256.ofNat 0
+    · simp [asmJumpi, hs, hc, withPc, asmNext]
+    · simp only [asmJumpi, hs, if_neg hc]
+
+
+/-- **`asmStep` does not read the pc, except to fetch the instruction.**
+
+If two programs carry the *same instruction* at positions `p` and `q`, then stepping either one from a
+state sitting at its own position gives the same result up to the pc. This is uniform over all 81 arms —
+jumps included, because a jump's result does not depend on the incoming pc at all.
+
+This is the whole asm-side content of the segment lift: a block's asm behaves the same wherever it is
+placed in the program. What the pc is *set to* differs, and that difference is exactly what the separate
+pc-tracking lemmas describe. -/
+theorem asmStep_sameUpToPc (o2pc : AssocList Nat Nat) (prog₁ prog₂ : List AsmInst)
+    (s : AsmState) (p q : Nat) (hp : p < prog₁.length) (hq : q < prog₂.length)
+    (heq : prog₁.get ⟨p, hp⟩ = prog₂.get ⟨q, hq⟩) :
+    sameUpToPc (asmStep o2pc prog₁ { s with pc := p }) (asmStep o2pc prog₂ { s with pc := q }) := by
+  unfold asmStep
+  rw [dif_pos (show ({ s with pc := p } : AsmState).pc < prog₁.length from hp),
+      dif_pos (show ({ s with pc := q } : AsmState).pc < prog₂.length from hq)]
+  simp only [show (⟨({ s with pc := p } : AsmState).pc, hp⟩ : Fin prog₁.length) = ⟨p, hp⟩ from rfl,
+             show (⟨({ s with pc := q } : AsmState).pc, hq⟩ : Fin prog₂.length) = ⟨q, hq⟩ from rfl, heq]
+  split <;>
+    first
+      | (simp only [sameUpToPc, asmPushVal_pc, asmPop_pc, asmBinop_pc, asmUnop_pc, asmTernop_pc,
+            asmDup_pc, asmSwap_pc, asmMload_pc, asmMstore_pc, asmMstore8_pc, asmSload_pc,
+            asmSstore_pc, asmSha3_pc, asmMcopy_pc, asmCopyToMem_pc, asmExtcodecopy_pc,
+            asmReturnOp_pc, asmRevertOp_pc, asmSelfdestruct_pc, asmJump_pc, asmCall_pc,
+            asmStaticCall_pc, asmDelegateCall_pc, asmCreate_pc, asmCreate2_pc, withPc_withPc]
+         done)
+      | exact asmReturndatacopy_same_pq s p q
+      | exact asmJumpi_same_pq o2pc s p q
+      | (simp [sameUpToPc, withPc, asmNext]; done)
+      | (repeat' split
+         all_goals
+           first
+             | (simp only [sameUpToPc, asmDup_pc, asmSwap_pc, asmLog_pc, withPc_withPc]; done)
+             | (simp [sameUpToPc, withPc]; done))
+      | (rcases hst : s.stack with _ | ⟨a, _ | ⟨b, t⟩⟩ <;>
+           simp [sameUpToPc, withPc, asmNext, asmStateUnop, AsmState.toVenomState,
+                 toVenomState_pc, hst])
+
+
+/-- **A block steps the same in the program as it does in isolation.**
+
+If `blk` is placed at `base` in `prog`, then stepping the whole program from `base + j` and stepping the
+block alone from `j` agree up to the pc — for every offset `j` inside the block, and for every opcode,
+terminator included. This is `asmStep_sameUpToPc` fed by `asmBlockAt`: the placement hypothesis is exactly
+the instruction-equality the congruence asks for. -/
+theorem asmStep_of_blockAt (o2pc : AssocList Nat Nat) (prog blk : List AsmInst)
+    (base j : Nat) (s : AsmState)
+    (hblk : asmBlockAt prog base blk) (hj : j < blk.length) :
+    sameUpToPc (asmStep o2pc prog { s with pc := base + j })
+               (asmStep o2pc blk { s with pc := j }) := by
+  have hlt : base + j < prog.length := by
+    have := hblk.1
+    omega
+  exact asmStep_sameUpToPc o2pc prog blk s (base + j) j hlt hj
+    (asmBlockAt_get_eq hblk hj hlt)
+
+/-! ## The pc actually tracks
+
+`sameUpToPc` says the two runs agree on everything *but* the pc — which is precisely the field the next
+step reads. To iterate, I need the pc too: a non-jump instruction that yields `AsmOK` advances the pc by
+exactly one, wherever it sits. -/
+
+/-- The two opcodes whose OK result does not advance the pc by one. -/
+def IsAsmJump : AsmInst → Bool
+  | AsmInst.AsmOp "JUMP"  => true
+  | AsmInst.AsmOp "JUMPI" => true
+  | _ => false
+
+theorem pc_of_withPc_ok (k : Nat) (r : AsmResult) (s' : AsmState)
+    (h : withPc k r = AsmResult.AsmOK s') : s'.pc = k := by
+  cases r <;> simp [withPc] at h <;> (subst h; rfl)
+
+theorem asmReturnOp_not_ok (s s' : AsmState) : asmReturnOp s ≠ AsmResult.AsmOK s' := by
+  unfold asmReturnOp
+  match s.stack with
+  | [] => simp
+  | [_] => simp
+  | _ :: _ :: _ => simp
+
+theorem asmRevertOp_not_ok (s s' : AsmState) : asmRevertOp s ≠ AsmResult.AsmOK s' := by
+  unfold asmRevertOp
+  match s.stack with
+  | [] => simp
+  | [_] => simp
+  | _ :: _ :: _ => simp
+
+theorem asmSelfdestruct_not_ok (s s' : AsmState) : asmSelfdestruct s ≠ AsmResult.AsmOK s' := by
+  unfold asmSelfdestruct
+  match s.stack with
+  | [] => simp
+  | _ :: _ => simp
+
+/-- **A non-jump instruction that succeeds advances the pc by exactly one, wherever it sits.**
+Uniform over the other 79 arms. -/
+theorem asmStateUnop_ok_pc (f : bytes32 → AsmState → bytes32) (s s' : AsmState) (p : Nat)
+    (h : asmStateUnop f { s with pc := p } = AsmResult.AsmOK s') : s'.pc = p + 1 := by
+  revert h; unfold asmStateUnop
+  match s.stack with
+  | [] => intro h; cases h
+  | a :: tl => intro h; cases h; rfl
+
+theorem asmStep_ok_pc (o2pc : AssocList Nat Nat) (prog : List AsmInst) (s s' : AsmState) (p : Nat)
+    (hp : p < prog.length) (hnj : IsAsmJump (prog.get ⟨p, hp⟩) = false)
+    (h : asmStep o2pc prog { s with pc := p } = AsmResult.AsmOK s') : s'.pc = p + 1 := by
+  revert h hnj
+  unfold asmStep
+  rw [dif_pos (show ({ s with pc := p } : AsmState).pc < prog.length from hp)]
+  simp only [show (⟨({ s with pc := p } : AsmState).pc, hp⟩ : Fin prog.length) = ⟨p, hp⟩ from rfl]
+  split <;> intro hnj h
+  all_goals
+    first
+      | (simp_all [IsAsmJump]; done)
+      | exact absurd h (asmReturnOp_not_ok _ _)
+      | exact absurd h (asmRevertOp_not_ok _ _)
+      | exact absurd h (asmSelfdestruct_not_ok _ _)
+      | (simp only [asmPushVal_pc, asmPop_pc, asmBinop_pc, asmUnop_pc, asmTernop_pc, asmDup_pc,
+            asmSwap_pc, asmMload_pc, asmMstore_pc, asmMstore8_pc, asmSload_pc, asmSstore_pc,
+            asmSha3_pc, asmMcopy_pc, asmCopyToMem_pc, asmExtcodecopy_pc, asmCall_pc,
+            asmStaticCall_pc, asmDelegateCall_pc, asmCreate_pc, asmCreate2_pc, asmLog_pc] at h
+         exact pc_of_withPc_ok _ _ _ h)
+      | exact asmReturndatacopy_pc_ok s p s' h
+      | exact asmStateUnop_ok_pc _ s s' p h
+      | (cases h; rfl)
+      | (repeat' (split at h)
+         all_goals
+           first
+             | (simp only [asmDup_pc, asmSwap_pc, asmLog_pc] at h
+                exact pc_of_withPc_ok _ _ _ h)
+             | (simp at h)
+         done)
+      | (rcases hst : s.stack with _ | ⟨a, _ | ⟨b, t⟩⟩ <;>
+           simp_all [asmNext]
+         done)
+      | (rcases hst : s.stack with _ | ⟨a, _ | ⟨b, t⟩⟩ <;>
+           simp_all [asmNext] <;> subst h <;> rfl
+         done)
+
+/-! ## Putting the two halves together
+
+`asmStep_sameUpToPc` gives everything but the pc; `asmStep_ok_pc` gives the pc. Together they say a
+non-jump instruction of a placed block steps the program exactly as it steps the block, with the pc
+displaced by `base`. -/
+
+theorem asmState_of_setPc_eq (a b : AsmState) (k : Nat)
+    (h : ({ a with pc := k } : AsmState) = { b with pc := k }) : a = { b with pc := a.pc } := by
+  cases a; cases b; simp_all [AsmState.mk.injEq]
+
+
+/-- **The segment step lemma.** A block placed at `base` steps the whole program exactly as it steps in
+isolation — same state, pc displaced by `base` — for every non-jump instruction in it. -/
+theorem asmStep_shift (o2pc : AssocList Nat Nat) (prog blk : List AsmInst)
+    (base j : Nat) (s s' : AsmState)
+    (hblk : asmBlockAt prog base blk) (hj : j < blk.length)
+    (hnj : IsAsmJump (blk.get ⟨j, hj⟩) = false)
+    (hstep : asmStep o2pc blk { s with pc := j } = AsmResult.AsmOK s') :
+    asmStep o2pc prog { s with pc := base + j }
+      = AsmResult.AsmOK { s' with pc := base + j + 1 } := by
+  have hlt : base + j < prog.length := by have := hblk.1; omega
+  have hgeti : prog.get ⟨base + j, hlt⟩ = blk.get ⟨j, hj⟩ := asmBlockAt_get_eq hblk hj hlt
+  have hsame := asmStep_of_blockAt o2pc prog blk base j s hblk hj
+  unfold sameUpToPc at hsame
+  rw [hstep] at hsame
+  -- the program-side step is an OK too …
+  obtain ⟨u, hu⟩ : ∃ u, asmStep o2pc prog { s with pc := base + j } = AsmResult.AsmOK u := by
+    cases hp : asmStep o2pc prog { s with pc := base + j } with
+    | AsmOK u => exact ⟨u, rfl⟩
+    | AsmHalt u   => rw [hp] at hsame; simp [withPc] at hsame
+    | AsmRevert u => rw [hp] at hsame; simp [withPc] at hsame
+    | AsmFault u  => rw [hp] at hsame; simp [withPc] at hsame
+    | AsmError m  => rw [hp] at hsame; simp [withPc] at hsame
+  rw [hu] at hsame ⊢
+  -- … its pc is base + j + 1 …
+  have hpc : u.pc = base + j + 1 := by
+    refine asmStep_ok_pc o2pc prog s u (base + j) hlt ?_ hu
+    rw [hgeti]; exact hnj
+  -- … and every other field agrees with the block-side result.
+  simp only [withPc] at hsame
+  have := asmState_of_setPc_eq u s' 0 (by injection hsame)
+  rw [this, hpc]
+
+/-! ## The segment lift
+
+The induction that the per-block recipe needs. -/
+
+
+/-- An `AsmOK` step is evidence that the pc was in range: out of bounds, `asmStep` errors. -/
+theorem asmStep_ok_inbounds (o2pc : AssocList Nat Nat) (prog : List AsmInst) (s s' : AsmState)
+    (h : asmStep o2pc prog s = AsmResult.AsmOK s') : s.pc < prog.length := by
+  by_contra hc
+  rw [asmStep, dif_neg hc] at h
+  cases h
+
+/-- **The segment lift.** A jump-free block placed at `base` runs the whole program exactly as it
+runs in isolation: same state throughout, pc displaced by `base`.
+
+This is the induction the per-block recipe needs. The `IsAsmJump`-free hypothesis is what confines
+it to a block's *body*; the terminator is where the displacement stops being uniform, which is
+exactly what `asmJump_pc` says. -/
+theorem runAsm_shift (n : Nat) (o2pc : AssocList Nat Nat) (prog blk : List AsmInst) (base : Nat)
+    (hblk : asmBlockAt prog base blk)
+    (hnj : ∀ j, (hj : j < blk.length) → IsAsmJump (blk.get ⟨j, hj⟩) = false) :
+    ∀ (x s' : AsmState), runAsm n o2pc blk x = AsmResult.AsmOK s' →
+      runAsm n o2pc prog { x with pc := base + x.pc }
+        = AsmResult.AsmOK { s' with pc := base + s'.pc } := by
+  induction n with
+  | zero =>
+    intro x s' h
+    rw [runAsm] at h ⊢
+    cases h
+    rfl
+  | succ n ih =>
+    intro x s' h
+    rw [runAsm] at h
+    cases hstep : asmStep o2pc blk x with
+    | AsmOK t =>
+      rw [hstep] at h
+      have hj : x.pc < blk.length := asmStep_ok_inbounds o2pc blk x t hstep
+      have hx : ({ x with pc := x.pc } : AsmState) = x := rfl
+      have hshift : asmStep o2pc prog { x with pc := base + x.pc }
+          = AsmResult.AsmOK { t with pc := base + x.pc + 1 } := by
+        have := asmStep_shift o2pc prog blk base x.pc x t hblk hj (hnj x.pc hj) (by rw [hx]; exact hstep)
+        exact this
+      have htpc : t.pc = x.pc + 1 :=
+        asmStep_ok_pc o2pc blk x t x.pc hj (hnj x.pc hj) (by rw [hx]; exact hstep)
+      rw [runAsm, hshift]
+      have : ({ t with pc := base + x.pc + 1 } : AsmState) = { t with pc := base + t.pc } := by
+        rw [htpc, Nat.add_assoc]
+      rw [this]
+      exact ih t s' h
+    | AsmHalt t   => rw [hstep] at h; cases h
+    | AsmRevert t => rw [hstep] at h; cases h
+    | AsmFault t  => rw [hstep] at h; cases h
+    | AsmError m  => rw [hstep] at h; cases h
+
+/-! ## Firing the lift on the compiler's own output
+
+At a **nonzero** base — 13, not 0. A base of 0 would make the displacement law degenerate and prove
+nothing. -/
+
+
+/-- The `then` block's jump-free body, as the compiler laid it out: `Dia.prog[13..17)`.
+    `Dia.prog[17]` is the `JUMP` — the body runs right up to the terminator and stops. -/
+def Dia.thenBody : List AsmInst := (Dia.prog.drop 13).take 4
+
+theorem dia_thenBody_shape :
+    Dia.thenBody = [AsmInst.AsmLabel "then", AsmInst.AsmOp "CALLVALUE",
+                    AsmInst.AsmOp "POP", Dia.prog[16]!] := by rfl
+
+theorem dia_thenBody_at : asmBlockAt Dia.prog 13 Dia.thenBody := by
+  refine ⟨by decide, ?_⟩
+  intro j hj
+  have : j < 4 := hj
+  interval_cases j <;> rfl
+
+theorem dia_thenBody_nojump :
+    ∀ j, (hj : j < Dia.thenBody.length) → IsAsmJump (Dia.thenBody.get ⟨j, hj⟩) = false := by
+  decide
+
+/-- **The lift, fired on the compiler's own output, at a nonzero base.** -/
+theorem dia_then_lift (x s' : AsmState)
+    (h : runAsm 4 Dia.o2pc Dia.thenBody x = AsmResult.AsmOK s') :
+    runAsm 4 Dia.o2pc Dia.prog { x with pc := 13 + x.pc }
+      = AsmResult.AsmOK { s' with pc := 13 + s'.pc } :=
+  runAsm_shift 4 Dia.o2pc Dia.prog Dia.thenBody 13 dia_thenBody_at dia_thenBody_nojump x s' h
+
+/-- **Non-vacuous, and it lands where it should.** Running the `then` block's body in isolation for
+four steps and running `Dia.prog` from pc 13 for four steps give the same state — and the program-side
+pc ends at **17**, which is exactly the index of that block's `JUMP`.
+
+So the lift carries a real compiled block, at a base of 13, right up to its terminator and stops there.
+The terminator is where it stops because the terminator is where it *must* stop: `asmJump_pc` says a
+JUMP's target is absolute, so no displacement law can cross it. -/
+theorem dia_then_lift_fires (x : AsmState) :
+    ∃ s', runAsm 4 Dia.o2pc Dia.thenBody { x with pc := 0 } = AsmResult.AsmOK s' ∧
+          runAsm 4 Dia.o2pc Dia.prog { x with pc := 13 }
+            = AsmResult.AsmOK { s' with pc := 13 + s'.pc } :=
+  ⟨_, rfl, dia_then_lift { x with pc := 0 } _ rfl⟩
+
+theorem dia_then_lift_lands_on_the_jump (x : AsmState) :
+    ∃ s', runAsm 4 Dia.o2pc Dia.prog { x with pc := 13 } = AsmResult.AsmOK s'
+        ∧ s'.pc = 17 ∧ Dia.prog[17]! = AsmInst.AsmOp "JUMP" := by
+  exact ⟨_, dia_then_lift { x with pc := 0 } _ rfl, rfl, rfl⟩
+
+/-! ## What the lift buys: the per-block asm hypothesis, without an absolute-pc trace -/
+
+
+/-- The state the `then` block's body reaches when run **in isolation**. Left as the result of the run
+    rather than spelled out: the word it pushes (`Dia.prog[16] = AsmPush [0,17]`) is a `wordOfBytes` over
+    a 32-byte pad that does not kernel-reduce, and it does not need to — nothing below normalises it. -/
+def Dia.thenS (asm : AsmState) : AsmState :=
+  match runAsm 4 Dia.o2pc Dia.thenBody { asm with pc := 0 } with
+  | AsmResult.AsmOK s => s
+  | _ => asm
+
+/-- The body's isolated run is a `rfl`: a block is a short literal list. -/
+theorem dia_thenBody_run (asm : AsmState) :
+    runAsm 4 Dia.o2pc Dia.thenBody { asm with pc := 0 } = AsmResult.AsmOK (Dia.thenS asm) := rfl
+
+/-- Its pc lands at 4 — the block's length. This is a *projection*, so it reduces even though the pushed
+    word above does not. -/
+theorem dia_thenS_pc (asm : AsmState) : (Dia.thenS asm).pc = 4 := rfl
+
+/-- **The recipe, on a real block.**
+
+The per-block asm hypotheses the `hstep` family consumes (`dia_hasm_then` and friends) were proved by a
+hand-rolled instruction-by-instruction trace through the *whole program* at absolute pcs, juggling
+`Fin.ext` at every step — about thirty lines a block, and nothing about it generalises.
+
+Here is the body of that same block through the lift instead: run it **in isolation**, where it is a
+`rfl`, then displace it to base 13. No absolute pc appears in the proof. The only thing specific to this
+block is which four instructions it has — everything else is `runAsm_shift`.
+
+It stops at 17 because 17 is the block's `JUMP`, and the terminator is not the lift's business: that is
+what the seven canonical `hstep`s are for. -/
+theorem dia_then_body_in_prog (asm : AsmState) (hpc : asm.pc = 13) :
+    runAsm 4 Dia.o2pc Dia.prog asm = AsmResult.AsmOK { Dia.thenS asm with pc := 17 } := by
+  have hlift := dia_then_lift { asm with pc := 0 } (Dia.thenS asm) (dia_thenBody_run asm)
+  have hid : ({ asm with pc := 13 + ({ asm with pc := 0 } : AsmState).pc } : AsmState) = asm := by
+    show ({ asm with pc := 13 } : AsmState) = asm
+    rw [← hpc]
+  rw [hid, dia_thenS_pc] at hlift
+  exact hlift
+
+
+/-! ## Which generated instructions can be a jump?
+
+`runAsm_shift` takes jump-freeness of the block's body as a HYPOTHESIS. For a per-block recipe it has to
+be a THEOREM. Working out which opcodes can emit a `JUMP`/`JUMPI` is the content — and the answer is not
+the one I assumed. -/
+
+theorem log_name_ne_jump (k : Nat) : ("LOG" ++ toString k) ≠ "JUMP" := by
+  intro h
+  have hd : ("LOG" ++ toString k).toList = "JUMP".toList := by rw [h]
+  rw [String.toList_append] at hd
+  simp [show "LOG".toList = ['L','O','G'] from rfl,
+        show "JUMP".toList = ['J','U','M','P'] from rfl] at hd
+
+theorem log_name_ne_jumpi (k : Nat) : ("LOG" ++ toString k) ≠ "JUMPI" := by
+  intro h
+  have hd : ("LOG" ++ toString k).toList = "JUMPI".toList := by rw [h]
+  rw [String.toList_append] at hd
+  simp [show "LOG".toList = ['L','O','G'] from rfl,
+        show "JUMPI".toList = ['J','U','M','P','I'] from rfl] at hd
+
+theorem swapName_not_jump (n : Nat) : IsAsmJump (AsmInst.AsmOp (swapName n)) = false := by
+  unfold swapName
+  simp only [apply_ite (f := fun s => IsAsmJump (AsmInst.AsmOp s))]
+  simp only [show IsAsmJump (AsmInst.AsmOp "SWAP1") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "SWAP2") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "SWAP3") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "SWAP4") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "SWAP5") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "SWAP6") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "SWAP7") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "SWAP8") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "SWAP9") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "SWAP10") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "SWAP11") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "SWAP12") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "SWAP13") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "SWAP14") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "SWAP15") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "SWAP16") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "SWAP?") = false from rfl,
+             ite_self]
+
+theorem dupName_not_jump (n : Nat) : IsAsmJump (AsmInst.AsmOp (dupName n)) = false := by
+  unfold dupName
+  simp only [apply_ite (f := fun s => IsAsmJump (AsmInst.AsmOp s))]
+  simp only [show IsAsmJump (AsmInst.AsmOp "DUP1") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "DUP2") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "DUP3") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "DUP4") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "DUP5") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "DUP6") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "DUP7") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "DUP8") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "DUP9") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "DUP10") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "DUP11") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "DUP12") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "DUP13") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "DUP14") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "DUP15") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "DUP16") = false from rfl,
+             show IsAsmJump (AsmInst.AsmOp "DUP?") = false from rfl,
+             ite_self]
+
+theorem IsAsmJump_op_false (s : String) (h1 : s ≠ "JUMP") (h2 : s ≠ "JUMPI") :
+    IsAsmJump (AsmInst.AsmOp s) = false := by
+  unfold IsAsmJump
+  split <;> simp_all
+
+/-- **The direct-emit table never names a jump.** `opcodeToEvmName` maps Venom opcodes to EVM mnemonics;
+    no arm produces `JUMP` or `JUMPI`. Those are minted only by the control-flow branches below. -/
+theorem opcodeToEvmName_not_jump (opc : Opcode) (name : String)
+    (h : opcodeToEvmName opc = some name) : IsAsmJump (AsmInst.AsmOp name) = false := by
+  refine IsAsmJump_op_false name ?_ ?_ <;>
+    (cases opc <;> simp_all [opcodeToEvmName] <;> (subst h; decide))
+
+/-- A `StackOp` that is not an explicit `SOEmit "JUMP"`/`SOEmit "JUMPI"`. -/
+def SOJumpFree (op : StackOp) : Prop :=
+  op ≠ StackOp.SOEmit "JUMP" ∧ op ≠ StackOp.SOEmit "JUMPI"
+
+/-- **A jump-free `StackOp` executes to jump-free asm.** Every other constructor emits either a fixed
+    mnemonic (POP/MSTORE/MLOAD), a `swapName`/`dupName`, a push, or a label — never a jump. -/
+theorem execStackOp_not_jump (op : StackOp) (h : SOJumpFree op) :
+    ∀ a ∈ execStackOp op, IsAsmJump a = false := by
+  cases op with
+  | SOPush o =>
+    intro a ha
+    cases o <;> simp [execStackOp] at ha <;> subst ha <;> rfl
+  | SOPop n =>
+    intro a ha
+    rw [show execStackOp (StackOp.SOPop n) = List.replicate n (AsmInst.AsmOp "POP") from rfl] at ha
+    rw [List.eq_of_mem_replicate ha]; rfl
+  | SOSwap n => intro a ha; simp [execStackOp] at ha; subst ha; exact swapName_not_jump n
+  | SODup n  => intro a ha; simp [execStackOp] at ha; subst ha; exact dupName_not_jump n
+  | SOPoke _ _ => intro a ha; simp [execStackOp] at ha
+  | SOSpill off => intro a ha; simp [execStackOp] at ha; rcases ha with h | h <;> subst h <;> rfl
+  | SORestore off => intro a ha; simp [execStackOp] at ha; rcases ha with h | h <;> subst h <;> rfl
+  | SOEmit opc =>
+    intro a ha
+    simp [execStackOp] at ha
+    subst ha
+    exact IsAsmJump_op_false opc
+      (fun hc => h.1 (by rw [hc])) (fun hc => h.2 (by rw [hc]))
+  | SOLabel l => intro a ha; simp [execStackOp] at ha; subst ha; rfl
+  | SOPushLabel l => intro a ha; simp [execStackOp] at ha; subst ha; rfl
+  | SOPushOfst l o => intro a ha; simp [execStackOp] at ha; subst ha; rfl
+
+/-- …and so does a jump-free plan. -/
+theorem executePlan_not_jump (ops : List StackOp) (h : ∀ op ∈ ops, SOJumpFree op) :
+    ∀ a ∈ executePlan ops, IsAsmJump a = false := by
+  intro a ha
+  simp only [executePlan, List.bind_eq_flatMap, List.mem_flatMap] at ha
+  obtain ⟨op, hop, ha⟩ := ha
+  exact execStackOp_not_jump op (h op hop) a ha
+
+/-- **The three body opcodes that emit a jump.**
+
+This is the part I would have got wrong by assuming. A block's *body* is not automatically jump-free:
+
+* `ASSERT` emits `ISZERO; PUSH revert; JUMPI` — a conditional abort, and it is **not** a terminator.
+* `ASSERT_UNREACHABLE` emits `PUSH end; JUMPI; INVALID; end:` — also not a terminator.
+* `INVOKE` emits `PUSH ret; PUSH f; JUMP; ret:` — a call, also not a terminator.
+
+`isTerminator` is exactly `JMP JNZ DJMP RET RETURN REVERT STOP SINK SELFDESTRUCT INVALID`, so all three
+sit in the middle of a block and jump from there. Everything *else* a body can contain routes through
+`opcodeToEvmName`, `LOG`, or `ISTORE`, none of which names a jump. -/
+def BodyJumpFree (opc : Opcode) : Prop :=
+  isTerminator opc = false ∧ opc ≠ Opcode.ASSERT ∧ opc ≠ Opcode.ASSERT_UNREACHABLE
+    ∧ opc ≠ Opcode.INVOKE
+
+theorem generateEmitOps_not_jump (inst : Instruction) (k : Nat) (ps : PlanState)
+    (h : BodyJumpFree inst.opcode) :
+    ∀ op ∈ (generateEmitOps inst k ps).1, SOJumpFree op := by
+  obtain ⟨hterm, hassert, hunreach, hinvoke⟩ := h
+  have hjmp : inst.opcode ≠ Opcode.JMP := by
+    intro hc; rw [hc] at hterm; exact absurd hterm (by decide)
+  have hjnz : inst.opcode ≠ Opcode.JNZ := by
+    intro hc; rw [hc] at hterm; exact absurd hterm (by decide)
+  have hdjmp : inst.opcode ≠ Opcode.DJMP := by
+    intro hc; rw [hc] at hterm; exact absurd hterm (by decide)
+  have hret : inst.opcode ≠ Opcode.RET := by
+    intro hc; rw [hc] at hterm; exact absurd hterm (by decide)
+  intro op hop
+  simp only [generateEmitOps] at hop
+  cases hname : opcodeToEvmName inst.opcode with
+  | some name =>
+    rw [hname] at hop
+    simp only [List.mem_singleton] at hop
+    subst hop
+    have hnj := opcodeToEvmName_not_jump _ name hname
+    refine ⟨?_, ?_⟩ <;> intro hc <;>
+      (rw [StackOp.SOEmit.inj hc] at hnj; simp [IsAsmJump] at hnj)
+  | none =>
+    rw [hname] at hop
+    simp only [if_neg hjnz, if_neg hjmp, if_neg hdjmp, if_neg hinvoke, if_neg hret,
+               if_neg hassert, if_neg hunreach] at hop
+    split_ifs at hop
+    · -- LOG: the only body opcode whose mnemonic is computed rather than a literal
+      simp only [List.mem_singleton] at hop
+      subst hop
+      exact ⟨fun hc => log_name_ne_jump k (StackOp.SOEmit.inj hc),
+             fun hc => log_name_ne_jumpi k (StackOp.SOEmit.inj hc)⟩
+    · -- ISTORE: SWAP1; MSTORE
+      simp only [List.mem_cons, List.not_mem_nil, or_false] at hop
+      rcases hop with hc | hc <;> subst hc <;> exact ⟨by decide, by decide⟩
+    · simp at hop
+
+/-! ### …and the exclusions are NECESSARY, not merely cautious
+
+If ASSERT/ASSERT_UNREACHABLE/INVOKE were terminators, or if they did not really jump, `BodyJumpFree`
+would be excluding them for nothing. They are not, and they do. -/
+
+theorem assert_not_terminator : isTerminator Opcode.ASSERT = false := by decide
+theorem assert_unreachable_not_terminator : isTerminator Opcode.ASSERT_UNREACHABLE = false := by decide
+theorem invoke_not_terminator : isTerminator Opcode.INVOKE = false := by decide
+
+/-- `ASSERT` is a **body** opcode and it emits a `JUMPI`. -/
+theorem assert_emits_jumpi (inst : Instruction) (h : inst.opcode = Opcode.ASSERT)
+    (k : Nat) (ps : PlanState) :
+    StackOp.SOEmit "JUMPI" ∈ (generateEmitOps inst k ps).1 := by
+  simp [generateEmitOps, h, opcodeToEvmName]
+
+/-- So a block whose body contains an `ASSERT` is **not** jump-free, and `runAsm_shift` genuinely does
+    not apply to it. The hypothesis is doing work. -/
+theorem assert_not_bodyJumpFree : ¬ BodyJumpFree Opcode.ASSERT := by
+  intro h; exact h.2.1 rfl
+
+
+/-- `runAsm_shift` wants jump-freeness **indexed by position**; `executePlan_not_jump` gives it by
+    membership. This is the adapter, and with it a jump-free plan's assembly is a legal segment. -/
+theorem executePlan_nojump_indexed (ops : List StackOp) (h : ∀ op ∈ ops, SOJumpFree op) :
+    ∀ j, (hj : j < (executePlan ops).length) →
+      IsAsmJump ((executePlan ops).get ⟨j, hj⟩) = false := by
+  intro j hj
+  exact executePlan_not_jump ops h _ (List.get_mem _ _)
+
+/-- **The lift applies to any jump-free plan's assembly, placed anywhere.** This is `runAsm_shift`
+    with its hypothesis discharged from the plan rather than assumed. -/
+theorem runAsm_shift_of_plan (n : Nat) (o2pc : AssocList Nat Nat) (prog : List AsmInst)
+    (ops : List StackOp) (base : Nat)
+    (hblk : asmBlockAt prog base (executePlan ops))
+    (hops : ∀ op ∈ ops, SOJumpFree op) :
+    ∀ (x s' : AsmState), runAsm n o2pc (executePlan ops) x = AsmResult.AsmOK s' →
+      runAsm n o2pc prog { x with pc := base + x.pc }
+        = AsmResult.AsmOK { s' with pc := base + s'.pc } :=
+  runAsm_shift n o2pc prog (executePlan ops) base hblk (executePlan_nojump_indexed ops hops)
+
+/-! ## The stack planners emit nothing — so a body instruction's plan is jump-free -/
+
+
+/-- A `StackOp` that is not an `SOEmit` at all. The stack planners in `PlanOps` build only
+    `SOSwap`/`SODup`/`SOPop`/`SOSpill`/`SORestore`; `emitOneInput` builds only `SOPush`/`SOPushLabel`.
+    None of them can name an EVM opcode, so none of them can be a jump. -/
+def NoEmit (op : StackOp) : Prop := ∀ s, op ≠ StackOp.SOEmit s
+
+theorem SOJumpFree_of_noEmit (op : StackOp) (h : NoEmit op) : SOJumpFree op :=
+  ⟨h "JUMP", h "JUMPI"⟩
+
+/-- The generic fold invariant: a left fold that only ever *appends* `NoEmit` ops to its op list
+    preserves "every op is a NoEmit". Every planner below is such a fold. -/
+theorem foldl_mem_noEmit {α β : Type} (l : List α)
+    (f : (List StackOp × β) → α → (List StackOp × β))
+    (hf : ∀ acc a, (∀ op ∈ acc.1, NoEmit op) → ∀ op ∈ (f acc a).1, NoEmit op)
+    (init : List StackOp × β) (hinit : ∀ op ∈ init.1, NoEmit op) :
+    ∀ op ∈ (l.foldl f init).1, NoEmit op := by
+  induction l generalizing init with
+  | nil => simpa using hinit
+  | cons a t ih => exact ih (f init a) (hf init a hinit)
+
+theorem doSwap_noEmit (dist : Nat) (ps : PlanState) :
+    ∀ op ∈ (doSwap dist ps).1, NoEmit op := by
+  unfold doSwap
+  split_ifs with h0 h16
+  · intro op hop; simp at hop
+  · intro op hop; simp at hop; subst hop; intro s; simp
+  · intro op hop
+    simp only [] at hop
+    rcases List.mem_append.mp hop with hs | hr
+    · -- the spill fold: only SOSpill
+      revert hs
+      refine foldl_mem_noEmit _ _ ?_ _ (by intro op hop; simp at hop) op
+      intro acc a hacc op hop
+      rcases List.mem_append.mp hop with h | h
+      · exact hacc op h
+      · simp at h; subst h; intro s; simp
+    · -- the restores: only SORestore
+      simp only [List.mem_map] at hr
+      obtain ⟨i, _, hi⟩ := hr
+      subst hi; intro s; simp
+
+theorem doDup_noEmit (dist : Nat) (ps : PlanState) :
+    ∀ op ∈ (doDup dist ps).1, NoEmit op := by
+  unfold doDup
+  split_ifs with h15
+  · intro op hop; simp at hop; subst hop; intro s; simp
+  · intro op hop
+    simp only [] at hop
+    rcases List.mem_append.mp hop with hs | hr
+    · revert hs
+      refine foldl_mem_noEmit _ _ ?_ _ (by intro op hop; simp at hop) op
+      intro acc a hacc op hop
+      rcases List.mem_append.mp hop with h | h
+      · exact hacc op h
+      · simp at h; subst h; intro s; simp
+    · simp only [List.mem_map] at hr
+      obtain ⟨i, _, hi⟩ := hr
+      subst hi; intro s; simp
+
+theorem doRestore_noEmit (o : Operand) (ps : PlanState) :
+    ∀ op ∈ (doRestore o ps).1, NoEmit op := by
+  unfold doRestore
+  split
+  · intro op hop; simp at hop
+  · intro op hop; simp at hop; subst hop; intro s; simp
+
+theorem reorderOne_noEmit (d : Unit) (targetOps : List Operand) (idx : Nat) (o : Operand)
+    (ps : PlanState) : ∀ op ∈ (reorderOne d targetOps idx o ps).1, NoEmit op := by
+  simp only [reorderOne]
+  repeat' split
+  all_goals intro op hop
+  all_goals
+    first
+      | (simp at hop; done)
+      | (exact doRestore_noEmit o _ op hop)
+      | (rcases List.mem_append.mp hop with h | h
+         · rcases List.mem_append.mp h with h | h
+           · first
+               | (simp at h; done)
+               | exact doRestore_noEmit o _ op h
+           · exact doSwap_noEmit _ _ op h
+         · exact doSwap_noEmit _ _ op h)
+
+theorem reorderPlan_noEmit (targetOps : List Operand) (ps : PlanState) :
+    ∀ op ∈ (reorderPlan targetOps ps).1, NoEmit op := by
+  unfold reorderPlan
+  refine foldl_mem_noEmit _ _ ?_ _ (by intro op hop; simp at hop)
+  rintro ⟨ops, ps'⟩ ⟨idx, o⟩ hacc op hop
+  rcases List.mem_append.mp hop with h | h
+  · exact hacc op h
+  · exact reorderOne_noEmit () targetOps idx o ps' op h
+
+theorem popmanyPlan_noEmit (toPop : List Operand) (ps : PlanState) :
+    ∀ op ∈ (popmanyPlan toPop ps).1, NoEmit op := by
+  simp only [popmanyPlan]
+  repeat' split
+  all_goals
+    first
+      | (intro op hop; simp at hop; done)
+      | (intro op hop
+         rcases List.mem_append.mp hop with h | h
+         · exact doSwap_noEmit _ _ op h
+         · simp at h; subst h; intro s; simp)
+      | (refine foldl_mem_noEmit _ _ ?_ _ (by intro op hop; simp at hop)
+         rintro ⟨ops, ps'⟩ v hacc op hop
+         simp only [] at hop
+         split at hop
+         · exact hacc op hop
+         · rcases List.mem_append.mp hop with h | h
+           · rcases List.mem_append.mp h with h | h
+             · exact hacc op h
+             · revert h
+               split
+               · intro h; simp at h
+               · exact doSwap_noEmit _ _ op
+           · simp at h; subst h; intro s; simp)
+
+theorem emitOneInput_noEmit (opc : Opcode) (nl : List String) (o : Operand) (ps : PlanState) :
+    ∀ op ∈ (emitOneInput opc nl o ps).1, NoEmit op := by
+  simp only [emitOneInput]
+  repeat' split
+  all_goals
+    intro op hop
+    first
+      | (simp at hop; done)
+      | (exact doRestore_noEmit _ _ op hop)
+      | (rcases List.mem_append.mp hop with h | h
+         · first
+             | (simp at h; done)
+             | exact doRestore_noEmit _ _ op h
+         · first
+             | (simp at h; subst h; intro s; simp)
+             | exact doDup_noEmit _ _ op h)
+
+theorem emitInputPlan_noEmit (opc : Opcode) (ops : List Operand) (nl : List String)
+    (ps : PlanState) : ∀ op ∈ (emitInputPlan opc ops nl ps).1, NoEmit op := by
+  unfold emitInputPlan
+  refine foldl_mem_noEmit _ _ ?_ _ (by intro op hop; simp at hop)
+  intro acc o hacc op hop
+  simp only [] at hop
+  rcases List.mem_append.mp hop with h | h
+  · exact hacc op h
+  · exact emitOneInput_noEmit opc nl o acc.2 op h
+
+theorem optimisticSwapPlan_noEmit (dfg : DfgAnalysis) (inst : Instruction) (nl : List String)
+    (nt : Bool) (ps : PlanState) :
+    ∀ op ∈ (optimisticSwapPlan dfg inst nl nt ps).1, NoEmit op := by
+  simp only [optimisticSwapPlan]
+  repeat' split
+  all_goals first | (intro op hop; simp at hop) | exact doSwap_noEmit _ _
+
+set_option maxHeartbeats 2000000 in
+/-- **A body instruction's whole plan is jump-free.**
+
+`generateRegularInstPlan` is `inputOps ++ joinOps ++ reorderOps ++ emitOps ++ popOps ++ optOps`.
+Five of the six come from the stack planners, which build only swaps, dups, pops, spills, restores
+and pushes — never an `SOEmit`, so never a jump. The sixth is `generateEmitOps`, and that is exactly
+where `BodyJumpFree` earns its keep. -/
+theorem generateRegularInstPlan_not_jump (liveness : DfState (List String)) (dfg : DfgAnalysis)
+    (cfg : CfgAnalysis) (fn : IrFunction) (inst : Instruction) (nextLiveness : List String)
+    (isHalting nextIsTerminator : Bool) (curBbLabel : String) (ps : PlanState)
+    (h : BodyJumpFree inst.opcode) :
+    ∀ op ∈ (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness isHalting
+              nextIsTerminator curBbLabel ps).1, SOJumpFree op := by
+  simp only [generateRegularInstPlan]
+  repeat' split
+  all_goals intro op hop
+  all_goals simp only [List.mem_append] at hop
+  all_goals repeat' (rcases hop with hop | hop)
+  all_goals
+    first
+      | exact SOJumpFree_of_noEmit _ (emitInputPlan_noEmit _ _ _ _ _ hop)
+      | exact SOJumpFree_of_noEmit _ (reorderPlan_noEmit _ _ _ hop)
+      | exact SOJumpFree_of_noEmit _ (popmanyPlan_noEmit _ _ _ hop)
+      | exact SOJumpFree_of_noEmit _ (optimisticSwapPlan_noEmit _ _ _ _ _ _ hop)
+      | exact generateEmitOps_not_jump _ _ _ h _ hop
+      | (simp at hop)
+
+
+/-- **The chain, closed.** A body instruction's compiled assembly, placed anywhere in the program,
+runs there exactly as it runs alone.
+
+No jump-freeness is assumed: it is *derived* from the opcode, via `generateRegularInstPlan_not_jump`
+(the plan emits no jump) and `runAsm_shift_of_plan` (a jump-free plan's asm is a liftable segment).
+The only hypotheses left are `BodyJumpFree` — which excludes exactly ASSERT, ASSERT_UNREACHABLE,
+INVOKE and the terminators, and excludes them because they really do jump — and the placement itself. -/
+theorem runAsm_shift_of_bodyInst (n : Nat) (o2pc : AssocList Nat Nat) (prog : List AsmInst)
+    (liveness : DfState (List String)) (dfg : DfgAnalysis) (cfg : CfgAnalysis) (fn : IrFunction)
+    (inst : Instruction) (nextLiveness : List String) (isHalting nextIsTerminator : Bool)
+    (curBbLabel : String) (ps : PlanState) (base : Nat)
+    (hbody : BodyJumpFree inst.opcode)
+    (hblk : asmBlockAt prog base
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness isHalting
+        nextIsTerminator curBbLabel ps).1)) :
+    ∀ (x s' : AsmState),
+      runAsm n o2pc (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness
+        isHalting nextIsTerminator curBbLabel ps).1) x = AsmResult.AsmOK s' →
+      runAsm n o2pc prog { x with pc := base + x.pc }
+        = AsmResult.AsmOK { s' with pc := base + s'.pc } :=
+  runAsm_shift_of_plan n o2pc prog _ base hblk
+    (generateRegularInstPlan_not_jump liveness dfg cfg fn inst nextLiveness isHalting
+      nextIsTerminator curBbLabel ps hbody)
+
+/-! ## From one instruction to a block: the dispatcher and the block-body fold -/
+
+
+theorem generatePhiPlan_noEmit (inst : Instruction) (nl : List String) (ps : PlanState) :
+    ∀ op ∈ (generatePhiPlan inst nl ps).1, NoEmit op := by
+  simp only [generatePhiPlan]
+  repeat' split
+  all_goals intro op hop
+  all_goals
+    first
+      | (simp at hop; done)
+      | (simp at hop; subst hop; intro s; simp)
+      | (rcases List.mem_append.mp hop with h | h
+         · exact doDup_noEmit _ _ op h
+         · simp at h; subst h; intro s; simp)
+
+theorem generateOffsetPlan_noEmit (inst : Instruction) (ps : PlanState) :
+    ∀ op ∈ (generateOffsetPlan inst ps).1, NoEmit op := by
+  simp only [generateOffsetPlan]
+  repeat' split
+  all_goals intro op hop
+  all_goals first | (simp at hop; done) | (simp at hop; subst hop; intro s; simp)
+
+theorem prepareParamsPlan_noEmit (liveness : DfState (List String)) (fn : IrFunction)
+    (ps : PlanState) : ∀ op ∈ (prepareParamsPlan liveness fn ps).1, NoEmit op := by
+  simp only [prepareParamsPlan]
+  repeat' split
+  all_goals intro op hop
+  all_goals
+    first
+      | (simp at hop; done)
+      | (rcases List.mem_append.mp hop with h | h
+         · exact popmanyPlan_noEmit _ _ op h
+         · exact optimisticSwapPlan_noEmit _ _ _ _ _ op h)
+
+theorem cleanStackPlan_noEmit (liveness : DfState (List String)) (cfg : CfgAnalysis)
+    (fn : IrFunction) (bb : BasicBlock) (ps : PlanState) :
+    ∀ op ∈ (cleanStackPlan liveness cfg fn bb ps).1, NoEmit op := by
+  simp only [cleanStackPlan]
+  repeat' split
+  all_goals intro op hop
+  all_goals first | (simp at hop; done) | (exact popmanyPlan_noEmit _ _ op hop)
+
+/-- **The dispatcher.** `generateInstPlan` routes to phi / offset / param / nop / regular. The first
+four are pure stack shuffling and cannot emit at all; only the regular path can, and there
+`BodyJumpFree` does the work. -/
+theorem generateInstPlan_not_jump (liveness : DfState (List String)) (dfg : DfgAnalysis)
+    (cfg : CfgAnalysis) (fn : IrFunction) (inst : Instruction) (nextLiveness : List String)
+    (isHalting nextIsTerminator : Bool) (curBbLabel : String) (ps : PlanState)
+    (h : BodyJumpFree inst.opcode) (ops : List StackOp) (ps' : PlanState)
+    (hsome : generateInstPlan liveness dfg cfg fn inst nextLiveness isHalting nextIsTerminator
+      curBbLabel ps = some (ops, ps')) :
+    ∀ op ∈ ops, SOJumpFree op := by
+  revert hsome
+  simp only [generateInstPlan]
+  split_ifs
+  · intro hsome; simp at hsome
+  all_goals intro hsome op hop
+  all_goals
+    (have hq : _ = ops := (Prod.ext_iff.mp (Option.some.inj hsome)).1
+     rw [← hq] at hop)
+  · exact SOJumpFree_of_noEmit _ (generatePhiPlan_noEmit _ _ _ op hop)
+  · exact SOJumpFree_of_noEmit _ (generateOffsetPlan_noEmit _ _ op hop)
+  · simp at hop
+  · simp at hop
+  · exact generateRegularInstPlan_not_jump _ _ _ _ _ _ _ _ _ _ h op hop
+
+/-! ## The block-body fold
+
+`generateBlockPlan` folds `generateInstPlan` over **all** the block's instructions — terminator included
+— so the block's plan is emphatically **not** jump-free, and a theorem saying it was would be false.
+What is true, and what the recipe needs, is that the fold stays jump-free as long as the instructions it
+has consumed so far are body instructions. -/
+
+/-- The invariant: an `Option` plan accumulator whose ops are all jump-free. -/
+def AccJumpFree (acc : Option (List StackOp × PlanState)) : Prop :=
+  ∀ ops ps, acc = some (ops, ps) → ∀ op ∈ ops, SOJumpFree op
+
+/-- Generic: a left fold over an `Option` accumulator preserves `AccJumpFree`, provided every element
+    it consumes does. -/
+theorem foldl_option_jumpfree {α : Type} (P : α → Prop) (l : List α)
+    (F : Option (List StackOp × PlanState) → α → Option (List StackOp × PlanState))
+    (hF : ∀ acc a, P a → AccJumpFree acc → AccJumpFree (F acc a))
+    (acc : Option (List StackOp × PlanState)) (hacc : AccJumpFree acc)
+    (hl : ∀ a ∈ l, P a) : AccJumpFree (l.foldl F acc) := by
+  induction l generalizing acc with
+  | nil => simpa using hacc
+  | cons a t ih =>
+    exact ih (F acc a) (hF acc a (hl a (by simp)) hacc) (fun b hb => hl b (by simp [hb]))
+
+/-- The step function `generateBlockPlan` folds. Mirrors the compiler's lambda exactly; the
+    correspondence is `generateBlockPlan_fold_eq` below, proved by `rfl`. A definition I write to mirror
+    the compiler proves nothing until that lemma exists. -/
+def blockFoldStep (liveness : DfState (List String)) (dfg : DfgAnalysis) (cfg : CfgAnalysis)
+    (fn : IrFunction) (bb : BasicBlock) (insts : List Instruction) (isHalting : Bool) (nParams : Nat)
+    (acc : Option (List StackOp × PlanState)) (instI : Instruction × Nat)
+    : Option (List StackOp × PlanState) :=
+  match acc with
+  | none => none
+  | some (ops, ps) =>
+    let (inst, i) := instI
+    let nextLive :=
+      if i + 1 < insts.length then liveVarsAt liveness bb.label (i + nParams + 1)
+      else liveVarsAt liveness bb.label bb.instructions.length
+    let nextIsTerm := if i + 1 < insts.length then isTerminator insts[i + 1]!.opcode else false
+    match generateInstPlan liveness dfg cfg fn inst nextLive isHalting nextIsTerm bb.label ps with
+    | none => none
+    | some (stepOps, ps') => some (ops ++ stepOps, ps')
+
+/-- One fold step keeps the accumulator jump-free, when the instruction it consumes is a body one. -/
+theorem blockFoldStep_jumpfree (liveness : DfState (List String)) (dfg : DfgAnalysis)
+    (cfg : CfgAnalysis) (fn : IrFunction) (bb : BasicBlock) (insts : List Instruction)
+    (isHalting : Bool) (nParams : Nat) (acc : Option (List StackOp × PlanState))
+    (instI : Instruction × Nat) (hbody : BodyJumpFree instI.1.opcode) (hacc : AccJumpFree acc) :
+    AccJumpFree (blockFoldStep liveness dfg cfg fn bb insts isHalting nParams acc instI) := by
+  unfold AccJumpFree blockFoldStep
+  cases acc with
+  | none => intro ops ps h; simp at h
+  | some p =>
+    obtain ⟨ops0, ps0⟩ := p
+    obtain ⟨inst, i⟩ := instI
+    simp only []
+    split
+    · intro ops ps h; simp at h
+    · rename_i stepOps ps' hgen
+      intro ops ps h
+      have hq : ops0 ++ stepOps = ops := (Prod.ext_iff.mp (Option.some.inj h)).1
+      subst hq
+      intro op hop
+      rcases List.mem_append.mp hop with hm | hm
+      · exact hacc ops0 ps0 rfl op hm
+      · exact generateInstPlan_not_jump _ _ _ _ _ _ _ _ _ _ hbody _ _ hgen op hm
+
+/-- **A run of body instructions folds to a jump-free plan.** -/
+theorem blockFold_jumpfree (liveness : DfState (List String)) (dfg : DfgAnalysis)
+    (cfg : CfgAnalysis) (fn : IrFunction) (bb : BasicBlock) (insts : List Instruction)
+    (isHalting : Bool) (nParams : Nat) (l : List (Instruction × Nat))
+    (hl : ∀ p ∈ l, BodyJumpFree p.1.opcode)
+    (acc : Option (List StackOp × PlanState)) (hacc : AccJumpFree acc) :
+    AccJumpFree (l.foldl (blockFoldStep liveness dfg cfg fn bb insts isHalting nParams) acc) :=
+  foldl_option_jumpfree (fun p => BodyJumpFree p.1.opcode) l _
+    (fun acc a hp hA => blockFoldStep_jumpfree _ _ _ _ _ _ _ _ acc a hp hA) acc hacc hl
+
+
+/-- **The correspondence.** `blockFoldStep` really is the lambda `generateBlockPlan` folds. Without this
+    the previous lemmas would be about a definition of mine and nothing else. -/
+theorem generateBlockPlan_eq_fold (liveness : DfState (List String)) (dfg : DfgAnalysis)
+    (cfg : CfgAnalysis) (fn : IrFunction) (bb : BasicBlock) (ps : PlanState) :
+    generateBlockPlan liveness dfg cfg fn bb ps =
+      (let labelOp := [StackOp.SOLabel bb.label]
+       let (paramOps, ps1) :=
+         if (fn.blocks.head?.map (·.label)) == some bb.label then prepareParamsPlan liveness fn ps
+         else ([], ps)
+       let (cleanOps, ps2) :=
+         if (cfg.predsOf bb.label).length = 1 then cleanStackPlan liveness cfg fn bb ps1
+         else ([], ps1)
+       let insts := nonParamInsts bb
+       let isHalting := bbIsHalting bb
+       let nParams := (getParams bb.instructions).length
+       match insts.zipIdx.foldl
+           (blockFoldStep liveness dfg cfg fn bb insts isHalting nParams) (some ([], ps2)) with
+       | none => none
+       | some (instOps, ps3) => some (labelOp ++ paramOps ++ cleanOps ++ instOps, ps3)) := rfl
+
+/-- The fold splits at the last instruction: everything before the terminator, then the terminator. -/
+theorem zipIdx_foldl_split {β : Type} (l : List Instruction) (x : Instruction)
+    (F : β → Instruction × Nat → β) (acc : β) :
+    (l ++ [x]).zipIdx.foldl F acc = F (l.zipIdx.foldl F acc) (x, l.length) := by
+  rw [List.zipIdx_append]
+  simp
+
+/-- `p ∈ l.zipIdx → p.1 ∈ l`. Not in the library under a name `exact?` finds. -/
+theorem fst_mem_of_mem_zipIdx {α : Type} (l : List α) (p : α × Nat) (hp : p ∈ l.zipIdx) :
+    p.1 ∈ l := by
+  simp only [List.mem_zipIdx_iff_getElem?] at hp
+  exact List.mem_of_getElem? hp
+
+/-- The empty accumulator is jump-free. -/
+theorem AccJumpFree_nil (ps : PlanState) : AccJumpFree (some ([], ps)) := by
+  intro ops ps' h op hop
+  cases h; simp at hop
+
+/-- **The accumulator entering the terminator step is jump-free.**
+
+This is what the recipe needs, and it is the strongest true statement: `generateBlockPlan` folds over
+*all* the block's instructions, so its final plan contains the terminator's `JUMP` and is not jump-free.
+Everything the fold has built **before** that last step is. -/
+theorem blockFold_preTerminator_jumpfree (liveness : DfState (List String)) (dfg : DfgAnalysis)
+    (cfg : CfgAnalysis) (fn : IrFunction) (bb : BasicBlock) (insts : List Instruction)
+    (isHalting : Bool) (nParams : Nat) (body : List Instruction) (ps : PlanState)
+    (hbody : ∀ inst ∈ body, BodyJumpFree inst.opcode) :
+    AccJumpFree (body.zipIdx.foldl
+      (blockFoldStep liveness dfg cfg fn bb insts isHalting nParams) (some ([], ps))) := by
+  refine blockFold_jumpfree liveness dfg cfg fn bb insts isHalting nParams _ ?_ _
+    (AccJumpFree_nil ps)
+  intro p hp
+  exact hbody p.1 (fst_mem_of_mem_zipIdx _ p hp)
+
+/-- …and the whole fold is that accumulator, put through one more step for the terminator. -/
+theorem blockFold_eq_preTerminator (liveness : DfState (List String)) (dfg : DfgAnalysis)
+    (cfg : CfgAnalysis) (fn : IrFunction) (bb : BasicBlock) (insts : List Instruction)
+    (isHalting : Bool) (nParams : Nat) (body : List Instruction) (term : Instruction)
+    (ps : PlanState) :
+    (body ++ [term]).zipIdx.foldl
+        (blockFoldStep liveness dfg cfg fn bb insts isHalting nParams) (some ([], ps))
+      = blockFoldStep liveness dfg cfg fn bb insts isHalting nParams
+          (body.zipIdx.foldl (blockFoldStep liveness dfg cfg fn bb insts isHalting nParams)
+            (some ([], ps)))
+          (term, body.length) :=
+  zipIdx_foldl_split body term _ _
+
+/-! ## Fired on a real block -/
+
+
+/-- `BodyJumpFree` is decidable — it is a conjunction of an equality on `Bool` and three
+    disequalities on `Opcode`. So for any concrete block it is `by decide`. -/
+instance BodyJumpFree_decidable (opc : Opcode) : Decidable (BodyJumpFree opc) := by
+  unfold BodyJumpFree; infer_instance
+
+/-- Dia's `then` block is `[tA, dJmpT]`: one body instruction, then the terminator. -/
+theorem dia_then_body_jumpfree :
+    ∀ inst ∈ (nonParamInsts Dia.bThen).dropLast, BodyJumpFree inst.opcode := by decide
+
+/-- …and the terminator itself is **not** — it is a `JMP`. So the whole block's plan really does
+    contain a jump, `blockFold_preTerminator_jumpfree` really is the strongest true statement, and the
+    hypothesis it carries is not timidity. -/
+theorem dia_then_terminator_not_jumpfree :
+    ¬ BodyJumpFree (nonParamInsts Dia.bThen).getLast!.opcode := by decide
+
+/-- The block splits as body ++ [terminator]. -/
+theorem dia_then_split :
+    nonParamInsts Dia.bThen
+      = (nonParamInsts Dia.bThen).dropLast ++ [(nonParamInsts Dia.bThen).getLast!] := by rfl
+
+/-- **Fired on a real block.** Everything Dia's `then` block's plan builds before its terminator step
+is jump-free — hence a liftable segment — while the block's plan as a whole is not, because the
+terminator is a `JMP`. The two theorems above are the two halves of that, and they meet exactly at the
+block boundary. -/
+theorem dia_then_preTerminator_jumpfree (liveness : DfState (List String)) (dfg : DfgAnalysis)
+    (cfg : CfgAnalysis) (fn : IrFunction) (insts : List Instruction) (isHalting : Bool)
+    (nParams : Nat) (ps : PlanState) :
+    AccJumpFree ((nonParamInsts Dia.bThen).dropLast.zipIdx.foldl
+      (blockFoldStep liveness dfg cfg fn Dia.bThen insts isHalting nParams) (some ([], ps))) :=
+  blockFold_preTerminator_jumpfree liveness dfg cfg fn Dia.bThen insts isHalting nParams _ ps
+    dia_then_body_jumpfree
+
+
+/-! ## Placement is a theorem, not a hypothesis
+
+`runAsm_shift` takes `asmBlockAt prog base blk` as a hypothesis: "the block's assembly really sits at
+`base` in the program." For a concrete function that is `by decide`, but for the recipe it has to be
+*derived* from how the compiler lays a function out. It can be, and the reason is structural:
+`executePlan` is a flatMap, so it distributes over `++`; and `asmResolve` is a **map**, so it preserves
+positions exactly. -/
+
+/-- A slice sits where the prefix ends. -/
+theorem asmBlockAt_of_append (pre blk post : List AsmInst) :
+    asmBlockAt (pre ++ blk ++ post) pre.length blk := by
+  constructor
+  · simp
+  · intro j hj
+    rw [List.append_assoc, List.getElem?_append_right (by omega)]
+    simp [List.getElem?_append_left hj]
+
+/-- `resolveInst` only rewrites `AsmPushLabel`/`AsmPushOfst` into pushes, so it cannot create — or
+    destroy — a jump. -/
+theorem resolveInst_not_jump (offs : AssocList String Nat) (a : AsmInst)
+    (h : IsAsmJump a = false) : IsAsmJump (resolveInst offs a) = false := by
+  cases a <;>
+    first
+      | (simpa [resolveInst] using h)
+      | (simp only [resolveInst]; split <;> rfl)
+      | (simp [resolveInst, IsAsmJump])
+
+theorem asmResolve_eq_map (asm : List AsmInst) :
+    (asmResolve asm).1 = asm.map (resolveInst (computeLabelOffsets asm).2) := rfl
+
+/-- **A block's assembly really is where the prefix ends.** No `asmBlockAt` hypothesis: it is derived.
+
+If the function's plan is `pre ++ blk ++ post`, then in the assembled, symbol-resolved program the
+block's own assembly sits at exactly `(executePlan pre).length`. `executePlan` distributes over `++`
+because it is a flatMap; `asmResolve` preserves the position because it is a map. -/
+theorem blockAsm_placed_gen (f : AsmInst → AsmInst) (pre blk post : List StackOp) :
+    asmBlockAt ((executePlan (pre ++ blk ++ post)).map f) (executePlan pre).length
+      ((executePlan blk).map f) := by
+  rw [executePlan_append, executePlan_append, List.map_append, List.map_append]
+  simpa using asmBlockAt_of_append
+    ((executePlan pre).map f) ((executePlan blk).map f) ((executePlan post).map f)
+
+/-- The compiler's own layout: `asmResolve` is a map, so the block's assembly is at the prefix length. -/
+theorem blockAsm_placed (pre blk post : List StackOp) :
+    asmBlockAt (asmResolve (executePlan (pre ++ blk ++ post))).1 (executePlan pre).length
+      ((executePlan blk).map
+        (resolveInst (computeLabelOffsets (executePlan (pre ++ blk ++ post))).2)) := by
+  rw [asmResolve_eq_map]
+  exact blockAsm_placed_gen _ pre blk post
+
+/-- …and that assembly is jump-free, if the block's plan is. -/
+theorem blockAsm_placed_nojump (offs : AssocList String Nat) (blk : List StackOp)
+    (hops : ∀ op ∈ blk, SOJumpFree op) :
+    ∀ j, (hj : j < ((executePlan blk).map (resolveInst offs)).length) →
+      IsAsmJump (((executePlan blk).map (resolveInst offs)).get ⟨j, hj⟩) = false := by
+  intro j hj
+  have hmem : ((executePlan blk).map (resolveInst offs)).get ⟨j, hj⟩ ∈
+      (executePlan blk).map (resolveInst offs) := List.get_mem _ _
+  rw [List.mem_map] at hmem
+  obtain ⟨a, ha, hres⟩ := hmem
+  rw [← hres]
+  exact resolveInst_not_jump offs a (executePlan_not_jump blk hops a ha)
+
+/-- **The lift, with nothing assumed about the assembly.**
+
+Give it a function plan split as `pre ++ blk ++ post` where `blk` emits no jump, and it says: the
+block's assembly, as the compiler actually lays it out and resolves it, runs inside the whole program
+exactly as it runs alone — displaced by the length of everything before it.
+
+`asmBlockAt` is gone. It used to be a hypothesis, discharged per-function by `decide`; now it is
+`blockAsm_placed`, a theorem about how `executePlan` and `asmResolve` compose. The only hypothesis left
+is about the *plan*: `blk` emits no `SOEmit "JUMP"`/`"JUMPI"` — which, for a block body,
+`blockFold_preTerminator_jumpfree` supplies from the Venom opcodes. -/
+theorem runAsm_shift_placed (n : Nat) (o2pc : AssocList Nat Nat)
+    (pre blk post : List StackOp) (hops : ∀ op ∈ blk, SOJumpFree op) :
+    ∀ (x s' : AsmState),
+      runAsm n o2pc ((executePlan blk).map
+          (resolveInst (computeLabelOffsets (executePlan (pre ++ blk ++ post))).2)) x
+        = AsmResult.AsmOK s' →
+      runAsm n o2pc (asmResolve (executePlan (pre ++ blk ++ post))).1
+          { x with pc := (executePlan pre).length + x.pc }
+        = AsmResult.AsmOK { s' with pc := (executePlan pre).length + s'.pc } :=
+  runAsm_shift n o2pc (asmResolve (executePlan (pre ++ blk ++ post))).1
+    ((executePlan blk).map
+      (resolveInst (computeLabelOffsets (executePlan (pre ++ blk ++ post))).2))
+    (executePlan pre).length
+    (blockAsm_placed pre blk post)
+    (blockAsm_placed_nojump _ blk hops)
+
+
+/-- **The per-block recipe.**
+
+Take a block's body — its instructions up to but not including the terminator — and let `bodyOps` be
+what the compiler's own fold plans for them. Then, wherever that sits inside the function's plan, the
+assembly it compiles to runs inside the whole program exactly as it runs alone, displaced by the length
+of everything before it.
+
+Every hypothesis is about the **Venom source**, not the assembly:
+* `hbody` — the body instructions are `BodyJumpFree` (decidable; excludes exactly the terminators plus
+  ASSERT / ASSERT_UNREACHABLE / INVOKE, which really do jump mid-block).
+* `hfold` — `bodyOps` is what the compiler's fold produces (`blockFoldStep`, tied to `generateBlockPlan`
+  by `generateBlockPlan_eq_fold`).
+* the split `pre ++ bodyOps ++ post` — where the function's plan puts it.
+
+`asmBlockAt`, `IsAsmJump`-freeness of the assembly, and the pc displacement are all *derived*. -/
+theorem runAsm_shift_blockBody (n : Nat) (o2pc : AssocList Nat Nat)
+    (liveness : DfState (List String)) (dfg : DfgAnalysis) (cfg : CfgAnalysis) (fn : IrFunction)
+    (bb : BasicBlock) (insts : List Instruction) (isHalting : Bool) (nParams : Nat)
+    (body : List Instruction) (ps0 ps1 : PlanState) (bodyOps pre post : List StackOp)
+    (hbody : ∀ inst ∈ body, BodyJumpFree inst.opcode)
+    (hfold : body.zipIdx.foldl
+      (blockFoldStep liveness dfg cfg fn bb insts isHalting nParams) (some ([], ps0))
+        = some (bodyOps, ps1)) :
+    ∀ (x s' : AsmState),
+      runAsm n o2pc ((executePlan bodyOps).map
+          (resolveInst (computeLabelOffsets (executePlan (pre ++ bodyOps ++ post))).2)) x
+        = AsmResult.AsmOK s' →
+      runAsm n o2pc (asmResolve (executePlan (pre ++ bodyOps ++ post))).1
+          { x with pc := (executePlan pre).length + x.pc }
+        = AsmResult.AsmOK { s' with pc := (executePlan pre).length + s'.pc } :=
+  runAsm_shift_placed n o2pc pre bodyOps post
+    (blockFold_preTerminator_jumpfree liveness dfg cfg fn bb insts isHalting nParams body ps0
+      hbody bodyOps ps1 hfold)
+
+/-! ## A block's plan splits as prologue ++ body ++ terminator -/
+
+
+/-- One `blockFoldStep` on a `some` accumulator appends. -/
+theorem blockFoldStep_append (liveness : DfState (List String)) (dfg : DfgAnalysis)
+    (cfg : CfgAnalysis) (fn : IrFunction) (bb : BasicBlock) (insts : List Instruction)
+    (isHalting : Bool) (nParams : Nat) (ops : List StackOp) (ps : PlanState)
+    (instI : Instruction × Nat) (out : List StackOp) (psOut : PlanState)
+    (h : blockFoldStep liveness dfg cfg fn bb insts isHalting nParams (some (ops, ps)) instI
+          = some (out, psOut)) :
+    ∃ stepOps, out = ops ++ stepOps := by
+  revert h
+  unfold blockFoldStep
+  obtain ⟨inst, i⟩ := instI
+  simp only []
+  split
+  · intro h; simp at h
+  · rename_i stepOps ps' hgen
+    intro h
+    exact ⟨stepOps, ((Prod.ext_iff.mp (Option.some.inj h)).1).symm⟩
+
+/-- **A block's instruction-fold splits as body ++ terminator.** The fold over `body ++ [term]` is the
+    fold over `body` — the jump-free part — with the terminator's ops appended. -/
+theorem blockFold_body_slice (liveness : DfState (List String)) (dfg : DfgAnalysis)
+    (cfg : CfgAnalysis) (fn : IrFunction) (bb : BasicBlock) (insts : List Instruction)
+    (isHalting : Bool) (nParams : Nat) (body : List Instruction) (term : Instruction)
+    (ps : PlanState) (ops : List StackOp) (psOut : PlanState)
+    (h : (body ++ [term]).zipIdx.foldl
+      (blockFoldStep liveness dfg cfg fn bb insts isHalting nParams) (some ([], ps))
+        = some (ops, psOut)) :
+    ∃ bodyOps psB termOps,
+      body.zipIdx.foldl (blockFoldStep liveness dfg cfg fn bb insts isHalting nParams)
+          (some ([], ps)) = some (bodyOps, psB)
+      ∧ ops = bodyOps ++ termOps := by
+  rw [blockFold_eq_preTerminator] at h
+  cases hb : body.zipIdx.foldl
+      (blockFoldStep liveness dfg cfg fn bb insts isHalting nParams) (some ([], ps)) with
+  | none => rw [hb] at h; simp [blockFoldStep] at h
+  | some p =>
+    obtain ⟨bodyOps, psB⟩ := p
+    rw [hb] at h
+    obtain ⟨termOps, hterm⟩ := blockFoldStep_append liveness dfg cfg fn bb insts isHalting nParams
+      bodyOps psB (term, body.length) ops psOut h
+    exact ⟨bodyOps, psB, termOps, rfl, hterm⟩
+
+/-- **A block's plan splits as prologue ++ body ++ terminator**, and the middle is jump-free whenever
+the body instructions are. This is the split `runAsm_shift_blockBody` wants, and note the prologue is
+generally *non-empty* — it always contains at least the block's own `SOLabel` — so even the entry
+block's body sits at a **nonzero** offset. A slice at offset 0 would make the displacement law
+degenerate. -/
+theorem generateBlockPlan_body_slice (liveness : DfState (List String)) (dfg : DfgAnalysis)
+    (cfg : CfgAnalysis) (fn : IrFunction) (bb : BasicBlock) (ps : PlanState)
+    (body : List Instruction) (term : Instruction)
+    (hsplit : nonParamInsts bb = body ++ [term])
+    (ops : List StackOp) (ps3 : PlanState)
+    (h : generateBlockPlan liveness dfg cfg fn bb ps = some (ops, ps3)) :
+    ∃ pre bodyOps termOps,
+      ops = pre ++ bodyOps ++ termOps
+      ∧ ((∀ inst ∈ body, BodyJumpFree inst.opcode) → ∀ op ∈ bodyOps, SOJumpFree op) := by
+  rw [generateBlockPlan_eq_fold] at h
+  simp only [hsplit] at h
+  split at h
+  · simp at h
+  · rename_i instOps psF hfold
+    simp only [Option.some.injEq, Prod.mk.injEq] at h
+    obtain ⟨hops, -⟩ := h
+    subst hops
+    obtain ⟨bodyOps, psB, termOps, hbf, hio⟩ :=
+      blockFold_body_slice _ _ _ _ _ _ _ _ body term _ _ _ hfold
+    subst hio
+    exact ⟨_, bodyOps, termOps, (List.append_assoc _ _ _).symm,
+      fun hbody => blockFold_preTerminator_jumpfree _ _ _ _ _ _ _ _ body _ hbody bodyOps psB hbf⟩
+
+/-! ## End to end: from the Venom source to the running program -/
+
+
+/-- **A block's body is a jump-free slice of the function's plan.**
+
+Composes the DFS layout (`generateFnPlanAux_head_prefix`, already in the codebase: the head block's
+plan is a *prefix* of the DFS output) with the in-block split (`generateBlockPlan_body_slice`:
+prologue ++ body ++ terminator). The result: the function's plan really is `pre ++ bodyOps ++ post`
+with `bodyOps` jump-free — the split `runAsm_shift_placed` needs, now a theorem. -/
+theorem fnPlan_body_slice {fuel : Nat} {L : DfState (List String)} {D : DfgAnalysis}
+    {C : CfgAnalysis} {fn : IrFunction} {lbl : String} {visited : List String} {ps : PlanState}
+    {bb : BasicBlock} {blockOps : List StackOp} {ps' : PlanState}
+    {body : List Instruction} {term : Instruction}
+    (hfn : ∀ bb ∈ fn.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst)
+    (hvis : visited.contains lbl = false)
+    (hfind : fn.blocks.find? (·.label == lbl) = some bb)
+    (hblock : generateBlockPlan L D C fn bb ps = some (blockOps, ps'))
+    (hsplit : nonParamInsts bb = body ++ [term])
+    (hbody : ∀ inst ∈ body, BodyJumpFree inst.opcode) :
+    ∃ pre bodyOps post vF psF,
+      generateFnPlanAux (fuel + 1) L D C fn [lbl] visited ps
+          = some (pre ++ bodyOps ++ post, vF, psF)
+      ∧ (∀ op ∈ bodyOps, SOJumpFree op) := by
+  obtain ⟨tailOps, vF, psF, hdfs⟩ :=
+    generateFnPlanAux_head_prefix (fuel := fuel) hfn hvis hfind hblock
+  obtain ⟨pre, bodyOps, termOps, hops, hjf⟩ :=
+    generateBlockPlan_body_slice L D C fn bb ps body term hsplit blockOps ps' hblock
+  refine ⟨pre, bodyOps, termOps ++ tailOps, vF, psF, ?_, hjf hbody⟩
+  rw [hdfs, hops]
+  simp [List.append_assoc]
+
+/-- **End to end.** The compiler plans a function; a block's body occupies a slice of that plan; the
+assembly that slice compiles to runs inside the whole assembled, symbol-resolved program exactly as it
+runs alone, displaced by the length of everything before it.
+
+Every hypothesis is about the **Venom source**: the block is found and unvisited, its instructions are
+`body ++ [term]`, and the body instructions are `BodyJumpFree` (decidable). Nothing is assumed about
+the plan, the assembly, the label offsets, or the program counter — the layout (`blockAsm_placed`), the
+jump-freeness of the emitted instructions (`blockFold_preTerminator_jumpfree` + `resolveInst_not_jump`)
+and the displacement (`runAsm_shift`) are all derived. -/
+theorem blockBody_runs_in_program {fuel : Nat} {L : DfState (List String)} {D : DfgAnalysis}
+    {C : CfgAnalysis} {fn : IrFunction} {lbl : String} {visited : List String} {ps : PlanState}
+    {bb : BasicBlock} {blockOps : List StackOp} {ps' : PlanState}
+    {body : List Instruction} {term : Instruction}
+    (hfn : ∀ bb ∈ fn.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst)
+    (hvis : visited.contains lbl = false)
+    (hfind : fn.blocks.find? (·.label == lbl) = some bb)
+    (hblock : generateBlockPlan L D C fn bb ps = some (blockOps, ps'))
+    (hsplit : nonParamInsts bb = body ++ [term])
+    (hbody : ∀ inst ∈ body, BodyJumpFree inst.opcode)
+    (n : Nat) (o2pc : AssocList Nat Nat) :
+    ∃ pre bodyOps post vF psF,
+      generateFnPlanAux (fuel + 1) L D C fn [lbl] visited ps
+          = some (pre ++ bodyOps ++ post, vF, psF)
+      ∧ ∀ (x s'' : AsmState),
+          runAsm n o2pc ((executePlan bodyOps).map
+              (resolveInst (computeLabelOffsets (executePlan (pre ++ bodyOps ++ post))).2)) x
+            = AsmResult.AsmOK s'' →
+          runAsm n o2pc (asmResolve (executePlan (pre ++ bodyOps ++ post))).1
+              { x with pc := (executePlan pre).length + x.pc }
+            = AsmResult.AsmOK { s'' with pc := (executePlan pre).length + s''.pc } := by
+  obtain ⟨pre, bodyOps, post, vF, psF, hdfs, hjf⟩ :=
+    fnPlan_body_slice (fuel := fuel) hfn hvis hfind hblock hsplit hbody
+  exact ⟨pre, bodyOps, post, vF, psF, hdfs,
+    runAsm_shift_placed n o2pc pre bodyOps post hjf⟩
+
+/-! ## The DFS lays every block down contiguously — and so the recipe is general -/
+
+
+/-- `ops` contains `bb`'s generated plan as a contiguous slice. The plan state it was generated from is
+    existential — the DFS threads it, and the slice property does not care which one it was. -/
+def BlockSliceOf (L : DfState (List String)) (D : DfgAnalysis) (C : CfgAnalysis) (fn : IrFunction)
+    (ops : List StackOp) (bb : BasicBlock) : Prop :=
+  ∃ psb blockOps psb' pre post,
+    generateBlockPlan L D C fn bb psb = some (blockOps, psb') ∧ ops = pre ++ blockOps ++ post
+
+theorem BlockSliceOf_append_left {L D C fn ops bb} (a : List StackOp)
+    (h : BlockSliceOf L D C fn ops bb) : BlockSliceOf L D C fn (a ++ ops) bb := by
+  obtain ⟨psb, blockOps, psb', pre, post, hbp, hops⟩ := h
+  exact ⟨psb, blockOps, psb', a ++ pre, post, hbp, by rw [hops]; simp [List.append_assoc]⟩
+
+theorem BlockSliceOf_append_right {L D C fn ops bb} (b : List StackOp)
+    (h : BlockSliceOf L D C fn ops bb) : BlockSliceOf L D C fn (ops ++ b) bb := by
+  obtain ⟨psb, blockOps, psb', pre, post, hbp, hops⟩ := h
+  exact ⟨psb, blockOps, psb', pre, post ++ b, hbp, by rw [hops]; simp [List.append_assoc]⟩
+
+theorem generateSuccsPlan_cons_gen (fuel : Nat) (L : DfState (List String)) (D : DfgAnalysis)
+    (C : CfgAnalysis) (fn : IrFunction) (ss : List Operand) (sp : SpilledMap) (succ : String)
+    (rest visited : List String) (psG : PlanState) :
+    generateSuccsPlan (fuel + 1) L D C fn ss sp (succ :: rest) visited psG =
+    (match generateFnPlanAux fuel L D C fn [succ] visited
+        { psG with stack := ss, spilled := sp } with
+     | none => none
+     | some (sOps, vAfter, psAfter) =>
+       match generateSuccsPlan fuel L D C fn ss sp rest vAfter
+               { psG with alloc := psAfter.alloc, labelCounter := psAfter.labelCounter } with
+       | none => none
+       | some (restOps, vF, psF) => some (sOps ++ restOps, vF, psF)) := rfl
+
+theorem contains_cons_false {l : List String} {x a : String} (hne : ¬ (x = a))
+    (h : l.contains a = false) : (x :: l).contains a = false := by
+  have h' : a ∉ l := by simpa using h
+  simp [Ne.symm hne, h']
+
+/-- **Every block the DFS plans has its plan as a contiguous slice of the DFS's output.**
+
+Mutual induction on the fuel, over `generateFnPlanAux` and `generateSuccsPlan` together. No
+visited-set monotonicity lemma is needed — at each recursive call the proof simply case-splits on
+whether the label in question landed in the intermediate `visited` set, which decides which sub-call
+planned it. -/
+theorem dfs_block_slice (L : DfState (List String)) (D : DfgAnalysis) (C : CfgAnalysis)
+    (fn : IrFunction) : ∀ fuel : Nat,
+    (∀ wl visited ps ops v ps2,
+      generateFnPlanAux fuel L D C fn wl visited ps = some (ops, v, ps2) →
+      ∀ lbl bb, fn.blocks.find? (·.label == lbl) = some bb →
+        v.contains lbl = true → visited.contains lbl = false →
+        BlockSliceOf L D C fn ops bb)
+    ∧
+    (∀ ss sp succs visited ps ops v ps2,
+      generateSuccsPlan fuel L D C fn ss sp succs visited ps = some (ops, v, ps2) →
+      ∀ lbl bb, fn.blocks.find? (·.label == lbl) = some bb →
+        v.contains lbl = true → visited.contains lbl = false →
+        BlockSliceOf L D C fn ops bb) := by
+  intro fuel
+  induction fuel with
+  | zero =>
+    constructor
+    · intro wl visited ps ops v ps2 h lbl bb _ hv hnv
+      rw [show generateFnPlanAux 0 L D C fn wl visited ps = some ([], visited, ps) from rfl] at h
+      simp only [Option.some.injEq, Prod.mk.injEq] at h
+      obtain ⟨-, hveq, -⟩ := h
+      rw [← hveq, hnv] at hv; simp at hv
+    · intro ss sp succs visited ps ops v ps2 h lbl bb _ hv hnv
+      rw [show generateSuccsPlan 0 L D C fn ss sp succs visited ps = some ([], visited, ps) from rfl] at h
+      simp only [Option.some.injEq, Prod.mk.injEq] at h
+      obtain ⟨-, hveq, -⟩ := h
+      rw [← hveq, hnv] at hv; simp at hv
+  | succ n ih =>
+    obtain ⟨ihA, ihB⟩ := ih
+    constructor
+    · -- generateFnPlanAux (n+1)
+      intro wl visited ps ops v ps2 h lbl bb hfind hv hnv
+      cases wl with
+      | nil =>
+        rw [generateFnPlanAux_nil] at h
+        simp only [Option.some.injEq, Prod.mk.injEq] at h
+        obtain ⟨-, hveq, -⟩ := h
+        rw [← hveq, hnv] at hv; simp at hv
+      | cons lbl0 rest =>
+        by_cases hv0 : visited.contains lbl0 = true
+        · rw [generateFnPlanAux_skip_visited n L D C fn lbl0 rest visited ps hv0] at h
+          exact ihA rest visited ps ops v ps2 h lbl bb hfind hv hnv
+        · simp only [Bool.not_eq_true] at hv0
+          cases hfind0 : fn.blocks.find? (·.label == lbl0) with
+          | none =>
+            rw [generateFnPlanAux_find_none n L D C fn lbl0 rest visited ps hv0 hfind0] at h
+            have hne : ¬ (lbl0 = lbl) := by
+              intro he; rw [he, hfind] at hfind0; simp at hfind0
+            have hnv' : (lbl0 :: visited).contains lbl = false := contains_cons_false hne hnv
+            exact ihA rest (lbl0 :: visited) ps ops v ps2 h lbl bb hfind hv hnv'
+          | some bb0 =>
+            rw [generateFnPlanAux_visit_block n L D C fn lbl0 rest visited ps bb0 hv0 hfind0] at h
+            split at h
+            · simp at h
+            · rename_i blockOps ps' hbp
+              split at h
+              · simp at h
+              · rename_i succOps visited'' ps'' hsp
+                split at h
+                · simp at h
+                · rename_i restOps vF psF hrp
+                  simp only [Option.some.injEq, Prod.mk.injEq] at h
+                  obtain ⟨hops, hveq, -⟩ := h
+                  by_cases hlbl : lbl0 = lbl
+                  · -- the block just planned
+                    subst hlbl
+                    rw [hfind0] at hfind
+                    cases hfind
+                    exact ⟨ps, blockOps, ps', [], succOps ++ restOps, hbp, by
+                      rw [← hops]; simp [List.append_assoc]⟩
+                  · have hnv' : (lbl0 :: visited).contains lbl = false :=
+                      contains_cons_false hlbl hnv
+                    by_cases hv'' : visited''.contains lbl = true
+                    · have := ihB ps'.stack ps'.spilled (C.succsOf lbl0) (lbl0 :: visited) ps'
+                        succOps visited'' ps'' hsp lbl bb hfind hv'' hnv'
+                      rw [← hops]
+                      exact BlockSliceOf_append_right restOps
+                        (BlockSliceOf_append_left blockOps this)
+                    · simp only [Bool.not_eq_true] at hv''
+                      have := ihA rest visited'' ps'' restOps vF psF hrp lbl bb hfind
+                        (by rw [← hveq] at hv; exact hv) hv''
+                      rw [← hops, List.append_assoc]
+                      exact BlockSliceOf_append_left blockOps
+                        (BlockSliceOf_append_left succOps this)
+    · -- generateSuccsPlan (n+1)
+      intro ss sp succs visited ps ops v ps2 h lbl bb hfind hv hnv
+      cases succs with
+      | nil =>
+        rw [generateSuccsPlan_nil] at h
+        simp only [Option.some.injEq, Prod.mk.injEq] at h
+        obtain ⟨-, hveq, -⟩ := h
+        rw [← hveq, hnv] at hv; simp at hv
+      | cons succ rest =>
+        rw [generateSuccsPlan_cons_gen n L D C fn ss sp succ rest visited ps] at h
+        split at h
+        · simp at h
+        · rename_i sOps vAfter psAfter hfa
+          split at h
+          · simp at h
+          · rename_i restOps vF psF hsr
+            simp only [Option.some.injEq, Prod.mk.injEq] at h
+            obtain ⟨hops, hveq, -⟩ := h
+            by_cases hva : vAfter.contains lbl = true
+            · have := ihA [succ] visited { ps with stack := ss, spilled := sp } sOps vAfter psAfter
+                hfa lbl bb hfind hva hnv
+              rw [← hops]
+              exact BlockSliceOf_append_right restOps this
+            · simp only [Bool.not_eq_true] at hva
+              have := ihB ss sp rest vAfter
+                { ps with alloc := psAfter.alloc, labelCounter := psAfter.labelCounter }
+                restOps vF psF hsr lbl bb hfind (by rw [← hveq] at hv; exact hv) hva
+              rw [← hops]
+              exact BlockSliceOf_append_left sOps this
+
+/-- **Any block's body is a jump-free slice of the DFS's plan.** No longer just the head of the
+    worklist: `dfs_block_slice` handles an arbitrary block the DFS visits. -/
+theorem fnPlan_body_slice_any {L : DfState (List String)} {D : DfgAnalysis} {C : CfgAnalysis}
+    {fn : IrFunction} {fuel : Nat} {wl visited : List String} {ps : PlanState}
+    {ops : List StackOp} {v : List String} {ps2 : PlanState}
+    (h : generateFnPlanAux fuel L D C fn wl visited ps = some (ops, v, ps2))
+    {lbl : String} {bb : BasicBlock}
+    (hfind : fn.blocks.find? (·.label == lbl) = some bb)
+    (hv : v.contains lbl = true) (hnv : visited.contains lbl = false)
+    {body : List Instruction} {term : Instruction}
+    (hsplit : nonParamInsts bb = body ++ [term])
+    (hbody : ∀ inst ∈ body, BodyJumpFree inst.opcode) :
+    ∃ pre bodyOps post,
+      ops = pre ++ bodyOps ++ post ∧ (∀ op ∈ bodyOps, SOJumpFree op) := by
+  obtain ⟨psb, blockOps, psb', pre0, post0, hbp, hops⟩ :=
+    (dfs_block_slice L D C fn fuel).1 wl visited ps ops v ps2 h lbl bb hfind hv hnv
+  obtain ⟨pre1, bodyOps, termOps, hblk, hjf⟩ :=
+    generateBlockPlan_body_slice L D C fn bb psb body term hsplit blockOps psb' hbp
+  refine ⟨pre0 ++ pre1, bodyOps, termOps ++ post0, ?_, hjf hbody⟩
+  rw [hops, hblk]
+  simp [List.append_assoc]
+
+/-- **End to end, for any block of the function.**
+
+The DFS plans a function; *any* block it visits has its body as a jump-free contiguous slice of that
+plan; and the assembly that slice compiles to runs inside the whole assembled, symbol-resolved program
+exactly as it runs alone, displaced by the length of everything before it.
+
+Every hypothesis is about the Venom source. This is the general form of `blockBody_runs_in_program`,
+which was stated only for the block at the head of the DFS worklist. -/
+theorem blockBody_runs_in_program_any {L : DfState (List String)} {D : DfgAnalysis} {C : CfgAnalysis}
+    {fn : IrFunction} {fuel : Nat} {wl visited : List String} {ps : PlanState}
+    {ops : List StackOp} {v : List String} {ps2 : PlanState}
+    (h : generateFnPlanAux fuel L D C fn wl visited ps = some (ops, v, ps2))
+    {lbl : String} {bb : BasicBlock}
+    (hfind : fn.blocks.find? (·.label == lbl) = some bb)
+    (hv : v.contains lbl = true) (hnv : visited.contains lbl = false)
+    {body : List Instruction} {term : Instruction}
+    (hsplit : nonParamInsts bb = body ++ [term])
+    (hbody : ∀ inst ∈ body, BodyJumpFree inst.opcode)
+    (n : Nat) (o2pc : AssocList Nat Nat) :
+    ∃ pre bodyOps post,
+      ops = pre ++ bodyOps ++ post
+      ∧ ∀ (x s'' : AsmState),
+          runAsm n o2pc ((executePlan bodyOps).map
+              (resolveInst (computeLabelOffsets (executePlan (pre ++ bodyOps ++ post))).2)) x
+            = AsmResult.AsmOK s'' →
+          runAsm n o2pc (asmResolve (executePlan (pre ++ bodyOps ++ post))).1
+              { x with pc := (executePlan pre).length + x.pc }
+            = AsmResult.AsmOK { s'' with pc := (executePlan pre).length + s''.pc } := by
+  obtain ⟨pre, bodyOps, post, hops, hjf⟩ :=
+    fnPlan_body_slice_any h hfind hv hnv hsplit hbody
+  exact ⟨pre, bodyOps, post, hops, runAsm_shift_placed n o2pc pre bodyOps post hjf⟩
+
+/-! ## …fired on a block the DFS reaches through a successor edge -/
+
+
+/-- The DFS state Dia's compilation actually runs with. -/
+abbrev Dia.L := livenessAnalyzeFuel (fnPlanFuel Dia.fn) Dia.fn
+abbrev Dia.D := DfgAnalysis.buildFunction Dia.fn
+abbrev Dia.C := cfgAnalyze Dia.fn
+abbrev Dia.PS : PlanState := { initPlanState 0 with labelCounter := 0 }
+
+/-- The DFS really does visit `then`, and it is **not** the head of the worklist — it is reached
+    through `generateSuccsPlan`, which is exactly the path the mutual induction was needed for. -/
+theorem dia_dfs_visits_then :
+    ∃ ops v ps2,
+      generateFnPlanAux (fnPlanFuel Dia.fn) Dia.L Dia.D Dia.C Dia.fn ["entry"] [] Dia.PS
+        = some (ops, v, ps2)
+      ∧ v.contains "then" = true
+      ∧ ([] : List String).contains "then" = false := by
+  refine ⟨_, _, _, rfl, ?_, rfl⟩
+  rfl
+
+/-- **The general recipe, fired on a block the DFS reaches through a successor edge.**
+
+`then` is not the head of the worklist — the DFS gets to it via `generateSuccsPlan` — so this witness
+exercises exactly the case that `generateFnPlanAux_head_prefix` could not reach and the mutual induction
+was built for. Firing on the entry block would have proved nothing about the generalisation. -/
+theorem dia_then_runs_in_program (n : Nat) (o2pc : AssocList Nat Nat) :
+    ∃ ops v ps2,
+      generateFnPlanAux (fnPlanFuel Dia.fn) Dia.L Dia.D Dia.C Dia.fn ["entry"] [] Dia.PS
+        = some (ops, v, ps2)
+      ∧ ∃ pre bodyOps post,
+          ops = pre ++ bodyOps ++ post
+          ∧ ∀ (x s'' : AsmState),
+              runAsm n o2pc ((executePlan bodyOps).map
+                  (resolveInst (computeLabelOffsets (executePlan (pre ++ bodyOps ++ post))).2)) x
+                = AsmResult.AsmOK s'' →
+              runAsm n o2pc (asmResolve (executePlan (pre ++ bodyOps ++ post))).1
+                  { x with pc := (executePlan pre).length + x.pc }
+                = AsmResult.AsmOK { s'' with pc := (executePlan pre).length + s''.pc } := by
+  refine ⟨_, _, _, rfl, ?_⟩
+  exact blockBody_runs_in_program_any (L := Dia.L) (D := Dia.D) (C := Dia.C)
+    (fn := Dia.fn) (fuel := fnPlanFuel Dia.fn) (wl := ["entry"]) (visited := []) (ps := Dia.PS)
+    rfl (lbl := "then") (bb := Dia.bThen) rfl (by rfl) rfl
+    dia_then_split dia_then_body_jumpfree n o2pc
+
+/-! ## The recipe composes with the terminator: reconstructing a whole-block trace -/
+
+
+/-- The `then` block's **jump-free** body: `Dia.prog[13..16)` = `[AsmLabel "then", CALLVALUE, POP]`.
+    This excludes the terminator's `PUSH join` (pc 16) and `JUMP` (pc 17) — the label push belongs to
+    the JMP's plan, not to a body instruction. -/
+def Dia.thenBody3 : List AsmInst := (Dia.prog.drop 13).take 3
+
+theorem dia_thenBody3_at : asmBlockAt Dia.prog 13 Dia.thenBody3 := by
+  refine ⟨by decide, ?_⟩
+  intro j hj
+  have : j < 3 := hj
+  interval_cases j <;> rfl
+
+theorem dia_thenBody3_nojump :
+    ∀ j, (hj : j < Dia.thenBody3.length) → IsAsmJump (Dia.thenBody3.get ⟨j, hj⟩) = false := by
+  decide
+
+/-- The body run in isolation: `CALLVALUE` then `POP` cancel, so the stack returns to `asm.stack` and
+    the state is `asm` at pc 3. A `rfl` — nothing here is an irreducible push. -/
+theorem dia_thenBody3_run (asm : AsmState) :
+    runAsm 3 Dia.o2pc Dia.thenBody3 { asm with pc := 0 }
+      = AsmResult.AsmOK { asm with pc := 3 } := by cases asm; rfl
+
+/-- Placed: the body runs the whole program from pc 13 to pc 16, leaving the state otherwise `asm`. -/
+theorem dia_thenBody3_in_prog (asm : AsmState) (hpc : asm.pc = 13) :
+    runAsm 3 Dia.o2pc Dia.prog asm = AsmResult.AsmOK { asm with pc := 16 } := by
+  have hlift := dia_thenBody3_run { asm with pc := 0 }
+  have hshift := runAsm_shift 3 Dia.o2pc Dia.prog Dia.thenBody3 13 dia_thenBody3_at
+    dia_thenBody3_nojump { asm with pc := 0 } _ hlift
+  have hid : ({ asm with pc := 13 + ({ asm with pc := 0 } : AsmState).pc } : AsmState) = asm := by
+    show ({ asm with pc := 13 } : AsmState) = asm; rw [← hpc]
+  rw [hid] at hshift
+  simpa using hshift
+
+/-! ### Body-then-terminator composition, one core plus one lemma per terminator kind -/
+
+
+/-- **The body-then-continuation core.** A jump-free body placed at `base` runs from `base` to
+    `base + body.length` (segment lift), and whatever the terminator does from there — `runAsm k` to any
+    result `R` — the whole placed run does the same. Every terminator composition is an instance: the
+    body half is shared, only the continuation `hcont` differs. -/
+theorem runAsm_body_then (o2pc : AssocList Nat Nat) (prog body : List AsmInst) (base : Nat)
+    (x bodyEnd : AsmState) (k : Nat) (R : AsmResult)
+    (hblk : asmBlockAt prog base body)
+    (hnj : ∀ j, (hj : j < body.length) → IsAsmJump (body.get ⟨j, hj⟩) = false)
+    (hx0 : x.pc = 0)
+    (hbodyrun : runAsm body.length o2pc body x = AsmResult.AsmOK bodyEnd)
+    (hbodyEndpc : bodyEnd.pc = body.length)
+    (hcont : runAsm k o2pc prog { bodyEnd with pc := base + body.length } = R) :
+    runAsm (body.length + k) o2pc prog { x with pc := base } = R := by
+  have hshift := runAsm_shift body.length o2pc prog body base hblk hnj x bodyEnd hbodyrun
+  rw [hx0] at hshift
+  simp only [Nat.add_zero] at hshift
+  rw [hbodyEndpc] at hshift
+  rw [runAsm_append_ok hshift, hcont]
+
+/-- Body then `STOP`: the block halts, in the body's end state advanced one pc. -/
+theorem runAsm_body_then_stop (o2pc : AssocList Nat Nat) (prog body : List AsmInst) (base : Nat)
+    (x bodyEnd : AsmState)
+    (hblk : asmBlockAt prog base body)
+    (hnj : ∀ j, (hj : j < body.length) → IsAsmJump (body.get ⟨j, hj⟩) = false)
+    (hx0 : x.pc = 0)
+    (hbodyrun : runAsm body.length o2pc body x = AsmResult.AsmOK bodyEnd)
+    (hbodyEndpc : bodyEnd.pc = body.length)
+    (hstop1 : base + body.length < prog.length)
+    (hstop : prog.get ⟨base + body.length, hstop1⟩ = AsmInst.AsmOp "STOP") :
+    runAsm (body.length + 1) o2pc prog { x with pc := base }
+      = AsmResult.AsmHalt (asmNext { bodyEnd with pc := base + body.length }) := by
+  refine runAsm_body_then o2pc prog body base x bodyEnd 1 _ hblk hnj hx0 hbodyrun hbodyEndpc ?_
+  rw [show (1 : Nat) = 0 + 1 from rfl, runAsm]
+  rw [asmStep, dif_pos (by simpa using hstop1)]
+  simp only [show (⟨({ bodyEnd with pc := base + body.length } : AsmState).pc, by simpa using hstop1⟩
+    : Fin prog.length) = ⟨base + body.length, hstop1⟩ from rfl, hstop]
+
+/-- Body then `RETURN`: the block halts, via the existing `runAsm_return`. Existential in the halt
+    state — the `venomAsmTerminalRel` that pins it down is discharged separately by the walk. -/
+theorem runAsm_body_then_return (o2pc : AssocList Nat Nat) (prog body : List AsmInst) (base : Nat)
+    (x bodyEnd : AsmState) (off sz : bytes32) (rest : List bytes32)
+    (hblk : asmBlockAt prog base body)
+    (hnj : ∀ j, (hj : j < body.length) → IsAsmJump (body.get ⟨j, hj⟩) = false)
+    (hx0 : x.pc = 0)
+    (hbodyrun : runAsm body.length o2pc body x = AsmResult.AsmOK bodyEnd)
+    (hbodyEndpc : bodyEnd.pc = body.length)
+    (hret1 : base + body.length < prog.length)
+    (hret : prog.get ⟨base + body.length, hret1⟩ = AsmInst.AsmOp "RETURN")
+    (hstk : bodyEnd.stack = off :: sz :: rest)
+    (hcov : sz.toNat = 0 ∨ ((off.toNat + sz.toNat + 31) / 32) * 32 ≤ bodyEnd.memory.size) :
+    ∃ as', runAsm (body.length + 1) o2pc prog { x with pc := base } = AsmResult.AsmHalt as' := by
+  have hcont := runAsm_return (offsetToPc := o2pc) (prog := prog)
+    (asMid := { bodyEnd with pc := base + body.length }) 0
+    (by simpa using hret1) (by simpa using hret) (by simpa using hstk) (by simpa using hcov)
+  exact ⟨_, runAsm_body_then o2pc prog body base x bodyEnd 1 _ hblk hnj hx0 hbodyrun hbodyEndpc hcont⟩
+
+/-- Body then `REVERT`: the block reverts, via the existing `runAsm_revert`. -/
+theorem runAsm_body_then_revert (o2pc : AssocList Nat Nat) (prog body : List AsmInst) (base : Nat)
+    (x bodyEnd : AsmState) (off sz : bytes32) (rest : List bytes32)
+    (hblk : asmBlockAt prog base body)
+    (hnj : ∀ j, (hj : j < body.length) → IsAsmJump (body.get ⟨j, hj⟩) = false)
+    (hx0 : x.pc = 0)
+    (hbodyrun : runAsm body.length o2pc body x = AsmResult.AsmOK bodyEnd)
+    (hbodyEndpc : bodyEnd.pc = body.length)
+    (hrev1 : base + body.length < prog.length)
+    (hrev : prog.get ⟨base + body.length, hrev1⟩ = AsmInst.AsmOp "REVERT")
+    (hstk : bodyEnd.stack = off :: sz :: rest)
+    (hcov : sz.toNat = 0 ∨ ((off.toNat + sz.toNat + 31) / 32) * 32 ≤ bodyEnd.memory.size) :
+    ∃ as', runAsm (body.length + 1) o2pc prog { x with pc := base } = AsmResult.AsmRevert as' := by
+  have hcont := runAsm_revert (offsetToPc := o2pc) (prog := prog)
+    (asMid := { bodyEnd with pc := base + body.length }) 0
+    (by simpa using hrev1) (by simpa using hrev) (by simpa using hstk) (by simpa using hcov)
+  exact ⟨_, runAsm_body_then o2pc prog body base x bodyEnd 1 _ hblk hnj hx0 hbodyrun hbodyEndpc hcont⟩
+
+/-- Body then `INVALID`: the block faults. -/
+theorem runAsm_body_then_invalid (o2pc : AssocList Nat Nat) (prog body : List AsmInst) (base : Nat)
+    (x bodyEnd : AsmState)
+    (hblk : asmBlockAt prog base body)
+    (hnj : ∀ j, (hj : j < body.length) → IsAsmJump (body.get ⟨j, hj⟩) = false)
+    (hx0 : x.pc = 0)
+    (hbodyrun : runAsm body.length o2pc body x = AsmResult.AsmOK bodyEnd)
+    (hbodyEndpc : bodyEnd.pc = body.length)
+    (hinv1 : base + body.length < prog.length)
+    (hinv : prog.get ⟨base + body.length, hinv1⟩ = AsmInst.AsmOp "INVALID") :
+    ∃ as', runAsm (body.length + 1) o2pc prog { x with pc := base } = AsmResult.AsmFault as' := by
+  have hcont : runAsm 1 o2pc prog { bodyEnd with pc := base + body.length }
+      = AsmResult.AsmFault { asmNext { bodyEnd with pc := base + body.length } with
+          returndata := ByteArray.empty } := by
+    rw [show (1 : Nat) = 0 + 1 from rfl, runAsm]
+    rw [asmStep, dif_pos (by simpa using hinv1)]
+    simp only [show (⟨({ bodyEnd with pc := base + body.length } : AsmState).pc, by simpa using hinv1⟩
+      : Fin prog.length) = ⟨base + body.length, hinv1⟩ from rfl, hinv]
+  exact ⟨_, runAsm_body_then o2pc prog body base x bodyEnd 1 _ hblk hnj hx0 hbodyrun hbodyEndpc hcont⟩
+
+/-- **Generic: a jump-free body composes with a resolved JMP terminator.**
+
+If `body` is a jump-free block placed at `base`, running in isolation from pc 0 to `bodyEnd` (which,
+being `body.length` jump-free steps, ends at pc `body.length`); and the terminator `PUSH target; JUMP`
+sits at `base + body.length`, with `target` resolving through the label map to `off` and `off` mapping
+to the successor pc `idx`; then the whole placed block runs from `base` to `idx`, in the body's end
+state.
+
+The general form of the reconstruction below: the segment lift for the body, the existing
+`resolved_jump_sim` for the terminator, glued by `runAsm_append_ok`. Nothing depends on the particular
+block. -/
+theorem runAsm_body_then_jmp (o2pc : AssocList Nat Nat) (offsets : AssocList String Nat)
+    (prog body : List AsmInst) (base : Nat) (x bodyEnd : AsmState)
+    (target : String) (off idx : Nat)
+    (hblk : asmBlockAt prog base body)
+    (hnj : ∀ j, (hj : j < body.length) → IsAsmJump (body.get ⟨j, hj⟩) = false)
+    (hx0 : x.pc = 0)
+    (hbodyrun : runAsm body.length o2pc body x = AsmResult.AsmOK bodyEnd)
+    (hbodyEndpc : bodyEnd.pc = body.length)
+    (hpush1 : base + body.length < prog.length)
+    (hpush : prog.get ⟨base + body.length, hpush1⟩
+      = resolveInst offsets (AsmInst.AsmPushLabel target))
+    (hoff_lk : AssocList.lookup String Nat offsets target = some off) (hoff : off < 2 ^ 256)
+    (hjump1 : base + body.length + 1 < prog.length)
+    (hjump : prog.get ⟨base + body.length + 1, hjump1⟩ = AsmInst.AsmOp "JUMP")
+    (hidx_lk : AssocList.lookup Nat Nat o2pc off = some idx) :
+    runAsm (body.length + 2) o2pc prog { x with pc := base }
+      = AsmResult.AsmOK { bodyEnd with pc := idx } := by
+  refine runAsm_body_then o2pc prog body base x bodyEnd 2 _ hblk hnj hx0 hbodyrun hbodyEndpc ?_
+  exact resolved_jump_sim (s := { bodyEnd with pc := base + body.length })
+    (by simpa using hpush1) (by simpa using hpush) hoff_lk hoff
+    (by simpa using hjump1) (by simpa using hjump) hidx_lk
+
+
+/-- **Body then JNZ, branch taken.** The condition the body leaves on the stack is nonzero, so the
+    resolved `PUSH ifNz; JUMPI` pair jumps to `ifNz`'s pc, consuming the condition. -/
+theorem runAsm_body_then_jnz_taken (o2pc : AssocList Nat Nat) (offsets : AssocList String Nat)
+    (prog body : List AsmInst) (base : Nat) (x bodyEnd : AsmState)
+    (ifNz : String) (off idx : Nat) (cond : bytes32) (stk : List bytes32)
+    (hblk : asmBlockAt prog base body)
+    (hnj : ∀ j, (hj : j < body.length) → IsAsmJump (body.get ⟨j, hj⟩) = false)
+    (hx0 : x.pc = 0)
+    (hbodyrun : runAsm body.length o2pc body x = AsmResult.AsmOK bodyEnd)
+    (hbodyEndpc : bodyEnd.pc = body.length)
+    (hstk : bodyEnd.stack = cond :: stk) (hcond : cond ≠ EvmYul.UInt256.ofNat 0)
+    (hpush1 : base + body.length < prog.length)
+    (hpush : prog.get ⟨base + body.length, hpush1⟩
+      = resolveInst offsets (AsmInst.AsmPushLabel ifNz))
+    (hoff_lk : AssocList.lookup String Nat offsets ifNz = some off) (hoff : off < 2 ^ 256)
+    (hjumpi1 : base + body.length + 1 < prog.length)
+    (hjumpi : prog.get ⟨base + body.length + 1, hjumpi1⟩ = AsmInst.AsmOp "JUMPI")
+    (hidx_lk : AssocList.lookup Nat Nat o2pc off = some idx) :
+    runAsm (body.length + 2) o2pc prog { x with pc := base }
+      = AsmResult.AsmOK { bodyEnd with stack := stk, pc := idx } := by
+  refine runAsm_body_then o2pc prog body base x bodyEnd 2 _ hblk hnj hx0 hbodyrun hbodyEndpc ?_
+  exact resolved_jumpi_taken_sim (s := { bodyEnd with pc := base + body.length })
+    (by simpa using hstk) hcond (by simpa using hpush1) (by simpa using hpush) hoff_lk hoff
+    (by simpa using hjumpi1) (by simpa using hjumpi) hidx_lk
+
+/-- **Body then JNZ, branch not taken.** The condition is zero: the `PUSH ifNz; JUMPI` pair falls
+    through (consuming the condition), and the following `PUSH ifZ; JUMP` jumps to `ifZ`'s pc. Four
+    terminator instructions. -/
+theorem runAsm_body_then_jnz_nottaken (o2pc : AssocList Nat Nat) (offsets : AssocList String Nat)
+    (prog body : List AsmInst) (base : Nat) (x bodyEnd : AsmState)
+    (ifNz ifZ : String) (offN offZ idxZ : Nat) (stk : List bytes32)
+    (hblk : asmBlockAt prog base body)
+    (hnj : ∀ j, (hj : j < body.length) → IsAsmJump (body.get ⟨j, hj⟩) = false)
+    (hx0 : x.pc = 0)
+    (hbodyrun : runAsm body.length o2pc body x = AsmResult.AsmOK bodyEnd)
+    (hbodyEndpc : bodyEnd.pc = body.length)
+    (hstk : bodyEnd.stack = EvmYul.UInt256.ofNat 0 :: stk)
+    (hpush1 : base + body.length < prog.length)
+    (hpushN : prog.get ⟨base + body.length, hpush1⟩
+      = resolveInst offsets (AsmInst.AsmPushLabel ifNz))
+    (hoffN_lk : AssocList.lookup String Nat offsets ifNz = some offN) (hoffN : offN < 2 ^ 256)
+    (hjumpi1 : base + body.length + 1 < prog.length)
+    (hjumpi : prog.get ⟨base + body.length + 1, hjumpi1⟩ = AsmInst.AsmOp "JUMPI")
+    (hpush2 : base + body.length + 2 < prog.length)
+    (hpushZ : prog.get ⟨base + body.length + 2, hpush2⟩
+      = resolveInst offsets (AsmInst.AsmPushLabel ifZ))
+    (hoffZ_lk : AssocList.lookup String Nat offsets ifZ = some offZ) (hoffZ : offZ < 2 ^ 256)
+    (hjump1 : base + body.length + 2 + 1 < prog.length)
+    (hjump : prog.get ⟨base + body.length + 2 + 1, hjump1⟩ = AsmInst.AsmOp "JUMP")
+    (hidxZ_lk : AssocList.lookup Nat Nat o2pc offZ = some idxZ) :
+    runAsm (body.length + 4) o2pc prog { x with pc := base }
+      = AsmResult.AsmOK { bodyEnd with stack := stk, pc := idxZ } := by
+  refine runAsm_body_then o2pc prog body base x bodyEnd 4 _ hblk hnj hx0 hbodyrun hbodyEndpc ?_
+  have hjumpi_step := resolved_jumpi_nottaken_sim (offsetToPc := o2pc) (prog := prog)
+    (s := { bodyEnd with pc := base + body.length })
+    (by simpa using hstk) (by simpa using hpush1) (by simpa using hpushN) hoffN_lk hoffN
+    (by simpa using hjumpi1) (by simpa using hjumpi)
+  have hjump_step := resolved_jump_sim
+    (s := { bodyEnd with stack := stk, pc := base + body.length + 2 })
+    (by simpa using hpush2) (by simpa using hpushZ) hoffZ_lk hoffZ
+    (by simpa using hjump1) (by simpa using hjump) hidxZ_lk
+  rw [show (4 : Nat) = 2 + 2 from rfl, runAsm_append_ok hjumpi_step, hjump_step]
+
+
+/-- **`dia_hasm_then`, reconstructed through the recipe.** The jump-free body via the segment lift
+    (`dia_thenBody3_in_prog`, no absolute-pc trace) composed with the terminator's `PUSH join; JUMP`
+    pair via `runAsm_body_then_jmp` — the same conclusion the original hand-rolled proof reaches, but
+    the composition is the general brick, fired here on a block the DFS reaches through a branch. -/
+theorem dia_hasm_then_via_recipe {asm : AsmState} (hpc : asm.pc = 13) :
+    runAsm 5 Dia.o2pc Dia.prog asm = AsmResult.AsmOK { asm with pc := 11 } := by
+  have hid : ({ asm with pc := 13 } : AsmState) = asm := by rw [← hpc]
+  have h := runAsm_body_then_jmp Dia.o2pc Dia.lo Dia.prog Dia.thenBody3 13
+    { asm with pc := 0 } { asm with pc := 3 } "join" 17 11
+    dia_thenBody3_at dia_thenBody3_nojump rfl
+    (dia_thenBody3_run asm) rfl
+    (by decide) rfl dia_lo_join (by decide) (by decide) rfl dia_o2pc_join
+  rw [hid] at h
+  exact h
+
+/-! ## The recipe plugs into the walk: recipe → hrun → WalkStep -/
+
+
+/-- **The recipe plugs into the walk's JMP step.**
+
+`hstep_jmp_block_ws` produces a `WalkStep` from a whole-block `hrun` (plus the Venom-side relation
+facts). This feeds that `hrun` from the recipe: the jump-free body via the segment lift, the JMP
+terminator via `resolved_jump_sim`, composed by `runAsm_body_then_jmp`. So a block's `WalkStep` is
+obtained with no absolute-pc asm trace — the asm run is assembled from the compiler's own layout, and
+only the Venom-side simulation facts (`hrb`, `hrel`, the plan-state agreements, the well-founded
+decrease) remain as inputs. -/
+theorem WalkStep_jmp_via_recipe {fn : IrFunction} {ctx : VenomContext}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat}
+    {prog body : List AsmInst} {labelOffsets : AssocList String Nat}
+    (pcOf : String → Nat) (psOf : String → PlanState) (wOf : String → Nat)
+    {bb bb' : BasicBlock} {s s' : VenomState} {x bodyEnd : AsmState} {psPostBody : PlanState}
+    {N f' base : Nat} {target : String} {off : Nat}
+    -- asm side: the recipe
+    (hblk : asmBlockAt prog base body)
+    (hnj : ∀ j, (hj : j < body.length) → IsAsmJump (body.get ⟨j, hj⟩) = false)
+    (hx0 : x.pc = 0)
+    (hbodyrun : runAsm body.length o2pc body x = AsmResult.AsmOK bodyEnd)
+    (hbodyEndpc : bodyEnd.pc = body.length)
+    (hpush1 : base + body.length < prog.length)
+    (hpush : prog.get ⟨base + body.length, hpush1⟩ = resolveInst offsets (AsmInst.AsmPushLabel target))
+    (hoff_lk : AssocList.lookup String Nat offsets target = some off) (hoff : off < 2 ^ 256)
+    (hjump1 : base + body.length + 1 < prog.length)
+    (hjump : prog.get ⟨base + body.length + 1, hjump1⟩ = AsmInst.AsmOp "JUMP")
+    (hidx_lk : AssocList.lookup Nat Nat o2pc off = some (pcOf bb'.label))
+    -- Venom side: the block simulation facts hstep_jmp_block consumes
+    (hrb : runBlock f' ctx bb s = ExecResult.OK s')
+    (hnh : s'.halted = false)
+    (hrel : venomAsmRel labelOffsets psPostBody s' { bodyEnd with pc := pcOf bb'.label })
+    (hstk : psPostBody.stack = (psOf bb'.label).stack)
+    (hsp : psPostBody.spilled = (psOf bb'.label).spilled)
+    (hfe : psPostBody.alloc.fnEom = (psOf bb'.label).alloc.fnEom)
+    (hno : psPostBody.alloc.nextOffset ≤ (psOf bb'.label).alloc.nextOffset)
+    (hle : body.length + 2 ≤ N)
+    (hlk' : lookupBlock s'.currentBb fn.blocks = some bb')
+    (hwdec : wOf bb'.label + (body.length + 2) ≤ wOf bb.label) :
+    WalkStep fn pcOf psOf wOf labelOffsets o2pc prog bb { x with pc := base } N
+      (runBlock f' ctx bb s) := by
+  have hrun := runAsm_body_then_jmp o2pc offsets prog body base x bodyEnd target off (pcOf bb'.label)
+    hblk hnj hx0 hbodyrun hbodyEndpc hpush1 hpush hoff_lk hoff hjump1 hjump hidx_lk
+  exact hstep_jmp_block_ws pcOf psOf wOf hrb hnh hrun hrel hstk hsp hfe hno rfl hle rfl hlk' hwdec
+
+/-- **The asm half discharged on a real block.** For Dia's `then` — reached through a branch, base 13 —
+    every asm-side input of `WalkStep_jmp_via_recipe` is filled from the compiler's own output, leaving
+    exactly the Venom-side simulation facts as the remaining hypotheses. This is a witness that the asm
+    half of the walk's JMP step is complete and non-vacuous; the residue is precisely the
+    `genBlockSimulation` work. -/
+theorem dia_then_WalkStep_asm_discharged
+    (pcOf : String → Nat) (psOf : String → PlanState) (wOf : String → Nat)
+    {ctx : VenomContext} {s s' : VenomState} {psPostBody : PlanState} {N f' : Nat}
+    (asm : AsmState)
+    (hpcThen : pcOf "join" = 11)
+    (hrb : runBlock f' ctx Dia.bThen s = ExecResult.OK s')
+    (hnh : s'.halted = false)
+    (hrel : venomAsmRel Dia.lo psPostBody s' { { asm with pc := 3 } with pc := pcOf "join" })
+    (hstk : psPostBody.stack = (psOf "join").stack)
+    (hsp : psPostBody.spilled = (psOf "join").spilled)
+    (hfe : psPostBody.alloc.fnEom = (psOf "join").alloc.fnEom)
+    (hno : psPostBody.alloc.nextOffset ≤ (psOf "join").alloc.nextOffset)
+    (hle : 3 + 2 ≤ N)
+    (hlk' : lookupBlock s'.currentBb Dia.fn.blocks = some Dia.bJoin)
+    (hbjoin : Dia.bJoin.label = "join")
+    (hwdec : wOf "join" + (3 + 2) ≤ wOf Dia.bThen.label) :
+    WalkStep Dia.fn pcOf psOf wOf Dia.lo Dia.o2pc Dia.prog Dia.bThen
+      { asm with pc := 13 } N (runBlock f' ctx Dia.bThen s) := by
+  have hbase : (13 : Nat) = 0 + 13 := rfl
+  refine WalkStep_jmp_via_recipe (bb' := Dia.bJoin) (target := "join") (off := 17)
+    (x := { asm with pc := 0 }) (bodyEnd := { asm with pc := 3 })
+    (psPostBody := psPostBody) pcOf psOf wOf
+    dia_thenBody3_at dia_thenBody3_nojump rfl (dia_thenBody3_run asm) rfl
+    (by decide) rfl dia_lo_join (by decide) (by decide) rfl
+    (by rw [hbjoin, hpcThen]; exact dia_o2pc_join)
+
+    hrb hnh ?_ ?_ ?_ ?_ ?_ hle hlk' ?_
+  · rw [hbjoin]; exact hrel
+  · rw [hbjoin]; exact hstk
+  · rw [hbjoin]; exact hsp
+  · rw [hbjoin]; exact hfe
+  · rw [hbjoin]; exact hno
+  · rw [hbjoin]; exact hwdec
+
+/-! ## …and into the halting steps: recipe halt-run → WalkStep -/
+
+
+/-- **The recipe plugs into the walk's halting steps.** Given a block that halts on the Venom side
+    (`hrb`), a body-then-halting-terminator asm run reaching `AsmHalt`/`AsmRevert`/`AsmFault` (from the
+    recipe), and the Venom-side `venomAsmTerminalRel` on that exact end state, the `WalkStep` holds. The
+    recipe's run is at step count `body.length + 1`; the walk's budget `N` is at least that, and a
+    halted run stays halted, so it lifts (`runAsm_le_of_ne_ok`). -/
+theorem WalkStep_halt_of_run {fn pcOf psOf wOf labelOffsets o2pc prog bb asm N f' ctx}
+    {s s' : VenomState} {haltAsm : AsmState} {n : Nat}
+    (hrb : runBlock f' ctx bb s = ExecResult.Halt s')
+    (hrun : runAsm n o2pc prog asm = AsmResult.AsmHalt haltAsm)
+    (hle : n ≤ N)
+    (hrel : venomAsmTerminalRel s' haltAsm) :
+    WalkStep fn pcOf psOf wOf labelOffsets o2pc prog bb asm N (runBlock f' ctx bb s) := by
+  rw [hrb]
+  refine ⟨haltAsm, ?_, hrel⟩
+  exact runAsm_le_of_ne_ok (by intro s hs; cases hs) hle hrun
+
+theorem WalkStep_revert_of_run {fn pcOf psOf wOf labelOffsets o2pc prog bb asm N f' ctx}
+    {s s' : VenomState} {rvAsm : AsmState} {n : Nat}
+    (hrb : runBlock f' ctx bb s = ExecResult.Abort AbortType.RevertAbort s')
+    (hrun : runAsm n o2pc prog asm = AsmResult.AsmRevert rvAsm)
+    (hle : n ≤ N)
+    (hrel : venomAsmTerminalRel s' rvAsm) :
+    WalkStep fn pcOf psOf wOf labelOffsets o2pc prog bb asm N (runBlock f' ctx bb s) := by
+  rw [hrb]
+  refine ⟨rvAsm, ?_, hrel⟩
+  exact runAsm_le_of_ne_ok (by intro s hs; cases hs) hle hrun
+
+theorem WalkStep_fault_of_run {fn pcOf psOf wOf labelOffsets o2pc prog bb asm N f' ctx}
+    {s s' : VenomState} {fltAsm : AsmState} {n : Nat}
+    (hrb : runBlock f' ctx bb s = ExecResult.Abort AbortType.ExHaltAbort s')
+    (hrun : runAsm n o2pc prog asm = AsmResult.AsmFault fltAsm)
+    (hle : n ≤ N)
+    (hrel : venomAsmTerminalRel s' fltAsm) :
+    WalkStep fn pcOf psOf wOf labelOffsets o2pc prog bb asm N (runBlock f' ctx bb s) := by
+  rw [hrb]
+  refine ⟨fltAsm, ?_, hrel⟩
+  exact runAsm_le_of_ne_ok (by intro s hs; cases hs) hle hrun
+
+/-! ## The walk relations ignore the asm pc — so the Venom-side input is program-position-free -/
+
+
+/-- `venomAsmTerminalRel` ignores the asm pc — it constrains only accounts/transient/returndata/logs. -/
+theorem venomAsmTerminalRel_setPc (vs : VenomState) (as : AsmState) (p : Nat) :
+    venomAsmTerminalRel vs { as with pc := p } = venomAsmTerminalRel vs as := rfl
+
+/-- `asmNext` only advances the pc, so it leaves the terminal relation unchanged. -/
+theorem venomAsmTerminalRel_asmNext (vs : VenomState) (as : AsmState) :
+    venomAsmTerminalRel vs (asmNext as) = venomAsmTerminalRel vs as := rfl
+
+/-- And it leaves `venomAsmRel` unchanged too — `asmNext` touches nothing the relation reads. -/
+theorem venomAsmRel_asmNext (lo : AssocList String Nat) (ps : PlanState) (vs : VenomState)
+    (as : AsmState) :
+    venomAsmRel lo ps vs (asmNext as) = venomAsmRel lo ps vs as := rfl
+
+/-- **The JMP walk bridge with a pc-free Venom relation.** Same as `WalkStep_jmp_via_recipe`, but the
+    Venom-side `hrel` is stated on the plain body-end state `bodyEnd`, not on the displaced
+    `{bodyEnd with pc := pcOf bb'.label}`. Since `venomAsmRel` ignores the pc, the two are interchangeable
+    — and this is the form a `genBlockSimulation` produces, which knows the block's stack and memory but
+    not where the block sits in the program. -/
+theorem WalkStep_jmp_via_recipe_pcfree {fn : IrFunction} {ctx : VenomContext}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat}
+    {prog body : List AsmInst} {labelOffsets : AssocList String Nat}
+    (pcOf : String → Nat) (psOf : String → PlanState) (wOf : String → Nat)
+    {bb bb' : BasicBlock} {s s' : VenomState} {x bodyEnd : AsmState} {psPostBody : PlanState}
+    {N f' base : Nat} {target : String} {off : Nat}
+    (hblk : asmBlockAt prog base body)
+    (hnj : ∀ j, (hj : j < body.length) → IsAsmJump (body.get ⟨j, hj⟩) = false)
+    (hx0 : x.pc = 0)
+    (hbodyrun : runAsm body.length o2pc body x = AsmResult.AsmOK bodyEnd)
+    (hbodyEndpc : bodyEnd.pc = body.length)
+    (hpush1 : base + body.length < prog.length)
+    (hpush : prog.get ⟨base + body.length, hpush1⟩ = resolveInst offsets (AsmInst.AsmPushLabel target))
+    (hoff_lk : AssocList.lookup String Nat offsets target = some off) (hoff : off < 2 ^ 256)
+    (hjump1 : base + body.length + 1 < prog.length)
+    (hjump : prog.get ⟨base + body.length + 1, hjump1⟩ = AsmInst.AsmOp "JUMP")
+    (hidx_lk : AssocList.lookup Nat Nat o2pc off = some (pcOf bb'.label))
+    (hrb : runBlock f' ctx bb s = ExecResult.OK s')
+    (hnh : s'.halted = false)
+    (hrel : venomAsmRel labelOffsets psPostBody s' bodyEnd)
+    (hstk : psPostBody.stack = (psOf bb'.label).stack)
+    (hsp : psPostBody.spilled = (psOf bb'.label).spilled)
+    (hfe : psPostBody.alloc.fnEom = (psOf bb'.label).alloc.fnEom)
+    (hno : psPostBody.alloc.nextOffset ≤ (psOf bb'.label).alloc.nextOffset)
+    (hle : body.length + 2 ≤ N)
+    (hlk' : lookupBlock s'.currentBb fn.blocks = some bb')
+    (hwdec : wOf bb'.label + (body.length + 2) ≤ wOf bb.label) :
+    WalkStep fn pcOf psOf wOf labelOffsets o2pc prog bb { x with pc := base } N
+      (runBlock f' ctx bb s) :=
+  WalkStep_jmp_via_recipe pcOf psOf wOf hblk hnj hx0 hbodyrun hbodyEndpc hpush1 hpush hoff_lk hoff
+    hjump1 hjump hidx_lk hrb hnh (venomAsmRel_setPc hrel) hstk hsp hfe hno hle hlk' hwdec
+
+/-! ## JNZ walk bridges — the same generic hstep, fed the branching recipe run -/
+
+
+/-- **The JNZ-taken walk step from the recipe.** `hstep_jmp_block_ws` is terminator-agnostic — its
+    OK-continuing conclusion needs only `runBlock = OK s'`, the successor block, the whole-block asm
+    run, and the relation; nothing about the terminator being a `JMP`. So the JNZ recipe's run
+    (`runAsm_body_then_jnz_taken`, condition nonzero → jumps to `ifNz`) feeds the same hstep. The
+    Venom relation is taken position-free (`venomAsmRel_setPc`). -/
+theorem WalkStep_jnz_taken_via_recipe {fn : IrFunction} {ctx : VenomContext}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat}
+    {prog body : List AsmInst} {labelOffsets : AssocList String Nat}
+    (pcOf : String → Nat) (psOf : String → PlanState) (wOf : String → Nat)
+    {bb bb' : BasicBlock} {s s' : VenomState} {x bodyEnd : AsmState} {psPostBody : PlanState}
+    {N f' base : Nat} {ifNz : String} {off : Nat} {cond : bytes32} {stk : List bytes32}
+    (hblk : asmBlockAt prog base body)
+    (hnj : ∀ j, (hj : j < body.length) → IsAsmJump (body.get ⟨j, hj⟩) = false)
+    (hx0 : x.pc = 0)
+    (hbodyrun : runAsm body.length o2pc body x = AsmResult.AsmOK bodyEnd)
+    (hbodyEndpc : bodyEnd.pc = body.length)
+    (hstk_c : bodyEnd.stack = cond :: stk) (hcond : cond ≠ EvmYul.UInt256.ofNat 0)
+    (hpush1 : base + body.length < prog.length)
+    (hpush : prog.get ⟨base + body.length, hpush1⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifNz))
+    (hoff_lk : AssocList.lookup String Nat offsets ifNz = some off) (hoff : off < 2 ^ 256)
+    (hjumpi1 : base + body.length + 1 < prog.length)
+    (hjumpi : prog.get ⟨base + body.length + 1, hjumpi1⟩ = AsmInst.AsmOp "JUMPI")
+    (hidx_lk : AssocList.lookup Nat Nat o2pc off = some (pcOf bb'.label))
+    (hrb : runBlock f' ctx bb s = ExecResult.OK s')
+    (hnh : s'.halted = false)
+    (hrel : venomAsmRel labelOffsets psPostBody s' { bodyEnd with stack := stk })
+    (hstk : psPostBody.stack = (psOf bb'.label).stack)
+    (hsp : psPostBody.spilled = (psOf bb'.label).spilled)
+    (hfe : psPostBody.alloc.fnEom = (psOf bb'.label).alloc.fnEom)
+    (hno : psPostBody.alloc.nextOffset ≤ (psOf bb'.label).alloc.nextOffset)
+    (hle : body.length + 2 ≤ N)
+    (hlk' : lookupBlock s'.currentBb fn.blocks = some bb')
+    (hwdec : wOf bb'.label + (body.length + 2) ≤ wOf bb.label) :
+    WalkStep fn pcOf psOf wOf labelOffsets o2pc prog bb { x with pc := base } N
+      (runBlock f' ctx bb s) := by
+  have hrun := runAsm_body_then_jnz_taken o2pc offsets prog body base x bodyEnd ifNz off
+    (pcOf bb'.label) cond stk hblk hnj hx0 hbodyrun hbodyEndpc hstk_c hcond hpush1 hpush hoff_lk
+    hoff hjumpi1 hjumpi hidx_lk
+  exact hstep_jmp_block_ws pcOf psOf wOf hrb hnh hrun (venomAsmRel_setPc hrel) hstk hsp hfe hno
+    rfl hle rfl hlk' hwdec
+
+/-- **The JNZ-not-taken walk step from the recipe.** Condition zero: the JUMPI falls through and the
+    following `PUSH ifZ; JUMP` jumps to `ifZ`. Same generic hstep, fed the four-instruction not-taken
+    run. -/
+theorem WalkStep_jnz_nottaken_via_recipe {fn : IrFunction} {ctx : VenomContext}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat}
+    {prog body : List AsmInst} {labelOffsets : AssocList String Nat}
+    (pcOf : String → Nat) (psOf : String → PlanState) (wOf : String → Nat)
+    {bb bb' : BasicBlock} {s s' : VenomState} {x bodyEnd : AsmState} {psPostBody : PlanState}
+    {N f' base : Nat} {ifNz ifZ : String} {offN offZ : Nat} {stk : List bytes32}
+    (hblk : asmBlockAt prog base body)
+    (hnj : ∀ j, (hj : j < body.length) → IsAsmJump (body.get ⟨j, hj⟩) = false)
+    (hx0 : x.pc = 0)
+    (hbodyrun : runAsm body.length o2pc body x = AsmResult.AsmOK bodyEnd)
+    (hbodyEndpc : bodyEnd.pc = body.length)
+    (hstk_c : bodyEnd.stack = EvmYul.UInt256.ofNat 0 :: stk)
+    (hpush1 : base + body.length < prog.length)
+    (hpushN : prog.get ⟨base + body.length, hpush1⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifNz))
+    (hoffN_lk : AssocList.lookup String Nat offsets ifNz = some offN) (hoffN : offN < 2 ^ 256)
+    (hjumpi1 : base + body.length + 1 < prog.length)
+    (hjumpi : prog.get ⟨base + body.length + 1, hjumpi1⟩ = AsmInst.AsmOp "JUMPI")
+    (hpush2 : base + body.length + 2 < prog.length)
+    (hpushZ : prog.get ⟨base + body.length + 2, hpush2⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifZ))
+    (hoffZ_lk : AssocList.lookup String Nat offsets ifZ = some offZ) (hoffZ : offZ < 2 ^ 256)
+    (hjump1 : base + body.length + 2 + 1 < prog.length)
+    (hjump : prog.get ⟨base + body.length + 2 + 1, hjump1⟩ = AsmInst.AsmOp "JUMP")
+    (hidxZ_lk : AssocList.lookup Nat Nat o2pc offZ = some (pcOf bb'.label))
+    (hrb : runBlock f' ctx bb s = ExecResult.OK s')
+    (hnh : s'.halted = false)
+    (hrel : venomAsmRel labelOffsets psPostBody s' { bodyEnd with stack := stk })
+    (hstk : psPostBody.stack = (psOf bb'.label).stack)
+    (hsp : psPostBody.spilled = (psOf bb'.label).spilled)
+    (hfe : psPostBody.alloc.fnEom = (psOf bb'.label).alloc.fnEom)
+    (hno : psPostBody.alloc.nextOffset ≤ (psOf bb'.label).alloc.nextOffset)
+    (hle : body.length + 4 ≤ N)
+    (hlk' : lookupBlock s'.currentBb fn.blocks = some bb')
+    (hwdec : wOf bb'.label + (body.length + 4) ≤ wOf bb.label) :
+    WalkStep fn pcOf psOf wOf labelOffsets o2pc prog bb { x with pc := base } N
+      (runBlock f' ctx bb s) := by
+  have hrun := runAsm_body_then_jnz_nottaken o2pc offsets prog body base x bodyEnd ifNz ifZ offN
+    offZ (pcOf bb'.label) stk hblk hnj hx0 hbodyrun hbodyEndpc hstk_c hpush1 hpushN hoffN_lk hoffN
+    hjumpi1 hjumpi hpush2 hpushZ hoffZ_lk hoffZ hjump1 hjump hidxZ_lk
+  exact hstep_jmp_block_ws pcOf psOf wOf hrb hnh hrun (venomAsmRel_setPc hrel) hstk hsp hfe hno
+    rfl hle rfl hlk' hwdec
+
+/-! ## The recipe supplies codegen_correct's hbsim arms directly -/
+
+
+/-- **The recipe's block run supplies `codegen_correct`'s `hbsim` OK-continuing arm.**
+
+`hbsim`'s continuing arm is `∃ asm' N', runAsm N prog asm = runAsm N' prog asm' ∧ Entry s' asm' N'` — a
+walk-continuation form. A block whose asm runs to `AsmOK asm'` in `blockLen` steps supplies it directly:
+`runAsm_append_ok` turns `runAsm blockLen prog asm = AsmOK asm'` into `runAsm (blockLen + N') prog asm =
+runAsm N' prog asm'`, so with the budget `N = blockLen + N'` the walk resumes from `asm'`. The successor
+invariant `Entry s' asm' N'` is the input the block simulation provides. -/
+theorem hbsim_OK_continue_of_run {Entry : VenomState → AsmState → Nat → Prop}
+    {o2pc : AssocList Nat Nat} {prog : List AsmInst} {asm asm' : AsmState} {s' : VenomState}
+    {blockLen N' : Nat}
+    (hrun : runAsm blockLen o2pc prog asm = AsmResult.AsmOK asm')
+    (hEntry : Entry s' asm' N') :
+    ∃ asm'' N'', runAsm (blockLen + N') o2pc prog asm = runAsm N'' o2pc prog asm''
+      ∧ Entry s' asm'' N'' :=
+  ⟨asm', N', runAsm_append_ok hrun, hEntry⟩
+
+/-- The halting arms: a block that halts/reverts/faults in `blockLen ≤ N` steps supplies the terminal
+    arm at the walk's budget `N` (a terminal run is absorbing under extra fuel). -/
+theorem hbsim_halt_of_run {o2pc : AssocList Nat Nat} {prog : List AsmInst} {asm haltAsm : AsmState}
+    {s' : VenomState} {blockLen N : Nat}
+    (hrun : runAsm blockLen o2pc prog asm = AsmResult.AsmHalt haltAsm) (hle : blockLen ≤ N)
+    (hrel : venomAsmTerminalRel s' haltAsm) :
+    ∃ asm', runAsm N o2pc prog asm = AsmResult.AsmHalt asm' ∧ venomAsmTerminalRel s' asm' :=
+  ⟨haltAsm, runAsm_le_of_ne_ok (by intro s hs; cases hs) hle hrun, hrel⟩
+
+theorem hbsim_revert_of_run {o2pc : AssocList Nat Nat} {prog : List AsmInst} {asm rvAsm : AsmState}
+    {s' : VenomState} {blockLen N : Nat}
+    (hrun : runAsm blockLen o2pc prog asm = AsmResult.AsmRevert rvAsm) (hle : blockLen ≤ N)
+    (hrel : venomAsmTerminalRel s' rvAsm) :
+    ∃ asm', runAsm N o2pc prog asm = AsmResult.AsmRevert asm' ∧ venomAsmTerminalRel s' asm' :=
+  ⟨rvAsm, runAsm_le_of_ne_ok (by intro s hs; cases hs) hle hrun, hrel⟩
+
+theorem hbsim_fault_of_run {o2pc : AssocList Nat Nat} {prog : List AsmInst} {asm fltAsm : AsmState}
+    {s' : VenomState} {blockLen N : Nat}
+    (hrun : runAsm blockLen o2pc prog asm = AsmResult.AsmFault fltAsm) (hle : blockLen ≤ N)
+    (hrel : venomAsmTerminalRel s' fltAsm) :
+    ∃ asm', runAsm N o2pc prog asm = AsmResult.AsmFault asm' ∧ venomAsmTerminalRel s' asm' :=
+  ⟨fltAsm, runAsm_le_of_ne_ok (by intro s hs; cases hs) hle hrun, hrel⟩
+
+/-- **Non-vacuous on the compiler's own output.** Dia's `then` block runs (via the recipe reconstruction
+    `dia_hasm_then_via_recipe`) to `AsmOK {asm with pc := 11}` in 5 steps, so for any successor invariant
+    `Entry` holding at the join, the `hbsim` OK-continuing arm holds — the walk resumes at the join. -/
+theorem dia_then_hbsim_continue {Entry : VenomState → AsmState → Nat → Prop} {s' : VenomState}
+    {asm : AsmState} {N' : Nat} (hpc : asm.pc = 13)
+    (hEntry : Entry s' { asm with pc := 11 } N') :
+    ∃ asm'' N'', runAsm (5 + N') Dia.o2pc Dia.prog asm = runAsm N'' Dia.o2pc Dia.prog asm''
+      ∧ Entry s' asm'' N'' :=
+  hbsim_OK_continue_of_run (dia_hasm_then_via_recipe hpc) hEntry
+
+/-! ## The full hbsim match, supplied from the recipe (with the correspondence proof) -/
+
+
+/-- The exact `hbsim` match shape `codegen_correct` requires, abbreviated. -/
+def HbsimMatch (Entry : VenomState → AsmState → Nat → Prop) (o2pc : AssocList Nat Nat)
+    (prog : List AsmInst) (asm : AsmState) (N : Nat) (r : ExecResult) : Prop :=
+  match r with
+  | ExecResult.OK s' =>
+      if s'.halted then
+        ∃ asm', runAsm N o2pc prog asm = AsmResult.AsmHalt asm' ∧ venomAsmTerminalRel s' asm'
+      else
+        ∃ asm' N', runAsm N o2pc prog asm = runAsm N' o2pc prog asm' ∧ Entry s' asm' N'
+  | ExecResult.Halt s' =>
+      ∃ asm', runAsm N o2pc prog asm = AsmResult.AsmHalt asm' ∧ venomAsmTerminalRel s' asm'
+  | ExecResult.Abort AbortType.RevertAbort s' =>
+      ∃ asm', runAsm N o2pc prog asm = AsmResult.AsmRevert asm' ∧ venomAsmTerminalRel s' asm'
+  | ExecResult.Abort AbortType.ExHaltAbort s' =>
+      ∃ asm', runAsm N o2pc prog asm = AsmResult.AsmFault asm' ∧ venomAsmTerminalRel s' asm'
+  | _ => True
+
+/-- **A continuing block supplies the whole `hbsim` match.** Given the block continues on the Venom side
+    (`runBlock = OK s'`, not halted), its asm runs to `AsmOK asm'` at the budget's head, and the successor
+    invariant holds, the entire `HbsimMatch` holds. This is the shape `codegen_correct`'s `hbsim` argument
+    is, produced directly from the recipe. -/
+theorem HbsimMatch_of_OK_continue {Entry : VenomState → AsmState → Nat → Prop}
+    {o2pc : AssocList Nat Nat} {prog : List AsmInst} {asm asm' : AsmState}
+    {f' blockLen N' : Nat} {ctx : VenomContext} {bb : BasicBlock} {s s' : VenomState}
+    (hrb : runBlock f' ctx bb s = ExecResult.OK s') (hnh : s'.halted = false)
+    (hrun : runAsm blockLen o2pc prog asm = AsmResult.AsmOK asm')
+    (hEntry : Entry s' asm' N') :
+    HbsimMatch Entry o2pc prog asm (blockLen + N') (runBlock f' ctx bb s) := by
+  rw [hrb]; simp only [HbsimMatch, hnh, Bool.false_eq_true, if_false]
+  exact ⟨asm', N', runAsm_append_ok hrun, hEntry⟩
+
+/-- A halting block supplies the whole match: `runBlock = Halt s'`, asm halts within budget. -/
+theorem HbsimMatch_of_halt {Entry : VenomState → AsmState → Nat → Prop}
+    {o2pc : AssocList Nat Nat} {prog : List AsmInst} {asm haltAsm : AsmState}
+    {f' blockLen N : Nat} {ctx : VenomContext} {bb : BasicBlock} {s s' : VenomState}
+    (hrb : runBlock f' ctx bb s = ExecResult.Halt s')
+    (hrun : runAsm blockLen o2pc prog asm = AsmResult.AsmHalt haltAsm) (hle : blockLen ≤ N)
+    (hrel : venomAsmTerminalRel s' haltAsm) :
+    HbsimMatch Entry o2pc prog asm N (runBlock f' ctx bb s) := by
+  rw [hrb]; exact ⟨haltAsm, runAsm_le_of_ne_ok (by intro s hs; cases hs) hle hrun, hrel⟩
+
+theorem HbsimMatch_of_revert {Entry : VenomState → AsmState → Nat → Prop}
+    {o2pc : AssocList Nat Nat} {prog : List AsmInst} {asm rvAsm : AsmState}
+    {f' blockLen N : Nat} {ctx : VenomContext} {bb : BasicBlock} {s s' : VenomState}
+    (hrb : runBlock f' ctx bb s = ExecResult.Abort AbortType.RevertAbort s')
+    (hrun : runAsm blockLen o2pc prog asm = AsmResult.AsmRevert rvAsm) (hle : blockLen ≤ N)
+    (hrel : venomAsmTerminalRel s' rvAsm) :
+    HbsimMatch Entry o2pc prog asm N (runBlock f' ctx bb s) := by
+  rw [hrb]; exact ⟨rvAsm, runAsm_le_of_ne_ok (by intro s hs; cases hs) hle hrun, hrel⟩
+
+theorem HbsimMatch_of_fault {Entry : VenomState → AsmState → Nat → Prop}
+    {o2pc : AssocList Nat Nat} {prog : List AsmInst} {asm fltAsm : AsmState}
+    {f' blockLen N : Nat} {ctx : VenomContext} {bb : BasicBlock} {s s' : VenomState}
+    (hrb : runBlock f' ctx bb s = ExecResult.Abort AbortType.ExHaltAbort s')
+    (hrun : runAsm blockLen o2pc prog asm = AsmResult.AsmFault fltAsm) (hle : blockLen ≤ N)
+    (hrel : venomAsmTerminalRel s' fltAsm) :
+    HbsimMatch Entry o2pc prog asm N (runBlock f' ctx bb s) := by
+  rw [hrb]; exact ⟨fltAsm, runAsm_le_of_ne_ok (by intro s hs; cases hs) hle hrun, hrel⟩
+
+/-- **CORRESPONDENCE: `HbsimMatch` IS `codegen_correct`'s hbsim match.** The exact inline match from
+    `codegen_correct` (with `prog`/`o2pc` = the resolved whole-function plan) is discharged from
+    `HbsimMatch` by `exact` (definitional equality). So the suppliers above produce the real `hbsim`
+    hypothesis, not a private mirror of it. -/
+theorem HbsimMatch_is_hbsim {ops : List StackOp} {asm : AsmState} {N : Nat}
+    {Entry : VenomState → AsmState → Nat → Prop} {r : ExecResult}
+    (h : HbsimMatch Entry (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 asm N r) :
+    (match r with
+     | ExecResult.OK s' =>
+         if s'.halted then
+           ∃ asm', runAsm N (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 asm
+             = AsmResult.AsmHalt asm' ∧ venomAsmTerminalRel s' asm'
+         else
+           ∃ asm' N', runAsm N (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 asm
+             = runAsm N' (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 asm' ∧ Entry s' asm' N'
+     | ExecResult.Halt s' =>
+         ∃ asm', runAsm N (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 asm
+           = AsmResult.AsmHalt asm' ∧ venomAsmTerminalRel s' asm'
+     | ExecResult.Abort AbortType.RevertAbort s' =>
+         ∃ asm', runAsm N (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 asm
+           = AsmResult.AsmRevert asm' ∧ venomAsmTerminalRel s' asm'
+     | ExecResult.Abort AbortType.ExHaltAbort s' =>
+         ∃ asm', runAsm N (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 asm
+           = AsmResult.AsmFault asm' ∧ venomAsmTerminalRel s' asm'
+     | _ => True) := by
+  unfold HbsimMatch at h
+  cases r with
+  | OK s' => exact h
+  | Halt s' => exact h
+  | Abort a s' => cases a <;> exact h
+  | IntRet _ _ => exact h
+  | Error _ => exact h
+
+/-- **Non-vacuous full match on the compiler's own output.** Dia's `then` (a continuing JMP block) supplies
+    the whole `hbsim` match — `runBlock = OK s'` non-halting, asm run via the recipe reconstruction. -/
+theorem dia_then_HbsimMatch {Entry : VenomState → AsmState → Nat → Prop}
+    {f' N' : Nat} {ctx : VenomContext} {s s' : VenomState} {asm : AsmState}
+    (hrb : runBlock f' ctx Dia.bThen s = ExecResult.OK s') (hnh : s'.halted = false)
+    (hpc : asm.pc = 13) (hEntry : Entry s' { asm with pc := 11 } N') :
+    HbsimMatch Entry Dia.o2pc Dia.prog asm (5 + N') (runBlock f' ctx Dia.bThen s) :=
+  HbsimMatch_of_OK_continue hrb hnh (dia_hasm_then_via_recipe hpc) hEntry
+
+/-! ## A halting block's hbsim from venomAsmRel — the terminal relation is derived, not assumed -/
+
+
+/-- **STOP's terminal relation follows from `venomAsmRel` at the body-end.** No assumed terminal
+    relation: the block simulation's `venomAsmRel` (which the body-fold produces) already gives the four
+    observable equalities, and neither `haltState` (Venom) nor `asmNext` (asm) disturbs them. -/
+theorem terminalRel_stop_of_rel {lo : AssocList String Nat} {ps : PlanState}
+    {vs : VenomState} {as : AsmState} (h : venomAsmRel lo ps vs as) :
+    venomAsmTerminalRel (haltState vs) (asmNext as) := by
+  refine venomAsmTerminalRel_haltState ?_
+  rw [venomAsmTerminalRel_asmNext]
+  exact venomAsmRel_terminal lo ps vs as h
+
+/-- **INVALID's terminal relation** similarly. Both sides set returndata to empty, so the returndata
+    conjunct is `empty = empty`; the other three come from `venomAsmRel`. -/
+theorem terminalRel_invalid_of_rel {lo : AssocList String Nat} {ps : PlanState}
+    {vs : VenomState} {as : AsmState} (h : venomAsmRel lo ps vs as) :
+    venomAsmTerminalRel (haltState (setReturndata ByteArray.empty vs))
+      { asmNext as with returndata := ByteArray.empty } := by
+  obtain ⟨_, _, _, hacc, htr, _, hlog, _, _, _, _, _⟩ := h
+  exact ⟨hacc, htr, rfl, hlog⟩
+
+/-- **A STOP block's full `hbsim` match from `venomAsmRel` at the body-end** — nothing about the terminal
+    state assumed. Combines the STOP recipe run (`AsmHalt (asmNext …)`) with `terminalRel_stop_of_rel`.
+    The Venom-side input is now just the body simulation's relation. -/
+theorem HbsimMatch_stop_of_rel {Entry : VenomState → AsmState → Nat → Prop}
+    {lo : AssocList String Nat} {ps : PlanState} {o2pc : AssocList Nat Nat} {prog : List AsmInst}
+    {asm asBodyEnd : AsmState} {f' blockLen N : Nat} {ctx : VenomContext} {bb : BasicBlock}
+    {s vsBodyEnd : VenomState}
+    (hrb : runBlock f' ctx bb s = ExecResult.Halt (haltState vsBodyEnd))
+    (hrun : runAsm blockLen o2pc prog asm = AsmResult.AsmHalt (asmNext asBodyEnd)) (hle : blockLen ≤ N)
+    (hrel : venomAsmRel lo ps vsBodyEnd asBodyEnd) :
+    HbsimMatch Entry o2pc prog asm N (runBlock f' ctx bb s) :=
+  HbsimMatch_of_halt hrb hrun hle (terminalRel_stop_of_rel hrel)
+
+/-- An INVALID block's full match from `venomAsmRel`, likewise (fault arm). -/
+theorem HbsimMatch_invalid_of_rel {Entry : VenomState → AsmState → Nat → Prop}
+    {lo : AssocList String Nat} {ps : PlanState} {o2pc : AssocList Nat Nat} {prog : List AsmInst}
+    {asm asBodyEnd : AsmState} {f' blockLen N : Nat} {ctx : VenomContext} {bb : BasicBlock}
+    {s vsBodyEnd : VenomState}
+    (hrb : runBlock f' ctx bb s
+      = ExecResult.Abort AbortType.ExHaltAbort (haltState (setReturndata ByteArray.empty vsBodyEnd)))
+    (hrun : runAsm blockLen o2pc prog asm
+      = AsmResult.AsmFault { asmNext asBodyEnd with returndata := ByteArray.empty }) (hle : blockLen ≤ N)
+    (hrel : venomAsmRel lo ps vsBodyEnd asBodyEnd) :
+    HbsimMatch Entry o2pc prog asm N (runBlock f' ctx bb s) :=
+  HbsimMatch_of_fault hrb hrun hle (terminalRel_invalid_of_rel hrel)
+
+/-! ## RETURN/REVERT terminal relation from venomAsmRel + memory-safety -/
+
+
+/-- **RETURN's terminal relation from `venomAsmRel` + memory-safety.** Both sides set returndata to
+    `memory.readWithPadding off sz` on their own memory; under `venomAsmRel`'s `memoryRel` and the
+    read region below the spill area (`off + sz ≤ fnEom`, the honest memory-safety input), the two
+    reads agree (`memoryRel_readWithPadding_slice`), and the other three observables come from the
+    relation. -/
+theorem terminalRel_return_of_rel {lo : AssocList String Nat} {ps : PlanState}
+    {vs : VenomState} {as : AsmState} {off sz : Nat} {rest : List bytes32}
+    (h : venomAsmRel lo ps vs as)
+    (hbelow : off + sz ≤ ps.alloc.fnEom) (hlen : sz < USize.size) :
+    venomAsmTerminalRel
+      (haltState (setReturndata (readMemory off sz vs) vs))
+      { as with stack := rest, returndata := as.memory.readWithPadding off sz } := by
+  obtain ⟨_, _, hmem, hacc, htr, _, hlog, _, _, _, _, _⟩ := h
+  exact ⟨hacc, htr, (memoryRel_readWithPadding_slice hmem hbelow hlen).symm, hlog⟩
+
+/-- REVERT is the same shape (revertState only sets `halted`; the asm side reverts). -/
+theorem terminalRel_revert_of_rel {lo : AssocList String Nat} {ps : PlanState}
+    {vs : VenomState} {as : AsmState} {off sz : Nat} {rest : List bytes32}
+    (h : venomAsmRel lo ps vs as)
+    (hbelow : off + sz ≤ ps.alloc.fnEom) (hlen : sz < USize.size) :
+    venomAsmTerminalRel
+      (revertState (setReturndata (readMemory off sz vs) vs))
+      { as with stack := rest, returndata := as.memory.readWithPadding off sz } := by
+  obtain ⟨_, _, hmem, hacc, htr, _, hlog, _, _, _, _, _⟩ := h
+  exact ⟨hacc, htr, (memoryRel_readWithPadding_slice hmem hbelow hlen).symm, hlog⟩
+
+/-- RETURN block's full `hbsim` match from `venomAsmRel` + memory-safety. -/
+theorem HbsimMatch_return_of_rel {Entry : VenomState → AsmState → Nat → Prop}
+    {lo : AssocList String Nat} {ps : PlanState} {o2pc : AssocList Nat Nat} {prog : List AsmInst}
+    {asm asBodyEnd : AsmState} {f' blockLen N off sz : Nat} {rest : List bytes32}
+    {ctx : VenomContext} {bb : BasicBlock} {s vsBodyEnd : VenomState}
+    (hrb : runBlock f' ctx bb s
+      = ExecResult.Halt (haltState (setReturndata (readMemory off sz vsBodyEnd) vsBodyEnd)))
+    (hrun : runAsm blockLen o2pc prog asm = AsmResult.AsmHalt
+      { asBodyEnd with stack := rest, returndata := asBodyEnd.memory.readWithPadding off sz })
+    (hle : blockLen ≤ N)
+    (hrel : venomAsmRel lo ps vsBodyEnd asBodyEnd)
+    (hbelow : off + sz ≤ ps.alloc.fnEom) (hlen : sz < USize.size) :
+    HbsimMatch Entry o2pc prog asm N (runBlock f' ctx bb s) :=
+  HbsimMatch_of_halt hrb hrun hle (terminalRel_return_of_rel hrel hbelow hlen)
+
+/-- REVERT block's full match, likewise (revert arm). -/
+theorem HbsimMatch_revert_of_rel {Entry : VenomState → AsmState → Nat → Prop}
+    {lo : AssocList String Nat} {ps : PlanState} {o2pc : AssocList Nat Nat} {prog : List AsmInst}
+    {asm asBodyEnd : AsmState} {f' blockLen N off sz : Nat} {rest : List bytes32}
+    {ctx : VenomContext} {bb : BasicBlock} {s vsBodyEnd : VenomState}
+    (hrb : runBlock f' ctx bb s
+      = ExecResult.Abort AbortType.RevertAbort
+          (revertState (setReturndata (readMemory off sz vsBodyEnd) vsBodyEnd)))
+    (hrun : runAsm blockLen o2pc prog asm = AsmResult.AsmRevert
+      { asBodyEnd with stack := rest, returndata := asBodyEnd.memory.readWithPadding off sz })
+    (hle : blockLen ≤ N)
+    (hrel : venomAsmRel lo ps vsBodyEnd asBodyEnd)
+    (hbelow : off + sz ≤ ps.alloc.fnEom) (hlen : sz < USize.size) :
+    HbsimMatch Entry o2pc prog asm N (runBlock f' ctx bb s) :=
+  HbsimMatch_of_revert hrb hrun hle (terminalRel_revert_of_rel hrel hbelow hlen)
+
+/-! ## The OK-continuing arm with a canonical Entry — the inter-block threading, packaged -/
+
+
+/-- A canonical walk invariant `Entry`: at Venom state `s` related to asm state `asm`, the current block
+    is found, `venomAsmRel` holds against its recorded plan, and the asm pc sits at the block's label.
+    This is the shape a block simulation naturally establishes at a block's entry; the budget slot is
+    left free for the walk to supply. -/
+def CanonEntry (fn : IrFunction) (lo : AssocList String Nat) (pcOf : String → Nat)
+    (psOf : String → PlanState) : VenomState → AsmState → Nat → Prop :=
+  fun s asm _N =>
+    ∃ bb, lookupBlock s.currentBb fn.blocks = some bb ∧
+          venomAsmRel lo (psOf s.currentBb) s asm ∧ asm.pc = pcOf s.currentBb
+
+/-- **The OK-continuing `hbsim` arm, with the canonical `Entry` preserved.** A continuing block
+    (`runBlock = OK s'`, not halted) whose recipe asm run lands at the successor's label supplies the
+    whole match — and the successor invariant `CanonEntry s' asm' N'` is discharged from exactly what the
+    block simulation produces: the successor lookup, the `venomAsmRel` on arrival, and the recipe's
+    landing pc. Nothing about the terminator or the program position is assumed beyond that. -/
+theorem HbsimMatch_continue_canon {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState}
+    {o2pc : AssocList Nat Nat} {prog : List AsmInst} {asm asm' : AsmState}
+    {f' blockLen N' : Nat} {ctx : VenomContext} {bb bb' : BasicBlock} {s s' : VenomState}
+    (hrb : runBlock f' ctx bb s = ExecResult.OK s') (hnh : s'.halted = false)
+    (hrun : runAsm blockLen o2pc prog asm = AsmResult.AsmOK asm')
+    (hlk' : lookupBlock s'.currentBb fn.blocks = some bb')
+    (hrel' : venomAsmRel lo (psOf s'.currentBb) s' asm')
+    (hpc' : asm'.pc = pcOf s'.currentBb) :
+    HbsimMatch (CanonEntry fn lo pcOf psOf) o2pc prog asm (blockLen + N')
+      (runBlock f' ctx bb s) := by
+  rw [hrb]; simp only [HbsimMatch, hnh, Bool.false_eq_true, if_false]
+  exact ⟨asm', N', runAsm_append_ok hrun, bb', hlk', hrel', hpc'⟩
+
+/-- Fired on Dia's `then` (real compiler output): the recipe run lands the walk at the join, and
+    `CanonEntry` at the join is discharged from the successor facts alone. -/
+theorem dia_then_HbsimMatch_canon {pcOf : String → Nat} {psOf : String → PlanState}
+    {f' N' : Nat} {ctx : VenomContext} {s s' : VenomState} {asm : AsmState} {bb' : BasicBlock}
+    (hrb : runBlock f' ctx Dia.bThen s = ExecResult.OK s') (hnh : s'.halted = false)
+    (hpc : asm.pc = 13)
+    (hlk' : lookupBlock s'.currentBb Dia.fn.blocks = some bb')
+    (hrel' : venomAsmRel Dia.lo (psOf s'.currentBb) s' { asm with pc := 11 })
+    (hpc' : (11 : Nat) = pcOf s'.currentBb) :
+    HbsimMatch (CanonEntry Dia.fn Dia.lo pcOf psOf) Dia.o2pc Dia.prog asm (5 + N')
+      (runBlock f' ctx Dia.bThen s) :=
+  HbsimMatch_continue_canon hrb hnh (dia_hasm_then_via_recipe hpc) hlk' hrel' hpc'
+
+/-! ## The body sim composes with the terminator into hbsim — the remaining obligation, connected -/
+
+
+/-- **The body sim output composes with the STOP terminator into `hbsim`.**
+
+`genBlockBodyH_sim_inv` (the existing body simulation) produces, over the whole-function program, the
+body's asm run to `as'` together with `venomAsmRel lo ps' vs' as'` at the post-body state. This composes
+that with the STOP terminator: the body run reaches `as'`, one more asm step (STOP) halts at
+`asmNext as'`, the Venom block halts at `haltState vs'`, and the terminal relation is *derived* from the
+body sim's `venomAsmRel` (`terminalRel_stop_of_rel`). No terminal relation is separately assumed — the
+whole hbsim comes from the body sim plus the terminator's own step. -/
+theorem HbsimMatch_stop_from_body {Entry : VenomState → AsmState → Nat → Prop}
+    {lo : AssocList String Nat} {ps' : PlanState} {o2pc : AssocList Nat Nat} {prog : List AsmInst}
+    {as0 as' : AsmState} {f' bodyLen N : Nat} {ctx : VenomContext} {bb : BasicBlock}
+    {s vs' : VenomState}
+    -- Venom: the block runs its body to vs', then STOPs
+    (hrb : runBlock f' ctx bb s = ExecResult.Halt (haltState vs'))
+    -- body sim output (from genBlockBodyH_sim_inv): asm reaches as', related to vs'
+    (hbody : runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as')
+    (hrel' : venomAsmRel lo ps' vs' as')
+    -- terminator: STOP sits at as'.pc, so one asm step halts at asmNext as'
+    (hstoppc : as'.pc < prog.length)
+    (hstop : prog.get ⟨as'.pc, hstoppc⟩ = AsmInst.AsmOp "STOP")
+    (hle : bodyLen + 1 ≤ N) :
+    HbsimMatch Entry o2pc prog as0 N (runBlock f' ctx bb s) := by
+  -- the STOP step from as'
+  have hstep : runAsm 1 o2pc prog as' = AsmResult.AsmHalt (asmNext as') := by
+    rw [show (1 : Nat) = 0 + 1 from rfl, runAsm, asmStep, dif_pos hstoppc]
+    simp only [hstop]
+  -- compose body ++ STOP
+  have hfull : runAsm (bodyLen + 1) o2pc prog as0 = AsmResult.AsmHalt (asmNext as') := by
+    rw [runAsm_append_ok hbody, hstep]
+  exact HbsimMatch_of_halt hrb hfull hle (terminalRel_stop_of_rel hrel')
+
+/-- Body sim + INVALID → hbsim (fault arm; terminal relation derived). -/
+theorem HbsimMatch_invalid_from_body {Entry : VenomState → AsmState → Nat → Prop}
+    {lo : AssocList String Nat} {ps' : PlanState} {o2pc : AssocList Nat Nat} {prog : List AsmInst}
+    {as0 as' : AsmState} {f' bodyLen N : Nat} {ctx : VenomContext} {bb : BasicBlock}
+    {s vs' : VenomState}
+    (hrb : runBlock f' ctx bb s
+      = ExecResult.Abort AbortType.ExHaltAbort (haltState (setReturndata ByteArray.empty vs')))
+    (hbody : runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as')
+    (hrel' : venomAsmRel lo ps' vs' as')
+    (hpc : as'.pc < prog.length) (hinv : prog.get ⟨as'.pc, hpc⟩ = AsmInst.AsmOp "INVALID")
+    (hle : bodyLen + 1 ≤ N) :
+    HbsimMatch Entry o2pc prog as0 N (runBlock f' ctx bb s) := by
+  have hstep : runAsm 1 o2pc prog as'
+      = AsmResult.AsmFault { asmNext as' with returndata := ByteArray.empty } := by
+    rw [show (1 : Nat) = 0 + 1 from rfl, runAsm, asmStep, dif_pos hpc]; simp only [hinv]
+  have hfull : runAsm (bodyLen + 1) o2pc prog as0
+      = AsmResult.AsmFault { asmNext as' with returndata := ByteArray.empty } := by
+    rw [runAsm_append_ok hbody, hstep]
+  exact HbsimMatch_of_fault hrb hfull hle (terminalRel_invalid_of_rel hrel')
+
+/-- Body sim + RETURN → hbsim (halt arm; terminal relation derived from `venomAsmRel` + memory-safety). -/
+theorem HbsimMatch_return_from_body {Entry : VenomState → AsmState → Nat → Prop}
+    {lo : AssocList String Nat} {ps' : PlanState} {o2pc : AssocList Nat Nat} {prog : List AsmInst}
+    {as0 as' : AsmState} {f' bodyLen N : Nat} {rest : List bytes32}
+    {ctx : VenomContext} {bb : BasicBlock} {s vs' : VenomState} {offW szW : bytes32}
+    (hrb : runBlock f' ctx bb s
+      = ExecResult.Halt (haltState (setReturndata (readMemory offW.toNat szW.toNat vs') vs')))
+    (hbody : runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as')
+    (hrel' : venomAsmRel lo ps' vs' as')
+    (hpc : as'.pc < prog.length) (hret : prog.get ⟨as'.pc, hpc⟩ = AsmInst.AsmOp "RETURN")
+    (hstk : as'.stack = offW :: szW :: rest)
+    (hcov : szW.toNat = 0 ∨ ((offW.toNat + szW.toNat + 31) / 32) * 32 ≤ as'.memory.size)
+    (hbelow : offW.toNat + szW.toNat ≤ ps'.alloc.fnEom) (hlen : szW.toNat < USize.size)
+    (hle : bodyLen + 1 ≤ N) :
+    HbsimMatch Entry o2pc prog as0 N (runBlock f' ctx bb s) := by
+  have hstep := runAsm_return (offsetToPc := o2pc) (prog := prog) (asMid := as') 0 hpc hret hstk hcov
+  refine HbsimMatch_of_halt hrb (by rw [runAsm_append_ok hbody]; exact hstep) hle ?_
+  exact terminalRel_return_of_rel (off := offW.toNat) (sz := szW.toNat) (rest := rest) hrel' hbelow hlen
+
+/-- Body sim + REVERT → hbsim (revert arm; terminal relation derived). -/
+theorem HbsimMatch_revert_from_body {Entry : VenomState → AsmState → Nat → Prop}
+    {lo : AssocList String Nat} {ps' : PlanState} {o2pc : AssocList Nat Nat} {prog : List AsmInst}
+    {as0 as' : AsmState} {f' bodyLen N : Nat} {rest : List bytes32}
+    {ctx : VenomContext} {bb : BasicBlock} {s vs' : VenomState} {offW szW : bytes32}
+    (hrb : runBlock f' ctx bb s
+      = ExecResult.Abort AbortType.RevertAbort
+          (revertState (setReturndata (readMemory offW.toNat szW.toNat vs') vs')))
+    (hbody : runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as')
+    (hrel' : venomAsmRel lo ps' vs' as')
+    (hpc : as'.pc < prog.length) (hrev : prog.get ⟨as'.pc, hpc⟩ = AsmInst.AsmOp "REVERT")
+    (hstk : as'.stack = offW :: szW :: rest)
+    (hcov : szW.toNat = 0 ∨ ((offW.toNat + szW.toNat + 31) / 32) * 32 ≤ as'.memory.size)
+    (hbelow : offW.toNat + szW.toNat ≤ ps'.alloc.fnEom) (hlen : szW.toNat < USize.size)
+    (hle : bodyLen + 1 ≤ N) :
+    HbsimMatch Entry o2pc prog as0 N (runBlock f' ctx bb s) := by
+  have hstep := runAsm_revert (offsetToPc := o2pc) (prog := prog) (asMid := as') 0 hpc hrev hstk hcov
+  refine HbsimMatch_of_revert hrb (by rw [runAsm_append_ok hbody]; exact hstep) hle ?_
+  exact terminalRel_revert_of_rel (off := offW.toNat) (sz := szW.toNat) (rest := rest) hrel' hbelow hlen
+
+/-! ## The continuing (JMP) case: body sim + JMP + successor-recording → hbsim -/
+
+
+/-- `jumpTo` only changes control-flow fields (prevBb/currentBb/instIdx), which `venomAsmRel` never
+    reads — so it is insensitive, exactly like `venomAsmRel_setPc`. -/
+theorem venomAsmRel_jumpTo (lo : AssocList String Nat) (ps : PlanState) (vs : VenomState)
+    (as : AsmState) (lbl : String) (h : venomAsmRel lo ps vs as) :
+    venomAsmRel lo ps (jumpTo lbl vs) as := h
+
+/-- **Body sim + JMP → the OK-continuing hbsim, with the canonical Entry.**
+
+The one continuing-case ingredient beyond the halting connectors is the successor-recording fact
+`ps' = psOf target` — the post-body plan lines up with the target's recorded entry (established for JMP
+chains). Given that, plus the body sim's `venomAsmRel` and the resolved `PUSH target; JUMP`, the walk
+resumes at the target with `CanonEntry` discharged: `jumpTo` and the landing pc are both invisible to the
+relation, so the arrival `venomAsmRel` is exactly the body sim's. -/
+theorem HbsimMatch_jmp_from_body {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {ps' : PlanState} {as0 as' : AsmState} {f' bodyLen N off : Nat}
+    {ctx : VenomContext} {bb bb' : BasicBlock} {s vs'' : VenomState} {target : String}
+    (hrb : runBlock f' ctx bb s = ExecResult.OK (jumpTo target vs'')) (hnh : vs''.halted = false)
+    (hbody : runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as')
+    (hrel' : venomAsmRel lo ps' vs'' as')
+    (hps : ps' = psOf target)
+    (hpush1 : as'.pc < prog.length)
+    (hpush : prog.get ⟨as'.pc, hpush1⟩ = resolveInst offsets (AsmInst.AsmPushLabel target))
+    (hoff_lk : AssocList.lookup String Nat offsets target = some off) (hoff : off < 2 ^ 256)
+    (hjump1 : as'.pc + 1 < prog.length)
+    (hjump : prog.get ⟨as'.pc + 1, hjump1⟩ = AsmInst.AsmOp "JUMP")
+    (hidx_lk : AssocList.lookup Nat Nat o2pc off = some (pcOf target))
+    (hlk' : lookupBlock target fn.blocks = some bb')
+    (hle : bodyLen + 2 ≤ N) :
+    HbsimMatch (CanonEntry fn lo pcOf psOf) o2pc prog as0 N (runBlock f' ctx bb s) := by
+  obtain ⟨N', rfl⟩ := Nat.le.dest hle
+  have hjmp := resolved_jump_sim (s := as') hpush1 hpush hoff_lk hoff hjump1 hjump hidx_lk
+  have hfull : runAsm (bodyLen + 2) o2pc prog as0 = AsmResult.AsmOK { as' with pc := pcOf target } := by
+    rw [runAsm_append_ok hbody, hjmp]
+  have harr : venomAsmRel lo (psOf (jumpTo target vs'').currentBb) (jumpTo target vs'')
+      { as' with pc := pcOf target } := by
+    show venomAsmRel lo (psOf target) (jumpTo target vs'') { as' with pc := pcOf target }
+    refine venomAsmRel_jumpTo _ _ _ _ _ (venomAsmRel_setPc ?_)
+    rw [← hps]; exact hrel'
+  exact HbsimMatch_continue_canon (bb' := bb') (N' := N') hrb hnh hfull hlk' harr rfl
+
+/-! ## The N-constrained walk `Entry`: threading the budget through continuing blocks
+
+`CanonEntry` ignores `N`, so feeding the recipe connectors to the multi-block driver
+`codegen_correct_ofBlocks_HbsimMatch` hits the halting-block ∀-N vacuity (`HbsimMatch (Halt) N` is false for
+`N < blockLen`). The fix is to carry `wOf currentBb ≤ N` (the remaining program length fits the walk budget)
+in the Entry — a halting block reached with `wOf(block) ≤ N` has `N ≥ blockLen`, so its `HbsimMatch (Halt)`
+holds; a continuing block threads `wOf(succ) ≤ N'` to its successor from the layout fact
+`wOf(succ) + blockLen ≤ wOf(cur)`. The halting connectors are already Entry-independent, so only the
+continuing connectors need this strengthened form. -/
+
+/-- **The N-constrained continuing-walk `Entry`**: `CanonEntry`, the budget lower-bound `wOf ≤ N`, and
+    `s.halted = false`. The JMP (and every
+    continuing) block needs the not-halted fact: `codegen_correct_ofBlocks_HbsimMatch`'s hstep exposes only
+    `Entry ∧ s.currentBb = bb.label` (no halted), yet a JMP block's `runBlock = OK (jumpTo …)` and the
+    continue arm's `hnh` both require `s.halted = false` (else the OK result is halted and the halt arm's
+    `runAsm N = AsmHalt` is false for a continuing terminator). Threading it in the Entry supplies it; the
+    continue arm re-establishes it at the successor for free (its `hnh`). -/
+def CanonEntryWH (fn : IrFunction) (lo : AssocList String Nat) (pcOf : String → Nat)
+    (psOf : String → PlanState) (wOf : String → Nat) : VenomState → AsmState → Nat → Prop :=
+  fun s asm N => CanonEntry fn lo pcOf psOf s asm N ∧ wOf s.currentBb ≤ N ∧ s.halted = false
+
+/-- **The OK-continuing arm for `CanonEntryWH`.** A continuing block whose recipe run lands at the successor
+    supplies the whole `HbsimMatch`: the successor's budget bound `wOf(successor) ≤ N'` is supplied by the
+    caller (derived from the layout fact `wOf(succ) + blockLen ≤ wOf(cur)`), and its `s'.halted = false` is
+    exactly the `hnh` the OK arm already carries. Otherwise this is `HbsimMatch_continue_canon`. -/
+theorem HbsimMatch_continue_canonWH {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {prog : List AsmInst} {asm asm' : AsmState}
+    {f' blockLen N' : Nat} {ctx : VenomContext} {bb bb' : BasicBlock} {s s' : VenomState}
+    (hrb : runBlock f' ctx bb s = ExecResult.OK s') (hnh : s'.halted = false)
+    (hrun : runAsm blockLen o2pc prog asm = AsmResult.AsmOK asm')
+    (hlk' : lookupBlock s'.currentBb fn.blocks = some bb')
+    (hrel' : venomAsmRel lo (psOf s'.currentBb) s' asm')
+    (hpc' : asm'.pc = pcOf s'.currentBb)
+    (hwsucc : wOf s'.currentBb ≤ N') :
+    HbsimMatch (CanonEntryWH fn lo pcOf psOf wOf) o2pc prog asm (blockLen + N')
+      (runBlock f' ctx bb s) := by
+  rw [hrb]; simp only [HbsimMatch, hnh, Bool.false_eq_true, if_false]
+  exact ⟨asm', N', runAsm_append_ok hrun, ⟨bb', hlk', hrel', hpc'⟩, hwsucc, hnh⟩
+
+/-- **The JMP connector for the N-constrained continuing-walk Entry.** Mirrors `HbsimMatch_jmp_from_body`
+    but produces `HbsimMatch (CanonEntryWH …)`: the successor's budget bound `wOf(target) ≤ N − (bodyLen+2)`
+    is derived from the block's layout fact `hlayout` and the current bound `hcur`, and `halted = false` is
+    threaded to the successor. -/
+theorem HbsimMatch_jmp_from_body_canonWH {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {ps' : PlanState} {as0 as' : AsmState} {f' bodyLen N off : Nat}
+    {ctx : VenomContext} {bb bb' : BasicBlock} {s vs'' : VenomState} {target : String}
+    (hrb : runBlock f' ctx bb s = ExecResult.OK (jumpTo target vs'')) (hnh : vs''.halted = false)
+    (hbody : runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as')
+    (hrel' : venomAsmRel lo ps' vs'' as')
+    (hps : ps' = psOf target)
+    (hpush1 : as'.pc < prog.length)
+    (hpush : prog.get ⟨as'.pc, hpush1⟩ = resolveInst offsets (AsmInst.AsmPushLabel target))
+    (hoff_lk : AssocList.lookup String Nat offsets target = some off) (hoff : off < 2 ^ 256)
+    (hjump1 : as'.pc + 1 < prog.length)
+    (hjump : prog.get ⟨as'.pc + 1, hjump1⟩ = AsmInst.AsmOp "JUMP")
+    (hidx_lk : AssocList.lookup Nat Nat o2pc off = some (pcOf target))
+    (hlk' : lookupBlock target fn.blocks = some bb')
+    (hlayout : wOf target + (bodyLen + 2) ≤ wOf bb.label)
+    (hcur : wOf bb.label ≤ N) :
+    HbsimMatch (CanonEntryWH fn lo pcOf psOf wOf) o2pc prog as0 N (runBlock f' ctx bb s) := by
+  have hle : bodyLen + 2 ≤ N := by omega
+  obtain ⟨N', hNeq⟩ := Nat.le.dest hle
+  subst hNeq
+  have hjmp := resolved_jump_sim (s := as') hpush1 hpush hoff_lk hoff hjump1 hjump hidx_lk
+  have hfull : runAsm (bodyLen + 2) o2pc prog as0 = AsmResult.AsmOK { as' with pc := pcOf target } := by
+    rw [runAsm_append_ok hbody, hjmp]
+  have harr : venomAsmRel lo (psOf (jumpTo target vs'').currentBb) (jumpTo target vs'')
+      { as' with pc := pcOf target } := by
+    show venomAsmRel lo (psOf target) (jumpTo target vs'') { as' with pc := pcOf target }
+    refine venomAsmRel_jumpTo _ _ _ _ _ (venomAsmRel_setPc ?_)
+    rw [← hps]; exact hrel'
+  have hnh' : (jumpTo target vs'').halted = false := by simp [jumpTo, hnh]
+  have hwsucc : wOf (jumpTo target vs'').currentBb ≤ N' := by show wOf target ≤ N'; omega
+  exact HbsimMatch_continue_canonWH (bb' := bb') (N' := N') hrb hnh' hfull hlk' harr rfl hwsucc
+
+/-- **The `Inv`-carrying JMP arm — the first invariant in this development that constrains the ASM side.**
+    Identical to `HbsimMatch_jmp_from_body_canonWH` but parameterised by `Inv : VenomState → AsmState → Prop`
+    and carrying it into the successor `Entry`. The point is WHERE the conjunction happens: a post-hoc
+    `HbsimMatch E ∧ Inv` lemma is sound but USELESS, because `HbsimMatch`'s continuing arm characterises the
+    successor asm state only by a run-equality (`runAsm N o2pc prog asm = runAsm N' o2pc prog asm'`), so its
+    obligation quantifies over an `asm'` the caller cannot constrain — the same trap as `reorderPlan_sim`'s
+    ∀-p `hstep` (`GenBlockSimComp.lean:2965`). Building the conjoined `Entry` HERE instead, via the
+    `Entry`-generic `HbsimMatch_of_OK_continue`, makes `hinvA` name the CONCRETE successor
+    `{ as' with pc := pcOf target }` — which the caller discharges from `runAsm_memory_size_mono`
+    (`GenInstSim.lean:14638`), since a JMP successor edits only `pc`. -/
+theorem HbsimMatch_jmp_from_body_canonWH_invA {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {ps' : PlanState} {as0 as' : AsmState} {f' bodyLen N off : Nat}
+    {ctx : VenomContext} {bb bb' : BasicBlock} {s vs'' : VenomState} {target : String}
+    {Inv : VenomState → AsmState → Prop}
+    (hrb : runBlock f' ctx bb s = ExecResult.OK (jumpTo target vs'')) (hnh : vs''.halted = false)
+    (hbody : runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as')
+    (hrel' : venomAsmRel lo ps' vs'' as')
+    (hps : ps' = psOf target)
+    (hpush1 : as'.pc < prog.length)
+    (hpush : prog.get ⟨as'.pc, hpush1⟩ = resolveInst offsets (AsmInst.AsmPushLabel target))
+    (hoff_lk : AssocList.lookup String Nat offsets target = some off) (hoff : off < 2 ^ 256)
+    (hjump1 : as'.pc + 1 < prog.length)
+    (hjump : prog.get ⟨as'.pc + 1, hjump1⟩ = AsmInst.AsmOp "JUMP")
+    (hidx_lk : AssocList.lookup Nat Nat o2pc off = some (pcOf target))
+    (hlk' : lookupBlock target fn.blocks = some bb')
+    (hlayout : wOf target + (bodyLen + 2) ≤ wOf bb.label)
+    (hcur : wOf bb.label ≤ N)
+    (hinvA : Inv (jumpTo target vs'') { as' with pc := pcOf target }) :
+    HbsimMatch (fun s a n => CanonEntryWH fn lo pcOf psOf wOf s a n ∧ Inv s a)
+      o2pc prog as0 N (runBlock f' ctx bb s) := by
+  have hle : bodyLen + 2 ≤ N := by omega
+  obtain ⟨N', hNeq⟩ := Nat.le.dest hle
+  subst hNeq
+  have hjmp := resolved_jump_sim (s := as') hpush1 hpush hoff_lk hoff hjump1 hjump hidx_lk
+  have hfull : runAsm (bodyLen + 2) o2pc prog as0 = AsmResult.AsmOK { as' with pc := pcOf target } := by
+    rw [runAsm_append_ok hbody, hjmp]
+  have harr : venomAsmRel lo (psOf (jumpTo target vs'').currentBb) (jumpTo target vs'')
+      { as' with pc := pcOf target } := by
+    show venomAsmRel lo (psOf target) (jumpTo target vs'') { as' with pc := pcOf target }
+    refine venomAsmRel_jumpTo _ _ _ _ _ (venomAsmRel_setPc ?_)
+    rw [← hps]; exact hrel'
+  have hnh' : (jumpTo target vs'').halted = false := by simp [jumpTo, hnh]
+  have hwsucc : wOf (jumpTo target vs'').currentBb ≤ N' := by show wOf target ≤ N'; omega
+  exact HbsimMatch_of_OK_continue hrb hnh' hfull
+    ⟨⟨⟨bb', hlk', harr, rfl⟩, hwsucc, hnh'⟩, hinvA⟩
+
+/-! ## JNZ both branches: body sim + JNZ + successor-recording → hbsim (continuing terminators) -/
+
+
+/-- **Body sim + JNZ (taken) → the OK-continuing hbsim.** Unlike JMP, the JUMPI pops the branch
+    condition, so the arrival stack is the body-end stack minus the condition. The inter-block input is
+    therefore the successor relation with the condition already dropped (`hrel_succ`) — the JNZ
+    successor-recording, playing the role `ps' = psOf target` plays for JMP. `jumpTo` and the landing pc
+    are still invisible to the relation. -/
+theorem HbsimMatch_jnz_taken_from_body {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {as0 as' : AsmState} {f' bodyLen N off : Nat} {cond : bytes32} {stk : List bytes32}
+    {ctx : VenomContext} {bb bb' : BasicBlock} {s vs'' : VenomState} {ifNz : String}
+    (hrb : runBlock f' ctx bb s = ExecResult.OK (jumpTo ifNz vs'')) (hnh : vs''.halted = false)
+    (hbody : runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as')
+    (hstk_c : as'.stack = cond :: stk) (hcond : cond ≠ EvmYul.UInt256.ofNat 0)
+    (hpush1 : as'.pc < prog.length)
+    (hpush : prog.get ⟨as'.pc, hpush1⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifNz))
+    (hoff_lk : AssocList.lookup String Nat offsets ifNz = some off) (hoff : off < 2 ^ 256)
+    (hjumpi1 : as'.pc + 1 < prog.length)
+    (hjumpi : prog.get ⟨as'.pc + 1, hjumpi1⟩ = AsmInst.AsmOp "JUMPI")
+    (hidx_lk : AssocList.lookup Nat Nat o2pc off = some (pcOf ifNz))
+    (hrel_succ : venomAsmRel lo (psOf ifNz) vs'' { as' with stack := stk })
+    (hlk' : lookupBlock ifNz fn.blocks = some bb')
+    (hle : bodyLen + 2 ≤ N) :
+    HbsimMatch (CanonEntry fn lo pcOf psOf) o2pc prog as0 N (runBlock f' ctx bb s) := by
+  obtain ⟨N', rfl⟩ := Nat.le.dest hle
+  have hstep := resolved_jumpi_taken_sim (s := as') hstk_c hcond hpush1 hpush hoff_lk hoff
+    hjumpi1 hjumpi hidx_lk
+  have hfull : runAsm (bodyLen + 2) o2pc prog as0
+      = AsmResult.AsmOK { as' with stack := stk, pc := pcOf ifNz } := by
+    rw [runAsm_append_ok hbody, hstep]
+  have harr : venomAsmRel lo (psOf (jumpTo ifNz vs'').currentBb) (jumpTo ifNz vs'')
+      { as' with stack := stk, pc := pcOf ifNz } := by
+    show venomAsmRel lo (psOf ifNz) (jumpTo ifNz vs'') { as' with stack := stk, pc := pcOf ifNz }
+    have h1 : venomAsmRel lo (psOf ifNz) vs'' { { as' with stack := stk } with pc := pcOf ifNz } :=
+      venomAsmRel_setPc hrel_succ
+    exact venomAsmRel_jumpTo _ _ _ _ _ h1
+  exact HbsimMatch_continue_canon (bb' := bb') (N' := N') hrb hnh hfull hlk' harr rfl
+
+/-- **Body sim + JNZ (not taken) → the OK-continuing hbsim.** Condition zero: the JUMPI falls through
+    (popping the condition), then `PUSH ifZ; JUMP` lands at `ifZ`. Four terminator instructions; same
+    successor-recording input, now for `ifZ`. -/
+theorem HbsimMatch_jnz_nottaken_from_body {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {as0 as' : AsmState} {f' bodyLen N offN offZ : Nat} {stk : List bytes32}
+    {ctx : VenomContext} {bb bb' : BasicBlock} {s vs'' : VenomState} {ifNz ifZ : String}
+    (hrb : runBlock f' ctx bb s = ExecResult.OK (jumpTo ifZ vs'')) (hnh : vs''.halted = false)
+    (hbody : runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as')
+    (hstk_c : as'.stack = EvmYul.UInt256.ofNat 0 :: stk)
+    (hpush1 : as'.pc < prog.length)
+    (hpushN : prog.get ⟨as'.pc, hpush1⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifNz))
+    (hoffN_lk : AssocList.lookup String Nat offsets ifNz = some offN) (hoffN : offN < 2 ^ 256)
+    (hjumpi1 : as'.pc + 1 < prog.length)
+    (hjumpi : prog.get ⟨as'.pc + 1, hjumpi1⟩ = AsmInst.AsmOp "JUMPI")
+    (hpush2 : as'.pc + 2 < prog.length)
+    (hpushZ : prog.get ⟨as'.pc + 2, hpush2⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifZ))
+    (hoffZ_lk : AssocList.lookup String Nat offsets ifZ = some offZ) (hoffZ : offZ < 2 ^ 256)
+    (hjump1 : as'.pc + 2 + 1 < prog.length)
+    (hjump : prog.get ⟨as'.pc + 2 + 1, hjump1⟩ = AsmInst.AsmOp "JUMP")
+    (hidxZ_lk : AssocList.lookup Nat Nat o2pc offZ = some (pcOf ifZ))
+    (hrel_succ : venomAsmRel lo (psOf ifZ) vs'' { as' with stack := stk })
+    (hlk' : lookupBlock ifZ fn.blocks = some bb')
+    (hle : bodyLen + 4 ≤ N) :
+    HbsimMatch (CanonEntry fn lo pcOf psOf) o2pc prog as0 N (runBlock f' ctx bb s) := by
+  obtain ⟨N', rfl⟩ := Nat.le.dest hle
+  have hjumpi_step := resolved_jumpi_nottaken_sim (offsetToPc := o2pc) (prog := prog) (s := as')
+    hstk_c hpush1 hpushN hoffN_lk hoffN hjumpi1 hjumpi
+  have hjump_step := resolved_jump_sim (s := { as' with stack := stk, pc := as'.pc + 2 })
+    (by simpa using hpush2) (by simpa using hpushZ) hoffZ_lk hoffZ
+    (by simpa using hjump1) (by simpa using hjump) hidxZ_lk
+  have hterm4 : runAsm 4 o2pc prog as'
+      = AsmResult.AsmOK { as' with stack := stk, pc := pcOf ifZ } := by
+    rw [show (4 : Nat) = 2 + 2 from rfl, runAsm_append_ok hjumpi_step, hjump_step]
+  have hfull : runAsm (bodyLen + 4) o2pc prog as0
+      = AsmResult.AsmOK { as' with stack := stk, pc := pcOf ifZ } := by
+    rw [runAsm_append_ok hbody, hterm4]
+  have harr : venomAsmRel lo (psOf (jumpTo ifZ vs'').currentBb) (jumpTo ifZ vs'')
+      { as' with stack := stk, pc := pcOf ifZ } := by
+    show venomAsmRel lo (psOf ifZ) (jumpTo ifZ vs'') { as' with stack := stk, pc := pcOf ifZ }
+    exact venomAsmRel_jumpTo _ _ _ _ _ (venomAsmRel_setPc hrel_succ)
+  exact HbsimMatch_continue_canon (bb' := bb') (N' := N') hrb hnh hfull hlk' harr rfl
+
+/-! ## Non-vacuity: a bare STOP block instantiates the body-sim connector -/
+
+
+/-- **Non-vacuity of the body-sim connectors.** A bare STOP block instantiates
+    `HbsimMatch_stop_from_body` with an empty body (`bodyLen = 0`, so the body-end state is the entry):
+    `runBlock` reduces to `Halt (haltState {s with instIdx := 0})`, the entry `venomAsmRel` is the body
+    sim's output, and the whole hbsim match is produced. So the connector's hypotheses are jointly
+    satisfiable — it is not vacuous. -/
+theorem HbsimMatch_stop_from_body_nonvacuous
+    {Entry : VenomState → AsmState → Nat → Prop} {lo : AssocList String Nat} {ps : PlanState}
+    {o2pc : AssocList Nat Nat} {prog : List AsmInst} {as0 : AsmState}
+    {ctx : VenomContext} {bb : BasicBlock} {s : VenomState} {N f' : Nat} {stopInst : Instruction}
+    (hbb : bb.instructions = [stopInst]) (hstopop : stopInst.opcode = Opcode.STOP)
+    (hrel : venomAsmRel lo ps { s with instIdx := 0 } as0)
+    (hstoppc : as0.pc < prog.length) (hstop : prog.get ⟨as0.pc, hstoppc⟩ = AsmInst.AsmOp "STOP")
+    (hle : 0 + 1 ≤ N) :
+    HbsimMatch Entry o2pc prog as0 N (runBlock (f' + 1) ctx bb { s with instIdx := 0 }) := by
+  have hrb : runBlock (f' + 1) ctx bb { s with instIdx := 0 }
+      = ExecResult.Halt (haltState { s with instIdx := 0 }) := by
+    simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, hbb, hstopop, stepInstBase,
+      isTerminator]
+  refine HbsimMatch_stop_from_body (bodyLen := 0) (as' := as0) (ps' := ps) hrb ?_ hrel hstoppc hstop hle
+  simp [runAsm]
+
+/-! ## Accurate terminator scope: RET is trivial, SINK is pre-codegen -/
+
+
+/-- **RET needs no hbsim connector: it falls into the `_ => True` arm.** A `RET` steps to `IntRet`, which
+    `hbsim` (and `HbsimMatch`) leaves as `True` — the walk claims correspondence only when the block step
+    reaches OK/Halt/Abort, never IntRet (which is call-level, handled by INVOKE, not `runBlocks`). So a
+    RET block's hbsim is trivially satisfied. -/
+theorem HbsimMatch_ret_trivial {Entry : VenomState → AsmState → Nat → Prop}
+    {o2pc : AssocList Nat Nat} {prog : List AsmInst} {asm : AsmState} {N : Nat}
+    {retVals : List bytes32} {s' : VenomState} :
+    HbsimMatch Entry o2pc prog asm N (ExecResult.IntRet retVals s') := by
+  unfold HbsimMatch; trivial
+
+/-- SINK is a pre-codegen pseudo-instruction, so it never appears in generated code —
+    `generateInstPlan` returns `none` for it. No hbsim connector is needed. -/
+theorem sink_is_precodegen : isPreCodegenOpcode Opcode.SINK = true := rfl
+
+/-! ## SELFDESTRUCT: body sim + SELFDESTRUCT → hbsim (accounts change handled) -/
+
+
+/-- **SELFDESTRUCT's terminal relation from `venomAsmRel`.** Both sides apply `selfdestruct addr` to
+    accounts (the Venom inline logic equals the `selfdestruct` function; the asm reuses it on the
+    converted state). `selfdestruct` reads only `callCtx.contract` and `accounts`, both of which
+    `venomAsmRel` equates (and `toVenomState` preserves), so the resulting accounts agree by
+    `selfdestruct_accounts_congr`; transient/returndata/logs come from the relation (selfdestruct and
+    asmNext touch none of them). The stack top being `addr` is the operand correspondence the body sim's
+    `planStackRel` provides. -/
+theorem terminalRel_selfdestruct_of_rel {lo : AssocList String Nat} {ps : PlanState}
+    {vs : VenomState} {as : AsmState} {addr : bytes32} {stk : List bytes32}
+    (h : venomAsmRel lo ps vs as) :
+    venomAsmTerminalRel (haltState (selfdestruct addr vs))
+      { asmNext as with stack := stk, accounts := (selfdestruct addr as.toVenomState).accounts } := by
+  obtain ⟨_, _, _, hacc, htr, hrd, hlog, hcc, _, _, _, _⟩ := h
+  refine ⟨?_, htr, hrd, hlog⟩
+  -- accounts: (selfdestruct addr as.toVenomState).accounts = (selfdestruct addr vs).accounts
+  show (selfdestruct addr as.toVenomState).accounts = (selfdestruct addr vs).accounts
+  exact selfdestruct_accounts_congr addr (s1 := as.toVenomState) (s2 := vs) hacc hcc
+
+/-- **Body sim + SELFDESTRUCT → hbsim** (halt arm; terminal relation derived, accounts included). -/
+theorem HbsimMatch_selfdestruct_from_body {Entry : VenomState → AsmState → Nat → Prop}
+    {lo : AssocList String Nat} {ps' : PlanState} {o2pc : AssocList Nat Nat} {prog : List AsmInst}
+    {as0 as' : AsmState} {f' bodyLen N : Nat} {addr : bytes32} {stk : List bytes32}
+    {ctx : VenomContext} {bb : BasicBlock} {s vs' : VenomState}
+    (hrb : runBlock f' ctx bb s = ExecResult.Halt (haltState (selfdestruct addr vs')))
+    (hbody : runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as')
+    (hrel' : venomAsmRel lo ps' vs' as')
+    (hpc : as'.pc < prog.length) (hsd : prog.get ⟨as'.pc, hpc⟩ = AsmInst.AsmOp "SELFDESTRUCT")
+    (hstk : as'.stack = addr :: stk) (hle : bodyLen + 1 ≤ N) :
+    HbsimMatch Entry o2pc prog as0 N (runBlock f' ctx bb s) := by
+  have hrel := terminalRel_selfdestruct_of_rel (lo := lo) (ps := ps') (addr := addr) (stk := stk) hrel'
+  refine HbsimMatch_of_halt hrb ?_ hle hrel
+  rw [runAsm_append_ok hbody, show (1 : Nat) = 0 + 1 from rfl, runAsm, asmStep, dif_pos hpc]
+  simp only [hsd]
+  simp only [asmSelfdestruct, hstk]
+
+/-! ## DJMP: body sim + dispatch chain → hbsim (the last terminator; every terminator now covered) -/
+
+
+/-- **Body sim + DJMP → the OK-continuing hbsim.** DJMP is the dynamic analog of JMP: the Venom step
+    jumps to `targetLabel` (the selector-indexed label), and the asm dispatch chain
+    (`djmp_switch_sim`) runs from the post-body state to `pcOf targetLabel`, consuming the selector.
+    Structurally identical to JNZ: the selector is popped, so the inter-block input is the successor
+    relation with the selector dropped; `jumpTo` and the landing pc stay invisible to `venomAsmRel`.
+    The dispatch run (to the exact target state) is the input the existing DJMP machinery supplies. -/
+theorem HbsimMatch_djmp_from_body {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState}
+    {o2pc : AssocList Nat Nat} {prog : List AsmInst}
+    {as0 as' : AsmState} {f' bodyLen chainLen N : Nat} {rest : List bytes32}
+    {ctx : VenomContext} {bb bb' : BasicBlock} {s vs'' : VenomState} {targetLabel : String}
+    (hrb : runBlock f' ctx bb s = ExecResult.OK (jumpTo targetLabel vs'')) (hnh : vs''.halted = false)
+    (hbody : runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as')
+    (hdispatch : runAsm chainLen o2pc prog as'
+      = AsmResult.AsmOK { as' with stack := rest, pc := pcOf targetLabel })
+    (hrel_succ : venomAsmRel lo (psOf targetLabel) vs'' { as' with stack := rest })
+    (hlk' : lookupBlock targetLabel fn.blocks = some bb')
+    (hle : bodyLen + chainLen ≤ N) :
+    HbsimMatch (CanonEntry fn lo pcOf psOf) o2pc prog as0 N (runBlock f' ctx bb s) := by
+  obtain ⟨N', rfl⟩ := Nat.le.dest hle
+  have hfull : runAsm (bodyLen + chainLen) o2pc prog as0
+      = AsmResult.AsmOK { as' with stack := rest, pc := pcOf targetLabel } := by
+    rw [runAsm_append_ok hbody, hdispatch]
+  have harr : venomAsmRel lo (psOf (jumpTo targetLabel vs'').currentBb) (jumpTo targetLabel vs'')
+      { as' with stack := rest, pc := pcOf targetLabel } := by
+    show venomAsmRel lo (psOf targetLabel) (jumpTo targetLabel vs'')
+      { as' with stack := rest, pc := pcOf targetLabel }
+    exact venomAsmRel_jumpTo _ _ _ _ _ (venomAsmRel_setPc hrel_succ)
+  exact HbsimMatch_continue_canon (bb' := bb') (N' := N') hrb hnh hfull hlk' harr rfl
+
+theorem HbsimMatch_jnz_taken_from_body_canonWH {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {as0 as' : AsmState} {f' bodyLen N off : Nat} {cond : bytes32} {stk : List bytes32}
+    {ctx : VenomContext} {bb bb' : BasicBlock} {s vs'' : VenomState} {ifNz : String}
+    (hrb : runBlock f' ctx bb s = ExecResult.OK (jumpTo ifNz vs'')) (hnh : vs''.halted = false)
+    (hbody : runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as')
+    (hstk_c : as'.stack = cond :: stk) (hcond : cond ≠ EvmYul.UInt256.ofNat 0)
+    (hpush1 : as'.pc < prog.length)
+    (hpush : prog.get ⟨as'.pc, hpush1⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifNz))
+    (hoff_lk : AssocList.lookup String Nat offsets ifNz = some off) (hoff : off < 2 ^ 256)
+    (hjumpi1 : as'.pc + 1 < prog.length)
+    (hjumpi : prog.get ⟨as'.pc + 1, hjumpi1⟩ = AsmInst.AsmOp "JUMPI")
+    (hidx_lk : AssocList.lookup Nat Nat o2pc off = some (pcOf ifNz))
+    (hrel_succ : venomAsmRel lo (psOf ifNz) vs'' { as' with stack := stk })
+    (hlk' : lookupBlock ifNz fn.blocks = some bb')
+    (hlayout : wOf ifNz + (bodyLen + 2) ≤ wOf bb.label) (hcur : wOf bb.label ≤ N) :
+    HbsimMatch (CanonEntryWH fn lo pcOf psOf wOf) o2pc prog as0 N (runBlock f' ctx bb s) := by
+  have hle : bodyLen + 2 ≤ N := by omega
+  obtain ⟨N', hNeq⟩ := Nat.le.dest hle; subst hNeq
+  have hstep := resolved_jumpi_taken_sim (s := as') hstk_c hcond hpush1 hpush hoff_lk hoff hjumpi1 hjumpi hidx_lk
+  have hfull : runAsm (bodyLen + 2) o2pc prog as0 = AsmResult.AsmOK { as' with stack := stk, pc := pcOf ifNz } := by
+    rw [runAsm_append_ok hbody, hstep]
+  have harr : venomAsmRel lo (psOf (jumpTo ifNz vs'').currentBb) (jumpTo ifNz vs'')
+      { as' with stack := stk, pc := pcOf ifNz } := by
+    show venomAsmRel lo (psOf ifNz) (jumpTo ifNz vs'') { as' with stack := stk, pc := pcOf ifNz }
+    exact venomAsmRel_jumpTo _ _ _ _ _ (venomAsmRel_setPc hrel_succ)
+  have hnh' : (jumpTo ifNz vs'').halted = false := by simp [jumpTo, hnh]
+  have hwsucc : wOf (jumpTo ifNz vs'').currentBb ≤ N' := by show wOf ifNz ≤ N'; omega
+  exact HbsimMatch_continue_canonWH (bb' := bb') (N' := N') hrb hnh' hfull hlk' harr rfl hwsucc
+
+theorem HbsimMatch_jnz_nottaken_from_body_canonWH {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {as0 as' : AsmState} {f' bodyLen N offN offZ : Nat} {stk : List bytes32}
+    {ctx : VenomContext} {bb bb' : BasicBlock} {s vs'' : VenomState} {ifNz ifZ : String}
+    (hrb : runBlock f' ctx bb s = ExecResult.OK (jumpTo ifZ vs'')) (hnh : vs''.halted = false)
+    (hbody : runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as')
+    (hstk_c : as'.stack = EvmYul.UInt256.ofNat 0 :: stk)
+    (hpush1 : as'.pc < prog.length)
+    (hpushN : prog.get ⟨as'.pc, hpush1⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifNz))
+    (hoffN_lk : AssocList.lookup String Nat offsets ifNz = some offN) (hoffN : offN < 2 ^ 256)
+    (hjumpi1 : as'.pc + 1 < prog.length)
+    (hjumpi : prog.get ⟨as'.pc + 1, hjumpi1⟩ = AsmInst.AsmOp "JUMPI")
+    (hpush2 : as'.pc + 2 < prog.length)
+    (hpushZ : prog.get ⟨as'.pc + 2, hpush2⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifZ))
+    (hoffZ_lk : AssocList.lookup String Nat offsets ifZ = some offZ) (hoffZ : offZ < 2 ^ 256)
+    (hjump1 : as'.pc + 2 + 1 < prog.length)
+    (hjump : prog.get ⟨as'.pc + 2 + 1, hjump1⟩ = AsmInst.AsmOp "JUMP")
+    (hidxZ_lk : AssocList.lookup Nat Nat o2pc offZ = some (pcOf ifZ))
+    (hrel_succ : venomAsmRel lo (psOf ifZ) vs'' { as' with stack := stk })
+    (hlk' : lookupBlock ifZ fn.blocks = some bb')
+    (hlayout : wOf ifZ + (bodyLen + 4) ≤ wOf bb.label) (hcur : wOf bb.label ≤ N) :
+    HbsimMatch (CanonEntryWH fn lo pcOf psOf wOf) o2pc prog as0 N (runBlock f' ctx bb s) := by
+  have hle : bodyLen + 4 ≤ N := by omega
+  obtain ⟨N', hNeq⟩ := Nat.le.dest hle; subst hNeq
+  have hjumpi_step := resolved_jumpi_nottaken_sim (offsetToPc := o2pc) (prog := prog) (s := as')
+    hstk_c hpush1 hpushN hoffN_lk hoffN hjumpi1 hjumpi
+  have hjump_step := resolved_jump_sim (s := { as' with stack := stk, pc := as'.pc + 2 })
+    (by simpa using hpush2) (by simpa using hpushZ) hoffZ_lk hoffZ
+    (by simpa using hjump1) (by simpa using hjump) hidxZ_lk
+  have hterm4 : runAsm 4 o2pc prog as' = AsmResult.AsmOK { as' with stack := stk, pc := pcOf ifZ } := by
+    rw [show (4 : Nat) = 2 + 2 from rfl, runAsm_append_ok hjumpi_step, hjump_step]
+  have hfull : runAsm (bodyLen + 4) o2pc prog as0 = AsmResult.AsmOK { as' with stack := stk, pc := pcOf ifZ } := by
+    rw [runAsm_append_ok hbody, hterm4]
+  have harr : venomAsmRel lo (psOf (jumpTo ifZ vs'').currentBb) (jumpTo ifZ vs'')
+      { as' with stack := stk, pc := pcOf ifZ } := by
+    show venomAsmRel lo (psOf ifZ) (jumpTo ifZ vs'') { as' with stack := stk, pc := pcOf ifZ }
+    exact venomAsmRel_jumpTo _ _ _ _ _ (venomAsmRel_setPc hrel_succ)
+  have hnh' : (jumpTo ifZ vs'').halted = false := by simp [jumpTo, hnh]
+  have hwsucc : wOf (jumpTo ifZ vs'').currentBb ≤ N' := by show wOf ifZ ≤ N'; omega
+  exact HbsimMatch_continue_canonWH (bb' := bb') (N' := N') hrb hnh' hfull hlk' harr rfl hwsucc
+
+theorem HbsimMatch_djmp_from_body_canonWH {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {prog : List AsmInst}
+    {as0 as' : AsmState} {f' bodyLen chainLen N : Nat} {rest : List bytes32}
+    {ctx : VenomContext} {bb bb' : BasicBlock} {s vs'' : VenomState} {targetLabel : String}
+    (hrb : runBlock f' ctx bb s = ExecResult.OK (jumpTo targetLabel vs'')) (hnh : vs''.halted = false)
+    (hbody : runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as')
+    (hdispatch : runAsm chainLen o2pc prog as'
+      = AsmResult.AsmOK { as' with stack := rest, pc := pcOf targetLabel })
+    (hrel_succ : venomAsmRel lo (psOf targetLabel) vs'' { as' with stack := rest })
+    (hlk' : lookupBlock targetLabel fn.blocks = some bb')
+    (hlayout : wOf targetLabel + (bodyLen + chainLen) ≤ wOf bb.label) (hcur : wOf bb.label ≤ N) :
+    HbsimMatch (CanonEntryWH fn lo pcOf psOf wOf) o2pc prog as0 N (runBlock f' ctx bb s) := by
+  have hle : bodyLen + chainLen ≤ N := by omega
+  obtain ⟨N', hNeq⟩ := Nat.le.dest hle; subst hNeq
+  have hfull : runAsm (bodyLen + chainLen) o2pc prog as0
+      = AsmResult.AsmOK { as' with stack := rest, pc := pcOf targetLabel } := by
+    rw [runAsm_append_ok hbody, hdispatch]
+  have harr : venomAsmRel lo (psOf (jumpTo targetLabel vs'').currentBb) (jumpTo targetLabel vs'')
+      { as' with stack := rest, pc := pcOf targetLabel } := by
+    show venomAsmRel lo (psOf targetLabel) (jumpTo targetLabel vs'') { as' with stack := rest, pc := pcOf targetLabel }
+    exact venomAsmRel_jumpTo _ _ _ _ _ (venomAsmRel_setPc hrel_succ)
+  have hnh' : (jumpTo targetLabel vs'').halted = false := by simp [jumpTo, hnh]
+  have hwsucc : wOf (jumpTo targetLabel vs'').currentBb ≤ N' := by show wOf targetLabel ≤ N'; omega
+  exact HbsimMatch_continue_canonWH (bb' := bb') (N' := N') hrb hnh' hfull hlk' harr rfl hwsucc
+
+
+namespace Example
+
+set_option maxHeartbeats 1600000 in
+/-- **Non-vacuity of the JNZ-taken connector for the N-constrained walk Entry.** The concrete conditional
+    block `entry: JNZ 1 then else` on the literal program `jnzProg`
+    (`[LABEL entry; PUSH 1; PUSH then@11; JUMPI; PUSH else@13; JUMP; …]`, offsets
+    `[("then",11),("else",13)]`, offsetToPc `[(11,6),(13,8)]`) satisfies EVERY hypothesis of
+    `HbsimMatch_jnz_taken_from_body_canonWH` simultaneously — the condition literal `1 ≠ 0` takes the branch,
+    the body (JUMPDEST + condition push) lands at the `PUSH then`, the successor relation holds with the
+    condition dropped, and the layout/budget bounds hold — so the connector fires and is not vacuous.
+    Uses the literal program deliberately: the *generated* program's label-offset map does not reduce in the
+    kernel for this (branching) function, while `jnzProg` does. -/
+theorem HbsimMatch_jnz_taken_from_body_canonWH_nonvacuous
+    {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {ctx : VenomContext} {k : Nat}
+    (hvshalt : vs.halted = false)
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    HbsimMatch
+      (CanonEntryWH jnzStopFnR lo (fun l => if l = "then" then 6 else 8) (fun _ => initPlanState 0)
+        (fun l => if l = "then" then 0 else 10))
+      ([(11, 6), (13, 8)] : AssocList Nat Nat) jnzProg as 10
+      (runBlock (k + 1) ctx jnzEntryR vs) := by
+  have hlen : jnzProg.length = 10 := rfl
+  set cond : bytes32 := wordOfBytes (List.toByteArray
+    (List.replicate (32 - (encodeNumBytes 1).length) (0 : byte) ++ encodeNumBytes 1)) with hcondd
+  have hct : cond.toNat = 1 := by rw [hcondd]; exact pushed_offset_toNat 1 (by norm_num)
+  have hcondne : cond ≠ EvmYul.UInt256.ofNat 0 := by
+    intro h; rw [h, EvmYul.uint256_ofNat_toNat] at hct; simp at hct
+  set s1 : AsmState := asmNext as with hs1
+  set s2 : AsmState := { asmNext s1 with stack := cond :: s1.stack } with hs2
+  have p1 : s1.pc = 1 := by rw [hs1]; show as.pc + 1 = 1; rw [haspc]
+  have p2 : s2.pc = 2 := by rw [hs2]; show s1.pc + 1 = 2; rw [p1]
+  have hb0 : as.pc < jnzProg.length := by rw [haspc, hlen]; decide
+  have hb1 : s1.pc < jnzProg.length := by rw [p1, hlen]; decide
+  have hb2 : s2.pc < jnzProg.length := by rw [p2, hlen]; decide
+  have hb3 : s2.pc + 1 < jnzProg.length := by rw [p2, hlen]; decide
+  have g0 : jnzProg.get ⟨as.pc, hb0⟩ = AsmInst.AsmLabel "entry" := by
+    rw [show (⟨as.pc, hb0⟩ : Fin _) = ⟨0, by rw [hlen]; decide⟩ from Fin.ext haspc]; rfl
+  have g1 : jnzProg.get ⟨s1.pc, hb1⟩ = AsmInst.AsmPush (encodeNumBytes 1) := by
+    rw [show (⟨s1.pc, hb1⟩ : Fin _) = ⟨1, by rw [hlen]; decide⟩ from Fin.ext p1]; rfl
+  have hpush : jnzProg.get ⟨s2.pc, hb2⟩
+      = resolveInst ([("then", 11), ("else", 13)] : AssocList String Nat) (AsmInst.AsmPushLabel "then") := by
+    rw [show (⟨s2.pc, hb2⟩ : Fin _) = ⟨2, by rw [hlen]; decide⟩ from Fin.ext p2]; rfl
+  have e3 : s2.pc + 1 = 3 := by rw [p2]
+  have hjumpi : jnzProg.get ⟨s2.pc + 1, hb3⟩ = AsmInst.AsmOp "JUMPI" := by
+    conv_lhs => rw [show (⟨s2.pc + 1, hb3⟩ : Fin jnzProg.length) = ⟨3, by rw [hlen]; decide⟩ from Fin.ext e3]
+    rfl
+  have hpushstep : asmStep ([(11, 6), (13, 8)] : AssocList Nat Nat) jnzProg s1 = AsmResult.AsmOK s2 := by
+    rw [asmStep_push_ok hb1 g1]; rfl
+  have hbody : runAsm 2 ([(11, 6), (13, 8)] : AssocList Nat Nat) jnzProg as = AsmResult.AsmOK s2 := by
+    rw [show (2 : Nat) = 1 + 1 from rfl, runAsm_succ_ok hb0 (asmStep_label_ok hb0 g0)]
+    rw [show (1 : Nat) = 0 + 1 from rfl, runAsm_succ_ok hb1 hpushstep]; rfl
+  have hone : (EvmYul.UInt256.ofNat 1 : EvmYul.UInt256) ≠ { val := 0 } := by decide
+  have hrb : runBlock (k + 1) ctx jnzEntryR vs
+      = ExecResult.OK (jumpTo "then" { vs with instIdx := 0 }) := by
+    simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, jnzEntryR, jnzInstR,
+      stepInstBase, isTerminator, jumpTo, evalOperand, hvshalt, hone]
+  have hnh : ({ vs with instIdx := 0 } : VenomState).halted = false := by simpa using hvshalt
+  refine HbsimMatch_jnz_taken_from_body_canonWH (bb' := thenBB) (off := 11) (cond := cond)
+    (stk := s1.stack) (bodyLen := 2) hrb hnh hbody rfl hcondne hb2 hpush (by decide) (by norm_num)
+    hb3 hjumpi (by decide) ?_ rfl (by decide) (by decide)
+  -- successor relation: the JUMPI drops the condition, leaving the entry stack at the `then` pc
+  show venomAsmRel lo (initPlanState 0) { vs with instIdx := 0 } { s2 with stack := s1.stack }
+  exact venomAsmRel_setPc hrel
+
+
+
+/-- A conditional block whose condition literal is ZERO: `entry: JNZ 0 then else` falls through to `else`. -/
+def jnzInst0 : Instruction :=
+  { id := 0, opcode := Opcode.JNZ,
+    operands := [Operand.Lit (EvmYul.UInt256.ofNat 0), Operand.Label "then", Operand.Label "else"],
+    outputs := [] }
+def jnzEntry0 : BasicBlock := { label := "entry", instructions := [jnzInst0] }
+def jnzStopFn0 : IrFunction := { name := "main", blocks := [jnzEntry0, thenBB, elseBB] }
+
+set_option maxHeartbeats 1600000 in
+/-- **Non-vacuity of the JNZ-not-taken connector for the N-constrained walk Entry.** The sibling of
+    `HbsimMatch_jnz_taken_from_body_canonWH_nonvacuous`, on the zero-condition block
+    `entry: JNZ 0 then else`: the JUMPI falls through (popping the condition) and the following
+    `PUSH else@13 ; JUMP` lands at `else` — the four-instruction terminator. Reuses the literal `jnzProg`,
+    whose pc 2..5 is exactly `PUSH then@11 ; JUMPI ; PUSH else@13 ; JUMP`, with the arrival state placed at
+    pc 2 carrying the zero condition on top (`bodyLen = 0`, so the body-sim run is `runAsm 0`). Every
+    hypothesis of the connector is satisfied at once, so it fires. -/
+theorem HbsimMatch_jnz_nottaken_from_body_canonWH_nonvacuous
+    {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {ctx : VenomContext} {k : Nat}
+    (hvshalt : vs.halted = false)
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 2) :
+    HbsimMatch
+      (CanonEntryWH jnzStopFn0 lo (fun l => if l = "else" then 8 else 6) (fun _ => initPlanState 0)
+        (fun l => if l = "else" then 0 else 10))
+      ([(11, 6), (13, 8)] : AssocList Nat Nat) jnzProg
+      { as with stack := EvmYul.UInt256.ofNat 0 :: as.stack } 10
+      (runBlock (k + 1) ctx jnzEntry0 vs) := by
+  have hlen : jnzProg.length = 10 := rfl
+  set as0 : AsmState := { as with stack := EvmYul.UInt256.ofNat 0 :: as.stack } with has0
+  have q0 : as0.pc = 2 := by rw [has0]; exact haspc
+  have hb2 : as0.pc < jnzProg.length := by rw [q0, hlen]; decide
+  have hb3 : as0.pc + 1 < jnzProg.length := by rw [q0, hlen]; decide
+  have hb4 : as0.pc + 2 < jnzProg.length := by rw [q0, hlen]; decide
+  have hb5 : as0.pc + 2 + 1 < jnzProg.length := by rw [q0, hlen]; decide
+  have hpushN : jnzProg.get ⟨as0.pc, hb2⟩
+      = resolveInst ([("then", 11), ("else", 13)] : AssocList String Nat) (AsmInst.AsmPushLabel "then") := by
+    rw [show (⟨as0.pc, hb2⟩ : Fin _) = ⟨2, by rw [hlen]; decide⟩ from Fin.ext q0]; rfl
+  have e3 : as0.pc + 1 = 3 := by rw [q0]
+  have hjumpi : jnzProg.get ⟨as0.pc + 1, hb3⟩ = AsmInst.AsmOp "JUMPI" := by
+    conv_lhs => rw [show (⟨as0.pc + 1, hb3⟩ : Fin jnzProg.length) = ⟨3, by rw [hlen]; decide⟩ from Fin.ext e3]
+    rfl
+  have e4 : as0.pc + 2 = 4 := by rw [q0]
+  have hpushZ : jnzProg.get ⟨as0.pc + 2, hb4⟩
+      = resolveInst ([("then", 11), ("else", 13)] : AssocList String Nat) (AsmInst.AsmPushLabel "else") := by
+    conv_lhs => rw [show (⟨as0.pc + 2, hb4⟩ : Fin jnzProg.length) = ⟨4, by rw [hlen]; decide⟩ from Fin.ext e4]
+    rfl
+  have e5 : as0.pc + 2 + 1 = 5 := by rw [q0]
+  have hjump : jnzProg.get ⟨as0.pc + 2 + 1, hb5⟩ = AsmInst.AsmOp "JUMP" := by
+    conv_lhs => rw [show (⟨as0.pc + 2 + 1, hb5⟩ : Fin jnzProg.length) = ⟨5, by rw [hlen]; decide⟩ from Fin.ext e5]
+    rfl
+  have hbody : runAsm 0 ([(11, 6), (13, 8)] : AssocList Nat Nat) jnzProg as0 = AsmResult.AsmOK as0 := by
+    simp [runAsm]
+  have hzero : (EvmYul.UInt256.ofNat 0 : EvmYul.UInt256) = { val := 0 } := by decide
+  have hrb : runBlock (k + 1) ctx jnzEntry0 vs
+      = ExecResult.OK (jumpTo "else" { vs with instIdx := 0 }) := by
+    simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, jnzEntry0, jnzInst0,
+      stepInstBase, isTerminator, jumpTo, evalOperand, hvshalt, hzero]
+  have hnh : ({ vs with instIdx := 0 } : VenomState).halted = false := by simpa using hvshalt
+  refine HbsimMatch_jnz_nottaken_from_body_canonWH (bb' := elseBB) (offN := 11) (offZ := 13)
+    (stk := as.stack) (bodyLen := 0) (ifNz := "then") hrb hnh hbody ?_ hb2 hpushN (by decide) (by norm_num)
+    hb3 hjumpi hb4 hpushZ (by decide) (by norm_num) hb5 hjump (by decide) ?_ rfl (by decide) (by decide)
+  · -- the arrival stack carries the zero condition on top
+    show as0.stack = EvmYul.UInt256.ofNat 0 :: as.stack
+    rw [has0]
+  · -- successor relation: the JUMPI pops the condition, restoring the entry stack
+    show venomAsmRel lo (initPlanState 0) { vs with instIdx := 0 } { as0 with stack := as.stack }
+    exact venomAsmRel_setPc hrel
+
+
+/-- A dynamic-jump block with a literal selector: `entry: DJMP 0 t0 t1` selects label index 0 = `t0`. -/
+def djmpInst0 : Instruction :=
+  { id := 0, opcode := Opcode.DJMP,
+    operands := [Operand.Lit (EvmYul.UInt256.ofNat 0), Operand.Label "t0", Operand.Label "t1"],
+    outputs := [] }
+def djmpEntry0 : BasicBlock := { label := "entry", instructions := [djmpInst0] }
+def dT0 : BasicBlock := { label := "t0", instructions := [stopInst] }
+def dT1 : BasicBlock := { label := "t1", instructions := [stopInst] }
+def djmpFn0 : IrFunction := { name := "main", blocks := [djmpEntry0, dT0, dT1] }
+
+/-- The dispatch tail: a bare `JUMP` consuming an already-computed destination, then `t0`'s block. -/
+def djmpProg0 : List AsmInst :=
+  [AsmInst.AsmOp "JUMP", AsmInst.AsmLabel "t0", AsmInst.AsmOp "STOP"]
+
+set_option maxHeartbeats 1600000 in
+/-- **Non-vacuity of the DJMP connector for the N-constrained walk Entry.** Completes the
+    continuing-connector witness set (JMP `e9bd237`-era, JNZ-taken `e9bd237`, JNZ-not-taken `be87070`).
+    The venom side is `entry: DJMP 0 t0 t1` — the selector literal `0` indexes the label list, so the block
+    steps to `OK (jumpTo "t0" …)`. The asm side is the simplest real dispatch chain: a bare `JUMP`
+    (`chainLen = 1`) consuming a destination already on the stack, which `asmJump` pops and resolves through
+    `offsetToPc [(7,1)]` to `pcOf "t0" = 1`, restoring the entry stack. Every connector hypothesis holds at
+    once (`bodyLen = 0`, so the body-sim run is `runAsm 0`), so the connector fires. -/
+theorem HbsimMatch_djmp_from_body_canonWH_nonvacuous
+    {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {ctx : VenomContext} {k : Nat}
+    (hvshalt : vs.halted = false)
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    HbsimMatch
+      (CanonEntryWH djmpFn0 lo (fun l => if l = "t0" then 1 else 2) (fun _ => initPlanState 0)
+        (fun l => if l = "t0" then 0 else 10))
+      ([(7, 1)] : AssocList Nat Nat) djmpProg0
+      { as with stack := EvmYul.UInt256.ofNat 7 :: as.stack } 10
+      (runBlock (k + 1) ctx djmpEntry0 vs) := by
+  have hlen : djmpProg0.length = 3 := rfl
+  set as' : AsmState := { as with stack := EvmYul.UInt256.ofNat 7 :: as.stack } with has'
+  have q0 : as'.pc = 0 := by rw [has']; exact haspc
+  have hb0 : as'.pc < djmpProg0.length := by rw [q0, hlen]; decide
+  have gJ : djmpProg0.get ⟨as'.pc, hb0⟩ = AsmInst.AsmOp "JUMP" := by
+    rw [show (⟨as'.pc, hb0⟩ : Fin _) = ⟨0, by rw [hlen]; decide⟩ from Fin.ext q0]; rfl
+  have hbody : runAsm 0 ([(7, 1)] : AssocList Nat Nat) djmpProg0 as' = AsmResult.AsmOK as' := by
+    simp [runAsm]
+  -- the dispatch chain: one bare JUMP, resolved via offsetToPc
+  have hdispatch : runAsm 1 ([(7, 1)] : AssocList Nat Nat) djmpProg0 as'
+      = AsmResult.AsmOK { as' with stack := as.stack, pc := 1 } := by
+    rw [show (1 : Nat) = 0 + 1 from rfl, runAsm_succ_ok hb0 ?step]
+    · rfl
+    · rw [asmStep_jump_ok hb0 gJ]
+      show asmJump ([(7, 1)] : AssocList Nat Nat) as' = _
+      rw [has']; rfl
+  have hsel : (EvmYul.UInt256.ofNat 0).toNat = 0 := by decide
+  have hrb : runBlock (k + 1) ctx djmpEntry0 vs
+      = ExecResult.OK (jumpTo "t0" { vs with instIdx := 0 }) := by
+    simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, djmpEntry0, djmpInst0,
+      stepInstBase, isTerminator, jumpTo, evalOperand, extractLabels, hvshalt, hsel]
+  have hnh : ({ vs with instIdx := 0 } : VenomState).halted = false := by simpa using hvshalt
+  refine HbsimMatch_djmp_from_body_canonWH (bb' := dT0) (targetLabel := "t0") (chainLen := 1)
+    (rest := as.stack) (bodyLen := 0) hrb hnh hbody ?_ ?_ rfl (by decide) (by decide)
+  · -- the dispatch run lands at pcOf "t0" = 1 with the entry stack
+    show runAsm 1 ([(7, 1)] : AssocList Nat Nat) djmpProg0 as'
+        = AsmResult.AsmOK { as' with stack := as.stack, pc := (if "t0" = "t0" then 1 else 2) }
+    simpa using hdispatch
+  · -- successor relation: the JUMP popped the destination, restoring the entry stack
+    show venomAsmRel lo (initPlanState 0) { vs with instIdx := 0 } { as' with stack := as.stack }
+    exact venomAsmRel_setPc hrel
+
+end Example
+
+/-! ## Top-level bridge: the per-block HbsimMatch is exactly codegen_correct's input -/
+
+
+/-- **`codegen_correct` from a per-block `HbsimMatch`.** The hbsim connectors of this arc each produce a
+    `HbsimMatch` for one block. This shows the `∀`-block `HbsimMatch` is exactly what `codegen_correct`
+    consumes: each is converted to the raw hbsim match by `HbsimMatch_is_hbsim` (the proven
+    correspondence), and `codegen_correct` does the rest. So a whole-function result reduces to supplying
+    the per-block `HbsimMatch` — which the connectors build from the body sim and the terminator. -/
+theorem codegen_correct_of_HbsimMatch
+    {fuel : Nat} {ctx : VenomContext} {fn : IrFunction} {fnEom lblCtr : Nat}
+    {ops : List StackOp} {psFinal : PlanState} {vs : VenomState} {as : AsmState}
+    {entryName entryLbl : String}
+    (Entry : VenomState → AsmState → Nat → Prop)
+    (hplan : generateFnPlan fn fnEom lblCtr = some (ops, psFinal))
+    (hent : ctx.entry = some entryName)
+    (hlk : lookupFunction entryName ctx.functions = some fn)
+    (hlbl : fnEntryLabel fn = some entryLbl)
+    (hbsim : ∀ (s : VenomState) (asm : AsmState) (N f' : Nat) (bb : BasicBlock),
+        Entry s asm N → lookupBlock s.currentBb fn.blocks = some bb →
+        HbsimMatch Entry (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 asm N
+          (runBlock f' ctx bb s))
+    (hentry : Entry { vs with prevBb := none, currentBb := entryLbl, instIdx := 0 } as
+        (asmResolve (executePlan ops)).1.length) :
+    (match runContext fuel ctx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length
+         (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length
+         (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length
+         (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) :=
+  codegen_correct Entry hplan hent hlk hlbl
+    (fun s asm N f' bb hE hL => by
+      have h := hbsim s asm N f' bb hE hL
+      unfold HbsimMatch at h
+      cases hr : runBlock f' ctx bb s with
+      | OK s' => rw [hr] at h; exact h
+      | Halt s' => rw [hr] at h; exact h
+      | Abort a s' => cases a <;> (rw [hr] at h; exact h)
+      | IntRet _ _ => rw [hr] at h; exact h
+      | Error _ => rw [hr] at h; exact h) hentry
+
+/-! ## The CFG assembly, base case: single-block via the HbsimMatch route -/
+
+
+/-- `lookupBlock` on a singleton block list: succeeds only at that block's label. -/
+theorem lookupBlock_singleton {lbl : String} {bb bb' : BasicBlock}
+    (h : lookupBlock lbl [bb] = some bb') : lbl = bb.label ∧ bb' = bb := by
+  simp only [lookupBlock, List.find?] at h
+  split at h
+  · rename_i hp; cases h
+    refine ⟨?_, rfl⟩
+    have : bb.label = lbl := by simpa using hp
+    exact this.symm
+  · simp at h
+
+/-- **The single-block CFG assembly, via the HbsimMatch route.** For a one-block function the `∀`-block
+    quantifier of `codegen_correct`'s hbsim collapses to a single per-state `HbsimMatch` obligation
+    (`lookupBlock` succeeds only at the block's label), which the connectors discharge from the body sim
+    and the terminator. The base case of the CFG assembly; the general case adds successor threading. -/
+theorem codegen_correct_singleBlock_of_HbsimMatch
+    {fuel : Nat} {ctx : VenomContext} {fnName : String} {fnEom lblCtr : Nat}
+    {ops : List StackOp} {psFinal : PlanState} {vs : VenomState} {as : AsmState}
+    {entryName entryLbl : String} {bb : BasicBlock}
+    (Entry : VenomState → AsmState → Nat → Prop)
+    (hplan : generateFnPlan { name := fnName, blocks := [bb] } fnEom lblCtr = some (ops, psFinal))
+    (hent : ctx.entry = some entryName)
+    (hlk : lookupFunction entryName ctx.functions = some { name := fnName, blocks := [bb] })
+    (hlbl : fnEntryLabel { name := fnName, blocks := [bb] } = some entryLbl)
+    (hstep : ∀ (s : VenomState) (asm : AsmState) (N f' : Nat),
+        Entry s asm N → s.currentBb = bb.label →
+        HbsimMatch Entry (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 asm N
+          (runBlock f' ctx bb s))
+    (hentry : Entry { vs with prevBb := none, currentBb := entryLbl, instIdx := 0 } as
+        (asmResolve (executePlan ops)).1.length) :
+    (match runContext fuel ctx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length
+         (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length
+         (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length
+         (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  refine codegen_correct_of_HbsimMatch Entry hplan hent hlk hlbl ?_ hentry
+  intro s asm N f' bb' hE hL
+  obtain ⟨hcurEq, hbbEq⟩ := lookupBlock_singleton hL
+  subst hbbEq
+  exact hstep s asm N f' hE hcurEq
+
+/-! ## The CFG assembly, general shape: ∀-block hbsim ⇒ per-block obligation over the function -/
+
+
+/-- `lookupBlock` returns a member of the list whose label matches. -/
+theorem lookupBlock_mem {lbl : String} {bs : List BasicBlock} {bb : BasicBlock}
+    (h : lookupBlock lbl bs = some bb) : bb ∈ bs ∧ bb.label = lbl := by
+  simp only [lookupBlock] at h
+  exact ⟨List.mem_of_find?_eq_some h, by
+    have := List.find?_some h; simpa using this⟩
+
+/-- **The general CFG assembly reduction, via the HbsimMatch route.** For an arbitrary function,
+    `codegen_correct`'s ∀-block hbsim reduces to a per-block obligation: for every block of the function,
+    when the walk is at that block, its `HbsimMatch` holds. `lookupBlock` returns a block of the function
+    matching the current label, so the ∀ over states-and-lookups becomes a ∀ over the function's blocks.
+    Each per-block obligation is what the connectors discharge (body sim + terminator, and for continuing
+    blocks the successor-recording). This is the shape of the CFG assembly; what remains is discharging
+    the per-block obligation for each block — the semantic body-sim + successor content.
+
+    ⚠️ NB the per-block `hstep` is `∀ N` (the walk budget), and `HbsimMatch (Halt) N` is FALSE for
+    `N < blockLen`. So this reduction is only dischargeable with an `Entry` that CONSTRAINS `N` (e.g.
+    `codegen_correct_singleBlockHalt`'s `N = programLength`, threading `N' = N − blockLen` to successors);
+    a bare `CanonEntry` (no N-constraint) makes the `hstep` unsatisfiable — see the retracted
+    `codegen_correct_ofRecipes` note below. -/
+theorem codegen_correct_ofBlocks_HbsimMatch
+    {fuel : Nat} {ctx : VenomContext} {fn : IrFunction} {fnEom lblCtr : Nat}
+    {ops : List StackOp} {psFinal : PlanState} {vs : VenomState} {as : AsmState}
+    {entryName entryLbl : String}
+    (Entry : VenomState → AsmState → Nat → Prop)
+    (hplan : generateFnPlan fn fnEom lblCtr = some (ops, psFinal))
+    (hent : ctx.entry = some entryName)
+    (hlk : lookupFunction entryName ctx.functions = some fn)
+    (hlbl : fnEntryLabel fn = some entryLbl)
+    (hstep : ∀ bb ∈ fn.blocks, ∀ (s : VenomState) (asm : AsmState) (N f' : Nat),
+        Entry s asm N → s.currentBb = bb.label →
+        HbsimMatch Entry (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 asm N
+          (runBlock f' ctx bb s))
+    (hentry : Entry { vs with prevBb := none, currentBb := entryLbl, instIdx := 0 } as
+        (asmResolve (executePlan ops)).1.length) :
+    (match runContext fuel ctx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length
+         (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length
+         (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length
+         (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  refine codegen_correct_of_HbsimMatch Entry hplan hent hlk hlbl ?_ hentry
+  intro s asm N f' bb hE hL
+  obtain ⟨hmem, hlbleq⟩ := lookupBlock_mem hL
+  exact hstep bb hmem s asm N f' hE hlbleq.symm
+
+/-! ## Discharging a per-block obligation from the body thread (STOP): runBlock derived, not assumed -/
+
+
+/-- **The Venom-side `hrb` for a body+STOP block, derived from the body thread.** `runBlock` reduces to
+    `execBlock` on the body-end state (`runBlock_to_term`), whose `instIdx` is `front.length`
+    (`execBodyThread_instIdx`) — exactly the STOP's position — so the STOP step halts at `haltState sEnd`.
+    This turns the `hrb` hypothesis of `HbsimMatch_stop_from_body` into a derivation. -/
+theorem runBlock_body_stop (ctx : VenomContext) (bb : BasicBlock) (restFuel : Nat)
+    (front : List Instruction) (stopInst hd : Instruction) (tl : List Instruction)
+    (s sEnd : VenomState)
+    (hbb : bb.instructions = front ++ [stopInst])
+    (hstopop : stopInst.opcode = Opcode.STOP)
+    (hcons : front ++ [stopInst] = hd :: tl)
+    (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd) :
+    runBlock (front.length + (restFuel + 1)) ctx bb s = ExecResult.Halt (haltState sEnd) := by
+  rw [runBlock_to_term ctx bb (restFuel + 1) front stopInst hd tl s sEnd hbb hcons hphi hnonterm hthread]
+  have hidx : sEnd.instIdx = front.length := by
+    have h := execBodyThread_instIdx front 0 { s with instIdx := 0 } sEnd rfl hthread
+    simpa using h
+  have hget : getInstruction bb sEnd.instIdx = some stopInst := by
+    rw [hidx]; simp [getInstruction, hbb]
+  simp only [execBlock, hget, stepInstBase, hstopop]
+
+/-- **A STOP block's `HbsimMatch` from the body thread + the body sim's asm output.** No `runBlock`
+    result is assumed: `runBlock_body_stop` derives it from the body thread. So the STOP per-block
+    obligation is discharged from exactly the body simulation's natural interface — the Venom body thread
+    (`hthread`) and the asm run + relation at the body-end (`hbody`/`hrel'`). -/
+theorem HbsimMatch_stop_bodyThread {Entry : VenomState → AsmState → Nat → Prop}
+    {lo : AssocList String Nat} {ps' : PlanState} {o2pc : AssocList Nat Nat} {prog : List AsmInst}
+    {as0 as' : AsmState} {bodyLen N restFuel : Nat} {ctx : VenomContext} {bb : BasicBlock}
+    {front : List Instruction} {stopInst hd : Instruction} {tl : List Instruction}
+    {s sEnd : VenomState}
+    (hbb : bb.instructions = front ++ [stopInst]) (hstopop : stopInst.opcode = Opcode.STOP)
+    (hcons : front ++ [stopInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hbody : runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as')
+    (hrel' : venomAsmRel lo ps' sEnd as')
+    (hpc : as'.pc < prog.length) (hstop : prog.get ⟨as'.pc, hpc⟩ = AsmInst.AsmOp "STOP")
+    (hle : bodyLen + 1 ≤ N) :
+    HbsimMatch Entry o2pc prog as0 N (runBlock (front.length + (restFuel + 1)) ctx bb s) :=
+  HbsimMatch_stop_from_body
+    (runBlock_body_stop ctx bb restFuel front stopInst hd tl s sEnd hbb hstopop hcons hphi hnonterm hthread)
+    hbody hrel' hpc hstop hle
+
+/-! ## runBlock-derivation, general + halting/continuing representatives -/
+
+
+/-- The body-end state sees the terminator as its current instruction. -/
+theorem getInstruction_bodyEnd {bb : BasicBlock} {front : List Instruction} {term : Instruction}
+    {s sEnd : VenomState} (hbb : bb.instructions = front ++ [term])
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd) :
+    getInstruction bb sEnd.instIdx = some term := by
+  have hidx : sEnd.instIdx = front.length := by
+    have h := execBodyThread_instIdx front 0 { s with instIdx := 0 } sEnd rfl hthread
+    simpa using h
+  rw [hidx]; simp [getInstruction, hbb]
+
+/-- **General: `runBlock` of a body+terminator block reduces to the terminator's step on the body-end
+    state.** Factors the common `runBlock_to_term` + body-thread part; each terminator instantiates the
+    step (`hstep`). -/
+theorem runBlock_body_term (ctx : VenomContext) (bb : BasicBlock) (restFuel : Nat)
+    (front : List Instruction) (term hd : Instruction) (tl : List Instruction)
+    (s sEnd : VenomState) (R : ExecResult)
+    (hbb : bb.instructions = front ++ [term])
+    (hcons : front ++ [term] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hstep : ∀ inst, getInstruction bb sEnd.instIdx = some inst →
+      execBlock (restFuel + 1) ctx bb sEnd = R) :
+    runBlock (front.length + (restFuel + 1)) ctx bb s = R := by
+  rw [runBlock_to_term ctx bb (restFuel + 1) front term hd tl s sEnd hbb hcons hphi hnonterm hthread]
+  exact hstep term (getInstruction_bodyEnd hbb hthread)
+
+/-- INVALID instantiation: the block faults at the body-end state. -/
+theorem runBlock_body_invalid (ctx : VenomContext) (bb : BasicBlock) (restFuel : Nat)
+    (front : List Instruction) (invInst hd : Instruction) (tl : List Instruction)
+    (s sEnd : VenomState)
+    (hbb : bb.instructions = front ++ [invInst]) (hinvop : invInst.opcode = Opcode.INVALID)
+    (hcons : front ++ [invInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd) :
+    runBlock (front.length + (restFuel + 1)) ctx bb s
+      = ExecResult.Abort AbortType.ExHaltAbort (haltState (setReturndata ByteArray.empty sEnd)) := by
+  refine runBlock_body_term ctx bb restFuel front invInst hd tl s sEnd _ hbb hcons hphi hnonterm
+    hthread ?_
+  intro inst hget
+  simp only [execBlock, getInstruction_bodyEnd hbb hthread, stepInstBase, hinvop]
+
+/-- JMP instantiation (continuing): the block steps to `OK (jumpTo lbl sEnd)`. -/
+theorem runBlock_body_jmp (ctx : VenomContext) (bb : BasicBlock) (restFuel : Nat)
+    (front : List Instruction) (jmpInst hd : Instruction) (tl : List Instruction)
+    (s sEnd : VenomState) (lbl : String)
+    (hbb : bb.instructions = front ++ [jmpInst]) (hjmpop : jmpInst.opcode = Opcode.JMP)
+    (hoperands : jmpInst.operands = [Operand.Label lbl])
+    (hcons : front ++ [jmpInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hnothalt : sEnd.halted = false) :
+    runBlock (front.length + (restFuel + 1)) ctx bb s = ExecResult.OK (jumpTo lbl sEnd) := by
+  refine runBlock_body_term ctx bb restFuel front jmpInst hd tl s sEnd _ hbb hcons hphi hnonterm
+    hthread ?_
+  intro inst hget
+  simp only [execBlock, getInstruction_bodyEnd hbb hthread, stepInstBase, hjmpop, hoperands,
+    isTerminator]
+  show (if (jumpTo lbl sEnd).halted = true then _ else _) = _
+  rw [show (jumpTo lbl sEnd).halted = sEnd.halted from rfl, hnothalt]
+  rfl
+
+/-! ## runBlock-derivation for the rest of the terminator family (RETURN/REVERT/SELFDESTRUCT/JNZ/DJMP) -/
+
+
+/-- RETURN instantiation. -/
+theorem runBlock_body_return (ctx : VenomContext) (bb : BasicBlock) (restFuel : Nat)
+    (front : List Instruction) (retInst hd : Instruction) (tl : List Instruction)
+    (s sEnd : VenomState) (offOp szOp : Operand) (off sz : bytes32)
+    (hbb : bb.instructions = front ++ [retInst]) (hop : retInst.opcode = Opcode.RETURN)
+    (hoperands : retInst.operands = [offOp, szOp])
+    (hoff : evalOperand offOp sEnd = some off) (hsz : evalOperand szOp sEnd = some sz)
+    (hcons : front ++ [retInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd) :
+    runBlock (front.length + (restFuel + 1)) ctx bb s
+      = ExecResult.Halt (haltState (setReturndata (readMemory off.toNat sz.toNat sEnd) sEnd)) := by
+  refine runBlock_body_term ctx bb restFuel front retInst hd tl s sEnd _ hbb hcons hphi hnonterm
+    hthread ?_
+  intro inst hget
+  simp only [execBlock, getInstruction_bodyEnd hbb hthread, stepInstBase, hop, hoperands, hoff, hsz]
+
+/-- REVERT instantiation. -/
+theorem runBlock_body_revert (ctx : VenomContext) (bb : BasicBlock) (restFuel : Nat)
+    (front : List Instruction) (revInst hd : Instruction) (tl : List Instruction)
+    (s sEnd : VenomState) (offOp szOp : Operand) (off sz : bytes32)
+    (hbb : bb.instructions = front ++ [revInst]) (hop : revInst.opcode = Opcode.REVERT)
+    (hoperands : revInst.operands = [offOp, szOp])
+    (hoff : evalOperand offOp sEnd = some off) (hsz : evalOperand szOp sEnd = some sz)
+    (hcons : front ++ [revInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd) :
+    runBlock (front.length + (restFuel + 1)) ctx bb s
+      = ExecResult.Abort AbortType.RevertAbort
+          (revertState (setReturndata (readMemory off.toNat sz.toNat sEnd) sEnd)) := by
+  refine runBlock_body_term ctx bb restFuel front revInst hd tl s sEnd _ hbb hcons hphi hnonterm
+    hthread ?_
+  intro inst hget
+  simp only [execBlock, getInstruction_bodyEnd hbb hthread, stepInstBase, hop, hoperands, hoff, hsz]
+
+/-- SELFDESTRUCT instantiation (accounts change). -/
+theorem runBlock_body_selfdestruct (ctx : VenomContext) (bb : BasicBlock) (restFuel : Nat)
+    (front : List Instruction) (sdInst hd : Instruction) (tl : List Instruction)
+    (s sEnd : VenomState) (addrOp : Operand) (addr : bytes32)
+    (hbb : bb.instructions = front ++ [sdInst]) (hop : sdInst.opcode = Opcode.SELFDESTRUCT)
+    (hoperands : sdInst.operands = [addrOp]) (haddr : evalOperand addrOp sEnd = some addr)
+    (hcons : front ++ [sdInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd) :
+    runBlock (front.length + (restFuel + 1)) ctx bb s
+      = ExecResult.Halt (haltState (selfdestruct addr sEnd)) := by
+  refine runBlock_body_term ctx bb restFuel front sdInst hd tl s sEnd _ hbb hcons hphi hnonterm
+    hthread ?_
+  intro inst hget
+  simp only [execBlock, getInstruction_bodyEnd hbb hthread, stepInstBase, hop, hoperands, haddr,
+    selfdestruct]
+
+/-- JNZ taken (condition nonzero). -/
+theorem runBlock_body_jnz_taken (ctx : VenomContext) (bb : BasicBlock) (restFuel : Nat)
+    (front : List Instruction) (jnzInst hd : Instruction) (tl : List Instruction)
+    (s sEnd : VenomState) (condOp : Operand) (ifNz ifZ : String) (cond : bytes32)
+    (hbb : bb.instructions = front ++ [jnzInst]) (hop : jnzInst.opcode = Opcode.JNZ)
+    (hoperands : jnzInst.operands = [condOp, Operand.Label ifNz, Operand.Label ifZ])
+    (hcond : evalOperand condOp sEnd = some cond) (hne : cond ≠ EvmYul.UInt256.ofNat 0)
+    (hcons : front ++ [jnzInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hnothalt : sEnd.halted = false) :
+    runBlock (front.length + (restFuel + 1)) ctx bb s = ExecResult.OK (jumpTo ifNz sEnd) := by
+  refine runBlock_body_term ctx bb restFuel front jnzInst hd tl s sEnd _ hbb hcons hphi hnonterm
+    hthread ?_
+  intro inst hget
+  have hb : (cond != ({ val := 0 } : bytes32)) = true := by
+    rw [bne_iff_ne]; intro h; exact hne h
+  simp only [execBlock, getInstruction_bodyEnd hbb hthread, stepInstBase, hop, hoperands, hcond,
+    if_pos hb, isTerminator]
+  show (if (jumpTo ifNz sEnd).halted = true then _ else _) = _
+  rw [show (jumpTo ifNz sEnd).halted = sEnd.halted from rfl, hnothalt]; rfl
+
+/-- JNZ not-taken (condition zero). -/
+theorem runBlock_body_jnz_nottaken (ctx : VenomContext) (bb : BasicBlock) (restFuel : Nat)
+    (front : List Instruction) (jnzInst hd : Instruction) (tl : List Instruction)
+    (s sEnd : VenomState) (condOp : Operand) (ifNz ifZ : String)
+    (hbb : bb.instructions = front ++ [jnzInst]) (hop : jnzInst.opcode = Opcode.JNZ)
+    (hoperands : jnzInst.operands = [condOp, Operand.Label ifNz, Operand.Label ifZ])
+    (hcond : evalOperand condOp sEnd = some ({ val := 0 } : bytes32))
+    (hcons : front ++ [jnzInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hnothalt : sEnd.halted = false) :
+    runBlock (front.length + (restFuel + 1)) ctx bb s = ExecResult.OK (jumpTo ifZ sEnd) := by
+  refine runBlock_body_term ctx bb restFuel front jnzInst hd tl s sEnd _ hbb hcons hphi hnonterm
+    hthread ?_
+  intro inst hget
+  simp only [execBlock, getInstruction_bodyEnd hbb hthread, stepInstBase, hop, hoperands, hcond,
+    bne_self_eq_false, if_neg (by decide : ¬ (false = true)), isTerminator]
+  show (if (jumpTo ifZ sEnd).halted = true then _ else _) = _
+  rw [show (jumpTo ifZ sEnd).halted = sEnd.halted from rfl, hnothalt]; rfl
+
+/-- DJMP (dynamic jump to the selector-indexed label). -/
+theorem runBlock_body_djmp (ctx : VenomContext) (bb : BasicBlock) (restFuel : Nat)
+    (front : List Instruction) (dInst hd : Instruction) (tl : List Instruction)
+    (s sEnd : VenomState) (selectorOp : Operand) (labelOps : List Operand)
+    (idx : bytes32) (labels : List String) (hi : idx.toNat < labels.length)
+    (hbb : bb.instructions = front ++ [dInst]) (hop : dInst.opcode = Opcode.DJMP)
+    (hoperands : dInst.operands = selectorOp :: labelOps)
+    (hsel : evalOperand selectorOp sEnd = some idx) (hlabels : extractLabels labelOps = some labels)
+    (hcons : front ++ [dInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hnothalt : sEnd.halted = false) :
+    runBlock (front.length + (restFuel + 1)) ctx bb s
+      = ExecResult.OK (jumpTo (labels.get ⟨idx.toNat, hi⟩) sEnd) := by
+  refine runBlock_body_term ctx bb restFuel front dInst hd tl s sEnd _ hbb hcons hphi hnonterm
+    hthread ?_
+  intro inst hget
+  simp only [execBlock, getInstruction_bodyEnd hbb hthread, stepInstBase, hop, hoperands, hsel,
+    hlabels, dif_pos hi, isTerminator]
+  show (if (jumpTo _ sEnd).halted = true then _ else _) = _
+  rw [show (jumpTo (labels.get ⟨idx.toNat, hi⟩) sEnd).halted = sEnd.halted from rfl, hnothalt]; rfl
+
+/-! ## The alignment bridge: genBlockBodyH_sim_inv output → HbsimMatch (the last gap closed) -/
+
+
+/-- **The alignment bridge: `genBlockBodyH_sim_inv`'s output → `HbsimMatch` for a STOP block.**
+
+`genBlockBodyH_sim_inv` produces the body's asm run plus `venomAsmRel` at the *`gvBodyStep`-fold* state
+(its Venom body model). `runBlock` threads the body via `execBodyThread`, and `execBodyThread_eq_gvFold`
+shows the two coincide. So the body sim's `venomAsmRel` — stated against the fold — is exactly the
+relation `HbsimMatch_stop_bodyThread` wants against the `execBodyThread` end state, and the STOP block's
+`HbsimMatch` follows. This closes the last gap between the reduction chain and the existing per-instruction
+body simulation. -/
+theorem HbsimMatch_stop_of_gvFold {Entry : VenomState → AsmState → Nat → Prop}
+    {lo : AssocList String Nat} {ps' : PlanState} {o2pc : AssocList Nat Nat} {prog : List AsmInst}
+    {as0 as' : AsmState} {bodyLen N restFuel : Nat} {ctx : VenomContext} {bb : BasicBlock}
+    {front : List Instruction} {stopInst hd : Instruction} {tl : List Instruction}
+    {s sEnd : VenomState}
+    (hbb : bb.instructions = front ++ [stopInst]) (hstopop : stopInst.opcode = Opcode.STOP)
+    (hcons : front ++ [stopInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hbody : runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as')
+    (hrel_gv : venomAsmRel lo ps'
+      ((front.zipIdx 0).foldl (fun v x => gvBodyStep x v) { s with instIdx := 0 }) as')
+    (hpc : as'.pc < prog.length) (hstop : prog.get ⟨as'.pc, hpc⟩ = AsmInst.AsmOp "STOP")
+    (hle : bodyLen + 1 ≤ N) :
+    HbsimMatch Entry o2pc prog as0 N (runBlock (front.length + (restFuel + 1)) ctx bb s) := by
+  have hgv : (front.zipIdx 0).foldl (fun v x => gvBodyStep x v) { s with instIdx := 0 } = sEnd :=
+    execBodyThread_eq_gvFold front 0 { s with instIdx := 0 } sEnd hthread
+  rw [hgv] at hrel_gv
+  exact HbsimMatch_stop_bodyThread hbb hstopop hcons hphi hnonterm hthread hbody hrel_gv hpc hstop hle
+
+/-! ## The full stack: a STOP block of modeled instructions ⇒ HbsimMatch, from RegularBodyH -/
+
+
+/-- **`venomAsmRel` is preserved by popping the shared TOS** (plan `stackPop 1` ↔ asm cons-tail). Only
+    `planStackRel` reads the stacks; the spill/memory relations and the 9 shared-field equalities are
+    untouched by a stack-only update. -/
+theorem venomAsmRel_pop_tos {lo : AssocList String Nat} {ps : PlanState} {vs : VenomState}
+    {as : AsmState} {a : bytes32} {A : List bytes32}
+    (hrel : venomAsmRel lo ps vs as) (hstk : as.stack = a :: A) :
+    venomAsmRel lo { ps with stack := stackPop 1 ps.stack } vs { as with stack := A } := by
+  obtain ⟨hplan, hspill, hmem, hacc, htr, hrd, hlog, hcc, htx, hbc, hcode, hph⟩ := hrel
+  rw [hstk] at hplan
+  exact ⟨planStackRel_pop hplan, hspill, hmem, hacc, htr, hrd, hlog, hcc, htx, hbc, hcode, hph⟩
+
+/-- The regular-instruction body plan (ops, end-state) — the fold `genBlockBodyH_sim_inv` builds over the
+    block body `front`. -/
+private abbrev bodyPlanRIP (liveness : DfState (List String)) (dfg : DfgAnalysis) (cfg : CfgAnalysis)
+    (fn : IrFunction) (nextLiveness : List String) (curBbLabel : String)
+    (front : List Instruction) (ps0 : PlanState) : List StackOp × PlanState :=
+  (front.zipIdx 0).foldl
+    (fun acc x => (acc.1 ++ (generateRegularInstPlan liveness dfg cfg fn x.1
+      nextLiveness false true curBbLabel acc.2).1,
+      (generateRegularInstPlan liveness dfg cfg fn x.1 nextLiveness false true curBbLabel acc.2).2))
+    ([], ps0)
+
+/-- **The full stack: a STOP block of modeled instructions ⇒ `HbsimMatch`, from the per-instruction
+    condition `RegularBodyH`.** Threads the three existing layers:
+    `bodyStepsReadyH_regular_list` (RegularBodyH ⇒ BodyStepsReadyH) → `genBlockBodyH_sim_inv` (the body
+    simulation, producing the asm run + `venomAsmRel` at the gvBodyStep fold) → `HbsimMatch_stop_of_gvFold`
+    (⇒ the block's `HbsimMatch`). So for a STOP block whose body is modeled regular opcodes, the whole
+    per-block obligation reduces to exactly `RegularBodyH` — the per-instruction correctness — plus the
+    structural plan-state invariants and the entry relation. -/
+theorem HbsimMatch_stop_regular {Entry : VenomState → AsmState → Nat → Prop}
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {o2pc : AssocList Nat Nat} {prog : List AsmInst}
+    {nextLiveness : List String} {curBbLabel : String} {dem : Nat}
+    {ps0 : PlanState} {as0 : AsmState} {N restFuel : Nat} {ctx : VenomContext} {bb : BasicBlock}
+    {front : List Instruction} {stopInst hd : Instruction} {tl : List Instruction}
+    {s sEnd : VenomState} {S : List String}
+    (hbb : bb.instructions = front ++ [stopInst]) (hstopop : stopInst.opcode = Opcode.STOP)
+    (hcons : front ++ [stopInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    -- the per-instruction condition (irreducible) + structural invariants
+    (hreg : RegularBodyH lo nextLiveness o2pc prog dem front S)
+    (hsd : StackDiscH ((front.zipIdx 0).map (fun _ => dem)).sum ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel0 : venomAsmRel lo ps0 { s with instIdx := 0 } as0)
+    (hblock : asmBlockAt prog as0.pc
+      (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1))
+    -- STOP placed right after the body
+    (hpc : as0.pc + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length < prog.length)
+    (hstop : prog.get ⟨as0.pc + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length, hpc⟩ = AsmInst.AsmOp "STOP")
+    (hle : (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 1 ≤ N) :
+    HbsimMatch Entry o2pc prog as0 N (runBlock (front.length + (restFuel + 1)) ctx bb s) := by
+  have hbrh := bodyStepsReadyH_regular_list (liveness := liveness) (dfg := dfg) (cfg := cfg) (fn := fn)
+    (curBbLabel := curBbLabel) front S 0 hreg
+  obtain ⟨as', hrun, hrel', hpc', _, _⟩ := genBlockBodyH_sim_inv
+    (fun z p => generateRegularInstPlan liveness dfg cfg fn z.1 nextLiveness false true curBbLabel p)
+    (fun _ => dem) (front.zipIdx 0) S ps0 { s with instIdx := 0 } as0 hbrh hsd hsv hrel0 hblock
+  have hpc_as : as'.pc < prog.length := hpc' ▸ hpc
+  have hstop_as : prog.get ⟨as'.pc, hpc_as⟩ = AsmInst.AsmOp "STOP" := by
+    rw [show (⟨as'.pc, hpc_as⟩ : Fin prog.length) = ⟨_, hpc⟩ from Fin.ext hpc']
+    exact hstop
+  exact HbsimMatch_stop_of_gvFold hbb hstopop hcons hphi hnonterm hthread hrun hrel'
+    hpc_as hstop_as hle
+
+/-! ## Sound rebuild: INVALID (halting, no emit) and JMP (continuing, PUSH-label emit) at RegularBodyH
+    via the CONCRETE post-body position (the vacuity-free formulation) -/
+
+
+/-- INVALID full-stack through the body sim (sound, concrete-position formulation — the halting sibling
+    of STOP). INVALID has no operands and emits no code, so it sits at the CONCRETE post-body position
+    `as0.pc + (executePlan bodyPlan).1.length`; the terminator facts are stated there (not via a
+    `∀`-quantified `hmk`, which was unsatisfiable). The sim gives `as'.pc = as0.pc + L`, transferring
+    them to the existential `as'`. -/
+theorem HbsimMatch_invalid_regular {Entry : VenomState → AsmState → Nat → Prop}
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {o2pc : AssocList Nat Nat} {prog : List AsmInst}
+    {nextLiveness : List String} {curBbLabel : String} {dem : Nat}
+    {ps0 : PlanState} {as0 : AsmState} {N restFuel : Nat} {ctx : VenomContext} {bb : BasicBlock}
+    {front : List Instruction} {invInst hd : Instruction} {tl : List Instruction}
+    {s sEnd : VenomState} {S : List String}
+    (hbb : bb.instructions = front ++ [invInst]) (hinvop : invInst.opcode = Opcode.INVALID)
+    (hcons : front ++ [invInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hreg : RegularBodyH lo nextLiveness o2pc prog dem front S)
+    (hsd : StackDiscH ((front.zipIdx 0).map (fun _ => dem)).sum ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel0 : venomAsmRel lo ps0 { s with instIdx := 0 } as0)
+    (hblock : asmBlockAt prog as0.pc
+      (executePlan ((front.zipIdx 0).foldl
+        (fun acc x => (acc.1 ++ (generateRegularInstPlan liveness dfg cfg fn x.1 nextLiveness
+          false true curBbLabel acc.2).1,
+          (generateRegularInstPlan liveness dfg cfg fn x.1 nextLiveness false true curBbLabel
+            acc.2).2)) ([], ps0)).1))
+    (hpc : as0.pc + (executePlan ((front.zipIdx 0).foldl
+        (fun acc x => (acc.1 ++ (generateRegularInstPlan liveness dfg cfg fn x.1 nextLiveness
+          false true curBbLabel acc.2).1,
+          (generateRegularInstPlan liveness dfg cfg fn x.1 nextLiveness false true curBbLabel
+            acc.2).2)) ([], ps0)).1).length < prog.length)
+    (hinv : prog.get ⟨as0.pc + (executePlan ((front.zipIdx 0).foldl
+        (fun acc x => (acc.1 ++ (generateRegularInstPlan liveness dfg cfg fn x.1 nextLiveness
+          false true curBbLabel acc.2).1,
+          (generateRegularInstPlan liveness dfg cfg fn x.1 nextLiveness false true curBbLabel
+            acc.2).2)) ([], ps0)).1).length, hpc⟩ = AsmInst.AsmOp "INVALID")
+    (hle : (executePlan ((front.zipIdx 0).foldl
+        (fun acc x => (acc.1 ++ (generateRegularInstPlan liveness dfg cfg fn x.1 nextLiveness
+          false true curBbLabel acc.2).1,
+          (generateRegularInstPlan liveness dfg cfg fn x.1 nextLiveness false true curBbLabel
+            acc.2).2)) ([], ps0)).1).length + 1 ≤ N) :
+    HbsimMatch Entry o2pc prog as0 N (runBlock (front.length + (restFuel + 1)) ctx bb s) := by
+  have hbrh := bodyStepsReadyH_regular_list (liveness := liveness) (dfg := dfg) (cfg := cfg) (fn := fn)
+    (curBbLabel := curBbLabel) (offsetToPc := o2pc) front S 0 hreg
+  obtain ⟨as', hrun, hrel', hpc', _, _⟩ := genBlockBodyH_sim_inv
+    (fun z p => generateRegularInstPlan liveness dfg cfg fn z.1 nextLiveness false true curBbLabel p)
+    (fun _ => dem) (front.zipIdx 0) S ps0 { s with instIdx := 0 } as0 hbrh hsd hsv hrel0 hblock
+  have hgv : (front.zipIdx 0).foldl (fun v x => gvBodyStep x v) { s with instIdx := 0 } = sEnd :=
+    execBodyThread_eq_gvFold front 0 { s with instIdx := 0 } sEnd hthread
+  rw [hgv] at hrel'
+  have hpc_as : as'.pc < prog.length := hpc' ▸ hpc
+  have hinv_as : prog.get ⟨as'.pc, hpc_as⟩ = AsmInst.AsmOp "INVALID" := by
+    rw [show (⟨as'.pc, hpc_as⟩ : Fin prog.length) = ⟨_, hpc⟩ from Fin.ext hpc']
+    exact hinv
+  exact HbsimMatch_invalid_from_body
+    (runBlock_body_invalid ctx bb restFuel front invInst hd tl s sEnd hbb hinvop hcons hphi hnonterm
+      hthread)
+    hrun hrel' hpc_as hinv_as hle
+
+
+/-- JMP full-stack through the body sim (sound, concrete-position formulation — the continuing shape).
+    `JMP target` has `computeOperands = []`, so its terminator asm is `joinOps ++ [PUSH target; JUMP]`
+    where `joinOps` is the join reorder (`reorderPlan` for the target's expected layout). **This lemma
+    handles the EMPTY-JOIN case** (`joinOps = []` — the arriving layout already matches the target, common
+    for straight-through edges): then `PUSH; JUMP` are adjacent right after the body, at the CONCRETE
+    positions `as0.pc + L` / `+1` (L = the body plan's asm length), and the program facts are stated there
+    and transferred to the existential `as'` via `as'.pc = as0.pc + L`. For a JMP that NEEDS a join
+    reorder the `PUSH` sits after the SWAPs, so `hpush`/`hjump` (as stated at `as0.pc + L`) cannot be
+    discharged — that case is the mature `GenBlockSim` machinery's job, not this lemma's. The one
+    inter-block input is the successor-recording `hps` (post-body plan fold = target's recorded entry),
+    stated against the concrete plan fold (not `as'`), so it is satisfiable. -/
+theorem HbsimMatch_jmp_regular
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat}
+    {prog : List AsmInst} {pcOf : String → Nat} {psOf : String → PlanState}
+    {nextLiveness : List String} {curBbLabel : String} {dem : Nat}
+    {ps0 : PlanState} {as0 : AsmState} {N restFuel : Nat} {ctx : VenomContext} {bb bb' : BasicBlock}
+    {front : List Instruction} {jmpInst hd : Instruction} {tl : List Instruction}
+    {s sEnd : VenomState} {S : List String} {target : String} {off : Nat}
+    (hbb : bb.instructions = front ++ [jmpInst]) (hjmpop : jmpInst.opcode = Opcode.JMP)
+    (hoperands : jmpInst.operands = [Operand.Label target])
+    (hcons : front ++ [jmpInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hnothalt : sEnd.halted = false)
+    (hreg : RegularBodyH lo nextLiveness o2pc prog dem front S)
+    (hsd : StackDiscH ((front.zipIdx 0).map (fun _ => dem)).sum ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel0 : venomAsmRel lo ps0 { s with instIdx := 0 } as0)
+    (hblock : asmBlockAt prog as0.pc
+      (executePlan ((front.zipIdx 0).foldl
+        (fun acc x => (acc.1 ++ (generateRegularInstPlan liveness dfg cfg fn x.1 nextLiveness
+          false true curBbLabel acc.2).1,
+          (generateRegularInstPlan liveness dfg cfg fn x.1 nextLiveness false true curBbLabel
+            acc.2).2)) ([], ps0)).1))
+    (hlk' : lookupBlock target fn.blocks = some bb')
+    (hps : ((front.zipIdx 0).foldl
+        (fun acc x => (acc.1 ++ (generateRegularInstPlan liveness dfg cfg fn x.1 nextLiveness
+          false true curBbLabel acc.2).1,
+          (generateRegularInstPlan liveness dfg cfg fn x.1 nextLiveness false true curBbLabel
+            acc.2).2)) ([], ps0)).2 = psOf target)
+    (hpush1 : as0.pc + (executePlan ((front.zipIdx 0).foldl
+        (fun acc x => (acc.1 ++ (generateRegularInstPlan liveness dfg cfg fn x.1 nextLiveness
+          false true curBbLabel acc.2).1,
+          (generateRegularInstPlan liveness dfg cfg fn x.1 nextLiveness false true curBbLabel
+            acc.2).2)) ([], ps0)).1).length < prog.length)
+    (hpush : prog.get ⟨as0.pc + (executePlan ((front.zipIdx 0).foldl
+        (fun acc x => (acc.1 ++ (generateRegularInstPlan liveness dfg cfg fn x.1 nextLiveness
+          false true curBbLabel acc.2).1,
+          (generateRegularInstPlan liveness dfg cfg fn x.1 nextLiveness false true curBbLabel
+            acc.2).2)) ([], ps0)).1).length, hpush1⟩ = resolveInst offsets (AsmInst.AsmPushLabel target))
+    (hoff_lk : AssocList.lookup String Nat offsets target = some off) (hoff : off < 2 ^ 256)
+    (hjump1 : as0.pc + (executePlan ((front.zipIdx 0).foldl
+        (fun acc x => (acc.1 ++ (generateRegularInstPlan liveness dfg cfg fn x.1 nextLiveness
+          false true curBbLabel acc.2).1,
+          (generateRegularInstPlan liveness dfg cfg fn x.1 nextLiveness false true curBbLabel
+            acc.2).2)) ([], ps0)).1).length + 1 < prog.length)
+    (hjump : prog.get ⟨as0.pc + (executePlan ((front.zipIdx 0).foldl
+        (fun acc x => (acc.1 ++ (generateRegularInstPlan liveness dfg cfg fn x.1 nextLiveness
+          false true curBbLabel acc.2).1,
+          (generateRegularInstPlan liveness dfg cfg fn x.1 nextLiveness false true curBbLabel
+            acc.2).2)) ([], ps0)).1).length + 1, hjump1⟩ = AsmInst.AsmOp "JUMP")
+    (hidx_lk : AssocList.lookup Nat Nat o2pc off = some (pcOf target))
+    (hle : (executePlan ((front.zipIdx 0).foldl
+        (fun acc x => (acc.1 ++ (generateRegularInstPlan liveness dfg cfg fn x.1 nextLiveness
+          false true curBbLabel acc.2).1,
+          (generateRegularInstPlan liveness dfg cfg fn x.1 nextLiveness false true curBbLabel
+            acc.2).2)) ([], ps0)).1).length + 2 ≤ N) :
+    HbsimMatch (CanonEntry fn lo pcOf psOf) o2pc prog as0 N
+      (runBlock (front.length + (restFuel + 1)) ctx bb s) := by
+  have hbrh := bodyStepsReadyH_regular_list (liveness := liveness) (dfg := dfg) (cfg := cfg) (fn := fn)
+    (curBbLabel := curBbLabel) (offsetToPc := o2pc) front S 0 hreg
+  obtain ⟨as', hrun, hrel', hpc', _, _⟩ := genBlockBodyH_sim_inv
+    (fun z p => generateRegularInstPlan liveness dfg cfg fn z.1 nextLiveness false true curBbLabel p)
+    (fun _ => dem) (front.zipIdx 0) S ps0 { s with instIdx := 0 } as0 hbrh hsd hsv hrel0 hblock
+  have hgv : (front.zipIdx 0).foldl (fun v x => gvBodyStep x v) { s with instIdx := 0 } = sEnd :=
+    execBodyThread_eq_gvFold front 0 { s with instIdx := 0 } sEnd hthread
+  rw [hgv] at hrel'
+  have hpc_as1 : as'.pc < prog.length := hpc' ▸ hpush1
+  have hpush_as : prog.get ⟨as'.pc, hpc_as1⟩ = resolveInst offsets (AsmInst.AsmPushLabel target) := by
+    rw [show (⟨as'.pc, hpc_as1⟩ : Fin prog.length) = ⟨_, hpush1⟩ from Fin.ext hpc']
+    exact hpush
+  have hjump_as1 : as'.pc + 1 < prog.length := hpc' ▸ hjump1
+  have hjump_as : prog.get ⟨as'.pc + 1, hjump_as1⟩ = AsmInst.AsmOp "JUMP" := by
+    rw [show (⟨as'.pc + 1, hjump_as1⟩ : Fin prog.length) = ⟨_, hjump1⟩ from Fin.ext (congrArg (· + 1) hpc')]
+    exact hjump
+  exact HbsimMatch_jmp_from_body (bb' := bb') (target := target) (off := off)
+    (runBlock_body_jmp ctx bb restFuel front jmpInst hd tl s sEnd target hbb hjmpop hoperands hcons
+      hphi hnonterm hthread hnothalt)
+    hnothalt hrun hrel' hps hpc_as1 hpush_as hoff_lk hoff hjump_as1 hjump_as hidx_lk hlk' hle
+
+/-! ## ⚠️ Vacuity refutation: the ∀-∃ `hmk` shape is UNSATISFIABLE (terminator `_regular` retraction) -/
+
+
+/-- **The `∀ as' bodyLen, as'.pc = as0.pc + bodyLen → ∃ (h : as'.pc < prog.length), …` shape is
+    unsatisfiable for any finite `prog`.** An earlier formulation of the operand/continuing terminator
+    full-stacks (INVALID / JMP / RETURN / REVERT / SELFDESTRUCT / JNZ / DJMP `_regular`) packaged the
+    terminator's resolved-asm facts this way, obtaining them from the body sim's *existential* `bodyLen`.
+    But that made `bodyLen` universally quantified in the hypothesis: choose `bodyLen = prog.length`, so
+    `as'.pc = as0.pc + prog.length ≥ prog.length` and the required `h : as'.pc < prog.length` cannot
+    exist. Those lemmas, though valid, could never be APPLIED to a real function — they were vacuous, so
+    they are retracted (this refutation is kept in their place, per the "keep the refutation, remove the
+    trap" rule). The SOUND formulation (as in `HbsimMatch_stop_regular`) states the terminator facts
+    about the CONCRETE post-body position `as0.pc + (executePlan bodyPlan).1.length`, and DERIVES any
+    stack / successor-recording facts from the body sim's `venomAsmRel` (`planStackRel_peek`, …) rather
+    than taking them as `∀`-quantified inputs (a stack fact quantified over all `as'` at a fixed pc is as
+    unsatisfiable as the pc bound). Rebuilding the operand/continuing terminators on that footing is the
+    open follow-up. -/
+theorem hmk_shape_unsatisfiable
+    (as0pc : Nat) (offW szW : bytes32) (rest : List bytes32) (N : Nat) (prog : List AsmInst) :
+    ¬ (∀ (as' : AsmState) (bodyLen : Nat), as'.pc = as0pc + bodyLen →
+        ∃ (h : as'.pc < prog.length), prog.get ⟨as'.pc, h⟩ = AsmInst.AsmOp "RETURN"
+          ∧ as'.stack = offW :: szW :: rest ∧ bodyLen + 1 ≤ N) := by
+  intro hmk
+  obtain ⟨h, _, _, _⟩ := hmk { (default : AsmState) with pc := as0pc + prog.length } prog.length rfl
+  exact Nat.not_lt.2 (Nat.le_add_left prog.length as0pc) h
+
+/-! ## Non-vacuity witness: the SOUND STOP `_regular` actually fires (counterpart to the refutation) -/
+
+
+/-- **Non-vacuity of the sound STOP `_regular`.** A bare `[STOP]` block (front = `[]`) instantiates
+    `HbsimMatch_stop_regular` with EVERY structural/reducible hypothesis discharged — `RegularBodyH []`
+    is `True`, `execBodyThread []` is identity, the empty plan fold gives an empty body asm — leaving only
+    the genuine semantic inputs (`venomAsmRel`, `StackDiscH`, `StackIsVars` — the invariants a real block
+    always carries) and the concrete STOP placement. So the lemma FIRES; it is not the vacuous ∀-∃ `hmk`
+    trap that its retracted siblings were. This is the "exhibit a witness for every hypothesis" check the
+    original vacuous version could never have survived. -/
+theorem HbsimMatch_stop_regular_nonvacuous
+    {Entry : VenomState → AsmState → Nat → Prop}
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {o2pc : AssocList Nat Nat} {prog : List AsmInst}
+    {nextLiveness : List String} {curBbLabel : String} {dem : Nat}
+    {ps0 : PlanState} {as0 : AsmState} {N restFuel : Nat} {ctx : VenomContext} {bb : BasicBlock}
+    {s : VenomState} {S : List String} {stopInst : Instruction}
+    (hbb : bb.instructions = [stopInst]) (hstopop : stopInst.opcode = Opcode.STOP)
+    (hphi : stopInst.opcode ≠ Opcode.PHI)
+    (hsd : StackDiscH 0 ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel0 : venomAsmRel lo ps0 { s with instIdx := 0 } as0)
+    (hblock : asmBlockAt prog as0.pc [])
+    (hpc : as0.pc < prog.length) (hstop : prog.get ⟨as0.pc, hpc⟩ = AsmInst.AsmOp "STOP")
+    (hle : 1 ≤ N) :
+    HbsimMatch Entry o2pc prog as0 N (runBlock (0 + (restFuel + 1)) ctx bb s) := by
+  refine HbsimMatch_stop_regular (liveness := liveness) (dfg := dfg) (cfg := cfg) (fn := fn)
+    (nextLiveness := nextLiveness) (curBbLabel := curBbLabel) (dem := dem) (front := [])
+    (lo := lo) (ps0 := ps0) (S := S) (o2pc := o2pc) (prog := prog) (as0 := as0)
+    (hd := stopInst) (tl := []) (sEnd := { s with instIdx := 0 })
+    (by simpa using hbb) hstopop (by simpa using hbb) hphi (by simp) ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_
+  · rfl                                             -- execBodyThread [] = identity
+  · trivial                                         -- RegularBodyH [] = True
+  · simpa using hsd
+  · exact hsv
+  · exact hrel0
+  · exact hblock
+  · exact hpc
+  · exact hstop
+  · exact hle
+
+
+/-- **Non-vacuity of the sound JMP `_regular` — the CONTINUING discriminating case.** A bare `[JMP target]`
+    block (front = []) instantiates `HbsimMatch_jmp_regular` with every structural/reducible hypothesis
+    discharged, leaving only the genuine inter-block inputs: the entry `venomAsmRel`/invariants, the
+    successor lookup + successor-recording `hps` (post-body plan fold = `psOf target`, here `ps0` since the
+    body is empty), and the concrete `PUSH target; JUMP` placement + label/offset resolutions. The lemma
+    FIRES, producing the walk's `HbsimMatch` with the `CanonEntry`. Unlike STOP this exercises the
+    successor-recording clause, so it validates the continuing shape's rebuild, not just the halting one.
+    (This witnesses the EMPTY-JOIN JMP subclass that `HbsimMatch_jmp_regular` handles — `PUSH; JUMP`
+    adjacent right after the body; a JMP needing a join reorder is out of that lemma's scope, per its
+    docstring.) -/
+theorem HbsimMatch_jmp_regular_nonvacuous
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat}
+    {prog : List AsmInst} {pcOf : String → Nat} {psOf : String → PlanState}
+    {nextLiveness : List String} {curBbLabel : String} {dem : Nat}
+    {ps0 : PlanState} {as0 : AsmState} {N restFuel : Nat} {ctx : VenomContext} {bb bb' : BasicBlock}
+    {s : VenomState} {S : List String} {jmpInst : Instruction} {target : String} {off : Nat}
+    (hbb : bb.instructions = [jmpInst]) (hjmpop : jmpInst.opcode = Opcode.JMP)
+    (hoperands : jmpInst.operands = [Operand.Label target])
+    (hnothalt : s.halted = false)
+    (hsd : StackDiscH 0 ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel0 : venomAsmRel lo ps0 { s with instIdx := 0 } as0)
+    (hblock : asmBlockAt prog as0.pc [])
+    (hlk' : lookupBlock target fn.blocks = some bb')
+    (hps : ps0 = psOf target)
+    (hpush1 : as0.pc < prog.length)
+    (hpush : prog.get ⟨as0.pc, hpush1⟩ = resolveInst offsets (AsmInst.AsmPushLabel target))
+    (hoff_lk : AssocList.lookup String Nat offsets target = some off) (hoff : off < 2 ^ 256)
+    (hjump1 : as0.pc + 1 < prog.length)
+    (hjump : prog.get ⟨as0.pc + 1, hjump1⟩ = AsmInst.AsmOp "JUMP")
+    (hidx_lk : AssocList.lookup Nat Nat o2pc off = some (pcOf target))
+    (hle : 2 ≤ N) :
+    HbsimMatch (CanonEntry fn lo pcOf psOf) o2pc prog as0 N
+      (runBlock (0 + (restFuel + 1)) ctx bb s) := by
+  refine HbsimMatch_jmp_regular (liveness := liveness) (dfg := dfg) (cfg := cfg) (fn := fn)
+    (nextLiveness := nextLiveness) (curBbLabel := curBbLabel) (dem := dem) (front := [])
+    (lo := lo) (ps0 := ps0) (S := S) (o2pc := o2pc) (offsets := offsets) (prog := prog)
+    (as0 := as0) (pcOf := pcOf) (psOf := psOf) (target := target) (off := off)
+    (hd := jmpInst) (tl := []) (sEnd := { s with instIdx := 0 }) (bb' := bb')
+    (by simpa using hbb) hjmpop hoperands (by simp) (by rw [hjmpop]; decide) (by simp) rfl
+    (by simpa using hnothalt) trivial ?_ hsv hrel0 ?_ hlk' ?_ ?_ ?_ hoff_lk hoff ?_ ?_ hidx_lk ?_
+  · simpa using hsd
+  · exact hblock
+  · exact hps
+  · exact hpush1
+  · exact hpush
+  · exact hjump1
+  · exact hjump
+  · exact hle
+
+/-! ## Filling the SELFDESTRUCT gap in the mature terminator hstep family
+    (the one codegen terminator with a connector but no `hstep_regularHSVP_*`) -/
+
+
+/-- **Spill-aware residual SELFDESTRUCT segment (VAR operand)** — the single-operand, accounts-terminal
+    twin of `hasm_regularHSVP_return_var`. Body prefix sim + single-operand emit (`emitInputPlan_single_var_sim`
+    puts the beneficiary on top) + the SELFDESTRUCT halt (`asmSelfdestruct_ok`); the terminal relation is
+    `venomAsmRel_selfdestruct` (accounts congruence). No memory-safety segment (SELFDESTRUCT reads no memory). -/
+theorem hasm_regularHSVP_selfdestruct_var {prog : List AsmInst} {offsetToPc : AssocList Nat Nat}
+    {lo : AssocList String Nat} (P : Nat)
+    {l : String} {gp : Instruction × Nat → PlanState → List StackOp × PlanState}
+    {lg : List ((Instruction × Nat) × List String)}
+    {front : List Instruction} {S0 : List String} {M0 M1 : AssocList Operand Nat}
+    {ps0 : PlanState} {vs0 sEnd : VenomState} {as0 : AsmState}
+    {addrv : String} {waddr : bytes32} {opc : Opcode} {nl : List String}
+    {bodyLen emitLen budget : Nat}
+    (hfront : lg.map Prod.fst = front.zipIdx 0)
+    (hready : BodyStepsReadyHSVP P lo offsetToPc prog gp lg S0 M0)
+    (hsd0 : StackDiscHS (totalGain lg + P) ps0 vs0 as0)
+    (hsv0 : StackPerm S0 ps0) (hspM : ps0.spilled = M0)
+    (hrel0 : venomAsmRel lo ps0 vs0 as0)
+    (hthread : execBodyThread front 0 vs0 = some sEnd)
+    (haddrS : addrv ∈ S0 ++ lg.flatMap (fun e => e.2))
+    (hspMF : (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2.spilled
+      = M1)
+    (haddrM : alookup' M1 (Operand.Var addrv) = none)
+    (hliveaddr : nl.contains addrv = true)
+    (hvaddr : lookupVar addrv sEnd = some waddr)
+    (hblock : asmBlockAt prog as0.pc
+      (executePlan (([StackOp.SOLabel l] ++ (lg.foldl
+        (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).1)
+        ++ (emitInputPlan opc [Operand.Var addrv] nl
+             (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).1)))
+    (hbodyLenEq : bodyLen = (executePlan ([StackOp.SOLabel l] ++ (lg.foldl
+        (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).1)).length)
+    (hemitLenEq : emitLen = (executePlan (emitInputPlan opc [Operand.Var addrv] nl
+        (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).1).length)
+    (hlt : as0.pc + bodyLen + emitLen < prog.length)
+    (hget : prog.get ⟨as0.pc + bodyLen + emitLen, hlt⟩ = AsmInst.AsmOp "SELFDESTRUCT")
+    (hbudget : bodyLen + emitLen + 1 ≤ budget) :
+    ∃ as', runAsm budget offsetToPc prog as0 = AsmResult.AsmHalt as' ∧
+           venomAsmTerminalRel (haltState (selfdestruct waddr sEnd)) as' := by
+  rw [executePlan_append] at hblock
+  obtain ⟨hbpre, hbemit⟩ := asmBlockAt_append hblock
+  obtain ⟨asMid, hbrun, hbrel, hbpc, hbsd, hbsv⟩ :=
+    genBlockPrefixBodyHSVP_sim_inv P l gp lg front S0 M0 ps0 vs0 sEnd as0
+      hfront hready hsd0 hsv0 hspM hrel0 hthread hbpre
+  rw [← hbodyLenEq] at hbrun hbpc
+  have haddrmem := stackPerm_mem hbsv haddrS
+  have hshallow : (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2))
+      ([], ps0)).2.stack.length ≤ 15 := by have := hbsd.shallow; omega
+  obtain ⟨d, hdepth, hlen⟩ := stackGetDepth_of_mem haddrmem
+  have hsmall : d ≤ 15 := by omega
+  have hnospill := alookup_of_spilled_eq hspMF haddrM
+  have hbemit' : asmBlockAt prog asMid.pc
+      (executePlan (emitInputPlan opc [Operand.Var addrv] nl
+        (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).1) := by
+    rw [hbpc, hbodyLenEq]; exact hbemit
+  obtain ⟨asMid2, herun, herel, hepc⟩ :=
+    emitInputPlan_single_var_sim hnospill hliveaddr hdepth hsmall hbrel hlen hbemit'
+  rw [← hemitLenEq] at herun hepc
+  have hpeek : stackPeek d (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2))
+      ([], ps0)).2.stack = Operand.Var addrv := stackGetDepth_peek hdepth
+  have hemitstack : (emitInputPlan opc [Operand.Var addrv] nl
+      (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).2.stack
+      = (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2.stack
+        ++ [Operand.Var addrv] := by
+    rw [emitInputPlan_single_var_eq hnospill hliveaddr hdepth hsmall hpeek]
+  have hval : operandVal sEnd lo (Operand.Var addrv) = some waddr := hvaddr
+  have htop : asMid2.stack = waddr :: asMid2.stack.drop 1 :=
+    venomAsmRel_asmStack_top1_var herel hemitstack hval
+  have hpc' : asMid2.pc < prog.length := by rw [hepc, hbpc]; omega
+  have hget' : prog.get ⟨asMid2.pc, hpc'⟩ = AsmInst.AsmOp "SELFDESTRUCT" :=
+    prog_get_transfer (by rw [hepc, hbpc]) hget
+  have hget'' : prog[asMid2.pc]? = some (AsmInst.AsmOp "SELFDESTRUCT") := by
+    rw [List.getElem?_eq_getElem hpc']
+    simp only [Option.some.injEq, List.get_eq_getElem] at hget' ⊢
+    exact hget'
+  have hsdblock : asmBlockAt prog asMid2.pc (executePlan [StackOp.SOEmit "SELFDESTRUCT"]) := by
+    have hep : executePlan [StackOp.SOEmit "SELFDESTRUCT"] = [AsmInst.AsmOp "SELFDESTRUCT"] := rfl
+    rw [hep]
+    refine ⟨by simp only [List.length_cons, List.length_nil]; omega, ?_⟩
+    intro j hj
+    simp only [List.length_cons, List.length_nil] at hj
+    obtain rfl : j = 0 := by omega
+    simp only [Nat.add_zero, List.getElem?_cons_zero, hget'']
+  obtain ⟨asF, hFrun, hFterm⟩ :=
+    emit_selfdestruct_sim (offsetToPc := offsetToPc) herel htop hsdblock
+  have hcompose : runAsm (bodyLen + emitLen + 1) offsetToPc prog as0 = AsmResult.AsmHalt asF := by
+    rw [show bodyLen + emitLen + 1 = bodyLen + (emitLen + 1) from by omega,
+        runAsm_add_ok hbrun, runAsm_add_ok herun]
+    exact hFrun
+  exact ⟨asF, runAsm_le_of_ne_ok (fun s => by simp) hbudget hcompose, hFterm⟩
+
+/-- **Per-block SELFDESTRUCT `hstep`** — the accounts-terminal, single-operand analogue of
+    `hstep_regularHSVP_return`, completing the mature terminator hstep family (SELFDESTRUCT was the one
+    codegen terminator with a connector but no hstep). `runBlock` halts with the accounts change
+    (`runBlock_halt` + `stepInstBase` = `Halt (haltState (selfdestruct ...))`); the asm run + terminal
+    relation come from `hasm_regularHSVP_selfdestruct_var`. `pcOf`/`psOf`/`wOf` abstract (SELFDESTRUCT
+    halts, no successor). -/
+theorem hstep_regularHSVP_selfdestruct
+    {fn : IrFunction} {ctx : VenomContext} {offsetToPc : AssocList Nat Nat}
+    {prog : List AsmInst} {lo : AssocList String Nat}
+    (pcOf : String → Nat) (psOf : String → PlanState) (wOf : String → Nat)
+    {bb : BasicBlock} {term hd : Instruction} {tl : List Instruction}
+    {extraFuel N : Nat} (P : Nat)
+    {l : String} {gp : Instruction × Nat → PlanState → List StackOp × PlanState}
+    {lg : List ((Instruction × Nat) × List String)}
+    {front : List Instruction} {S0 : List String} {M0 M1 : AssocList Operand Nat}
+    {ps0 : PlanState} {vs0 sEnd : VenomState} {as0 : AsmState}
+    {addrv : String} {waddr : bytes32} {opc : Opcode} {nl : List String}
+    {bodyLen emitLen : Nat}
+    (hbb : bb.instructions = front ++ [term])
+    (hcons : front ++ [term] = hd :: tl)
+    (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hterm_step : stepInstBase term sEnd = ExecResult.Halt (haltState (selfdestruct waddr sEnd)))
+    (hfront : lg.map Prod.fst = front.zipIdx 0)
+    (hready : BodyStepsReadyHSVP P lo offsetToPc prog gp lg S0 M0)
+    (hsd0 : StackDiscHS (totalGain lg + P) ps0 vs0 as0)
+    (hsv0 : StackPerm S0 ps0) (hspM : ps0.spilled = M0)
+    (hrel0 : venomAsmRel lo ps0 vs0 as0)
+    (hthread : execBodyThread front 0 vs0 = some sEnd)
+    (hvs0 : vs0 = { vs0 with instIdx := 0 })
+    (haddrS : addrv ∈ S0 ++ lg.flatMap (fun e => e.2))
+    (hspMF : (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2.spilled
+      = M1)
+    (haddrM : alookup' M1 (Operand.Var addrv) = none)
+    (hliveaddr : nl.contains addrv = true)
+    (hvaddr : lookupVar addrv sEnd = some waddr)
+    (hblock : asmBlockAt prog as0.pc
+      (executePlan (([StackOp.SOLabel l] ++ (lg.foldl
+        (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).1)
+        ++ (emitInputPlan opc [Operand.Var addrv] nl
+             (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).1)))
+    (hbodyLenEq : bodyLen = (executePlan ([StackOp.SOLabel l] ++ (lg.foldl
+        (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).1)).length)
+    (hemitLenEq : emitLen = (executePlan (emitInputPlan opc [Operand.Var addrv] nl
+        (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).1).length)
+    (hlt : as0.pc + bodyLen + emitLen < prog.length)
+    (hget : prog.get ⟨as0.pc + bodyLen + emitLen, hlt⟩ = AsmInst.AsmOp "SELFDESTRUCT")
+    (hN : bodyLen + emitLen + 1 ≤ N) :
+    (match runBlock (front.length + (extraFuel + 1)) ctx bb vs0 with
+     | ExecResult.OK s' =>
+         if s'.halted then
+           ∃ asm', runAsm N offsetToPc prog as0 = AsmResult.AsmHalt asm' ∧ venomAsmTerminalRel s' asm'
+         else
+           ∃ (bb'' : BasicBlock) (asm'' : AsmState) (blockLen' : Nat),
+             lookupBlock s'.currentBb fn.blocks = some bb'' ∧
+             runAsm blockLen' offsetToPc prog as0 = AsmResult.AsmOK asm'' ∧ blockLen' ≤ N ∧
+             asm''.pc = pcOf bb''.label ∧ venomAsmRel lo (psOf bb''.label) s' asm'' ∧
+             wOf bb''.label + blockLen' ≤ wOf bb.label
+     | ExecResult.Halt s' =>
+         ∃ asm', runAsm N offsetToPc prog as0 = AsmResult.AsmHalt asm' ∧ venomAsmTerminalRel s' asm'
+     | ExecResult.Abort AbortType.RevertAbort s' =>
+         ∃ asm', runAsm N offsetToPc prog as0 = AsmResult.AsmRevert asm' ∧ venomAsmTerminalRel s' asm'
+     | ExecResult.Abort AbortType.ExHaltAbort s' =>
+         ∃ asm', runAsm N offsetToPc prog as0 = AsmResult.AsmFault asm' ∧ venomAsmTerminalRel s' asm'
+     | _ => True) := by
+  have hthread' : execBodyThread front 0 { vs0 with instIdx := 0 } = some sEnd := by
+    rw [← hvs0]; exact hthread
+  have hrb : runBlock (front.length + (extraFuel + 1)) ctx bb vs0
+      = ExecResult.Halt (haltState (selfdestruct waddr sEnd)) :=
+    runBlock_halt ctx bb extraFuel front term hd tl vs0 sEnd
+      (haltState (selfdestruct waddr sEnd)) hbb hcons hphi hnonterm hthread' hterm_step
+  obtain ⟨as', hasm, hterm⟩ :=
+    hasm_regularHSVP_selfdestruct_var P hfront hready hsd0 hsv0 hspM hrel0 hthread
+      haddrS hspMF haddrM hliveaddr hvaddr hblock hbodyLenEq hemitLenEq hlt hget hN
+  rw [hrb]
+  exact ⟨as', hasm, hterm⟩
+
+/-! ## Reframing the walk-invariant gap: `StackDiscHS` = threaded `venomAsmRel` (`defined`) + plan facts -/
+
+
+/-- **`venomAsmRel` supplies the `defined` component of `StackDiscHS`.** Every `Var z` on the plan stack
+    has a value in the Venom state — because `planStackRel` (the first conjunct of `venomAsmRel`) evaluates
+    each plan-stack entry to its asm-stack counterpart via `operandVal`, and `operandVal … (Var z)` is
+    exactly `lookupVar z vs`. So of the three `StackDiscHS` fields (`shallow`/`noSpill`/`defined`), `defined`
+    is not a fresh invariant to thread across blocks — it falls out of the relation the walk already
+    carries. -/
+theorem venomAsmRel_stack_defined {lo : AssocList String Nat} {ps : PlanState}
+    {vs : VenomState} {as : AsmState} (h : venomAsmRel lo ps vs as) :
+    ∀ z, Operand.Var z ∈ ps.stack → ∃ w, lookupVar z vs = some w := by
+  intro z hz
+  obtain ⟨hlen, hrel⟩ := h.1
+  have hzr : Operand.Var z ∈ ps.stack.reverse := List.mem_reverse.mpr hz
+  obtain ⟨i, hi, hget⟩ := List.mem_iff_getElem.mp hzr
+  have hi' : i < ps.stack.length := by rwa [List.length_reverse] at hi
+  have hval := hrel i hi'
+  have hrev : ps.stack.reverse[i]! = Operand.Var z := by
+    rw [List.getElem!_eq_getElem?_getD, List.getElem?_eq_getElem hi, Option.getD_some, hget]
+  rw [hrev, operandVal] at hval
+  exact ⟨_, hval⟩
+
+/-- **`StackDiscH` reduces to `venomAsmRel` plus two PLAN facts.** Packaging `venomAsmRel_stack_defined`:
+    the no-spill block-entry discipline `StackDiscH k ps vs` follows from the walk-threaded `venomAsmRel`
+    (giving `defined`) together with `shallow` (`ps.stack.length + k ≤ 15`) and `noSpill` — both properties
+    of the RECORDED entry plan state `ps = psOf bb`, not of the arriving Venom/asm states. -/
+theorem stackDiscH_of_venomAsmRel {lo : AssocList String Nat} {ps : PlanState}
+    {vs : VenomState} {as : AsmState} {k : Nat}
+    (hrel : venomAsmRel lo ps vs as)
+    (hshallow : ps.stack.length + k ≤ 15)
+    (hnospill : ∀ op, alookup' ps.spilled op = none) :
+    StackDiscH k ps vs where
+  noSpill := hnospill
+  shallow := hshallow
+  defined := venomAsmRel_stack_defined hrel
+
+/-- **`StackDiscHS` (the spill-aware form the hsteps consume) from `venomAsmRel` + two plan facts**, for a
+    spill-free block entry. Composes `stackDiscH_of_venomAsmRel` with `StackDiscHS.of_stackDiscH` (a no-spill
+    state is spill-aware for any asm state — `spillWf` vacuous). So the whole `StackDiscHS` input the mature
+    terminator hsteps require is NOT a fresh invariant to thread block-to-block: `defined` comes from the
+    `venomAsmRel` the walk already carries, and `shallow`/`noSpill` are properties of the RECORDED entry
+    plan state `psOf bb`. This reframes the "walk invariant" gap I called the deep load-bearing piece: it is
+    a PLAN-GENERATOR-invariant problem (prove `psOf bb`'s stack is `≤ 15` and spill-free at every entry, and
+    `StackPerm S0 (psOf bb)` = `(psOf bb).stack = S0.map Var`), NOT a strengthening of the driver's
+    block-to-block contract. A meaningfully different — and more localized — remaining task. -/
+theorem stackDiscHS_of_venomAsmRel {lo : AssocList String Nat} {ps : PlanState}
+    {vs : VenomState} {as : AsmState} {k : Nat}
+    (hrel : venomAsmRel lo ps vs as)
+    (hshallow : ps.stack.length + k ≤ 15)
+    (hnospill : ∀ op, alookup' ps.spilled op = none) :
+    StackDiscHS k ps vs as :=
+  StackDiscHS.of_stackDiscH (stackDiscH_of_venomAsmRel hrel hshallow hnospill)
+
+/-! ## Reframed gap (4), base case: plan properties at the ENTRY block (StackDiscHS/StackPerm from venomAsmRel) -/
+
+
+/-- **Plan properties at the ENTRY block — the base case of the reframed gap (4).** `psOfFn_entry` says the
+    recorded entry plan state is `initPlanState` (empty stack, no spills). So `StackPerm [] (psOf entry)`
+    holds trivially, and — composed with `stackDiscHS_of_venomAsmRel` (the reframing) — `StackDiscHS` at the
+    entry follows from the walk-threaded `venomAsmRel` alone. This is the base of the plan-generation
+    induction; the DFS-recording inductive step (`psOf bb`'s stack shape for non-entry blocks) is the
+    remaining deep part. -/
+theorem stackPerm_at_entry {fuel fnEom lblCtr : Nat} {fn : IrFunction} {entry : BasicBlock}
+    (hentry : entryBlock fn = some entry)
+    (hfn : ∀ bb ∈ fn.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst)
+    (hfuel : 0 < fuel) :
+    StackPerm [] (psOfFn fuel fn fnEom lblCtr entry.label) := by
+  rw [psOfFn_entry hentry hfn hfuel]
+  simp [StackPerm, initPlanState]
+
+theorem stackDiscHS_at_entry {fuel fnEom lblCtr : Nat} {fn : IrFunction} {entry : BasicBlock}
+    {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {k : Nat}
+    (hentry : entryBlock fn = some entry)
+    (hfn : ∀ bb ∈ fn.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst)
+    (hfuel : 0 < fuel)
+    (hrel : venomAsmRel lo (psOfFn fuel fn fnEom lblCtr entry.label) vs as)
+    (hk : k ≤ 15) :
+    StackDiscHS k (psOfFn fuel fn fnEom lblCtr entry.label) vs as := by
+  have hpe := psOfFn_entry (fnEom := fnEom) (lblCtr := lblCtr) hentry hfn hfuel
+  refine stackDiscHS_of_venomAsmRel hrel ?_ ?_
+  · rw [hpe, show ({initPlanState fnEom with labelCounter := lblCtr} : PlanState).stack.length = 0 from rfl,
+      Nat.zero_add]
+    exact hk
+  · intro op; rw [hpe]; rfl
+
+/-! ## Reframed gap (4): var-set reconciliation — `StackPerm` respects a permutation of its var set -/
+
+
+/-- **`StackPerm` respects a permutation of its var set.** Since `StackPerm S p` is `List.Perm p.stack
+    (S.map Var)`, permuting `S` to `S'` (`List.Perm S S'`) transfers the stack discipline. This is the
+    var-set reconciliation step for the universal walk invariant: the body sim produces `StackPerm (S0 ++
+    body-vars) (psOf succ)`, while a successor's hstep wants `StackPerm succLiveIn (psOf succ)`; whenever the
+    two var lists agree up to permutation (which a well-formed jump guarantees), this lemma bridges them.
+    Both hypotheses are manifestly satisfiable (`StackPerm S p` for any `p` with `stack = S.map Var`;
+    `Perm S S'` for `S' = S`), so it is not vacuous. -/
+theorem stackPerm_congr {S S' : List String} {p : PlanState}
+    (h : StackPerm S p) (hperm : List.Perm S S') : StackPerm S' p :=
+  h.trans (hperm.map Operand.Var)
+
+/-- Non-vacuity witness: a concrete state satisfies both hypotheses and the conclusion fires. -/
+theorem stackPerm_congr_nonvacuous (p : PlanState) (hp : p.stack = [Operand.Var "a", Operand.Var "b"]) :
+    StackPerm ["b", "a"] p :=
+  stackPerm_congr (S := ["a", "b"]) (by rw [StackPerm, hp]; rfl) (by decide)
+
+/-! ## Reframed gap (4): `StackDiscHS` from `venomAsmRel` + `StackPerm` + var-count bound (body-sim shape) -/
+
+
+/-- **`StackDiscHS` from `venomAsmRel` + `StackPerm` + a var-count bound.** A variant of
+    `stackDiscHS_of_venomAsmRel` where the caller supplies `StackPerm S ps` and a bound on `S.length`
+    instead of the raw `shallow` — the shape the body sim yields at a successor entry
+    (`StackPerm (S0 ++ body-vars) (psOf succ)`). `stackPerm_length` turns the var count into the stack
+    bound; `venomAsmRel_stack_defined` gives `defined`; `noSpill` (spill-free entry) makes `spillWf`
+    vacuous. So the whole `StackDiscHS` a successor hstep consumes is assembled from the walk-threaded
+    `venomAsmRel`, the body-sim `StackPerm`, and two plan facts (var count ≤ 15, spill-free). -/
+theorem stackDiscHS_of_venomAsmRel_perm {lo : AssocList String Nat} {ps : PlanState}
+    {vs : VenomState} {as : AsmState} {k : Nat} {S : List String}
+    (hrel : venomAsmRel lo ps vs as)
+    (hsv : StackPerm S ps)
+    (hlen : S.length + k ≤ 15)
+    (hnospill : ∀ op, alookup' ps.spilled op = none) :
+    StackDiscHS k ps vs as := by
+  refine stackDiscHS_of_venomAsmRel hrel ?_ hnospill
+  rw [stackPerm_length hsv]; exact hlen
+
+/-- Non-vacuity witness (built up front, per the discipline): a spill-free empty-stack state satisfies
+    every hypothesis and the conclusion fires. -/
+theorem stackDiscHS_of_venomAsmRel_perm_nonvacuous {lo : AssocList String Nat} {ps : PlanState}
+    {vs : VenomState} {as : AsmState} {k : Nat}
+    (hrel : venomAsmRel lo ps vs as) (hemp : ps.stack = []) (hsp : ps.spilled = []) (hk : k ≤ 15) :
+    StackDiscHS k ps vs as :=
+  stackDiscHS_of_venomAsmRel_perm (S := []) hrel
+    (by show List.Perm ps.stack _; rw [hemp]; exact List.Perm.refl _)
+    (by simpa using hk)
+    (by intro op; rw [hsp]; rfl)
+
+/-! ## Reframed gap (4): successor hstep invariants from venomAsmRel + per-block plan facts (no threading) -/
+
+
+/-- **A successor block's `StackDiscHS` + `StackPerm` hstep inputs, from the walk-threaded `venomAsmRel`
+    plus per-block plan facts.** This bundles the reframed-gap-(4) consumption lemmas and makes their
+    payoff explicit: the driver does NOT need to thread `StackDiscHS`/`StackPerm` block-to-block — it
+    threads `venomAsmRel` (which it already does), and the two hstep invariants are RE-DERIVED at each
+    successor entry from `venomAsmRel` + properties of the RECORDED plan state `ps = psOf succ` (spill-free,
+    the body-sim `StackPerm bodyVarSet`, the var-list reconciliation `bodyVarSet ≡ succLiveIn`, and the var
+    count bound). So the only genuinely per-block-plan obligations left are those `psOf`-facts; the
+    invariant "threading" dissolves. -/
+theorem succ_hstep_invariants_of_venomAsmRel
+    {lo : AssocList String Nat} {ps : PlanState} {vs : VenomState} {as : AsmState} {k : Nat}
+    {bodyVarSet succLiveIn : List String}
+    (hrel : venomAsmRel lo ps vs as)
+    (hnospill : ∀ op, alookup' ps.spilled op = none)
+    (hsv : StackPerm bodyVarSet ps)
+    (hperm : List.Perm bodyVarSet succLiveIn)
+    (hlen : succLiveIn.length + k ≤ 15) :
+    StackDiscHS k ps vs as ∧ StackPerm succLiveIn ps :=
+  ⟨stackDiscHS_of_venomAsmRel_perm hrel (stackPerm_congr hsv hperm) hlen hnospill,
+   stackPerm_congr hsv hperm⟩
+
+/-- Non-vacuity witness: a spill-free empty-stack state with `bodyVarSet = succLiveIn = []` satisfies
+    every hypothesis and both conclusions fire. -/
+theorem succ_hstep_invariants_nonvacuous
+    {lo : AssocList String Nat} {ps : PlanState} {vs : VenomState} {as : AsmState} {k : Nat}
+    (hrel : venomAsmRel lo ps vs as) (hemp : ps.stack = []) (hsp : ps.spilled = []) (hk : k ≤ 15) :
+    StackDiscHS k ps vs as ∧ StackPerm [] ps :=
+  succ_hstep_invariants_of_venomAsmRel (bodyVarSet := []) (succLiveIn := [])
+    hrel (by intro op; rw [hsp]; rfl)
+    (by show List.Perm ps.stack _; rw [hemp]; exact List.Perm.refl _)
+    (List.Perm.refl _) (by simpa using hk)
+
+/-! ## Non-vacuity witness for INVALID `_regular` (completes the no-emit sound family: STOP/INVALID/JMP) -/
+
+
+/-- **Non-vacuity of the sound INVALID `_regular`.** The halting sibling of `HbsimMatch_stop_regular_nonvacuous`:
+    a bare `[INVALID]` block (front = []) instantiates `HbsimMatch_invalid_regular` with every
+    structural/reducible hypothesis discharged, leaving only the genuine invariants + the concrete INVALID
+    placement. So the lemma fires — completing the witness set for the no-emit/empty-join sound `_regular`
+    family (STOP, INVALID, JMP). -/
+theorem HbsimMatch_invalid_regular_nonvacuous
+    {Entry : VenomState → AsmState → Nat → Prop}
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {o2pc : AssocList Nat Nat} {prog : List AsmInst}
+    {nextLiveness : List String} {curBbLabel : String} {dem : Nat}
+    {ps0 : PlanState} {as0 : AsmState} {N restFuel : Nat} {ctx : VenomContext} {bb : BasicBlock}
+    {s : VenomState} {S : List String} {invInst : Instruction}
+    (hbb : bb.instructions = [invInst]) (hinvop : invInst.opcode = Opcode.INVALID)
+    (hphi : invInst.opcode ≠ Opcode.PHI)
+    (hsd : StackDiscH 0 ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel0 : venomAsmRel lo ps0 { s with instIdx := 0 } as0)
+    (hblock : asmBlockAt prog as0.pc [])
+    (hpc : as0.pc < prog.length) (hinv : prog.get ⟨as0.pc, hpc⟩ = AsmInst.AsmOp "INVALID")
+    (hle : 1 ≤ N) :
+    HbsimMatch Entry o2pc prog as0 N (runBlock (0 + (restFuel + 1)) ctx bb s) := by
+  refine HbsimMatch_invalid_regular (liveness := liveness) (dfg := dfg) (cfg := cfg) (fn := fn)
+    (nextLiveness := nextLiveness) (curBbLabel := curBbLabel) (dem := dem) (front := [])
+    (lo := lo) (ps0 := ps0) (S := S) (o2pc := o2pc) (prog := prog) (as0 := as0)
+    (hd := invInst) (tl := []) (sEnd := { s with instIdx := 0 })
+    (by simpa using hbb) hinvop (by simpa using hbb) hphi (by simp) ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_
+  · rfl
+  · trivial
+  · simpa using hsd
+  · exact hsv
+  · exact hrel0
+  · exact hblock
+  · exact hpc
+  · exact hinv
+  · exact hle
+
+/-! ## The ∀-block terminator-dispatch assembler: one per-block connector for every terminator
+
+The per-block obligation of `codegen_correct_ofBlocks_HbsimMatch` was previously discharged by picking,
+at each call site, the matching `HbsimMatch_*_from_body` connector by hand. These two lemmas collapse
+that hand-dispatch into a single per-block entry point: supply the block's body-sim run plus its
+terminator-classified recipe and get the `HbsimMatch`, with the case analysis carried once, inside the
+lemma. `HbsimMatch_halting_dispatch` covers the five halting terminators for an arbitrary `Entry`;
+`HbsimMatch_dispatch` covers all eight for the canonical walk `Entry`. -/
+
+
+/-- **A block's halting-terminator recipe**: the block runs its body to `vs'`, then executes one of the
+    five halting terminators (STOP / INVALID / RETURN / REVERT / SELFDESTRUCT), each bundled with the
+    Venom-side `runBlock` result and the asm-side terminator instruction sitting at `as'.pc` (plus the
+    operand/memory facts the operand-carrying terminators need). The body-sim half (`hbody`/`hrel'`) is
+    shared across all five arms. -/
+def HaltingTermRecipe (prog : List AsmInst) (as' : AsmState)
+    (ps' : PlanState) (vs' : VenomState)
+    (f' : Nat) (ctx : VenomContext) (bb : BasicBlock) (s : VenomState) : Prop :=
+  (runBlock f' ctx bb s = ExecResult.Halt (haltState vs')
+    ∧ ∃ h : as'.pc < prog.length, prog.get ⟨as'.pc, h⟩ = AsmInst.AsmOp "STOP")
+  ∨ (runBlock f' ctx bb s
+        = ExecResult.Abort AbortType.ExHaltAbort (haltState (setReturndata ByteArray.empty vs'))
+    ∧ ∃ h : as'.pc < prog.length, prog.get ⟨as'.pc, h⟩ = AsmInst.AsmOp "INVALID")
+  ∨ (∃ (offW szW : bytes32) (rest : List bytes32),
+      runBlock f' ctx bb s
+          = ExecResult.Halt (haltState (setReturndata (readMemory offW.toNat szW.toNat vs') vs'))
+      ∧ (∃ h : as'.pc < prog.length, prog.get ⟨as'.pc, h⟩ = AsmInst.AsmOp "RETURN")
+      ∧ as'.stack = offW :: szW :: rest
+      ∧ (szW.toNat = 0 ∨ ((offW.toNat + szW.toNat + 31) / 32) * 32 ≤ as'.memory.size)
+      ∧ offW.toNat + szW.toNat ≤ ps'.alloc.fnEom ∧ szW.toNat < USize.size)
+  ∨ (∃ (offW szW : bytes32) (rest : List bytes32),
+      runBlock f' ctx bb s
+          = ExecResult.Abort AbortType.RevertAbort
+              (revertState (setReturndata (readMemory offW.toNat szW.toNat vs') vs'))
+      ∧ (∃ h : as'.pc < prog.length, prog.get ⟨as'.pc, h⟩ = AsmInst.AsmOp "REVERT")
+      ∧ as'.stack = offW :: szW :: rest
+      ∧ (szW.toNat = 0 ∨ ((offW.toNat + szW.toNat + 31) / 32) * 32 ≤ as'.memory.size)
+      ∧ offW.toNat + szW.toNat ≤ ps'.alloc.fnEom ∧ szW.toNat < USize.size)
+  ∨ (∃ (addr : bytes32) (stk : List bytes32),
+      runBlock f' ctx bb s = ExecResult.Halt (haltState (selfdestruct addr vs'))
+      ∧ (∃ h : as'.pc < prog.length, prog.get ⟨as'.pc, h⟩ = AsmInst.AsmOp "SELFDESTRUCT")
+      ∧ as'.stack = addr :: stk)
+
+/-- **The halting-terminator dispatcher.** Given the shared body-sim output (`hbody`/`hrel'`) and a
+    `HaltingTermRecipe` classifying the block's halting terminator, produce the block's `HbsimMatch` for
+    ANY `Entry` — dispatching to the matching per-terminator connector. Unifies the five halting
+    connectors into a single per-block entry point (the halting half of the ∀-block assembler). -/
+theorem HbsimMatch_halting_dispatch {Entry : VenomState → AsmState → Nat → Prop}
+    {lo : AssocList String Nat} {ps' : PlanState} {o2pc : AssocList Nat Nat} {prog : List AsmInst}
+    {as0 as' : AsmState} {f' bodyLen N : Nat} {ctx : VenomContext} {bb : BasicBlock}
+    {s vs' : VenomState}
+    (hbody : runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as')
+    (hrel' : venomAsmRel lo ps' vs' as')
+    (hle : bodyLen + 1 ≤ N)
+    (hrecipe : HaltingTermRecipe prog as' ps' vs' f' ctx bb s) :
+    HbsimMatch Entry o2pc prog as0 N (runBlock f' ctx bb s) := by
+  rcases hrecipe with ⟨hrb, hpc, hstop⟩ | ⟨hrb, hpc, hinv⟩
+    | ⟨offW, szW, rest, hrb, ⟨hpc, hret⟩, hstk, hcov, hbelow, hlen⟩
+    | ⟨offW, szW, rest, hrb, ⟨hpc, hrev⟩, hstk, hcov, hbelow, hlen⟩
+    | ⟨addr, stk, hrb, ⟨hpc, hsd⟩, hstk⟩
+  · exact HbsimMatch_stop_from_body hrb hbody hrel' hpc hstop hle
+  · exact HbsimMatch_invalid_from_body hrb hbody hrel' hpc hinv hle
+  · exact HbsimMatch_return_from_body hrb hbody hrel' hpc hret hstk hcov hbelow hlen hle
+  · exact HbsimMatch_revert_from_body hrb hbody hrel' hpc hrev hstk hcov hbelow hlen hle
+  · exact HbsimMatch_selfdestruct_from_body hrb hbody hrel' hpc hsd hstk hle
+
+/-- **Non-vacuity: a bare STOP block drives the dispatcher.** Empty body (`bodyLen = 0`), STOP arm of the
+    recipe — every hypothesis is satisfied and the `HbsimMatch` is produced, so the dispatcher applies to
+    a real block. -/
+theorem HbsimMatch_halting_dispatch_nonvacuous
+    {Entry : VenomState → AsmState → Nat → Prop} {lo : AssocList String Nat} {ps : PlanState}
+    {o2pc : AssocList Nat Nat} {prog : List AsmInst} {as0 : AsmState}
+    {ctx : VenomContext} {bb : BasicBlock} {s : VenomState} {N f' : Nat} {stopInst : Instruction}
+    (hbb : bb.instructions = [stopInst]) (hstopop : stopInst.opcode = Opcode.STOP)
+    (hrel : venomAsmRel lo ps { s with instIdx := 0 } as0)
+    (hstoppc : as0.pc < prog.length) (hstop : prog.get ⟨as0.pc, hstoppc⟩ = AsmInst.AsmOp "STOP")
+    (hle : 0 + 1 ≤ N) :
+    HbsimMatch Entry o2pc prog as0 N (runBlock (f' + 1) ctx bb { s with instIdx := 0 }) := by
+  have hrb : runBlock (f' + 1) ctx bb { s with instIdx := 0 }
+      = ExecResult.Halt (haltState { s with instIdx := 0 }) := by
+    simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, hbb, hstopop, stepInstBase]
+  refine HbsimMatch_halting_dispatch (bodyLen := 0) (as' := as0) (ps' := ps)
+    (by simp [runAsm]) hrel hle ?_
+  exact Or.inl ⟨hrb, hstoppc, hstop⟩
+
+/-- **A block's full terminator recipe** (all eight codegen terminators). Each disjunct bundles exactly
+    the hypotheses its per-terminator connector needs beyond the shared body-sim run `hbody`: the Venom
+    `runBlock` result, the resolved asm terminator instruction(s), the operand/memory facts, the arrival
+    relation, the successor lookup, and the fuel bound. Halting arms carry the body-end relation
+    `venomAsmRel lo ps' vs' as'`; continuing arms carry the successor-recording relation instead
+    (`ps' = psOf target` for JMP; the condition/selector-dropped `venomAsmRel` for JNZ/DJMP). -/
+def TermRecipe (fn : IrFunction) (lo : AssocList String Nat) (pcOf : String → Nat)
+    (psOf : String → PlanState) (o2pc : AssocList Nat Nat) (offsets : AssocList String Nat)
+    (prog : List AsmInst) (as' : AsmState) (ps' : PlanState) (vs' : VenomState)
+    (bodyLen N f' : Nat) (ctx : VenomContext) (bb : BasicBlock) (s : VenomState) : Prop :=
+  -- STOP
+  (venomAsmRel lo ps' vs' as' ∧ bodyLen + 1 ≤ N
+    ∧ runBlock f' ctx bb s = ExecResult.Halt (haltState vs')
+    ∧ ∃ h : as'.pc < prog.length, prog.get ⟨as'.pc, h⟩ = AsmInst.AsmOp "STOP")
+  -- INVALID
+  ∨ (venomAsmRel lo ps' vs' as' ∧ bodyLen + 1 ≤ N
+    ∧ runBlock f' ctx bb s
+        = ExecResult.Abort AbortType.ExHaltAbort (haltState (setReturndata ByteArray.empty vs'))
+    ∧ ∃ h : as'.pc < prog.length, prog.get ⟨as'.pc, h⟩ = AsmInst.AsmOp "INVALID")
+  -- RETURN
+  ∨ (∃ (offW szW : bytes32) (rest : List bytes32), venomAsmRel lo ps' vs' as' ∧ bodyLen + 1 ≤ N
+      ∧ runBlock f' ctx bb s
+          = ExecResult.Halt (haltState (setReturndata (readMemory offW.toNat szW.toNat vs') vs'))
+      ∧ (∃ h : as'.pc < prog.length, prog.get ⟨as'.pc, h⟩ = AsmInst.AsmOp "RETURN")
+      ∧ as'.stack = offW :: szW :: rest
+      ∧ (szW.toNat = 0 ∨ ((offW.toNat + szW.toNat + 31) / 32) * 32 ≤ as'.memory.size)
+      ∧ offW.toNat + szW.toNat ≤ ps'.alloc.fnEom ∧ szW.toNat < USize.size)
+  -- REVERT
+  ∨ (∃ (offW szW : bytes32) (rest : List bytes32), venomAsmRel lo ps' vs' as' ∧ bodyLen + 1 ≤ N
+      ∧ runBlock f' ctx bb s
+          = ExecResult.Abort AbortType.RevertAbort
+              (revertState (setReturndata (readMemory offW.toNat szW.toNat vs') vs'))
+      ∧ (∃ h : as'.pc < prog.length, prog.get ⟨as'.pc, h⟩ = AsmInst.AsmOp "REVERT")
+      ∧ as'.stack = offW :: szW :: rest
+      ∧ (szW.toNat = 0 ∨ ((offW.toNat + szW.toNat + 31) / 32) * 32 ≤ as'.memory.size)
+      ∧ offW.toNat + szW.toNat ≤ ps'.alloc.fnEom ∧ szW.toNat < USize.size)
+  -- SELFDESTRUCT
+  ∨ (∃ (addr : bytes32) (stk : List bytes32), venomAsmRel lo ps' vs' as' ∧ bodyLen + 1 ≤ N
+      ∧ runBlock f' ctx bb s = ExecResult.Halt (haltState (selfdestruct addr vs'))
+      ∧ (∃ h : as'.pc < prog.length, prog.get ⟨as'.pc, h⟩ = AsmInst.AsmOp "SELFDESTRUCT")
+      ∧ as'.stack = addr :: stk)
+  -- JMP
+  ∨ (∃ (target : String) (off : Nat) (bb' : BasicBlock),
+      venomAsmRel lo ps' vs' as' ∧ ps' = psOf target ∧ bodyLen + 2 ≤ N ∧ vs'.halted = false
+      ∧ runBlock f' ctx bb s = ExecResult.OK (jumpTo target vs')
+      ∧ (∃ h1 : as'.pc < prog.length,
+          prog.get ⟨as'.pc, h1⟩ = resolveInst offsets (AsmInst.AsmPushLabel target))
+      ∧ AssocList.lookup String Nat offsets target = some off ∧ off < 2 ^ 256
+      ∧ (∃ h2 : as'.pc + 1 < prog.length, prog.get ⟨as'.pc + 1, h2⟩ = AsmInst.AsmOp "JUMP")
+      ∧ AssocList.lookup Nat Nat o2pc off = some (pcOf target)
+      ∧ lookupBlock target fn.blocks = some bb')
+  -- JNZ (taken)
+  ∨ (∃ (ifNz : String) (off : Nat) (cond : bytes32) (stk : List bytes32) (bb' : BasicBlock),
+      bodyLen + 2 ≤ N ∧ vs'.halted = false
+      ∧ runBlock f' ctx bb s = ExecResult.OK (jumpTo ifNz vs')
+      ∧ as'.stack = cond :: stk ∧ cond ≠ EvmYul.UInt256.ofNat 0
+      ∧ (∃ h1 : as'.pc < prog.length,
+          prog.get ⟨as'.pc, h1⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifNz))
+      ∧ AssocList.lookup String Nat offsets ifNz = some off ∧ off < 2 ^ 256
+      ∧ (∃ h2 : as'.pc + 1 < prog.length, prog.get ⟨as'.pc + 1, h2⟩ = AsmInst.AsmOp "JUMPI")
+      ∧ AssocList.lookup Nat Nat o2pc off = some (pcOf ifNz)
+      ∧ venomAsmRel lo (psOf ifNz) vs' { as' with stack := stk }
+      ∧ lookupBlock ifNz fn.blocks = some bb')
+  -- JNZ (not taken)
+  ∨ (∃ (ifNz ifZ : String) (offN offZ : Nat) (stk : List bytes32) (bb' : BasicBlock),
+      bodyLen + 4 ≤ N ∧ vs'.halted = false
+      ∧ runBlock f' ctx bb s = ExecResult.OK (jumpTo ifZ vs')
+      ∧ as'.stack = EvmYul.UInt256.ofNat 0 :: stk
+      ∧ (∃ h1 : as'.pc < prog.length,
+          prog.get ⟨as'.pc, h1⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifNz))
+      ∧ AssocList.lookup String Nat offsets ifNz = some offN ∧ offN < 2 ^ 256
+      ∧ (∃ h2 : as'.pc + 1 < prog.length, prog.get ⟨as'.pc + 1, h2⟩ = AsmInst.AsmOp "JUMPI")
+      ∧ (∃ h3 : as'.pc + 2 < prog.length,
+          prog.get ⟨as'.pc + 2, h3⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifZ))
+      ∧ AssocList.lookup String Nat offsets ifZ = some offZ ∧ offZ < 2 ^ 256
+      ∧ (∃ h4 : as'.pc + 2 + 1 < prog.length, prog.get ⟨as'.pc + 2 + 1, h4⟩ = AsmInst.AsmOp "JUMP")
+      ∧ AssocList.lookup Nat Nat o2pc offZ = some (pcOf ifZ)
+      ∧ venomAsmRel lo (psOf ifZ) vs' { as' with stack := stk }
+      ∧ lookupBlock ifZ fn.blocks = some bb')
+  -- DJMP
+  ∨ (∃ (targetLabel : String) (chainLen : Nat) (rest : List bytes32) (bb' : BasicBlock),
+      bodyLen + chainLen ≤ N ∧ vs'.halted = false
+      ∧ runBlock f' ctx bb s = ExecResult.OK (jumpTo targetLabel vs')
+      ∧ runAsm chainLen o2pc prog as'
+          = AsmResult.AsmOK { as' with stack := rest, pc := pcOf targetLabel }
+      ∧ venomAsmRel lo (psOf targetLabel) vs' { as' with stack := rest }
+      ∧ lookupBlock targetLabel fn.blocks = some bb')
+
+/-- **The ∀-block terminator-dispatch assembler.** Given the shared body-sim run `hbody` and a
+    `TermRecipe` classifying the block's terminator, produce the block's `HbsimMatch` for the canonical
+    walk `Entry` — dispatching each of the eight terminators to its connector. This is the per-block
+    obligation of `codegen_correct_ofBlocks_HbsimMatch` discharged uniformly: a block is handled by
+    supplying its body sim plus its (decidable-terminator-classified) recipe, with no case analysis at
+    the call site. -/
+theorem HbsimMatch_dispatch {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {as0 as' : AsmState} {ps' : PlanState} {bodyLen N f' : Nat}
+    {ctx : VenomContext} {bb : BasicBlock} {s vs' : VenomState}
+    (hbody : runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as')
+    (hrecipe : TermRecipe fn lo pcOf psOf o2pc offsets prog as' ps' vs' bodyLen N f' ctx bb s) :
+    HbsimMatch (CanonEntry fn lo pcOf psOf) o2pc prog as0 N (runBlock f' ctx bb s) := by
+  rcases hrecipe with
+      ⟨hrel', hle, hrb, hpc, hstop⟩
+    | ⟨hrel', hle, hrb, hpc, hinv⟩
+    | ⟨offW, szW, rest, hrel', hle, hrb, ⟨hpc, hret⟩, hstk, hcov, hbelow, hlen⟩
+    | ⟨offW, szW, rest, hrel', hle, hrb, ⟨hpc, hrev⟩, hstk, hcov, hbelow, hlen⟩
+    | ⟨addr, stk, hrel', hle, hrb, ⟨hpc, hsd⟩, hstk⟩
+    | ⟨target, off, bb', hrel', hps, hle, hnh, hrb, ⟨hp1, hpush⟩, hoff_lk, hoff, ⟨hp2, hjump⟩,
+        hidx_lk, hlk'⟩
+    | ⟨ifNz, off, cond, stk, bb', hle, hnh, hrb, hstk_c, hcond, ⟨hp1, hpush⟩, hoff_lk, hoff,
+        ⟨hp2, hjumpi⟩, hidx_lk, hrel_succ, hlk'⟩
+    | ⟨ifNz, ifZ, offN, offZ, stk, bb', hle, hnh, hrb, hstk_c, ⟨hp1, hpushN⟩, hoffN_lk, hoffN,
+        ⟨hp2, hjumpi⟩, ⟨hp3, hpushZ⟩, hoffZ_lk, hoffZ, ⟨hp4, hjump⟩, hidxZ_lk, hrel_succ, hlk'⟩
+    | ⟨targetLabel, chainLen, rest, bb', hle, hnh, hrb, hdispatch, hrel_succ, hlk'⟩
+  · exact HbsimMatch_stop_from_body hrb hbody hrel' hpc hstop hle
+  · exact HbsimMatch_invalid_from_body hrb hbody hrel' hpc hinv hle
+  · exact HbsimMatch_return_from_body hrb hbody hrel' hpc hret hstk hcov hbelow hlen hle
+  · exact HbsimMatch_revert_from_body hrb hbody hrel' hpc hrev hstk hcov hbelow hlen hle
+  · exact HbsimMatch_selfdestruct_from_body hrb hbody hrel' hpc hsd hstk hle
+  · exact HbsimMatch_jmp_from_body hrb hnh hbody hrel' hps hp1 hpush hoff_lk hoff hp2 hjump
+      hidx_lk hlk' hle
+  · exact HbsimMatch_jnz_taken_from_body hrb hnh hbody hstk_c hcond hp1 hpush hoff_lk hoff hp2
+      hjumpi hidx_lk hrel_succ hlk' hle
+  · exact HbsimMatch_jnz_nottaken_from_body hrb hnh hbody hstk_c hp1 hpushN hoffN_lk hoffN hp2
+      hjumpi hp3 hpushZ hoffZ_lk hoffZ hp4 hjump hidxZ_lk hrel_succ hlk' hle
+  · exact HbsimMatch_djmp_from_body hrb hnh hbody hdispatch hrel_succ hlk' hle
+
+/-- **The N-constrained block terminator recipe.** `TermRecipe` with every fuel bound `bodyLen + K ≤ N`
+    replaced by the block-layout fact against `wOf bb.label` (halting: `bodyLen + 1 ≤ wOf bb.label`;
+    continuing: `wOf(succ) + blockLen ≤ wOf bb.label`). Paired with `wOf bb.label ≤ N` (the Entry's
+    budget bound) this yields both the halting `hle` and the continuing successor bound. -/
+def TermRecipeW (fn : IrFunction) (lo : AssocList String Nat) (pcOf : String → Nat)
+    (psOf : String → PlanState) (wOf : String → Nat) (o2pc : AssocList Nat Nat)
+    (offsets : AssocList String Nat) (prog : List AsmInst) (as' : AsmState) (ps' : PlanState)
+    (vs' : VenomState) (bodyLen f' : Nat) (ctx : VenomContext) (bb : BasicBlock) (s : VenomState) : Prop :=
+  (venomAsmRel lo ps' vs' as' ∧ bodyLen + 1 ≤ wOf bb.label
+    ∧ runBlock f' ctx bb s = ExecResult.Halt (haltState vs')
+    ∧ ∃ h : as'.pc < prog.length, prog.get ⟨as'.pc, h⟩ = AsmInst.AsmOp "STOP")
+  ∨ (venomAsmRel lo ps' vs' as' ∧ bodyLen + 1 ≤ wOf bb.label
+    ∧ runBlock f' ctx bb s
+        = ExecResult.Abort AbortType.ExHaltAbort (haltState (setReturndata ByteArray.empty vs'))
+    ∧ ∃ h : as'.pc < prog.length, prog.get ⟨as'.pc, h⟩ = AsmInst.AsmOp "INVALID")
+  ∨ (∃ (offW szW : bytes32) (rest : List bytes32), venomAsmRel lo ps' vs' as' ∧ bodyLen + 1 ≤ wOf bb.label
+      ∧ runBlock f' ctx bb s
+          = ExecResult.Halt (haltState (setReturndata (readMemory offW.toNat szW.toNat vs') vs'))
+      ∧ (∃ h : as'.pc < prog.length, prog.get ⟨as'.pc, h⟩ = AsmInst.AsmOp "RETURN")
+      ∧ as'.stack = offW :: szW :: rest
+      ∧ (szW.toNat = 0 ∨ ((offW.toNat + szW.toNat + 31) / 32) * 32 ≤ as'.memory.size)
+      ∧ offW.toNat + szW.toNat ≤ ps'.alloc.fnEom ∧ szW.toNat < USize.size)
+  ∨ (∃ (offW szW : bytes32) (rest : List bytes32), venomAsmRel lo ps' vs' as' ∧ bodyLen + 1 ≤ wOf bb.label
+      ∧ runBlock f' ctx bb s
+          = ExecResult.Abort AbortType.RevertAbort
+              (revertState (setReturndata (readMemory offW.toNat szW.toNat vs') vs'))
+      ∧ (∃ h : as'.pc < prog.length, prog.get ⟨as'.pc, h⟩ = AsmInst.AsmOp "REVERT")
+      ∧ as'.stack = offW :: szW :: rest
+      ∧ (szW.toNat = 0 ∨ ((offW.toNat + szW.toNat + 31) / 32) * 32 ≤ as'.memory.size)
+      ∧ offW.toNat + szW.toNat ≤ ps'.alloc.fnEom ∧ szW.toNat < USize.size)
+  ∨ (∃ (addr : bytes32) (stk : List bytes32), venomAsmRel lo ps' vs' as' ∧ bodyLen + 1 ≤ wOf bb.label
+      ∧ runBlock f' ctx bb s = ExecResult.Halt (haltState (selfdestruct addr vs'))
+      ∧ (∃ h : as'.pc < prog.length, prog.get ⟨as'.pc, h⟩ = AsmInst.AsmOp "SELFDESTRUCT")
+      ∧ as'.stack = addr :: stk)
+  ∨ (∃ (target : String) (off : Nat) (bb' : BasicBlock),
+      venomAsmRel lo ps' vs' as' ∧ ps' = psOf target ∧ wOf target + (bodyLen + 2) ≤ wOf bb.label
+      ∧ vs'.halted = false
+      ∧ runBlock f' ctx bb s = ExecResult.OK (jumpTo target vs')
+      ∧ (∃ h1 : as'.pc < prog.length,
+          prog.get ⟨as'.pc, h1⟩ = resolveInst offsets (AsmInst.AsmPushLabel target))
+      ∧ AssocList.lookup String Nat offsets target = some off ∧ off < 2 ^ 256
+      ∧ (∃ h2 : as'.pc + 1 < prog.length, prog.get ⟨as'.pc + 1, h2⟩ = AsmInst.AsmOp "JUMP")
+      ∧ AssocList.lookup Nat Nat o2pc off = some (pcOf target)
+      ∧ lookupBlock target fn.blocks = some bb')
+  ∨ (∃ (ifNz : String) (off : Nat) (cond : bytes32) (stk : List bytes32) (bb' : BasicBlock),
+      wOf ifNz + (bodyLen + 2) ≤ wOf bb.label ∧ vs'.halted = false
+      ∧ runBlock f' ctx bb s = ExecResult.OK (jumpTo ifNz vs')
+      ∧ as'.stack = cond :: stk ∧ cond ≠ EvmYul.UInt256.ofNat 0
+      ∧ (∃ h1 : as'.pc < prog.length,
+          prog.get ⟨as'.pc, h1⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifNz))
+      ∧ AssocList.lookup String Nat offsets ifNz = some off ∧ off < 2 ^ 256
+      ∧ (∃ h2 : as'.pc + 1 < prog.length, prog.get ⟨as'.pc + 1, h2⟩ = AsmInst.AsmOp "JUMPI")
+      ∧ AssocList.lookup Nat Nat o2pc off = some (pcOf ifNz)
+      ∧ venomAsmRel lo (psOf ifNz) vs' { as' with stack := stk }
+      ∧ lookupBlock ifNz fn.blocks = some bb')
+  ∨ (∃ (ifNz ifZ : String) (offN offZ : Nat) (stk : List bytes32) (bb' : BasicBlock),
+      wOf ifZ + (bodyLen + 4) ≤ wOf bb.label ∧ vs'.halted = false
+      ∧ runBlock f' ctx bb s = ExecResult.OK (jumpTo ifZ vs')
+      ∧ as'.stack = EvmYul.UInt256.ofNat 0 :: stk
+      ∧ (∃ h1 : as'.pc < prog.length,
+          prog.get ⟨as'.pc, h1⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifNz))
+      ∧ AssocList.lookup String Nat offsets ifNz = some offN ∧ offN < 2 ^ 256
+      ∧ (∃ h2 : as'.pc + 1 < prog.length, prog.get ⟨as'.pc + 1, h2⟩ = AsmInst.AsmOp "JUMPI")
+      ∧ (∃ h3 : as'.pc + 2 < prog.length,
+          prog.get ⟨as'.pc + 2, h3⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifZ))
+      ∧ AssocList.lookup String Nat offsets ifZ = some offZ ∧ offZ < 2 ^ 256
+      ∧ (∃ h4 : as'.pc + 2 + 1 < prog.length, prog.get ⟨as'.pc + 2 + 1, h4⟩ = AsmInst.AsmOp "JUMP")
+      ∧ AssocList.lookup Nat Nat o2pc offZ = some (pcOf ifZ)
+      ∧ venomAsmRel lo (psOf ifZ) vs' { as' with stack := stk }
+      ∧ lookupBlock ifZ fn.blocks = some bb')
+  ∨ (∃ (targetLabel : String) (chainLen : Nat) (rest : List bytes32) (bb' : BasicBlock),
+      wOf targetLabel + (bodyLen + chainLen) ≤ wOf bb.label ∧ vs'.halted = false
+      ∧ runBlock f' ctx bb s = ExecResult.OK (jumpTo targetLabel vs')
+      ∧ runAsm chainLen o2pc prog as'
+          = AsmResult.AsmOK { as' with stack := rest, pc := pcOf targetLabel }
+      ∧ venomAsmRel lo (psOf targetLabel) vs' { as' with stack := rest }
+      ∧ lookupBlock targetLabel fn.blocks = some bb')
+
+/-- **The ∀-block terminator-dispatch assembler for the N-constrained walk Entry.** Given the body-sim run
+    `hbody`, the Entry's budget bound `hcur : wOf bb.label ≤ N`, and a `TermRecipeW` classifying the block's
+    terminator, produce the block's `HbsimMatch (CanonEntryWH …)` — halting arms via the Entry-independent
+    connectors (deriving `bodyLen + 1 ≤ N` from the layout fact + `hcur`), continuing arms via the `canonWH`
+    connectors (which thread `wOf`/`halted` to the successor). This is the generic per-block obligation of a
+    multi-block recipe driver, discharged uniformly with no vacuity. -/
+theorem HbsimMatch_dispatchW {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {as0 as' : AsmState} {ps' : PlanState} {bodyLen N f' : Nat}
+    {ctx : VenomContext} {bb : BasicBlock} {s vs' : VenomState}
+    (hbody : runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as')
+    (hcur : wOf bb.label ≤ N)
+    (hrecipe : TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' vs' bodyLen f' ctx bb s) :
+    HbsimMatch (CanonEntryWH fn lo pcOf psOf wOf) o2pc prog as0 N (runBlock f' ctx bb s) := by
+  rcases hrecipe with
+      ⟨hrel', hw, hrb, hpc, hstop⟩
+    | ⟨hrel', hw, hrb, hpc, hinv⟩
+    | ⟨offW, szW, rest, hrel', hw, hrb, ⟨hpc, hret⟩, hstk, hcov, hbelow, hlen⟩
+    | ⟨offW, szW, rest, hrel', hw, hrb, ⟨hpc, hrev⟩, hstk, hcov, hbelow, hlen⟩
+    | ⟨addr, stk, hrel', hw, hrb, ⟨hpc, hsd⟩, hstk⟩
+    | ⟨target, off, bb', hrel', hps, hw, hnh, hrb, ⟨hp1, hpush⟩, hoff_lk, hoff, ⟨hp2, hjump⟩,
+        hidx_lk, hlk'⟩
+    | ⟨ifNz, off, cond, stk, bb', hw, hnh, hrb, hstk_c, hcond, ⟨hp1, hpush⟩, hoff_lk, hoff,
+        ⟨hp2, hjumpi⟩, hidx_lk, hrel_succ, hlk'⟩
+    | ⟨ifNz, ifZ, offN, offZ, stk, bb', hw, hnh, hrb, hstk_c, ⟨hp1, hpushN⟩, hoffN_lk, hoffN,
+        ⟨hp2, hjumpi⟩, ⟨hp3, hpushZ⟩, hoffZ_lk, hoffZ, ⟨hp4, hjump⟩, hidxZ_lk, hrel_succ, hlk'⟩
+    | ⟨targetLabel, chainLen, rest, bb', hw, hnh, hrb, hdispatch, hrel_succ, hlk'⟩
+  · exact HbsimMatch_stop_from_body hrb hbody hrel' hpc hstop (by omega)
+  · exact HbsimMatch_invalid_from_body hrb hbody hrel' hpc hinv (by omega)
+  · exact HbsimMatch_return_from_body hrb hbody hrel' hpc hret hstk hcov hbelow hlen (by omega)
+  · exact HbsimMatch_revert_from_body hrb hbody hrel' hpc hrev hstk hcov hbelow hlen (by omega)
+  · exact HbsimMatch_selfdestruct_from_body hrb hbody hrel' hpc hsd hstk (by omega)
+  · exact HbsimMatch_jmp_from_body_canonWH hrb hnh hbody hrel' hps hp1 hpush hoff_lk hoff hp2 hjump
+      hidx_lk hlk' hw hcur
+  · exact HbsimMatch_jnz_taken_from_body_canonWH hrb hnh hbody hstk_c hcond hp1 hpush hoff_lk hoff hp2
+      hjumpi hidx_lk hrel_succ hlk' hw hcur
+  · exact HbsimMatch_jnz_nottaken_from_body_canonWH hrb hnh hbody hstk_c hp1 hpushN hoffN_lk hoffN hp2
+      hjumpi hp3 hpushZ hoffZ_lk hoffZ hp4 hjump hidxZ_lk hrel_succ hlk' hw hcur
+  · exact HbsimMatch_djmp_from_body_canonWH hrb hnh hbody hdispatch hrel_succ hlk' hw hcur
+
+/-- **The generic multi-block recipe driver.** Reduces a whole function's `codegen_correct` to a per-block
+    obligation: for each block reached under the N-constrained walk Entry `CanonEntryWH`, supply the block's
+    body-sim run and its `TermRecipeW`. Threads through `codegen_correct_ofBlocks_HbsimMatch` with the
+    per-block `HbsimMatch` discharged uniformly by `HbsimMatch_dispatchW` — no per-terminator case analysis at
+    the call site, and no vacuity: the wOf-bounded Entry keeps the budget sound.
+
+    `hsupply` is an error-OR-recipe disjunction, and that is load-bearing. A block with `m` body
+    instructions needs `m+1` steps, so `runBlock (k+1)` is out-of-fuel `Error` for `k < m` — which NO
+    `TermRecipeW` arm matches. Demanding a recipe at every `k` would therefore be unsatisfiable for every
+    non-empty-body block, restricting the driver to all-empty-body functions; the disjunction lets the caller
+    answer "at this fuel the block just runs out" instead. (`hrun0` is the same story at `f' = 0`.) -/
+theorem codegen_correct_ofBlocks_recipeW
+    {fuel : Nat} {ctx : VenomContext} {fn : IrFunction} {fnEom lblCtr : Nat}
+    {ops : List StackOp} {psFinal : PlanState} {vs : VenomState} {as : AsmState}
+    {entryName entryLbl : String} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {offsets : AssocList String Nat}
+    (hplan : generateFnPlan fn fnEom lblCtr = some (ops, psFinal))
+    (hent : ctx.entry = some entryName)
+    (hlk : lookupFunction entryName ctx.functions = some fn)
+    (hlbl : fnEntryLabel fn = some entryLbl)
+    (hrun0 : ∀ bb ∈ fn.blocks, ∀ s : VenomState, runBlock 0 ctx bb s = ExecResult.Error "out of fuel")
+    (hsupply : ∀ bb ∈ fn.blocks, ∀ (s : VenomState) (asm : AsmState) (N k : Nat),
+        CanonEntryWH fn lo pcOf psOf wOf s asm N → s.currentBb = bb.label →
+        (∃ e, runBlock (k+1) ctx bb s = ExecResult.Error e) ∨
+        (∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+          runAsm bodyLen (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 asm
+            = AsmResult.AsmOK as' ∧
+          TermRecipeW fn lo pcOf psOf wOf (asmResolve (executePlan ops)).2 offsets
+            (asmResolve (executePlan ops)).1 as' ps' vs' bodyLen (k+1) ctx bb s))
+    (hentry : CanonEntryWH fn lo pcOf psOf wOf
+        { vs with prevBb := none, currentBb := entryLbl, instIdx := 0 } as
+        (asmResolve (executePlan ops)).1.length) :
+    (match runContext fuel ctx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length (asmResolve (executePlan ops)).2
+         (asmResolve (executePlan ops)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length (asmResolve (executePlan ops)).2
+         (asmResolve (executePlan ops)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length (asmResolve (executePlan ops)).2
+         (asmResolve (executePlan ops)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  refine codegen_correct_ofBlocks_HbsimMatch (Entry := CanonEntryWH fn lo pcOf psOf wOf)
+    hplan hent hlk hlbl ?_ hentry
+  intro bb hbb s asm N f' hE hlbleq
+  have hcur : wOf bb.label ≤ N := by
+    obtain ⟨_, hwN, _⟩ := hE; rw [hlbleq] at hwN; exact hwN
+  cases f' with
+  | zero => rw [hrun0 bb hbb s]; simp [HbsimMatch]
+  | succ k =>
+    rcases hsupply bb hbb s asm N k hE hlbleq with ⟨e, herr⟩ | ⟨as', ps', vs', bodyLen, hbody, hrecipe⟩
+    · rw [herr]; simp [HbsimMatch]
+    · exact HbsimMatch_dispatchW hbody hcur hrecipe
+
+/-- **Strengthening `HbsimMatch`'s Entry with a state invariant.** `HbsimMatch` mentions `Entry` in exactly
+    ONE arm (OK / not-halted), so an invariant can be conjoined onto it wholesale: given the match for `E` and
+    a proof that `Inv` holds of the continuing result, the match holds for `E ∧ Inv`. No per-terminator work —
+    the eight dispatcher arms are untouched. -/
+theorem HbsimMatch_and_inv {E : VenomState → AsmState → Nat → Prop} {Inv : VenomState → Prop}
+    {o2pc : AssocList Nat Nat} {prog : List AsmInst} {asm : AsmState} {N : Nat} {r : ExecResult}
+    (h : HbsimMatch E o2pc prog asm N r)
+    (hinv : ∀ s', r = ExecResult.OK s' → s'.halted = false → Inv s') :
+    HbsimMatch (fun s a n => E s a n ∧ Inv s) o2pc prog asm N r := by
+  cases r with
+  | OK s' =>
+    by_cases hh : s'.halted
+    · simp only [HbsimMatch, hh, if_true] at h ⊢; exact h
+    · simp only [HbsimMatch, hh] at h ⊢
+      obtain ⟨asm', N', hrun, hE⟩ := h
+      exact ⟨asm', N', hrun, hE, hinv s' rfl (by simpa using hh)⟩
+  | Halt s' => exact h
+  | Abort t s' => cases t <;> exact h
+  | IntRet l s' => trivial
+  | Error e => trivial
+
+
+set_option maxHeartbeats 1000000 in
+/-- **The invariant-carrying driver.** Same as `codegen_correct_ofBlocks_recipeW`, but the walk carries a
+    caller-chosen `Inv : VenomState → Prop`: `hsupply` receives `Inv s` (so a recipe may depend on the state's
+    VALUES — e.g. RETURN's `hbelow : off + sz ≤ fnEom`, which is false for an arbitrary `s` and unprovable
+    under the plain driver), and in exchange the caller discharges `hpres`, that `Inv` survives a block.
+
+    This is a strict generalisation: `Inv := fun _ => True` recovers the original. It works because
+    `codegen_correct_ofBlocks_HbsimMatch` takes `Entry` as a FREE PARAMETER and `HbsimMatch` mentions `Entry`
+    in exactly one arm, so `HbsimMatch_and_inv` conjoins the invariant wholesale — the eight dispatcher arms
+    need no change. -/
+theorem codegen_correct_ofBlocks_recipeW_inv
+    {fuel : Nat} {ctx : VenomContext} {fn : IrFunction} {fnEom lblCtr : Nat}
+    {ops : List StackOp} {psFinal : PlanState} {vs : VenomState} {as : AsmState}
+    {entryName entryLbl : String} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {offsets : AssocList String Nat} (Inv : VenomState → Prop)
+    (hplan : generateFnPlan fn fnEom lblCtr = some (ops, psFinal))
+    (hent : ctx.entry = some entryName)
+    (hlk : lookupFunction entryName ctx.functions = some fn)
+    (hlbl : fnEntryLabel fn = some entryLbl)
+    (hrun0 : ∀ bb ∈ fn.blocks, ∀ s : VenomState, runBlock 0 ctx bb s = ExecResult.Error "out of fuel")
+    (hsupply : ∀ bb ∈ fn.blocks, ∀ (s : VenomState) (asm : AsmState) (N k : Nat),
+        CanonEntryWH fn lo pcOf psOf wOf s asm N → Inv s → s.currentBb = bb.label →
+        (∃ e, runBlock (k+1) ctx bb s = ExecResult.Error e) ∨
+        (∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+          runAsm bodyLen (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 asm
+            = AsmResult.AsmOK as' ∧
+          TermRecipeW fn lo pcOf psOf wOf (asmResolve (executePlan ops)).2 offsets
+            (asmResolve (executePlan ops)).1 as' ps' vs' bodyLen (k+1) ctx bb s))
+    (hpres : ∀ bb ∈ fn.blocks, ∀ (s s' : VenomState) (f' : Nat),
+        Inv s → runBlock f' ctx bb s = ExecResult.OK s' → Inv s')
+    (hentry : CanonEntryWH fn lo pcOf psOf wOf
+        { vs with prevBb := none, currentBb := entryLbl, instIdx := 0 } as
+        (asmResolve (executePlan ops)).1.length)
+    (hinv0 : Inv { vs with prevBb := none, currentBb := entryLbl, instIdx := 0 }) :
+    (match runContext fuel ctx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length (asmResolve (executePlan ops)).2
+         (asmResolve (executePlan ops)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length (asmResolve (executePlan ops)).2
+         (asmResolve (executePlan ops)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length (asmResolve (executePlan ops)).2
+         (asmResolve (executePlan ops)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  refine codegen_correct_ofBlocks_HbsimMatch
+    (Entry := fun s a n => CanonEntryWH fn lo pcOf psOf wOf s a n ∧ Inv s)
+    hplan hent hlk hlbl ?_ ⟨hentry, hinv0⟩
+  intro bb hbb s asm N f' hE hlbleq
+  obtain ⟨hE', hinv⟩ := hE
+  have hcur : wOf bb.label ≤ N := by
+    obtain ⟨_, hwN, _⟩ := hE'; rw [hlbleq] at hwN; exact hwN
+  refine HbsimMatch_and_inv ?_ (fun s' hr _ => hpres bb hbb s s' f' hinv hr)
+  cases f' with
+  | zero => rw [hrun0 bb hbb s]; simp [HbsimMatch]
+  | succ k =>
+    rcases hsupply bb hbb s asm N k hE' hinv hlbleq with ⟨e, herr⟩ | ⟨as', ps', vs', bodyLen, hbody, hrecipe⟩
+    · rw [herr]; simp [HbsimMatch]
+    · exact HbsimMatch_dispatchW hbody hcur hrecipe
+
+/-! ## Generic `TermRecipeW` producers: the Venom result DERIVED from the block, not assumed
+
+`codegen_correct_ofBlocks_recipeW`'s `hsupply` must hand each block a `TermRecipeW`, whose Venom component is
+a `runBlock … = …` fact. The concrete capstones discharge that per function by `simp`. These producers derive
+it instead, from the block's *structure* (`bb.instructions = front ++ [term]`, the terminator's opcode, and
+the body thread `execBodyThread`) via the `runBlock_body_*` family — so a caller supplies only the asm-side
+placement and the body-end relation. This is the first slice of discharging `hsupply` generically. -/
+
+/-- **Generic STOP `TermRecipeW`.** For ANY block `front ++ [stopInst]` whose body threads to `sEnd`, the
+    STOP arm's Venom result is derived (`runBlock_body_stop`), not assumed. -/
+theorem termRecipeW_stop_of_body {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {as' : AsmState} {ps' : PlanState} {bodyLen restFuel : Nat}
+    {ctx : VenomContext} {bb : BasicBlock} {s sEnd : VenomState}
+    {front : List Instruction} {stopInst hd : Instruction} {tl : List Instruction}
+    (hbb : bb.instructions = front ++ [stopInst]) (hstopop : stopInst.opcode = Opcode.STOP)
+    (hcons : front ++ [stopInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hrel' : venomAsmRel lo ps' sEnd as')
+    (hw : bodyLen + 1 ≤ wOf bb.label)
+    (hstoppc : as'.pc < prog.length)
+    (hstop : prog.get ⟨as'.pc, hstoppc⟩ = AsmInst.AsmOp "STOP") :
+    TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' sEnd bodyLen
+      (front.length + (restFuel + 1)) ctx bb s :=
+  Or.inl ⟨hrel', hw,
+    runBlock_body_stop ctx bb restFuel front stopInst hd tl s sEnd hbb hstopop hcons hphi hnonterm hthread,
+    hstoppc, hstop⟩
+
+/-- **Generic INVALID `TermRecipeW`.** The aborting sibling: the `Abort ExHaltAbort` result is derived
+    (`runBlock_body_invalid`) from the block's structure. -/
+theorem termRecipeW_invalid_of_body {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {as' : AsmState} {ps' : PlanState} {bodyLen restFuel : Nat}
+    {ctx : VenomContext} {bb : BasicBlock} {s sEnd : VenomState}
+    {front : List Instruction} {invInst hd : Instruction} {tl : List Instruction}
+    (hbb : bb.instructions = front ++ [invInst]) (hinvop : invInst.opcode = Opcode.INVALID)
+    (hcons : front ++ [invInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hrel' : venomAsmRel lo ps' sEnd as')
+    (hw : bodyLen + 1 ≤ wOf bb.label)
+    (hinvpc : as'.pc < prog.length)
+    (hinv : prog.get ⟨as'.pc, hinvpc⟩ = AsmInst.AsmOp "INVALID") :
+    TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' sEnd bodyLen
+      (front.length + (restFuel + 1)) ctx bb s :=
+  Or.inr (Or.inl ⟨hrel', hw,
+    runBlock_body_invalid ctx bb restFuel front invInst hd tl s sEnd hbb hinvop hcons hphi hnonterm hthread,
+    hinvpc, hinv⟩)
+
+/-- Non-vacuity: a bare `[STOP]` block (empty body) drives the generic STOP producer — the body thread is
+    trivial, so every hypothesis is dischargeable and the recipe is produced. -/
+theorem termRecipeW_stop_of_body_nonvacuous {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {as' : AsmState} {ps' : PlanState} {restFuel : Nat}
+    {ctx : VenomContext} {bb : BasicBlock} {s : VenomState} {stopInst : Instruction}
+    (hbb : bb.instructions = [stopInst]) (hstopop : stopInst.opcode = Opcode.STOP)
+    (hrel' : venomAsmRel lo ps' { s with instIdx := 0 } as')
+    (hw : 0 + 1 ≤ wOf bb.label)
+    (hstoppc : as'.pc < prog.length)
+    (hstop : prog.get ⟨as'.pc, hstoppc⟩ = AsmInst.AsmOp "STOP") :
+    TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' { s with instIdx := 0 } 0
+      (([] : List Instruction).length + (restFuel + 1)) ctx bb s :=
+  termRecipeW_stop_of_body (front := []) (stopInst := stopInst) (hd := stopInst) (tl := [])
+    (by simpa using hbb) hstopop (by simp) (by rw [hstopop]; decide) (by intro i hi; cases hi)
+    (by simp [execBodyThread]) hrel' hw hstoppc hstop
+
+/-- **Generic SELFDESTRUCT `TermRecipeW`.** The operand-carrying halting sibling: the Venom result
+    (`Halt (haltState (selfdestruct addr sEnd))`) is derived from the block's structure plus the operand
+    evaluation (`runBlock_body_selfdestruct`), not assumed. -/
+theorem termRecipeW_selfdestruct_of_body {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {as' : AsmState} {ps' : PlanState} {bodyLen restFuel : Nat}
+    {ctx : VenomContext} {bb : BasicBlock} {s sEnd : VenomState}
+    {front : List Instruction} {sdInst hd : Instruction} {tl : List Instruction}
+    {addrOp : Operand} {addr : bytes32} {stk : List bytes32}
+    (hbb : bb.instructions = front ++ [sdInst]) (hop : sdInst.opcode = Opcode.SELFDESTRUCT)
+    (hoperands : sdInst.operands = [addrOp]) (haddr : evalOperand addrOp sEnd = some addr)
+    (hcons : front ++ [sdInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hrel' : venomAsmRel lo ps' sEnd as')
+    (hw : bodyLen + 1 ≤ wOf bb.label)
+    (hsdpc : as'.pc < prog.length)
+    (hsd : prog.get ⟨as'.pc, hsdpc⟩ = AsmInst.AsmOp "SELFDESTRUCT")
+    (hstk : as'.stack = addr :: stk) :
+    TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' sEnd bodyLen
+      (front.length + (restFuel + 1)) ctx bb s :=
+  Or.inr (Or.inr (Or.inr (Or.inr (Or.inl
+    ⟨addr, stk, hrel', hw,
+      runBlock_body_selfdestruct ctx bb restFuel front sdInst hd tl s sEnd addrOp addr hbb hop
+        hoperands haddr hcons hphi hnonterm hthread,
+      ⟨hsdpc, hsd⟩, hstk⟩))))
+
+/-- **Generic JMP `TermRecipeW`.** The continuing case: the Venom result (`OK (jumpTo lbl sEnd)`) is derived
+    from the block's structure (`runBlock_body_jmp`), not assumed; the caller still supplies the resolved
+    push/JUMP placement, the successor's plan state, and the layout bound. -/
+theorem termRecipeW_jmp_of_body {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {as' : AsmState} {ps' : PlanState} {bodyLen restFuel off : Nat}
+    {ctx : VenomContext} {bb bb' : BasicBlock} {s sEnd : VenomState}
+    {front : List Instruction} {jmpInst hd : Instruction} {tl : List Instruction} {lbl : String}
+    (hbb : bb.instructions = front ++ [jmpInst]) (hjmpop : jmpInst.opcode = Opcode.JMP)
+    (hoperands : jmpInst.operands = [Operand.Label lbl])
+    (hcons : front ++ [jmpInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hnothalt : sEnd.halted = false)
+    (hrel' : venomAsmRel lo ps' sEnd as') (hps : ps' = psOf lbl)
+    (hw : wOf lbl + (bodyLen + 2) ≤ wOf bb.label)
+    (hpush1 : as'.pc < prog.length)
+    (hpush : prog.get ⟨as'.pc, hpush1⟩ = resolveInst offsets (AsmInst.AsmPushLabel lbl))
+    (hoff_lk : AssocList.lookup String Nat offsets lbl = some off) (hoff : off < 2 ^ 256)
+    (hjump1 : as'.pc + 1 < prog.length)
+    (hjump : prog.get ⟨as'.pc + 1, hjump1⟩ = AsmInst.AsmOp "JUMP")
+    (hidx_lk : AssocList.lookup Nat Nat o2pc off = some (pcOf lbl))
+    (hlk' : lookupBlock lbl fn.blocks = some bb') :
+    TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' sEnd bodyLen
+      (front.length + (restFuel + 1)) ctx bb s :=
+  Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl
+    ⟨lbl, off, bb', hrel', hps, hw, hnothalt,
+      runBlock_body_jmp ctx bb restFuel front jmpInst hd tl s sEnd lbl hbb hjmpop hoperands hcons hphi
+        hnonterm hthread hnothalt,
+      ⟨hpush1, hpush⟩, hoff_lk, hoff, ⟨hjump1, hjump⟩, hidx_lk, hlk'⟩)))))
+
+/-- **Generic RETURN `TermRecipeW`.** Venom result derived (`runBlock_body_return`); the caller supplies the
+    RETURN placement, the operand stack, and the memory-safety side conditions. -/
+theorem termRecipeW_return_of_body {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {as' : AsmState} {ps' : PlanState} {bodyLen restFuel : Nat}
+    {ctx : VenomContext} {bb : BasicBlock} {s sEnd : VenomState}
+    {front : List Instruction} {retInst hd : Instruction} {tl : List Instruction}
+    {offOp szOp : Operand} {off sz : bytes32} {rest : List bytes32}
+    (hbb : bb.instructions = front ++ [retInst]) (hop : retInst.opcode = Opcode.RETURN)
+    (hoperands : retInst.operands = [offOp, szOp])
+    (hoffv : evalOperand offOp sEnd = some off) (hszv : evalOperand szOp sEnd = some sz)
+    (hcons : front ++ [retInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hrel' : venomAsmRel lo ps' sEnd as')
+    (hw : bodyLen + 1 ≤ wOf bb.label)
+    (hretpc : as'.pc < prog.length) (hret : prog.get ⟨as'.pc, hretpc⟩ = AsmInst.AsmOp "RETURN")
+    (hstk : as'.stack = off :: sz :: rest)
+    (hcov : sz.toNat = 0 ∨ ((off.toNat + sz.toNat + 31) / 32) * 32 ≤ as'.memory.size)
+    (hbelow : off.toNat + sz.toNat ≤ ps'.alloc.fnEom) (hlen : sz.toNat < USize.size) :
+    TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' sEnd bodyLen
+      (front.length + (restFuel + 1)) ctx bb s :=
+  Or.inr (Or.inr (Or.inl
+    ⟨off, sz, rest, hrel', hw,
+      runBlock_body_return ctx bb restFuel front retInst hd tl s sEnd offOp szOp off sz hbb hop
+        hoperands hoffv hszv hcons hphi hnonterm hthread,
+      ⟨hretpc, hret⟩, hstk, hcov, hbelow, hlen⟩))
+
+/-- **Generic REVERT `TermRecipeW`.** The aborting sibling of RETURN (`runBlock_body_revert`). -/
+theorem termRecipeW_revert_of_body {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {as' : AsmState} {ps' : PlanState} {bodyLen restFuel : Nat}
+    {ctx : VenomContext} {bb : BasicBlock} {s sEnd : VenomState}
+    {front : List Instruction} {revInst hd : Instruction} {tl : List Instruction}
+    {offOp szOp : Operand} {off sz : bytes32} {rest : List bytes32}
+    (hbb : bb.instructions = front ++ [revInst]) (hop : revInst.opcode = Opcode.REVERT)
+    (hoperands : revInst.operands = [offOp, szOp])
+    (hoffv : evalOperand offOp sEnd = some off) (hszv : evalOperand szOp sEnd = some sz)
+    (hcons : front ++ [revInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hrel' : venomAsmRel lo ps' sEnd as')
+    (hw : bodyLen + 1 ≤ wOf bb.label)
+    (hrevpc : as'.pc < prog.length) (hrev : prog.get ⟨as'.pc, hrevpc⟩ = AsmInst.AsmOp "REVERT")
+    (hstk : as'.stack = off :: sz :: rest)
+    (hcov : sz.toNat = 0 ∨ ((off.toNat + sz.toNat + 31) / 32) * 32 ≤ as'.memory.size)
+    (hbelow : off.toNat + sz.toNat ≤ ps'.alloc.fnEom) (hlen : sz.toNat < USize.size) :
+    TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' sEnd bodyLen
+      (front.length + (restFuel + 1)) ctx bb s :=
+  Or.inr (Or.inr (Or.inr (Or.inl
+    ⟨off, sz, rest, hrel', hw,
+      runBlock_body_revert ctx bb restFuel front revInst hd tl s sEnd offOp szOp off sz hbb hop
+        hoperands hoffv hszv hcons hphi hnonterm hthread,
+      ⟨hrevpc, hrev⟩, hstk, hcov, hbelow, hlen⟩)))
+
+/-- **Generic JNZ-taken `TermRecipeW`.** Venom result derived (`runBlock_body_jnz_taken`). -/
+theorem termRecipeW_jnz_taken_of_body {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {as' : AsmState} {ps' : PlanState} {bodyLen restFuel off : Nat}
+    {ctx : VenomContext} {bb bb' : BasicBlock} {s sEnd : VenomState}
+    {front : List Instruction} {jnzInst hd : Instruction} {tl : List Instruction}
+    {condOp : Operand} {ifNz ifZ : String} {cond : bytes32} {stk : List bytes32}
+    (hbb : bb.instructions = front ++ [jnzInst]) (hop : jnzInst.opcode = Opcode.JNZ)
+    (hoperands : jnzInst.operands = [condOp, Operand.Label ifNz, Operand.Label ifZ])
+    (hcondv : evalOperand condOp sEnd = some cond) (hne : cond ≠ EvmYul.UInt256.ofNat 0)
+    (hcons : front ++ [jnzInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hnothalt : sEnd.halted = false)
+    (hw : wOf ifNz + (bodyLen + 2) ≤ wOf bb.label)
+    (hstk_c : as'.stack = cond :: stk)
+    (hpush1 : as'.pc < prog.length)
+    (hpush : prog.get ⟨as'.pc, hpush1⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifNz))
+    (hoff_lk : AssocList.lookup String Nat offsets ifNz = some off) (hoffb : off < 2 ^ 256)
+    (hjumpi1 : as'.pc + 1 < prog.length)
+    (hjumpi : prog.get ⟨as'.pc + 1, hjumpi1⟩ = AsmInst.AsmOp "JUMPI")
+    (hidx_lk : AssocList.lookup Nat Nat o2pc off = some (pcOf ifNz))
+    (hrel_succ : venomAsmRel lo (psOf ifNz) sEnd { as' with stack := stk })
+    (hlk' : lookupBlock ifNz fn.blocks = some bb') :
+    TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' sEnd bodyLen
+      (front.length + (restFuel + 1)) ctx bb s :=
+  Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl
+    ⟨ifNz, off, cond, stk, bb', hw, hnothalt,
+      runBlock_body_jnz_taken ctx bb restFuel front jnzInst hd tl s sEnd condOp ifNz ifZ cond hbb hop
+        hoperands hcondv hne hcons hphi hnonterm hthread hnothalt,
+      hstk_c, hne, ⟨hpush1, hpush⟩, hoff_lk, hoffb, ⟨hjumpi1, hjumpi⟩, hidx_lk, hrel_succ, hlk'⟩))))))
+
+/-- **Generic JNZ-not-taken `TermRecipeW`.** Venom result derived (`runBlock_body_jnz_nottaken`): the
+    condition evaluates to zero, so the block falls through to `ifZ`. -/
+theorem termRecipeW_jnz_nottaken_of_body {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {as' : AsmState} {ps' : PlanState} {bodyLen restFuel offN offZ : Nat}
+    {ctx : VenomContext} {bb bb' : BasicBlock} {s sEnd : VenomState}
+    {front : List Instruction} {jnzInst hd : Instruction} {tl : List Instruction}
+    {condOp : Operand} {ifNz ifZ : String} {stk : List bytes32}
+    (hbb : bb.instructions = front ++ [jnzInst]) (hop : jnzInst.opcode = Opcode.JNZ)
+    (hoperands : jnzInst.operands = [condOp, Operand.Label ifNz, Operand.Label ifZ])
+    (hcondv : evalOperand condOp sEnd = some ({ val := 0 } : bytes32))
+    (hcons : front ++ [jnzInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hnothalt : sEnd.halted = false)
+    (hw : wOf ifZ + (bodyLen + 4) ≤ wOf bb.label)
+    (hstk_c : as'.stack = EvmYul.UInt256.ofNat 0 :: stk)
+    (hpush1 : as'.pc < prog.length)
+    (hpushN : prog.get ⟨as'.pc, hpush1⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifNz))
+    (hoffN_lk : AssocList.lookup String Nat offsets ifNz = some offN) (hoffNb : offN < 2 ^ 256)
+    (hjumpi1 : as'.pc + 1 < prog.length)
+    (hjumpi : prog.get ⟨as'.pc + 1, hjumpi1⟩ = AsmInst.AsmOp "JUMPI")
+    (hpush2 : as'.pc + 2 < prog.length)
+    (hpushZ : prog.get ⟨as'.pc + 2, hpush2⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifZ))
+    (hoffZ_lk : AssocList.lookup String Nat offsets ifZ = some offZ) (hoffZb : offZ < 2 ^ 256)
+    (hjump1 : as'.pc + 2 + 1 < prog.length)
+    (hjump : prog.get ⟨as'.pc + 2 + 1, hjump1⟩ = AsmInst.AsmOp "JUMP")
+    (hidxZ_lk : AssocList.lookup Nat Nat o2pc offZ = some (pcOf ifZ))
+    (hrel_succ : venomAsmRel lo (psOf ifZ) sEnd { as' with stack := stk })
+    (hlk' : lookupBlock ifZ fn.blocks = some bb') :
+    TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' sEnd bodyLen
+      (front.length + (restFuel + 1)) ctx bb s :=
+  Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl
+    ⟨ifNz, ifZ, offN, offZ, stk, bb', hw, hnothalt,
+      runBlock_body_jnz_nottaken ctx bb restFuel front jnzInst hd tl s sEnd condOp ifNz ifZ hbb hop
+        hoperands hcondv hcons hphi hnonterm hthread hnothalt,
+      hstk_c, ⟨hpush1, hpushN⟩, hoffN_lk, hoffNb, ⟨hjumpi1, hjumpi⟩, ⟨hpush2, hpushZ⟩, hoffZ_lk, hoffZb,
+      ⟨hjump1, hjump⟩, hidxZ_lk, hrel_succ, hlk'⟩)))))))
+
+/-- **Generic DJMP `TermRecipeW`.** Venom result derived (`runBlock_body_djmp`): the selector indexes the
+    label list. The caller supplies the dispatch chain's asm run. Completes the generic-producer family:
+    the Venom side of every one of the eight `TermRecipeW` arms is now derived from the block's structure. -/
+theorem termRecipeW_djmp_of_body {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {as' : AsmState} {ps' : PlanState} {bodyLen restFuel chainLen : Nat}
+    {ctx : VenomContext} {bb bb' : BasicBlock} {s sEnd : VenomState}
+    {front : List Instruction} {dInst hd : Instruction} {tl : List Instruction}
+    {selectorOp : Operand} {labelOps : List Operand} {idx : bytes32} {labels : List String}
+    {rest : List bytes32} {hi : idx.toNat < labels.length}
+    (hbb : bb.instructions = front ++ [dInst]) (hop : dInst.opcode = Opcode.DJMP)
+    (hoperands : dInst.operands = selectorOp :: labelOps)
+    (hsel : evalOperand selectorOp sEnd = some idx) (hlabels : extractLabels labelOps = some labels)
+    (hcons : front ++ [dInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hnothalt : sEnd.halted = false)
+    (hw : wOf (labels.get ⟨idx.toNat, hi⟩) + (bodyLen + chainLen) ≤ wOf bb.label)
+    (hdispatch : runAsm chainLen o2pc prog as'
+      = AsmResult.AsmOK { as' with stack := rest, pc := pcOf (labels.get ⟨idx.toNat, hi⟩) })
+    (hrel_succ : venomAsmRel lo (psOf (labels.get ⟨idx.toNat, hi⟩)) sEnd { as' with stack := rest })
+    (hlk' : lookupBlock (labels.get ⟨idx.toNat, hi⟩) fn.blocks = some bb') :
+    TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' sEnd bodyLen
+      (front.length + (restFuel + 1)) ctx bb s :=
+  Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr
+    ⟨labels.get ⟨idx.toNat, hi⟩, chainLen, rest, bb', hw, hnothalt,
+      runBlock_body_djmp ctx bb restFuel front dInst hd tl s sEnd selectorOp labelOps idx labels hi
+        hbb hop hoperands hsel hlabels hcons hphi hnonterm hthread hnothalt,
+      hdispatch, hrel_succ, hlk'⟩)))))))
+
+/-! ## The first generic `hsupply` slices: empty-body halting blocks
+
+`codegen_correct_ofBlocks_recipeW`'s `hsupply` needs, per block, a body-sim run plus a `TermRecipeW`. For a
+block whose only instruction is its terminator BOTH halves are already generic: the asm side is the SOLabel
+step (`soLabel_sim`), the Venom side is `termRecipeW_*_of_body`. Composing them discharges `hsupply` for an
+ARBITRARY such block from its layout facts alone — no per-function `simp`, no per-function `runBlock`. -/
+
+/-- **Generic `hsupply` for an empty-body STOP block.** For ANY `bb` whose instructions are `[stopInst]`: the
+    SOLabel step supplies the body-sim run, the STOP producer supplies the recipe. The caller gives only the
+    block's asm layout (`asmBlockAt` at the block's pc, the STOP placement one past it) and the budget bound. -/
+theorem hsupplyW_emptyStop {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {asm : AsmState} {ps : PlanState} {k : Nat}
+    {ctx : VenomContext} {bb : BasicBlock} {s : VenomState} {stopInst : Instruction}
+    (hbb : bb.instructions = [stopInst]) (hstopop : stopInst.opcode = Opcode.STOP)
+    (hrel : venomAsmRel lo ps { s with instIdx := 0 } asm)
+    (hbLabel : asmBlockAt prog asm.pc (executePlan [StackOp.SOLabel bb.label]))
+    (hstoppc : asm.pc + 1 < prog.length)
+    (hstop : prog.get ⟨asm.pc + 1, hstoppc⟩ = AsmInst.AsmOp "STOP")
+    (hw : 1 + 1 ≤ wOf bb.label) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+      runAsm bodyLen o2pc prog asm = AsmResult.AsmOK as' ∧
+      TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' vs' bodyLen (k + 1) ctx bb s := by
+  obtain ⟨as1, hrun1, hrel1, hpc1⟩ :=
+    soLabel_sim (offsetToPc := o2pc) lo ps { s with instIdx := 0 } asm prog bb.label hrel hbLabel
+  have hlen1 : (executePlan [StackOp.SOLabel bb.label]).length = 1 := rfl
+  have hpc1' : as1.pc = asm.pc + 1 := by rw [hlen1] at hpc1; exact hpc1
+  have hlt : as1.pc < prog.length := by rw [hpc1']; exact hstoppc
+  have hst : prog.get ⟨as1.pc, hlt⟩ = AsmInst.AsmOp "STOP" := by
+    conv_lhs => rw [show (⟨as1.pc, hlt⟩ : Fin _) = ⟨asm.pc + 1, hstoppc⟩ from Fin.ext hpc1']
+    exact hstop
+  rw [hlen1] at hrun1
+  refine ⟨as1, ps, { s with instIdx := 0 }, 1, hrun1, ?_⟩
+  have hfuel : k + 1 = ([] : List Instruction).length + (k + 1) := by simp
+  rw [hfuel]
+  exact termRecipeW_stop_of_body (front := []) (stopInst := stopInst) (hd := stopInst) (tl := [])
+    (restFuel := k) (by simpa using hbb) hstopop (by simp) (by rw [hstopop]; decide)
+    (by intro i hi; cases hi) (by simp [execBodyThread]) hrel1 hw hlt hst
+
+/-- **Generic `hsupply` for an empty-body INVALID block** — the aborting sibling, same composition. -/
+theorem hsupplyW_emptyInvalid {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {asm : AsmState} {ps : PlanState} {k : Nat}
+    {ctx : VenomContext} {bb : BasicBlock} {s : VenomState} {invInst : Instruction}
+    (hbb : bb.instructions = [invInst]) (hinvop : invInst.opcode = Opcode.INVALID)
+    (hrel : venomAsmRel lo ps { s with instIdx := 0 } asm)
+    (hbLabel : asmBlockAt prog asm.pc (executePlan [StackOp.SOLabel bb.label]))
+    (hinvpc : asm.pc + 1 < prog.length)
+    (hinv : prog.get ⟨asm.pc + 1, hinvpc⟩ = AsmInst.AsmOp "INVALID")
+    (hw : 1 + 1 ≤ wOf bb.label) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+      runAsm bodyLen o2pc prog asm = AsmResult.AsmOK as' ∧
+      TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' vs' bodyLen (k + 1) ctx bb s := by
+  obtain ⟨as1, hrun1, hrel1, hpc1⟩ :=
+    soLabel_sim (offsetToPc := o2pc) lo ps { s with instIdx := 0 } asm prog bb.label hrel hbLabel
+  have hlen1 : (executePlan [StackOp.SOLabel bb.label]).length = 1 := rfl
+  have hpc1' : as1.pc = asm.pc + 1 := by rw [hlen1] at hpc1; exact hpc1
+  have hlt : as1.pc < prog.length := by rw [hpc1']; exact hinvpc
+  have hiv : prog.get ⟨as1.pc, hlt⟩ = AsmInst.AsmOp "INVALID" := by
+    conv_lhs => rw [show (⟨as1.pc, hlt⟩ : Fin _) = ⟨asm.pc + 1, hinvpc⟩ from Fin.ext hpc1']
+    exact hinv
+  rw [hlen1] at hrun1
+  refine ⟨as1, ps, { s with instIdx := 0 }, 1, hrun1, ?_⟩
+  have hfuel : k + 1 = ([] : List Instruction).length + (k + 1) := by simp
+  rw [hfuel]
+  exact termRecipeW_invalid_of_body (front := []) (invInst := invInst) (hd := invInst) (tl := [])
+    (restFuel := k) (by simpa using hbb) hinvop (by simp) (by rw [hinvop]; decide)
+    (by intro i hi; cases hi) (by simp [execBodyThread]) hrel1 hw hlt hiv
+
+/-- **Generic `hsupply` for an empty-body JMP block** — the first CONTINUING empty-body slice. For ANY `bb`
+    whose instructions are `[jmpInst]`: the SOLabel step supplies the body-sim run (`soLabel_sim`), the JMP
+    producer supplies the recipe (`termRecipeW_jmp_of_body`). Unlike the halting slices this one must also
+    hand over the successor: its plan state (`hps`), its block (`hlk'`), and its jump-target resolution
+    (`hoff_lk`/`hidx_lk`). The caller gives only layout facts — no per-function `runBlock` reduction. -/
+theorem hsupplyW_emptyJmp {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {asm : AsmState} {ps : PlanState} {k off : Nat}
+    {ctx : VenomContext} {bb bb' : BasicBlock} {s : VenomState} {jmpInst : Instruction} {lbl : String}
+    (hbb : bb.instructions = [jmpInst]) (hjmpop : jmpInst.opcode = Opcode.JMP)
+    (hoperands : jmpInst.operands = [Operand.Label lbl])
+    (hnothalt : s.halted = false)
+    (hrel : venomAsmRel lo ps { s with instIdx := 0 } asm) (hps : ps = psOf lbl)
+    (hbLabel : asmBlockAt prog asm.pc (executePlan [StackOp.SOLabel bb.label]))
+    (hpush1 : asm.pc + 1 < prog.length)
+    (hpush : prog.get ⟨asm.pc + 1, hpush1⟩ = resolveInst offsets (AsmInst.AsmPushLabel lbl))
+    (hoff_lk : AssocList.lookup String Nat offsets lbl = some off) (hoff : off < 2 ^ 256)
+    (hjump1 : asm.pc + 1 + 1 < prog.length)
+    (hjump : prog.get ⟨asm.pc + 1 + 1, hjump1⟩ = AsmInst.AsmOp "JUMP")
+    (hidx_lk : AssocList.lookup Nat Nat o2pc off = some (pcOf lbl))
+    (hlk' : lookupBlock lbl fn.blocks = some bb')
+    (hw : wOf lbl + (1 + 2) ≤ wOf bb.label) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+      runAsm bodyLen o2pc prog asm = AsmResult.AsmOK as' ∧
+      TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' vs' bodyLen (k + 1) ctx bb s := by
+  obtain ⟨as1, hrun1, hrel1, hpc1⟩ :=
+    soLabel_sim (offsetToPc := o2pc) lo ps { s with instIdx := 0 } asm prog bb.label hrel hbLabel
+  have hlen1 : (executePlan [StackOp.SOLabel bb.label]).length = 1 := rfl
+  have hpc1' : as1.pc = asm.pc + 1 := by rw [hlen1] at hpc1; exact hpc1
+  have hlt1 : as1.pc < prog.length := by rw [hpc1']; exact hpush1
+  have hp : prog.get ⟨as1.pc, hlt1⟩ = resolveInst offsets (AsmInst.AsmPushLabel lbl) := by
+    conv_lhs => rw [show (⟨as1.pc, hlt1⟩ : Fin _) = ⟨asm.pc + 1, hpush1⟩ from Fin.ext hpc1']
+    exact hpush
+  have hlt2 : as1.pc + 1 < prog.length := by rw [hpc1']; exact hjump1
+  have e2 : as1.pc + 1 = asm.pc + 1 + 1 := by rw [hpc1']
+  have hj : prog.get ⟨as1.pc + 1, hlt2⟩ = AsmInst.AsmOp "JUMP" := by
+    conv_lhs => rw [show (⟨as1.pc + 1, hlt2⟩ : Fin _) = ⟨asm.pc + 1 + 1, hjump1⟩ from Fin.ext e2]
+    exact hjump
+  rw [hlen1] at hrun1
+  refine ⟨as1, ps, { s with instIdx := 0 }, 1, hrun1, ?_⟩
+  have hfuel : k + 1 = ([] : List Instruction).length + (k + 1) := by simp
+  rw [hfuel]
+  exact termRecipeW_jmp_of_body (front := []) (jmpInst := jmpInst) (hd := jmpInst) (tl := [])
+    (restFuel := k) (bb' := bb') (by simpa using hbb) hjmpop hoperands (by simp)
+    (by rw [hjmpop]; decide) (by intro i hi; cases hi) (by simp [execBodyThread])
+    (by simpa using hnothalt) hrel1 hps hw hlt1 hp hoff_lk hoff hlt2 hj hidx_lk hlk'
+
+
+/-- **Generic `hsupply` for a NON-EMPTY-body STOP block.** The empty-body slices bottom out in
+    `soLabel_sim`; this one takes the real body-sim stack — `RegularBodyH` (the per-instruction condition)
+    → `bodyStepsReadyH_regular_list` → `genBlockBodyH_sim_inv` — for the asm half, and
+    `termRecipeW_stop_of_body` for the Venom half, reconciling the two notions of the body-end Venom state
+    (`genBlockBodyH_sim_inv`'s `gvBodyStep` fold vs the producer's `execBodyThread` `sEnd`) through
+    `execBodyThread_eq_gvFold`. So `codegen_correct_ofBlocks_recipeW`'s per-block obligation is discharged
+    for ANY STOP block of modeled instructions — the body no longer has to be empty. Mirrors
+    `HbsimMatch_stop_regular`, but lands in the recipe shape the driver consumes. -/
+theorem termRecipeW_stop_regular
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat}
+    {prog : List AsmInst}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {nextLiveness : List String} {curBbLabel : String} {dem : Nat}
+    {ps0 : PlanState} {as0 : AsmState} {restFuel : Nat} {ctx : VenomContext} {bb : BasicBlock}
+    {front : List Instruction} {stopInst hd : Instruction} {tl : List Instruction}
+    {s sEnd : VenomState} {S : List String}
+    (hbb : bb.instructions = front ++ [stopInst]) (hstopop : stopInst.opcode = Opcode.STOP)
+    (hcons : front ++ [stopInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    -- the per-instruction condition (irreducible) + structural invariants
+    (hreg : RegularBodyH lo nextLiveness o2pc prog dem front S)
+    (hsd : StackDiscH ((front.zipIdx 0).map (fun _ => dem)).sum ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel0 : venomAsmRel lo ps0 { s with instIdx := 0 } as0)
+    (hblock : asmBlockAt prog as0.pc
+      (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1))
+    -- STOP placed right after the body
+    (hpc : as0.pc + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length < prog.length)
+    (hstop : prog.get ⟨as0.pc + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length, hpc⟩ = AsmInst.AsmOp "STOP")
+    (hle : (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 1 ≤ wOf bb.label) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+      runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as' ∧
+      TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' vs' bodyLen
+        (front.length + (restFuel + 1)) ctx bb s := by
+  have hbrh := bodyStepsReadyH_regular_list (liveness := liveness) (dfg := dfg) (cfg := cfg) (fn := fn)
+    (curBbLabel := curBbLabel) front S 0 hreg
+  obtain ⟨as', hrun, hrel', hpc', _, _⟩ := genBlockBodyH_sim_inv
+    (fun z p => generateRegularInstPlan liveness dfg cfg fn z.1 nextLiveness false true curBbLabel p)
+    (fun _ => dem) (front.zipIdx 0) S ps0 { s with instIdx := 0 } as0 hbrh hsd hsv hrel0 hblock
+  have hpc_as : as'.pc < prog.length := hpc' ▸ hpc
+  have hstop_as : prog.get ⟨as'.pc, hpc_as⟩ = AsmInst.AsmOp "STOP" := by
+    rw [show (⟨as'.pc, hpc_as⟩ : Fin prog.length) = ⟨_, hpc⟩ from Fin.ext hpc']
+    exact hstop
+  have hgv : (front.zipIdx 0).foldl (fun v x => gvBodyStep x v) { s with instIdx := 0 } = sEnd :=
+    execBodyThread_eq_gvFold front 0 { s with instIdx := 0 } sEnd hthread
+  rw [hgv] at hrel'
+  exact ⟨as', _, sEnd, _, hrun,
+    termRecipeW_stop_of_body hbb hstopop hcons hphi hnonterm hthread hrel' hle hpc_as hstop_as⟩
+
+/-- **Generic `hsupply` for a NON-EMPTY-body INVALID block** — the aborting sibling of
+    `termRecipeW_stop_regular`: identical body-sim stack, the terminator's placement swapped. -/
+theorem termRecipeW_invalid_regular
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat}
+    {prog : List AsmInst}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {nextLiveness : List String} {curBbLabel : String} {dem : Nat}
+    {ps0 : PlanState} {as0 : AsmState} {restFuel : Nat} {ctx : VenomContext} {bb : BasicBlock}
+    {front : List Instruction} {invInst hd : Instruction} {tl : List Instruction}
+    {s sEnd : VenomState} {S : List String}
+    (hbb : bb.instructions = front ++ [invInst]) (hinvop : invInst.opcode = Opcode.INVALID)
+    (hcons : front ++ [invInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    -- the per-instruction condition (irreducible) + structural invariants
+    (hreg : RegularBodyH lo nextLiveness o2pc prog dem front S)
+    (hsd : StackDiscH ((front.zipIdx 0).map (fun _ => dem)).sum ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel0 : venomAsmRel lo ps0 { s with instIdx := 0 } as0)
+    (hblock : asmBlockAt prog as0.pc
+      (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1))
+    -- STOP placed right after the body
+    (hpc : as0.pc + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length < prog.length)
+    (hinv : prog.get ⟨as0.pc + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length, hpc⟩ = AsmInst.AsmOp "INVALID")
+    (hle : (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 1 ≤ wOf bb.label) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+      runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as' ∧
+      TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' vs' bodyLen
+        (front.length + (restFuel + 1)) ctx bb s := by
+  have hbrh := bodyStepsReadyH_regular_list (liveness := liveness) (dfg := dfg) (cfg := cfg) (fn := fn)
+    (curBbLabel := curBbLabel) front S 0 hreg
+  obtain ⟨as', hrun, hrel', hpc', _, _⟩ := genBlockBodyH_sim_inv
+    (fun z p => generateRegularInstPlan liveness dfg cfg fn z.1 nextLiveness false true curBbLabel p)
+    (fun _ => dem) (front.zipIdx 0) S ps0 { s with instIdx := 0 } as0 hbrh hsd hsv hrel0 hblock
+  have hpc_as : as'.pc < prog.length := hpc' ▸ hpc
+  have hinv_as : prog.get ⟨as'.pc, hpc_as⟩ = AsmInst.AsmOp "INVALID" := by
+    rw [show (⟨as'.pc, hpc_as⟩ : Fin prog.length) = ⟨_, hpc⟩ from Fin.ext hpc']
+    exact hinv
+  have hgv : (front.zipIdx 0).foldl (fun v x => gvBodyStep x v) { s with instIdx := 0 } = sEnd :=
+    execBodyThread_eq_gvFold front 0 { s with instIdx := 0 } sEnd hthread
+  rw [hgv] at hrel'
+  exact ⟨as', _, sEnd, _, hrun,
+    termRecipeW_invalid_of_body hbb hinvop hcons hphi hnonterm hthread hrel' hle hpc_as hinv_as⟩
+
+
+
+
+
+
+
+
+set_option maxHeartbeats 1000000 in
+/-- **Generic `hsupply` for a NON-EMPTY-body JMP block** — the first CONTINUING `_regular` slice. -/
+theorem termRecipeW_jmp_regular
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat}
+    {prog : List AsmInst}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {nextLiveness : List String} {curBbLabel : String} {dem : Nat}
+    {ps0 : PlanState} {as0 : AsmState} {restFuel off : Nat} {ctx : VenomContext} {bb bb' : BasicBlock}
+    {front : List Instruction} {jmpInst hd : Instruction} {tl : List Instruction}
+    {s sEnd : VenomState} {S : List String} {lbl : String}
+    (hbb : bb.instructions = front ++ [jmpInst]) (hjmpop : jmpInst.opcode = Opcode.JMP)
+    (hoperands : jmpInst.operands = [Operand.Label lbl])
+    (hcons : front ++ [jmpInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hnothalt : sEnd.halted = false)
+    (hreg : RegularBodyH lo nextLiveness o2pc prog dem front S)
+    (hsd : StackDiscH ((front.zipIdx 0).map (fun _ => dem)).sum ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel0 : venomAsmRel lo ps0 { s with instIdx := 0 } as0)
+    (hblock : asmBlockAt prog as0.pc
+      (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1))
+    (hps : (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2 = psOf lbl)
+    (hpc : as0.pc + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length < prog.length)
+    (hpush : prog.get ⟨as0.pc + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length, hpc⟩
+      = resolveInst offsets (AsmInst.AsmPushLabel lbl))
+    (hoff_lk : AssocList.lookup String Nat offsets lbl = some off) (hoff : off < 2 ^ 256)
+    (hpc2 : as0.pc + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 1 < prog.length)
+    (hjump : prog.get ⟨as0.pc + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 1, hpc2⟩ = AsmInst.AsmOp "JUMP")
+    (hidx_lk : AssocList.lookup Nat Nat o2pc off = some (pcOf lbl))
+    (hlk' : lookupBlock lbl fn.blocks = some bb')
+    (hle : wOf lbl + ((executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 2) ≤ wOf bb.label) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+      runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as' ∧
+      TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' vs' bodyLen
+        (front.length + (restFuel + 1)) ctx bb s := by
+  have hbrh := bodyStepsReadyH_regular_list (liveness := liveness) (dfg := dfg) (cfg := cfg) (fn := fn)
+    (curBbLabel := curBbLabel) front S 0 hreg
+  obtain ⟨as', hrun, hrel', hpc', _, _⟩ := genBlockBodyH_sim_inv
+    (fun z p => generateRegularInstPlan liveness dfg cfg fn z.1 nextLiveness false true curBbLabel p)
+    (fun _ => dem) (front.zipIdx 0) S ps0 { s with instIdx := 0 } as0 hbrh hsd hsv hrel0 hblock
+  have hpc_as : as'.pc < prog.length := hpc' ▸ hpc
+  have hpush_as : prog.get ⟨as'.pc, hpc_as⟩ = resolveInst offsets (AsmInst.AsmPushLabel lbl) := by
+    rw [show (⟨as'.pc, hpc_as⟩ : Fin prog.length) = ⟨_, hpc⟩ from Fin.ext hpc']
+    exact hpush
+  have hpc2_as : as'.pc + 1 < prog.length := by rw [hpc']; exact hpc2
+  have e2 : as'.pc + 1 = as0.pc + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 1 := by rw [hpc']
+  have hjump_as : prog.get ⟨as'.pc + 1, hpc2_as⟩ = AsmInst.AsmOp "JUMP" := by
+    rw [show (⟨as'.pc + 1, hpc2_as⟩ : Fin prog.length) = ⟨_, hpc2⟩ from Fin.ext e2]
+    exact hjump
+  have hgv : (front.zipIdx 0).foldl (fun v x => gvBodyStep x v) { s with instIdx := 0 } = sEnd :=
+    execBodyThread_eq_gvFold front 0 { s with instIdx := 0 } sEnd hthread
+  rw [hgv] at hrel'
+  exact ⟨as', _, sEnd, _, hrun,
+    termRecipeW_jmp_of_body hbb hjmpop hoperands hcons hphi hnonterm hthread hnothalt hrel' hps hle
+      hpc_as hpush_as hoff_lk hoff hpc2_as hjump_as hidx_lk hlk'⟩
+
+
+/-- **Non-vacuity of `termRecipeW_jmp_regular`.** Instantiated at an EMPTY body every generator-side
+    hypothesis discharges outright: the per-instruction condition `RegularBodyH` is trivially true at `[]`,
+    and the body fold collapses DEFINITIONALLY to `([], ps0)` — so the emitted plan is empty, `bodyLen = 0`,
+    `hps` becomes `ps0 = psOf lbl`, and the terminator sits at `as0.pc`. What remains are the state
+    hypotheses every consumer already carries, and those are inhabited: `venomAsmRel_init0_iff` characterises
+    `venomAsmRel lo (initPlanState 0) vs asm` as "asm mirrors vs with an empty stack" (satisfiable for any
+    `vs`), and `StackDiscH 0 (initPlanState 0) vs` holds for ANY `vs`. So the slice applies to something. -/
+theorem termRecipeW_jmp_regular_nonvacuous
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat}
+    {prog : List AsmInst}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {nextLiveness : List String} {curBbLabel : String} {dem : Nat}
+    {ps0 : PlanState} {as0 : AsmState} {restFuel off : Nat} {ctx : VenomContext} {bb bb' : BasicBlock}
+    {jmpInst : Instruction} {s : VenomState} {S : List String} {lbl : String}
+    (hbb : bb.instructions = [jmpInst]) (hjmpop : jmpInst.opcode = Opcode.JMP)
+    (hoperands : jmpInst.operands = [Operand.Label lbl])
+    (hnothalt : s.halted = false)
+    (hsd : StackDiscH 0 ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel0 : venomAsmRel lo ps0 { s with instIdx := 0 } as0)
+    (hps : ps0 = psOf lbl)
+    (hpc : as0.pc < prog.length)
+    (hpush : prog.get ⟨as0.pc, hpc⟩ = resolveInst offsets (AsmInst.AsmPushLabel lbl))
+    (hoff_lk : AssocList.lookup String Nat offsets lbl = some off) (hoff : off < 2 ^ 256)
+    (hpc2 : as0.pc + 1 < prog.length)
+    (hjump : prog.get ⟨as0.pc + 1, hpc2⟩ = AsmInst.AsmOp "JUMP")
+    (hidx_lk : AssocList.lookup Nat Nat o2pc off = some (pcOf lbl))
+    (hlk' : lookupBlock lbl fn.blocks = some bb')
+    (hle : wOf lbl + (0 + 2) ≤ wOf bb.label) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+      runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as' ∧
+      TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' vs' bodyLen
+        (([] : List Instruction).length + (restFuel + 1)) ctx bb s :=
+  termRecipeW_jmp_regular (liveness := liveness) (dfg := dfg) (cfg := cfg) (front := [])
+    (jmpInst := jmpInst) (hd := jmpInst) (tl := []) (dem := dem) (nextLiveness := nextLiveness)
+    (curBbLabel := curBbLabel) (S := S) (sEnd := { s with instIdx := 0 }) (restFuel := restFuel)
+    (bb' := bb') (off := off)
+    (hbb := hbb) (hjmpop := hjmpop) (hoperands := hoperands) (hcons := rfl)
+    (hphi := by rw [hjmpop]; decide) (hnonterm := by intro i hi; cases hi)
+    (hthread := by simp [execBodyThread]) (hnothalt := hnothalt)
+    (hreg := by simp [RegularBodyH]) (hsd := hsd) (hsv := hsv) (hrel0 := hrel0)
+    (hblock := show asmBlockAt prog as0.pc [] from ⟨by simp; omega, by intro j hj; simp at hj⟩)
+    (hps := hps) (hpc := hpc) (hpush := hpush) (hoff_lk := hoff_lk) (hoff := hoff)
+    (hpc2 := hpc2) (hjump := hjump) (hidx_lk := hidx_lk) (hlk' := hlk') (hle := hle)
+
+
+
+set_option maxHeartbeats 1000000 in
+/-- **Generic `hsupply` for a NON-EMPTY-body JNZ (taken) block** — the branching `_regular` slice. The
+    condition is a VARIABLE the body already leaves on the plan stack (`hcondtos`), so no operand
+    materialization is needed: the terminator's own asm is just `PUSH ifNz ; JUMPI`. Both facts the recipe
+    needs about the asm stack are DERIVED from the body-sim relation rather than assumed — the
+    condition-on-top (`venomAsmRel_asmStack_top1_var`) and the condition-dropped successor relation
+    (`venomAsmRel_pop_tos`, since only `planStackRel` reads the stacks). Mirrors the older route's
+    `termRecipe_jnz_taken_of_regular` into the N-constrained walk shape the driver consumes. -/
+theorem termRecipeW_jnz_taken_regular
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {nextLiveness : List String} {curBbLabel : String} {dem : Nat}
+    {ps0 : PlanState} {as0 : AsmState} {restFuel off : Nat} {ctx : VenomContext} {bb bb' : BasicBlock}
+    {front : List Instruction} {jnzInst hd : Instruction} {tl : List Instruction}
+    {s sEnd : VenomState} {S : List String} {condvar ifNz ifZ : String} {cond : bytes32}
+    {base : List Operand}
+    (hbb : bb.instructions = front ++ [jnzInst]) (hop : jnzInst.opcode = Opcode.JNZ)
+    (hoperands : jnzInst.operands = [Operand.Var condvar, Operand.Label ifNz, Operand.Label ifZ])
+    (hcondv : evalOperand (Operand.Var condvar) sEnd = some cond)
+    (hcond_ne : cond ≠ EvmYul.UInt256.ofNat 0)
+    (hval : operandVal sEnd lo (Operand.Var condvar) = some cond)
+    (hcons : front ++ [jnzInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hnothalt : sEnd.halted = false)
+    (hreg : RegularBodyH lo nextLiveness o2pc prog dem front S)
+    (hsd : StackDiscH ((front.zipIdx 0).map (fun _ => dem)).sum ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel0 : venomAsmRel lo ps0 { s with instIdx := 0 } as0)
+    (hblock : asmBlockAt prog as0.pc
+      (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1))
+    (hcondtos : (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2.stack
+      = base ++ [Operand.Var condvar])
+    (hpsj : psOf ifNz = { (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2 with
+      stack := stackPop 1 (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2.stack })
+    (hp1 : as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length < prog.length)
+    (hpush : prog.get ⟨as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length, hp1⟩
+      = resolveInst offsets (AsmInst.AsmPushLabel ifNz))
+    (hoff_lk : AssocList.lookup String Nat offsets ifNz = some off) (hoff : off < 2 ^ 256)
+    (hp2 : as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 1 < prog.length)
+    (hjumpi : prog.get ⟨as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 1, hp2⟩
+      = AsmInst.AsmOp "JUMPI")
+    (hidx_lk : AssocList.lookup Nat Nat o2pc off = some (pcOf ifNz))
+    (hlk' : lookupBlock ifNz fn.blocks = some bb')
+    (hw : wOf ifNz + ((executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 2)
+      ≤ wOf bb.label) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+      runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as' ∧
+      TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' vs' bodyLen
+        (front.length + (restFuel + 1)) ctx bb s := by
+  have hbrh := bodyStepsReadyH_regular_list (liveness := liveness) (dfg := dfg) (cfg := cfg) (fn := fn)
+    (curBbLabel := curBbLabel) front S 0 hreg
+  obtain ⟨as', hrun, hrel', hpc', _, _⟩ := genBlockBodyH_sim_inv
+    (fun z p => generateRegularInstPlan liveness dfg cfg fn z.1 nextLiveness false true curBbLabel p)
+    (fun _ => dem) (front.zipIdx 0) S ps0 { s with instIdx := 0 } as0 hbrh hsd hsv hrel0 hblock
+  have hgv : (front.zipIdx 0).foldl (fun v x => gvBodyStep x v) { s with instIdx := 0 } = sEnd :=
+    execBodyThread_eq_gvFold front 0 { s with instIdx := 0 } sEnd hthread
+  rw [hgv] at hrel'
+  have hstk_c : as'.stack = cond :: as'.stack.drop 1 :=
+    venomAsmRel_asmStack_top1_var hrel' hcondtos hval
+  have hsucc : venomAsmRel lo (psOf ifNz) sEnd { as' with stack := as'.stack.drop 1 } := by
+    rw [hpsj]; exact venomAsmRel_pop_tos hrel' hstk_c
+  have hp1' : as'.pc < prog.length := hpc' ▸ hp1
+  have hpush' : prog.get ⟨as'.pc, hp1'⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifNz) :=
+    prog_get_transfer hpc' hpush
+  have hp2' : as'.pc + 1 < prog.length := by rw [hpc']; exact hp2
+  have hjumpi' : prog.get ⟨as'.pc + 1, hp2'⟩ = AsmInst.AsmOp "JUMPI" :=
+    prog_get_transfer (congrArg (· + 1) hpc') hjumpi
+  exact ⟨as', (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2, sEnd, _, hrun,
+    termRecipeW_jnz_taken_of_body (condOp := Operand.Var condvar) (ifZ := ifZ) (stk := as'.stack.drop 1)
+      hbb hop hoperands hcondv hcond_ne hcons hphi hnonterm hthread hnothalt hw
+      hstk_c hp1' hpush' hoff_lk hoff hp2' hjumpi' hidx_lk hsucc hlk'⟩
+
+set_option maxHeartbeats 1000000 in
+/-- **Generic `hsupply` for a NON-EMPTY-body JNZ (not taken) block** — the fall-through sibling of
+    `termRecipeW_jnz_taken_regular`. The condition evaluates to zero, so control reaches `ifZ` via the
+    4-op tail (`PUSH ifNz ; JUMPI` falls through, then `PUSH ifZ ; JUMP`) rather than the 2-op taken tail.
+    Same derivation: the condition-on-top and the condition-dropped successor relation both come from the
+    body-sim relation. With this the JNZ pair is complete for non-empty bodies. -/
+theorem termRecipeW_jnz_nottaken_regular
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {nextLiveness : List String} {curBbLabel : String} {dem : Nat}
+    {ps0 : PlanState} {as0 : AsmState} {restFuel offN offZ : Nat} {ctx : VenomContext}
+    {bb bb' : BasicBlock}
+    {front : List Instruction} {jnzInst hd : Instruction} {tl : List Instruction}
+    {s sEnd : VenomState} {S : List String} {condvar ifNz ifZ : String} {base : List Operand}
+    (hbb : bb.instructions = front ++ [jnzInst]) (hop : jnzInst.opcode = Opcode.JNZ)
+    (hoperands : jnzInst.operands = [Operand.Var condvar, Operand.Label ifNz, Operand.Label ifZ])
+    (hcondv : evalOperand (Operand.Var condvar) sEnd = some ({ val := 0 } : bytes32))
+    (hval : operandVal sEnd lo (Operand.Var condvar) = some (EvmYul.UInt256.ofNat 0))
+    (hcons : front ++ [jnzInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hnothalt : sEnd.halted = false)
+    (hreg : RegularBodyH lo nextLiveness o2pc prog dem front S)
+    (hsd : StackDiscH ((front.zipIdx 0).map (fun _ => dem)).sum ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel0 : venomAsmRel lo ps0 { s with instIdx := 0 } as0)
+    (hblock : asmBlockAt prog as0.pc
+      (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1))
+    (hcondtos : (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2.stack
+      = base ++ [Operand.Var condvar])
+    (hpsj : psOf ifZ = { (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2 with
+      stack := stackPop 1 (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2.stack })
+    (hp1 : as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length < prog.length)
+    (hpushN : prog.get ⟨as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length, hp1⟩
+      = resolveInst offsets (AsmInst.AsmPushLabel ifNz))
+    (hoffN_lk : AssocList.lookup String Nat offsets ifNz = some offN) (hoffN : offN < 2 ^ 256)
+    (hp2 : as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 1 < prog.length)
+    (hjumpi : prog.get ⟨as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 1, hp2⟩
+      = AsmInst.AsmOp "JUMPI")
+    (hp3 : as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 2 < prog.length)
+    (hpushZ : prog.get ⟨as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 2, hp3⟩
+      = resolveInst offsets (AsmInst.AsmPushLabel ifZ))
+    (hoffZ_lk : AssocList.lookup String Nat offsets ifZ = some offZ) (hoffZ : offZ < 2 ^ 256)
+    (hp4 : as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 2 + 1
+      < prog.length)
+    (hjump : prog.get ⟨as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 2 + 1, hp4⟩
+      = AsmInst.AsmOp "JUMP")
+    (hidxZ_lk : AssocList.lookup Nat Nat o2pc offZ = some (pcOf ifZ))
+    (hlk' : lookupBlock ifZ fn.blocks = some bb')
+    (hw : wOf ifZ + ((executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 4)
+      ≤ wOf bb.label) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+      runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as' ∧
+      TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' vs' bodyLen
+        (front.length + (restFuel + 1)) ctx bb s := by
+  have hbrh := bodyStepsReadyH_regular_list (liveness := liveness) (dfg := dfg) (cfg := cfg) (fn := fn)
+    (curBbLabel := curBbLabel) front S 0 hreg
+  obtain ⟨as', hrun, hrel', hpc', _, _⟩ := genBlockBodyH_sim_inv
+    (fun z p => generateRegularInstPlan liveness dfg cfg fn z.1 nextLiveness false true curBbLabel p)
+    (fun _ => dem) (front.zipIdx 0) S ps0 { s with instIdx := 0 } as0 hbrh hsd hsv hrel0 hblock
+  have hgv : (front.zipIdx 0).foldl (fun v x => gvBodyStep x v) { s with instIdx := 0 } = sEnd :=
+    execBodyThread_eq_gvFold front 0 { s with instIdx := 0 } sEnd hthread
+  rw [hgv] at hrel'
+  have hstk_c : as'.stack = EvmYul.UInt256.ofNat 0 :: as'.stack.drop 1 :=
+    venomAsmRel_asmStack_top1_var hrel' hcondtos hval
+  have hsucc : venomAsmRel lo (psOf ifZ) sEnd { as' with stack := as'.stack.drop 1 } := by
+    rw [hpsj]; exact venomAsmRel_pop_tos hrel' hstk_c
+  have hp1' : as'.pc < prog.length := hpc' ▸ hp1
+  have hpushN' : prog.get ⟨as'.pc, hp1'⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifNz) :=
+    prog_get_transfer hpc' hpushN
+  have hp2' : as'.pc + 1 < prog.length := by rw [hpc']; exact hp2
+  have hjumpi' : prog.get ⟨as'.pc + 1, hp2'⟩ = AsmInst.AsmOp "JUMPI" :=
+    prog_get_transfer (congrArg (· + 1) hpc') hjumpi
+  have hp3' : as'.pc + 2 < prog.length := by rw [hpc']; exact hp3
+  have hpushZ' : prog.get ⟨as'.pc + 2, hp3'⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifZ) :=
+    prog_get_transfer (congrArg (· + 2) hpc') hpushZ
+  have hp4' : as'.pc + 2 + 1 < prog.length := by rw [hpc']; exact hp4
+  have hjump' : prog.get ⟨as'.pc + 2 + 1, hp4'⟩ = AsmInst.AsmOp "JUMP" :=
+    prog_get_transfer (congrArg (· + 2 + 1) hpc') hjump
+  exact ⟨as', (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2, sEnd, _, hrun,
+    termRecipeW_jnz_nottaken_of_body (condOp := Operand.Var condvar) (ifNz := ifNz)
+      (stk := as'.stack.drop 1) hbb hop hoperands hcondv hcons hphi hnonterm hthread hnothalt hw
+      hstk_c hp1' hpushN' hoffN_lk hoffN hp2' hjumpi' hp3' hpushZ' hoffZ_lk hoffZ hp4' hjump'
+      hidxZ_lk hsucc hlk'⟩
+
+set_option maxHeartbeats 1000000 in
+/-- **Generic `hsupply` for a NON-EMPTY-body DJMP block** — the dynamic-jump case, and the last
+    terminator reachable from `RegularBodyH` alone. Like JNZ the selector is a variable the body leaves on
+    the plan stack, so the selector-on-top and selector-dropped successor relation are derived from the
+    body-sim relation; unlike JNZ the terminator's asm is a scan chain, supplied by `djmp_switch_sim_state`
+    (the `pre` list of non-matching entries, the matching entry, and the trampoline). Only the scan/match
+    positions are relative to the body-end pc, so they transfer across `hpc'`; the trampoline is absolute.
+
+    With this, every terminator whose operands the BODY materializes has a non-empty-body slice
+    (STOP/INVALID/JMP/JNZ×2/DJMP). The remaining three — RETURN/REVERT/SELFDESTRUCT — read their operands
+    through the terminator's own emit segment, so their slices belong to the spill-aware `HSVP` layer
+    (cf. `termRecipe_{return,revert,selfdestruct}_of_HSVP`), not to this one. -/
+theorem termRecipeW_djmp_regular
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {nextLiveness : List String} {curBbLabel : String} {dem : Nat}
+    {ps0 : PlanState} {as0 : AsmState} {restFuel : Nat} {ctx : VenomContext} {bb bb' : BasicBlock}
+    {front : List Instruction} {dInst hd : Instruction} {tl : List Instruction}
+    {s sEnd : VenomState} {S : List String} {selvar : String} {idx : bytes32} {base : List Operand}
+    {labelOps : List Operand} {labels : List String} {hi : idx.toNat < labels.length}
+    {pre : List (List byte × String × Nat)}
+    {matb : List byte} {tName lName : String} {matoff idxTramp loff target : Nat}
+    (hbb : bb.instructions = front ++ [dInst]) (hop : dInst.opcode = Opcode.DJMP)
+    (hoperands : dInst.operands = Operand.Var selvar :: labelOps)
+    (hselv : evalOperand (Operand.Var selvar) sEnd = some idx)
+    (hlabels : extractLabels labelOps = some labels)
+    (hval : operandVal sEnd lo (Operand.Var selvar) = some idx)
+    (hcons : front ++ [dInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hnothalt : sEnd.halted = false)
+    (hreg : RegularBodyH lo nextLiveness o2pc prog dem front S)
+    (hsd : StackDiscH ((front.zipIdx 0).map (fun _ => dem)).sum ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel0 : venomAsmRel lo ps0 { s with instIdx := 0 } as0)
+    (hblock : asmBlockAt prog as0.pc
+      (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1))
+    (hseltos : (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2.stack
+      = base ++ [Operand.Var selvar])
+    (hpsj : psOf (labels.get ⟨idx.toNat, hi⟩)
+      = { (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2 with
+          stack := stackPop 1
+            (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2.stack })
+    (hpct : pcOf (labels.get ⟨idx.toNat, hi⟩) = target)
+    (hpre : ∀ (k : Nat) (hk : k < pre.length),
+        djmpEntryHere offsets prog ((as0.pc + (executePlan
+            (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length) + 5 * k)
+          (pre.get ⟨k, hk⟩).1 (pre.get ⟨k, hk⟩).2.1 (pre.get ⟨k, hk⟩).2.2 ∧
+        idx ≠ djmpVal (pre.get ⟨k, hk⟩).1)
+    (hmatch : djmpEntryHere offsets prog ((as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length)
+          + 5 * pre.length) matb tName matoff)
+    (hsel : idx = djmpVal matb)
+    (hidx_lk : AssocList.lookup Nat Nat o2pc matoff = some idxTramp)
+    (ht0 : ∃ h : idxTramp < prog.length, prog.get ⟨idxTramp, h⟩ = AsmInst.AsmLabel tName)
+    (ht1 : ∃ h : idxTramp + 1 < prog.length, prog.get ⟨idxTramp + 1, h⟩ = AsmInst.AsmOp "POP")
+    (ht2 : ∃ h : idxTramp + 2 < prog.length,
+        prog.get ⟨idxTramp + 2, h⟩ = resolveInst offsets (AsmInst.AsmPushLabel lName))
+    (hl_lk : AssocList.lookup String Nat offsets lName = some loff) (hloff : loff < 2 ^ 256)
+    (ht3 : ∃ h : idxTramp + 3 < prog.length, prog.get ⟨idxTramp + 3, h⟩ = AsmInst.AsmOp "JUMP")
+    (htarget_lk : AssocList.lookup Nat Nat o2pc loff = some target)
+    (hlk : lookupBlock (labels.get ⟨idx.toNat, hi⟩) fn.blocks = some bb')
+    (hw : wOf (labels.get ⟨idx.toNat, hi⟩)
+        + ((executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length
+          + (5 * pre.length + 5 + 4)) ≤ wOf bb.label) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+      runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as' ∧
+      TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' vs' bodyLen
+        (front.length + (restFuel + 1)) ctx bb s := by
+  have hbrh := bodyStepsReadyH_regular_list (liveness := liveness) (dfg := dfg) (cfg := cfg) (fn := fn)
+    (curBbLabel := curBbLabel) front S 0 hreg
+  obtain ⟨as', hrun, hrel', hpc', _, _⟩ := genBlockBodyH_sim_inv
+    (fun z p => generateRegularInstPlan liveness dfg cfg fn z.1 nextLiveness false true curBbLabel p)
+    (fun _ => dem) (front.zipIdx 0) S ps0 { s with instIdx := 0 } as0 hbrh hsd hsv hrel0 hblock
+  have hgv : (front.zipIdx 0).foldl (fun v x => gvBodyStep x v) { s with instIdx := 0 } = sEnd :=
+    execBodyThread_eq_gvFold front 0 { s with instIdx := 0 } sEnd hthread
+  rw [hgv] at hrel'
+  have hstk_c : as'.stack = idx :: as'.stack.drop 1 :=
+    venomAsmRel_asmStack_top1_var hrel' hseltos hval
+  have hsucc : venomAsmRel lo (psOf (labels.get ⟨idx.toNat, hi⟩)) sEnd
+      { as' with stack := as'.stack.drop 1 } := by
+    rw [hpsj]; exact venomAsmRel_pop_tos hrel' hstk_c
+  have hdispatch := djmp_switch_sim_state (offsetToPc := o2pc) pre as' hstk_c
+    (by intro k hk; rw [hpc']; exact hpre k hk)
+    (by rw [hpc']; exact hmatch) hsel hidx_lk ht0 ht1 ht2 hl_lk hloff ht3 htarget_lk
+  rw [← hpct] at hdispatch
+  exact ⟨as', (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2, sEnd,
+    (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length, hrun,
+    termRecipeW_djmp_of_body (selectorOp := Operand.Var selvar) (labelOps := labelOps) (hi := hi)
+      (rest := as'.stack.drop 1) (chainLen := 5 * pre.length + 5 + 4)
+      hbb hop hoperands hselv hlabels hcons hphi hnonterm hthread hnothalt hw hdispatch hsucc hlk⟩
+
+/-! ## The emit-segment slices: RETURN / REVERT / SELFDESTRUCT (non-empty body)
+
+The six slices above bottom out in `RegularBodyH` because their terminator's operands are materialized by
+the BODY (JNZ/DJMP read a variable the body left on the plan stack; STOP/INVALID/JMP have no value
+operands). These three cannot: `generateBlockPlan` folds `generateInstPlan` over the terminator too
+(`CodegenPipeline.lean:456`), so a terminator with value operands emits its OWN input-materialization and
+the opcode lands AFTER a plan-dependent segment — "the opcode is at `as'.pc`" is not statable.
+
+So they take the spill-aware route instead, mirroring the older `termRecipe_*_of_HSVP` producers: body sim
+(`genBlockPrefixBodyHSVP_sim_inv`) THEN the operand emission (`emitInputPlan_{single,pair}_var_sim`),
+composed by `runAsm_add_ok`, with the recipe packaged at the POST-EMIT state (operands on top by
+`venomAsmRel_asmStack_top{1,2}_var`, terminator at that pc). They halt, so there is no successor-recording
+and no var-set threading. Unlike the older producers these do NOT assume the terminator step: the Venom
+result is derived from the block's structure by `termRecipeW_*_of_body` (`runBlock_body_*`).
+
+With these, non-empty-body `hsupply` coverage is **8/8** — every codegen terminator. -/
+
+set_option maxHeartbeats 1000000 in
+/-- **Generic `hsupply` for a NON-EMPTY-body SELFDESTRUCT block** — the single-operand emit-segment slice.
+    Body sim then `emitInputPlan_single_var_sim` puts the address on top; the recipe is packaged there. No
+    memory-safety segment, hence no M1 FFI axioms. -/
+theorem termRecipeW_selfdestruct_HSVP
+    {fn : IrFunction} {ctx : VenomContext} {o2pc : AssocList Nat Nat}
+    {prog : List AsmInst} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {offsets : AssocList String Nat}
+    {bb : BasicBlock} {term hd : Instruction} {tl : List Instruction}
+    {extraFuel : Nat} (P : Nat)
+    {l : String} {gp : Instruction × Nat → PlanState → List StackOp × PlanState}
+    {lg : List ((Instruction × Nat) × List String)}
+    {front : List Instruction} {S0 : List String} {M0 M1 : AssocList Operand Nat}
+    {ps0 : PlanState} {vs0 sEnd : VenomState} {as0 : AsmState}
+    {addrv : String} {waddr : bytes32} {opc : Opcode} {nl : List String}
+    {bodyLen emitLen : Nat}
+    (hbb : bb.instructions = front ++ [term])
+    (hop : term.opcode = Opcode.SELFDESTRUCT)
+    (hoperands : term.operands = [Operand.Var addrv])
+    (hevaladdr : evalOperand (Operand.Var addrv) sEnd = some waddr)
+    (hcons : front ++ [term] = hd :: tl)
+    (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hfront : lg.map Prod.fst = front.zipIdx 0)
+    (hready : BodyStepsReadyHSVP P lo o2pc prog gp lg S0 M0)
+    (hsd0 : StackDiscHS (totalGain lg + P) ps0 vs0 as0)
+    (hsv0 : StackPerm S0 ps0) (hspM : ps0.spilled = M0)
+    (hrel0 : venomAsmRel lo ps0 vs0 as0)
+    (hthread : execBodyThread front 0 vs0 = some sEnd)
+    (hvs0 : vs0 = { vs0 with instIdx := 0 })
+    (haddrS : addrv ∈ S0 ++ lg.flatMap (fun e => e.2))
+    (hspMF : (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2.spilled
+      = M1)
+    (haddrM : alookup' M1 (Operand.Var addrv) = none)
+    (hliveaddr : nl.contains addrv = true)
+    (hvaddr : lookupVar addrv sEnd = some waddr)
+    (hblock : asmBlockAt prog as0.pc
+      (executePlan (([StackOp.SOLabel l] ++ (lg.foldl
+        (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).1)
+        ++ (emitInputPlan opc [Operand.Var addrv] nl
+             (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).1)))
+    (hbodyLenEq : bodyLen = (executePlan ([StackOp.SOLabel l] ++ (lg.foldl
+        (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).1)).length)
+    (hemitLenEq : emitLen = (executePlan (emitInputPlan opc [Operand.Var addrv] nl
+        (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).1).length)
+    (hlt : as0.pc + bodyLen + emitLen < prog.length)
+    (hget : prog.get ⟨as0.pc + bodyLen + emitLen, hlt⟩ = AsmInst.AsmOp "SELFDESTRUCT")
+    (hw : bodyLen + emitLen + 1 ≤ wOf bb.label) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen' : Nat),
+      runAsm bodyLen' o2pc prog as0 = AsmResult.AsmOK as' ∧
+      TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' vs' bodyLen'
+        (front.length + (extraFuel + 1)) ctx bb vs0 := by
+  rw [executePlan_append] at hblock
+  obtain ⟨hbpre, hbemit⟩ := asmBlockAt_append hblock
+  obtain ⟨asMid, hbrun, hbrel, hbpc, hbsd, hbsv⟩ :=
+    genBlockPrefixBodyHSVP_sim_inv P l gp lg front S0 M0 ps0 vs0 sEnd as0
+      hfront hready hsd0 hsv0 hspM hrel0 hthread hbpre
+  rw [← hbodyLenEq] at hbrun hbpc
+  have haddrmem := stackPerm_mem hbsv haddrS
+  have hshallow : (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2))
+      ([], ps0)).2.stack.length ≤ 15 := by have := hbsd.shallow; omega
+  obtain ⟨d, hdepth, hlen⟩ := stackGetDepth_of_mem haddrmem
+  have hsmall : d ≤ 15 := by omega
+  have hnospill := alookup_of_spilled_eq hspMF haddrM
+  have hbemit' : asmBlockAt prog asMid.pc
+      (executePlan (emitInputPlan opc [Operand.Var addrv] nl
+        (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).1) := by
+    rw [hbpc, hbodyLenEq]; exact hbemit
+  obtain ⟨asMid2, herun, herel, hepc⟩ :=
+    emitInputPlan_single_var_sim hnospill hliveaddr hdepth hsmall hbrel hlen hbemit'
+  rw [← hemitLenEq] at herun hepc
+  have hpeek : stackPeek d (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2))
+      ([], ps0)).2.stack = Operand.Var addrv := stackGetDepth_peek hdepth
+  have hemitstack : (emitInputPlan opc [Operand.Var addrv] nl
+      (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).2.stack
+      = (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2.stack
+        ++ [Operand.Var addrv] := by
+    rw [emitInputPlan_single_var_eq hnospill hliveaddr hdepth hsmall hpeek]
+  have hval : operandVal sEnd lo (Operand.Var addrv) = some waddr := hvaddr
+  have htop : asMid2.stack = waddr :: asMid2.stack.drop 1 :=
+    venomAsmRel_asmStack_top1_var herel hemitstack hval
+  have hpc' : asMid2.pc < prog.length := by rw [hepc, hbpc]; omega
+  have hget' : prog.get ⟨asMid2.pc, hpc'⟩ = AsmInst.AsmOp "SELFDESTRUCT" :=
+    prog_get_transfer (by rw [hepc, hbpc]) hget
+  have hthread' : execBodyThread front 0 { vs0 with instIdx := 0 } = some sEnd := by
+    rw [← hvs0]; exact hthread
+  have hbody : runAsm (bodyLen + emitLen) o2pc prog as0 = AsmResult.AsmOK asMid2 := by
+    rw [runAsm_add_ok hbrun]; exact herun
+  exact ⟨asMid2, _, sEnd, bodyLen + emitLen, hbody,
+    termRecipeW_selfdestruct_of_body (addrOp := Operand.Var addrv) (addr := waddr)
+      (stk := asMid2.stack.drop 1) hbb hop hoperands hevaladdr hcons hphi hnonterm hthread' herel
+      hw hpc' hget' htop⟩
+
+set_option maxHeartbeats 1000000 in
+/-- **Generic `hsupply` for a NON-EMPTY-body RETURN block** — the two-operand emit-segment slice. The
+    emit arranges `[sz, off]` so `off` ends on top (`venomAsmRel_asmStack_top2_var`), and the memory-safety
+    facts ride along: coverage transfers from `as0` to the post-emit state because the body's asm run only
+    grows memory (`runAsm_memory_size_mono`), and `fnEom` is unchanged by the emit
+    (`emitInputPlan_pair_var_eq`). -/
+theorem termRecipeW_return_HSVP
+    {fn : IrFunction} {ctx : VenomContext} {o2pc : AssocList Nat Nat}
+    {prog : List AsmInst} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {offsets : AssocList String Nat}
+    {bb : BasicBlock} {term hd : Instruction} {tl : List Instruction}
+    {extraFuel : Nat} (P : Nat)
+    {l : String} {gp : Instruction × Nat → PlanState → List StackOp × PlanState}
+    {lg : List ((Instruction × Nat) × List String)}
+    {front : List Instruction} {S0 : List String} {M0 M1 : AssocList Operand Nat}
+    {ps0 : PlanState} {vs0 sEnd : VenomState} {as0 : AsmState}
+    {offv szv : String} {woff wsz : bytes32} {opc : Opcode} {nl : List String}
+    {bodyLen emitLen : Nat}
+    (hbb : bb.instructions = front ++ [term])
+    (hop : term.opcode = Opcode.RETURN)
+    (hoperands : term.operands = [Operand.Var offv, Operand.Var szv])
+    (hevaloff : evalOperand (Operand.Var offv) sEnd = some woff)
+    (hevalsz : evalOperand (Operand.Var szv) sEnd = some wsz)
+    (hcons : front ++ [term] = hd :: tl)
+    (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hfront : lg.map Prod.fst = front.zipIdx 0)
+    (hready : BodyStepsReadyHSVP P lo o2pc prog gp lg S0 M0)
+    (hsd0 : StackDiscHS (totalGain lg + P) ps0 vs0 as0)
+    (hsv0 : StackPerm S0 ps0) (hspM : ps0.spilled = M0)
+    (hrel0 : venomAsmRel lo ps0 vs0 as0)
+    (hthread : execBodyThread front 0 vs0 = some sEnd)
+    (hvs0 : vs0 = { vs0 with instIdx := 0 })
+    (hoffS : offv ∈ S0 ++ lg.flatMap (fun e => e.2)) (hszS : szv ∈ S0 ++ lg.flatMap (fun e => e.2))
+    (hspMF : (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2.spilled
+      = M1)
+    (hoffM : alookup' M1 (Operand.Var offv) = none) (hszM : alookup' M1 (Operand.Var szv) = none)
+    (hliveoff : nl.contains offv = true) (hliveszv : nl.contains szv = true)
+    (hvoff : lookupVar offv sEnd = some woff) (hvsz : lookupVar szv sEnd = some wsz)
+    (hcov0 : wsz.toNat = 0 ∨ ((woff.toNat + wsz.toNat + 31) / 32) * 32 ≤ as0.memory.size)
+    (hsafe : woff.toNat + wsz.toNat ≤
+      (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2.alloc.fnEom)
+    (hlenu : wsz.toNat < USize.size)
+    (hblock : asmBlockAt prog as0.pc
+      (executePlan (([StackOp.SOLabel l] ++ (lg.foldl
+        (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).1)
+        ++ (emitInputPlan opc [Operand.Var szv, Operand.Var offv] nl
+             (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).1)))
+    (hbodyLenEq : bodyLen = (executePlan ([StackOp.SOLabel l] ++ (lg.foldl
+        (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).1)).length)
+    (hemitLenEq : emitLen = (executePlan (emitInputPlan opc [Operand.Var szv, Operand.Var offv] nl
+        (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).1).length)
+    (hlt : as0.pc + bodyLen + emitLen < prog.length)
+    (hget : prog.get ⟨as0.pc + bodyLen + emitLen, hlt⟩ = AsmInst.AsmOp "RETURN")
+    (hw : bodyLen + emitLen + 1 ≤ wOf bb.label) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen' : Nat),
+      runAsm bodyLen' o2pc prog as0 = AsmResult.AsmOK as' ∧
+      TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' vs' bodyLen'
+        (front.length + (extraFuel + 1)) ctx bb vs0 := by
+  rw [executePlan_append] at hblock
+  obtain ⟨hbpre, hbemit⟩ := asmBlockAt_append hblock
+  obtain ⟨asMid, hbrun, hbrel, hbpc, hbsd, hbsv⟩ :=
+    genBlockPrefixBodyHSVP_sim_inv P l gp lg front S0 M0 ps0 vs0 sEnd as0
+      hfront hready hsd0 hsv0 hspM hrel0 hthread hbpre
+  rw [← hbodyLenEq] at hbrun hbpc
+  have hoffmem := stackPerm_mem hbsv hoffS
+  have hszmem := stackPerm_mem hbsv hszS
+  have hshallow : (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2))
+      ([], ps0)).2.stack.length ≤ 15 := by have := hbsd.shallow; omega
+  obtain ⟨d_y, d_x', hdepth_y, hsmall_y, hleny, hdepth_x', hsmall_x', hlenx'⟩ :=
+    binopVar_depths_of_shallow (x := offv) (y := szv) hshallow hoffmem hszmem
+  have hnospill_sz := alookup_of_spilled_eq hspMF hszM
+  have hnospill_off := alookup_of_spilled_eq hspMF hoffM
+  have hbemit' : asmBlockAt prog asMid.pc
+      (executePlan (emitInputPlan opc [Operand.Var szv, Operand.Var offv] nl
+        (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).1) := by
+    rw [hbpc, hbodyLenEq]; exact hbemit
+  obtain ⟨asMid2, herun, herel, hepc, hemem⟩ :=
+    emitInputPlan_pair_var_sim (offsetToPc := o2pc) hnospill_sz hliveszv hdepth_y hsmall_y
+      hleny hnospill_off hliveoff hdepth_x' hsmall_x' hlenx' hbrel hbemit'
+  rw [← hemitLenEq] at herun hepc
+  have hemitstack : (emitInputPlan opc [Operand.Var szv, Operand.Var offv] nl
+      (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).2.stack
+      = (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2.stack
+        ++ [Operand.Var szv, Operand.Var offv] := by
+    rw [emitInputPlan_pair_var_eq hnospill_sz hliveszv hdepth_y hsmall_y hnospill_off hliveoff
+      hdepth_x' hsmall_x']
+  have htop : asMid2.stack = woff :: wsz :: asMid2.stack.drop 2 :=
+    venomAsmRel_asmStack_top2_var herel hemitstack hvoff hvsz
+  have hpc' : asMid2.pc < prog.length := by rw [hepc, hbpc]; omega
+  have hget' : prog.get ⟨asMid2.pc, hpc'⟩ = AsmInst.AsmOp "RETURN" :=
+    prog_get_transfer (by rw [hepc, hbpc]) hget
+  have hcov : wsz.toNat = 0 ∨ ((woff.toNat + wsz.toNat + 31) / 32) * 32 ≤ asMid2.memory.size := by
+    rcases hcov0 with h | h
+    · exact Or.inl h
+    · exact Or.inr (le_trans h (by rw [hemem]; exact runAsm_memory_size_mono hbrun))
+  have hsafe' : woff.toNat + wsz.toNat ≤ (emitInputPlan opc [Operand.Var szv, Operand.Var offv] nl
+      (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).2.alloc.fnEom := by
+    rw [emitInputPlan_pair_var_eq hnospill_sz hliveszv hdepth_y hsmall_y hnospill_off hliveoff
+      hdepth_x' hsmall_x']
+    exact hsafe
+  have hthread' : execBodyThread front 0 { vs0 with instIdx := 0 } = some sEnd := by
+    rw [← hvs0]; exact hthread
+  have hbody : runAsm (bodyLen + emitLen) o2pc prog as0 = AsmResult.AsmOK asMid2 := by
+    rw [runAsm_add_ok hbrun]; exact herun
+  exact ⟨asMid2, _, sEnd, bodyLen + emitLen, hbody,
+    termRecipeW_return_of_body (offOp := Operand.Var offv) (szOp := Operand.Var szv)
+      (off := woff) (sz := wsz) (rest := asMid2.stack.drop 2) hbb hop hoperands hevaloff hevalsz
+      hcons hphi hnonterm hthread' herel hw hpc' hget' htop hcov hsafe' hlenu⟩
+
+
+
+set_option maxHeartbeats 1000000 in
+/-- **Generic `hsupply` for a NON-EMPTY-body REVERT block** — the aborting twin of the RETURN slice
+    (`Abort RevertAbort → AsmRevert`); identical emit segment and memory-safety transfer. -/
+theorem termRecipeW_revert_HSVP
+    {fn : IrFunction} {ctx : VenomContext} {o2pc : AssocList Nat Nat}
+    {prog : List AsmInst} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {offsets : AssocList String Nat}
+    {bb : BasicBlock} {term hd : Instruction} {tl : List Instruction}
+    {extraFuel : Nat} (P : Nat)
+    {l : String} {gp : Instruction × Nat → PlanState → List StackOp × PlanState}
+    {lg : List ((Instruction × Nat) × List String)}
+    {front : List Instruction} {S0 : List String} {M0 M1 : AssocList Operand Nat}
+    {ps0 : PlanState} {vs0 sEnd : VenomState} {as0 : AsmState}
+    {offv szv : String} {woff wsz : bytes32} {opc : Opcode} {nl : List String}
+    {bodyLen emitLen : Nat}
+    (hbb : bb.instructions = front ++ [term])
+    (hop : term.opcode = Opcode.REVERT)
+    (hoperands : term.operands = [Operand.Var offv, Operand.Var szv])
+    (hevaloff : evalOperand (Operand.Var offv) sEnd = some woff)
+    (hevalsz : evalOperand (Operand.Var szv) sEnd = some wsz)
+    (hcons : front ++ [term] = hd :: tl)
+    (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hfront : lg.map Prod.fst = front.zipIdx 0)
+    (hready : BodyStepsReadyHSVP P lo o2pc prog gp lg S0 M0)
+    (hsd0 : StackDiscHS (totalGain lg + P) ps0 vs0 as0)
+    (hsv0 : StackPerm S0 ps0) (hspM : ps0.spilled = M0)
+    (hrel0 : venomAsmRel lo ps0 vs0 as0)
+    (hthread : execBodyThread front 0 vs0 = some sEnd)
+    (hvs0 : vs0 = { vs0 with instIdx := 0 })
+    (hoffS : offv ∈ S0 ++ lg.flatMap (fun e => e.2)) (hszS : szv ∈ S0 ++ lg.flatMap (fun e => e.2))
+    (hspMF : (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2.spilled
+      = M1)
+    (hoffM : alookup' M1 (Operand.Var offv) = none) (hszM : alookup' M1 (Operand.Var szv) = none)
+    (hliveoff : nl.contains offv = true) (hliveszv : nl.contains szv = true)
+    (hvoff : lookupVar offv sEnd = some woff) (hvsz : lookupVar szv sEnd = some wsz)
+    (hcov0 : wsz.toNat = 0 ∨ ((woff.toNat + wsz.toNat + 31) / 32) * 32 ≤ as0.memory.size)
+    (hsafe : woff.toNat + wsz.toNat ≤
+      (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2.alloc.fnEom)
+    (hlenu : wsz.toNat < USize.size)
+    (hblock : asmBlockAt prog as0.pc
+      (executePlan (([StackOp.SOLabel l] ++ (lg.foldl
+        (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).1)
+        ++ (emitInputPlan opc [Operand.Var szv, Operand.Var offv] nl
+             (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).1)))
+    (hbodyLenEq : bodyLen = (executePlan ([StackOp.SOLabel l] ++ (lg.foldl
+        (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).1)).length)
+    (hemitLenEq : emitLen = (executePlan (emitInputPlan opc [Operand.Var szv, Operand.Var offv] nl
+        (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).1).length)
+    (hlt : as0.pc + bodyLen + emitLen < prog.length)
+    (hget : prog.get ⟨as0.pc + bodyLen + emitLen, hlt⟩ = AsmInst.AsmOp "REVERT")
+    (hw : bodyLen + emitLen + 1 ≤ wOf bb.label) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen' : Nat),
+      runAsm bodyLen' o2pc prog as0 = AsmResult.AsmOK as' ∧
+      TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' vs' bodyLen'
+        (front.length + (extraFuel + 1)) ctx bb vs0 := by
+  rw [executePlan_append] at hblock
+  obtain ⟨hbpre, hbemit⟩ := asmBlockAt_append hblock
+  obtain ⟨asMid, hbrun, hbrel, hbpc, hbsd, hbsv⟩ :=
+    genBlockPrefixBodyHSVP_sim_inv P l gp lg front S0 M0 ps0 vs0 sEnd as0
+      hfront hready hsd0 hsv0 hspM hrel0 hthread hbpre
+  rw [← hbodyLenEq] at hbrun hbpc
+  have hoffmem := stackPerm_mem hbsv hoffS
+  have hszmem := stackPerm_mem hbsv hszS
+  have hshallow : (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2))
+      ([], ps0)).2.stack.length ≤ 15 := by have := hbsd.shallow; omega
+  obtain ⟨d_y, d_x', hdepth_y, hsmall_y, hleny, hdepth_x', hsmall_x', hlenx'⟩ :=
+    binopVar_depths_of_shallow (x := offv) (y := szv) hshallow hoffmem hszmem
+  have hnospill_sz := alookup_of_spilled_eq hspMF hszM
+  have hnospill_off := alookup_of_spilled_eq hspMF hoffM
+  have hbemit' : asmBlockAt prog asMid.pc
+      (executePlan (emitInputPlan opc [Operand.Var szv, Operand.Var offv] nl
+        (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).1) := by
+    rw [hbpc, hbodyLenEq]; exact hbemit
+  obtain ⟨asMid2, herun, herel, hepc, hemem⟩ :=
+    emitInputPlan_pair_var_sim (offsetToPc := o2pc) hnospill_sz hliveszv hdepth_y hsmall_y
+      hleny hnospill_off hliveoff hdepth_x' hsmall_x' hlenx' hbrel hbemit'
+  rw [← hemitLenEq] at herun hepc
+  have hemitstack : (emitInputPlan opc [Operand.Var szv, Operand.Var offv] nl
+      (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).2.stack
+      = (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2.stack
+        ++ [Operand.Var szv, Operand.Var offv] := by
+    rw [emitInputPlan_pair_var_eq hnospill_sz hliveszv hdepth_y hsmall_y hnospill_off hliveoff
+      hdepth_x' hsmall_x']
+  have htop : asMid2.stack = woff :: wsz :: asMid2.stack.drop 2 :=
+    venomAsmRel_asmStack_top2_var herel hemitstack hvoff hvsz
+  have hpc' : asMid2.pc < prog.length := by rw [hepc, hbpc]; omega
+  have hget' : prog.get ⟨asMid2.pc, hpc'⟩ = AsmInst.AsmOp "REVERT" :=
+    prog_get_transfer (by rw [hepc, hbpc]) hget
+  have hcov : wsz.toNat = 0 ∨ ((woff.toNat + wsz.toNat + 31) / 32) * 32 ≤ asMid2.memory.size := by
+    rcases hcov0 with h | h
+    · exact Or.inl h
+    · exact Or.inr (le_trans h (by rw [hemem]; exact runAsm_memory_size_mono hbrun))
+  have hsafe' : woff.toNat + wsz.toNat ≤ (emitInputPlan opc [Operand.Var szv, Operand.Var offv] nl
+      (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).2.alloc.fnEom := by
+    rw [emitInputPlan_pair_var_eq hnospill_sz hliveszv hdepth_y hsmall_y hnospill_off hliveoff
+      hdepth_x' hsmall_x']
+    exact hsafe
+  have hthread' : execBodyThread front 0 { vs0 with instIdx := 0 } = some sEnd := by
+    rw [← hvs0]; exact hthread
+  have hbody : runAsm (bodyLen + emitLen) o2pc prog as0 = AsmResult.AsmOK asMid2 := by
+    rw [runAsm_add_ok hbrun]; exact herun
+  exact ⟨asMid2, _, sEnd, bodyLen + emitLen, hbody,
+    termRecipeW_revert_of_body (offOp := Operand.Var offv) (szOp := Operand.Var szv)
+      (off := woff) (sz := wsz) (rest := asMid2.stack.drop 2) hbb hop hoperands hevaloff hevalsz
+      hcons hphi hnonterm hthread' herel hw hpc' hget' htop hcov hsafe' hlenu⟩
+
+set_option maxHeartbeats 1000000 in
+/-- **Non-vacuity of the emit-segment family.** Instantiated at an EMPTY body (`lg = []`) every
+    generator-side hypothesis discharges outright: `BodyStepsReadyHSVP … []` is trivially true,
+    `totalGain [] = 0`, `execBodyThread [] 0 vs0 = some vs0` (so the body-end state IS the entry state), and
+    the HSVP body fold collapses DEFINITIONALLY to `([], ps0)` — leaving `bodyLen = 1` (the SOLabel) and the
+    emit segment intact. What remains are the state hypotheses every consumer already carries
+    (`StackDiscHS`/`StackPerm`/`venomAsmRel`) plus the emit placement. So the emit-segment slices apply to
+    something; their non-vacuity is exhibited here rather than asserted by inheritance. -/
+theorem termRecipeW_selfdestruct_HSVP_nonvacuous
+    {fn : IrFunction} {ctx : VenomContext} {o2pc : AssocList Nat Nat}
+    {prog : List AsmInst} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {offsets : AssocList String Nat}
+    {bb : BasicBlock} {term : Instruction} {extraFuel : Nat} (P : Nat)
+    {l : String} {gp : Instruction × Nat → PlanState → List StackOp × PlanState}
+    {S0 : List String} {M0 M1 : AssocList Operand Nat}
+    {ps0 : PlanState} {vs0 : VenomState} {as0 : AsmState}
+    {addrv : String} {waddr : bytes32} {opc : Opcode} {nl : List String}
+    {bodyLen emitLen : Nat}
+    (hbb : bb.instructions = [term])
+    (hop : term.opcode = Opcode.SELFDESTRUCT)
+    (hoperands : term.operands = [Operand.Var addrv])
+    (hevaladdr : evalOperand (Operand.Var addrv) vs0 = some waddr)
+    (hsd0 : StackDiscHS P ps0 vs0 as0)
+    (hsv0 : StackPerm S0 ps0) (hspM : ps0.spilled = M0)
+    (hrel0 : venomAsmRel lo ps0 vs0 as0)
+    (hvs0 : vs0 = { vs0 with instIdx := 0 })
+    (haddrS : addrv ∈ S0)
+    (hspMF : ps0.spilled = M1)
+    (haddrM : alookup' M1 (Operand.Var addrv) = none)
+    (hliveaddr : nl.contains addrv = true)
+    (hvaddr : lookupVar addrv vs0 = some waddr)
+    (hblock : asmBlockAt prog as0.pc
+      (executePlan ([StackOp.SOLabel l] ++ (emitInputPlan opc [Operand.Var addrv] nl ps0).1)))
+    (hbodyLenEq : bodyLen = 1)
+    (hemitLenEq : emitLen = (executePlan (emitInputPlan opc [Operand.Var addrv] nl ps0).1).length)
+    (hlt : as0.pc + bodyLen + emitLen < prog.length)
+    (hget : prog.get ⟨as0.pc + bodyLen + emitLen, hlt⟩ = AsmInst.AsmOp "SELFDESTRUCT")
+    (hw : bodyLen + emitLen + 1 ≤ wOf bb.label) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen' : Nat),
+      runAsm bodyLen' o2pc prog as0 = AsmResult.AsmOK as' ∧
+      TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' vs' bodyLen'
+        (([] : List Instruction).length + (extraFuel + 1)) ctx bb vs0 :=
+  termRecipeW_selfdestruct_HSVP (P := P) (l := l) (gp := gp) (lg := []) (front := [])
+    (S0 := S0) (M0 := M0) (M1 := M1) (ps0 := ps0) (vs0 := vs0) (sEnd := vs0) (as0 := as0)
+    (addrv := addrv) (waddr := waddr) (opc := opc) (nl := nl) (bodyLen := bodyLen) (emitLen := emitLen)
+    (term := term) (hd := term) (tl := []) (extraFuel := extraFuel)
+    (hbb := hbb) (hop := hop) (hoperands := hoperands) (hevaladdr := hevaladdr)
+    (hcons := rfl) (hphi := by rw [hop]; decide) (hnonterm := by intro i hi; cases hi)
+    (hfront := rfl) (hready := by simp [BodyStepsReadyHSVP])
+    (hsd0 := by simpa [totalGain] using hsd0)
+    (hsv0 := hsv0) (hspM := hspM) (hrel0 := hrel0)
+    (hthread := by simp [execBodyThread]) (hvs0 := hvs0)
+    (haddrS := by simpa using haddrS) (hspMF := hspMF) (haddrM := haddrM)
+    (hliveaddr := hliveaddr) (hvaddr := hvaddr) (hblock := hblock)
+    (hbodyLenEq := by rw [hbodyLenEq]; rfl) (hemitLenEq := hemitLenEq)
+    (hlt := hlt) (hget := hget) (hw := hw)
+
+set_option maxHeartbeats 1000000 in
+set_option maxHeartbeats 1000000 in
+/-- **The shared prologue of every driver-facing non-empty-body slice**: the block's JUMPDEST step
+    (`soLabel_sim`) followed by its real body (`genBlockBodyH_sim_inv`), composed by `runAsm_add_ok`, landing
+    at the body-end state with the relation at the body fold's plan state and the pc one-past-the-body. Every
+    `hsupplyW_regular*` differs only in what it does AFTER this — which `termRecipeW_*_of_body` it feeds and
+    which placement facts it transfers — so this is stated once and shared. -/
+theorem labelThenBody_sim
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {o2pc : AssocList Nat Nat} {prog : List AsmInst}
+    {nextLiveness : List String} {curBbLabel : String} {dem : Nat}
+    {ps0 : PlanState} {asm : AsmState} {bb : BasicBlock}
+    {front : List Instruction} {s sEnd : VenomState} {S : List String}
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hreg : RegularBodyH lo nextLiveness o2pc prog dem front S)
+    (hsd : StackDiscH ((front.zipIdx 0).map (fun _ => dem)).sum ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel : venomAsmRel lo ps0 { s with instIdx := 0 } asm)
+    (hbLabel : asmBlockAt prog asm.pc (executePlan [StackOp.SOLabel bb.label]))
+    (hblock : asmBlockAt prog (asm.pc + 1)
+      (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1)) :
+    ∃ as' : AsmState,
+      runAsm (1 + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length)
+          o2pc prog asm = AsmResult.AsmOK as' ∧
+      venomAsmRel lo (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2 sEnd as' ∧
+      as'.pc = asm.pc + 1
+        + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length := by
+  obtain ⟨as1, hrun1, hrel1, hpc1⟩ :=
+    soLabel_sim (offsetToPc := o2pc) lo ps0 { s with instIdx := 0 } asm prog bb.label hrel hbLabel
+  have hlen1 : (executePlan [StackOp.SOLabel bb.label]).length = 1 := rfl
+  have hpc1' : as1.pc = asm.pc + 1 := by rw [hlen1] at hpc1; exact hpc1
+  rw [hlen1] at hrun1
+  have hblock1 : asmBlockAt prog as1.pc
+      (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1) := by
+    rw [hpc1']; exact hblock
+  have hbrh := bodyStepsReadyH_regular_list (liveness := liveness) (dfg := dfg) (cfg := cfg) (fn := fn)
+    (curBbLabel := curBbLabel) front S 0 hreg
+  obtain ⟨as', hrun, hrel', hpc', _, _⟩ := genBlockBodyH_sim_inv
+    (fun z p => generateRegularInstPlan liveness dfg cfg fn z.1 nextLiveness false true curBbLabel p)
+    (fun _ => dem) (front.zipIdx 0) S ps0 { s with instIdx := 0 } as1 hbrh hsd hsv hrel1 hblock1
+  have hgv : (front.zipIdx 0).foldl (fun v x => gvBodyStep x v) { s with instIdx := 0 } = sEnd :=
+    execBodyThread_eq_gvFold front 0 { s with instIdx := 0 } sEnd hthread
+  rw [hgv] at hrel'
+  refine ⟨as', ?_, hrel', by rw [hpc', hpc1']⟩
+  rw [runAsm_add_ok hrun1]; exact hrun
+
+/-- **Generic `hsupply` for a NON-EMPTY-body STOP block, from the block's own pc.** The `_regular` slices
+    take `as0` already positioned at the body; the driver instead hands over `asm` at the block's LABEL. This
+    composes the two: `soLabel_sim` (the JUMPDEST step) then `genBlockBodyH_sim_inv` (the real body), joined
+    by `runAsm_add_ok`, and packages the recipe at the body-end via `termRecipeW_stop_of_body`. So
+    `codegen_correct_ofBlocks_recipeW`'s per-block obligation is discharged for a STOP block with a REAL
+    body, from the pc the driver actually supplies. -/
+theorem hsupplyW_regularStop
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat}
+    {prog : List AsmInst}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {nextLiveness : List String} {curBbLabel : String} {dem : Nat}
+    {ps0 : PlanState} {asm : AsmState} {restFuel : Nat} {ctx : VenomContext} {bb : BasicBlock}
+    {front : List Instruction} {stopInst hd : Instruction} {tl : List Instruction}
+    {s sEnd : VenomState} {S : List String}
+    (hbb : bb.instructions = front ++ [stopInst]) (hstopop : stopInst.opcode = Opcode.STOP)
+    (hcons : front ++ [stopInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hreg : RegularBodyH lo nextLiveness o2pc prog dem front S)
+    (hsd : StackDiscH ((front.zipIdx 0).map (fun _ => dem)).sum ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel : venomAsmRel lo ps0 { s with instIdx := 0 } asm)
+    (hbLabel : asmBlockAt prog asm.pc (executePlan [StackOp.SOLabel bb.label]))
+    (hblock : asmBlockAt prog (asm.pc + 1)
+      (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1))
+    (hpc : asm.pc + 1 + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length < prog.length)
+    (hstop : prog.get ⟨asm.pc + 1 + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length, hpc⟩
+      = AsmInst.AsmOp "STOP")
+    (hw : 1 + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 1
+      ≤ wOf bb.label) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+      runAsm bodyLen o2pc prog asm = AsmResult.AsmOK as' ∧
+      TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' vs' bodyLen
+        (front.length + (restFuel + 1)) ctx bb s := by
+  obtain ⟨as', hbody, hrel', hpcas⟩ :=
+    labelThenBody_sim hthread hreg hsd hsv hrel hbLabel hblock
+  have hlt : as'.pc < prog.length := by rw [hpcas]; exact hpc
+  have hst : prog.get ⟨as'.pc, hlt⟩ = AsmInst.AsmOp "STOP" := prog_get_transfer hpcas hstop
+  exact ⟨as', _, sEnd, _, hbody,
+    termRecipeW_stop_of_body hbb hstopop hcons hphi hnonterm hthread hrel' hw hlt hst⟩
+
+/-! ### The driver-facing forms: composing the label step onto the `_regular` cores
+
+The `_regular` slices above take `as0` already positioned at the BODY. The driver hands over `asm` at the
+block's LABEL (`CanonEntryWH` pins `asm.pc = pcOf s.currentBb`, and a block's plan opens with `SOLabel`), so
+a `_regular` core alone cannot discharge `codegen_correct_ofBlocks_recipeW`'s obligation — the label step has
+to be composed on. (The `_HSVP` three need no such wrapper: their plan already carries `[SOLabel l] ++ …`.)
+
+Each of these is `soLabel_sim` (the JUMPDEST step) ∘ `genBlockBodyH_sim_inv` (the real body), joined by
+`runAsm_add_ok`, packaged through the matching `termRecipeW_*_of_body`; the branching ones additionally
+derive operand-on-top and the operand-dropped successor relation from the body-end relation. With
+`hsupplyW_regularStop` these complete the driver-facing non-empty-body forms for all eight terminators. -/
+
+set_option maxHeartbeats 1000000 in
+/-- Non-empty-body INVALID block, from the block's own pc. -/
+theorem hsupplyW_regularInvalid
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat}
+    {prog : List AsmInst}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {nextLiveness : List String} {curBbLabel : String} {dem : Nat}
+    {ps0 : PlanState} {asm : AsmState} {restFuel : Nat} {ctx : VenomContext} {bb : BasicBlock}
+    {front : List Instruction} {invInst hd : Instruction} {tl : List Instruction}
+    {s sEnd : VenomState} {S : List String}
+    (hbb : bb.instructions = front ++ [invInst]) (hinvop : invInst.opcode = Opcode.INVALID)
+    (hcons : front ++ [invInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hreg : RegularBodyH lo nextLiveness o2pc prog dem front S)
+    (hsd : StackDiscH ((front.zipIdx 0).map (fun _ => dem)).sum ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel : venomAsmRel lo ps0 { s with instIdx := 0 } asm)
+    (hbLabel : asmBlockAt prog asm.pc (executePlan [StackOp.SOLabel bb.label]))
+    (hblock : asmBlockAt prog (asm.pc + 1)
+      (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1))
+    (hpc : asm.pc + 1 + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length < prog.length)
+    (hinv : prog.get ⟨asm.pc + 1 + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length, hpc⟩
+      = AsmInst.AsmOp "INVALID")
+    (hw : 1 + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 1
+      ≤ wOf bb.label) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+      runAsm bodyLen o2pc prog asm = AsmResult.AsmOK as' ∧
+      TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' vs' bodyLen
+        (front.length + (restFuel + 1)) ctx bb s := by
+  obtain ⟨as', hbody, hrel', hpcas⟩ :=
+    labelThenBody_sim hthread hreg hsd hsv hrel hbLabel hblock
+  have hlt : as'.pc < prog.length := by rw [hpcas]; exact hpc
+  have hiv : prog.get ⟨as'.pc, hlt⟩ = AsmInst.AsmOp "INVALID" := prog_get_transfer hpcas hinv
+  exact ⟨as', _, sEnd, _, hbody,
+    termRecipeW_invalid_of_body hbb hinvop hcons hphi hnonterm hthread hrel' hw hlt hiv⟩
+
+set_option maxHeartbeats 1000000 in
+/-- Non-empty-body JMP block, from the block's own pc. -/
+theorem hsupplyW_regularJmp
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat}
+    {prog : List AsmInst}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {nextLiveness : List String} {curBbLabel : String} {dem off : Nat}
+    {ps0 : PlanState} {asm : AsmState} {restFuel : Nat} {ctx : VenomContext} {bb bb' : BasicBlock}
+    {front : List Instruction} {jmpInst hd : Instruction} {tl : List Instruction} {lbl : String}
+    {s sEnd : VenomState} {S : List String}
+    (hbb : bb.instructions = front ++ [jmpInst]) (hjmpop : jmpInst.opcode = Opcode.JMP)
+    (hoperands : jmpInst.operands = [Operand.Label lbl])
+    (hcons : front ++ [jmpInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hnothalt : sEnd.halted = false)
+    (hreg : RegularBodyH lo nextLiveness o2pc prog dem front S)
+    (hsd : StackDiscH ((front.zipIdx 0).map (fun _ => dem)).sum ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel : venomAsmRel lo ps0 { s with instIdx := 0 } asm)
+    (hbLabel : asmBlockAt prog asm.pc (executePlan [StackOp.SOLabel bb.label]))
+    (hblock : asmBlockAt prog (asm.pc + 1)
+      (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1))
+    (hps : (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2 = psOf lbl)
+    (hpc : asm.pc + 1 + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length < prog.length)
+    (hpush : prog.get ⟨asm.pc + 1 + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length, hpc⟩
+      = resolveInst offsets (AsmInst.AsmPushLabel lbl))
+    (hoff_lk : AssocList.lookup String Nat offsets lbl = some off) (hoff : off < 2 ^ 256)
+    (hpc2 : asm.pc + 1 + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 1 < prog.length)
+    (hjump : prog.get ⟨asm.pc + 1 + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 1, hpc2⟩
+      = AsmInst.AsmOp "JUMP")
+    (hidx_lk : AssocList.lookup Nat Nat o2pc off = some (pcOf lbl))
+    (hlk' : lookupBlock lbl fn.blocks = some bb')
+    (hw : wOf lbl + ((1 + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length) + 2) ≤ wOf bb.label) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+      runAsm bodyLen o2pc prog asm = AsmResult.AsmOK as' ∧
+      TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' vs' bodyLen
+        (front.length + (restFuel + 1)) ctx bb s := by
+  obtain ⟨as', hbody, hrel', hpcas⟩ :=
+    labelThenBody_sim hthread hreg hsd hsv hrel hbLabel hblock
+  have hlt : as'.pc < prog.length := by rw [hpcas]; exact hpc
+  have hp : prog.get ⟨as'.pc, hlt⟩ = resolveInst offsets (AsmInst.AsmPushLabel lbl) :=
+    prog_get_transfer hpcas hpush
+  have hlt2 : as'.pc + 1 < prog.length := by rw [hpcas]; exact hpc2
+  have hj : prog.get ⟨as'.pc + 1, hlt2⟩ = AsmInst.AsmOp "JUMP" :=
+    prog_get_transfer (congrArg (· + 1) hpcas) hjump
+  exact ⟨as', _, sEnd, _, hbody,
+    termRecipeW_jmp_of_body (bb' := bb') hbb hjmpop hoperands hcons hphi hnonterm hthread hnothalt
+      hrel' hps hw hlt hp hoff_lk hoff hlt2 hj hidx_lk hlk'⟩
+set_option maxHeartbeats 1000000 in
+/-- Non-empty-body JNZ (taken) block, from the block's own pc. -/
+theorem hsupplyW_regularJnzTaken
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat}
+    {prog : List AsmInst}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {nextLiveness : List String} {curBbLabel : String} {dem off : Nat}
+    {ps0 : PlanState} {asm : AsmState} {restFuel : Nat} {ctx : VenomContext} {bb bb' : BasicBlock}
+    {front : List Instruction} {jnzInst hd : Instruction} {tl : List Instruction}
+    {s sEnd : VenomState} {S : List String} {condvar ifNz ifZ : String} {cond : bytes32}
+    {base : List Operand}
+    (hbb : bb.instructions = front ++ [jnzInst]) (hop : jnzInst.opcode = Opcode.JNZ)
+    (hoperands : jnzInst.operands = [Operand.Var condvar, Operand.Label ifNz, Operand.Label ifZ])
+    (hcondv : evalOperand (Operand.Var condvar) sEnd = some cond)
+    (hcond_ne : cond ≠ EvmYul.UInt256.ofNat 0)
+    (hval : operandVal sEnd lo (Operand.Var condvar) = some cond)
+    (hcons : front ++ [jnzInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hnothalt : sEnd.halted = false)
+    (hreg : RegularBodyH lo nextLiveness o2pc prog dem front S)
+    (hsd : StackDiscH ((front.zipIdx 0).map (fun _ => dem)).sum ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel : venomAsmRel lo ps0 { s with instIdx := 0 } asm)
+    (hbLabel : asmBlockAt prog asm.pc (executePlan [StackOp.SOLabel bb.label]))
+    (hblock : asmBlockAt prog (asm.pc + 1) (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1))
+    (hcondtos : (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2.stack = base ++ [Operand.Var condvar])
+    (hpsj : psOf ifNz = { (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2 with stack := stackPop 1 (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2.stack })
+    (hpc : asm.pc + 1 + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length < prog.length)
+    (hpush : prog.get ⟨asm.pc + 1 + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length, hpc⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifNz))
+    (hoff_lk : AssocList.lookup String Nat offsets ifNz = some off) (hoff : off < 2 ^ 256)
+    (hpc2 : asm.pc + 1 + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 1 < prog.length)
+    (hjumpi : prog.get ⟨asm.pc + 1 + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 1, hpc2⟩ = AsmInst.AsmOp "JUMPI")
+    (hidx_lk : AssocList.lookup Nat Nat o2pc off = some (pcOf ifNz))
+    (hlk' : lookupBlock ifNz fn.blocks = some bb')
+    (hw : wOf ifNz + ((1 + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length) + 2) ≤ wOf bb.label) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+      runAsm bodyLen o2pc prog asm = AsmResult.AsmOK as' ∧
+      TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' vs' bodyLen
+        (front.length + (restFuel + 1)) ctx bb s := by
+  obtain ⟨as', hbody, hrel', hpcas⟩ :=
+    labelThenBody_sim hthread hreg hsd hsv hrel hbLabel hblock
+  have hstk_c : as'.stack = cond :: as'.stack.drop 1 :=
+    venomAsmRel_asmStack_top1_var hrel' hcondtos hval
+  have hsucc : venomAsmRel lo (psOf ifNz) sEnd { as' with stack := as'.stack.drop 1 } := by
+    rw [hpsj]; exact venomAsmRel_pop_tos hrel' hstk_c
+  have hlt : as'.pc < prog.length := by rw [hpcas]; exact hpc
+  have hp : prog.get ⟨as'.pc, hlt⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifNz) :=
+    prog_get_transfer hpcas hpush
+  have hlt2 : as'.pc + 1 < prog.length := by rw [hpcas]; exact hpc2
+  have hji : prog.get ⟨as'.pc + 1, hlt2⟩ = AsmInst.AsmOp "JUMPI" :=
+    prog_get_transfer (congrArg (· + 1) hpcas) hjumpi
+  exact ⟨as', (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2, sEnd, _, hbody,
+    termRecipeW_jnz_taken_of_body (condOp := Operand.Var condvar) (ifZ := ifZ)
+      (stk := as'.stack.drop 1) hbb hop hoperands hcondv hcond_ne hcons hphi hnonterm hthread
+      hnothalt hw hstk_c hlt hp hoff_lk hoff hlt2 hji hidx_lk hsucc hlk'⟩
+
+set_option maxHeartbeats 1000000 in
+/-- Non-empty-body JNZ (not taken) block, from the block's own pc. -/
+theorem hsupplyW_regularJnzNottaken
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat}
+    {prog : List AsmInst}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {nextLiveness : List String} {curBbLabel : String} {dem offN offZ : Nat}
+    {ps0 : PlanState} {asm : AsmState} {restFuel : Nat} {ctx : VenomContext} {bb bb' : BasicBlock}
+    {front : List Instruction} {jnzInst hd : Instruction} {tl : List Instruction}
+    {s sEnd : VenomState} {S : List String} {condvar ifNz ifZ : String} {base : List Operand}
+    (hbb : bb.instructions = front ++ [jnzInst]) (hop : jnzInst.opcode = Opcode.JNZ)
+    (hoperands : jnzInst.operands = [Operand.Var condvar, Operand.Label ifNz, Operand.Label ifZ])
+    (hcondv : evalOperand (Operand.Var condvar) sEnd = some ({ val := 0 } : bytes32))
+    (hval : operandVal sEnd lo (Operand.Var condvar) = some (EvmYul.UInt256.ofNat 0))
+    (hcons : front ++ [jnzInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hnothalt : sEnd.halted = false)
+    (hreg : RegularBodyH lo nextLiveness o2pc prog dem front S)
+    (hsd : StackDiscH ((front.zipIdx 0).map (fun _ => dem)).sum ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel : venomAsmRel lo ps0 { s with instIdx := 0 } asm)
+    (hbLabel : asmBlockAt prog asm.pc (executePlan [StackOp.SOLabel bb.label]))
+    (hblock : asmBlockAt prog (asm.pc + 1) (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1))
+    (hcondtos : (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2.stack = base ++ [Operand.Var condvar])
+    (hpsj : psOf ifZ = { (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2 with stack := stackPop 1 (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2.stack })
+    (hpc : asm.pc + 1 + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length < prog.length)
+    (hpushN : prog.get ⟨asm.pc + 1 + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length, hpc⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifNz))
+    (hoffN_lk : AssocList.lookup String Nat offsets ifNz = some offN) (hoffN : offN < 2 ^ 256)
+    (hpc2 : asm.pc + 1 + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 1 < prog.length)
+    (hjumpi : prog.get ⟨asm.pc + 1 + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 1, hpc2⟩ = AsmInst.AsmOp "JUMPI")
+    (hpc3 : asm.pc + 1 + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 2 < prog.length)
+    (hpushZ : prog.get ⟨asm.pc + 1 + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 2, hpc3⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifZ))
+    (hoffZ_lk : AssocList.lookup String Nat offsets ifZ = some offZ) (hoffZ : offZ < 2 ^ 256)
+    (hpc4 : asm.pc + 1 + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 2 + 1 < prog.length)
+    (hjump : prog.get ⟨asm.pc + 1 + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 2 + 1, hpc4⟩ = AsmInst.AsmOp "JUMP")
+    (hidxZ_lk : AssocList.lookup Nat Nat o2pc offZ = some (pcOf ifZ))
+    (hlk' : lookupBlock ifZ fn.blocks = some bb')
+    (hw : wOf ifZ + ((1 + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length) + 4) ≤ wOf bb.label) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+      runAsm bodyLen o2pc prog asm = AsmResult.AsmOK as' ∧
+      TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' vs' bodyLen
+        (front.length + (restFuel + 1)) ctx bb s := by
+  obtain ⟨as', hbody, hrel', hpcas⟩ :=
+    labelThenBody_sim hthread hreg hsd hsv hrel hbLabel hblock
+  have hstk_c : as'.stack = EvmYul.UInt256.ofNat 0 :: as'.stack.drop 1 :=
+    venomAsmRel_asmStack_top1_var hrel' hcondtos hval
+  have hsucc : venomAsmRel lo (psOf ifZ) sEnd { as' with stack := as'.stack.drop 1 } := by
+    rw [hpsj]; exact venomAsmRel_pop_tos hrel' hstk_c
+  have hlt : as'.pc < prog.length := by rw [hpcas]; exact hpc
+  have hpN : prog.get ⟨as'.pc, hlt⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifNz) :=
+    prog_get_transfer hpcas hpushN
+  have hlt2 : as'.pc + 1 < prog.length := by rw [hpcas]; exact hpc2
+  have hji : prog.get ⟨as'.pc + 1, hlt2⟩ = AsmInst.AsmOp "JUMPI" :=
+    prog_get_transfer (congrArg (· + 1) hpcas) hjumpi
+  have hlt3 : as'.pc + 2 < prog.length := by rw [hpcas]; exact hpc3
+  have hpZ : prog.get ⟨as'.pc + 2, hlt3⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifZ) :=
+    prog_get_transfer (congrArg (· + 2) hpcas) hpushZ
+  have hlt4 : as'.pc + 2 + 1 < prog.length := by rw [hpcas]; exact hpc4
+  have hj : prog.get ⟨as'.pc + 2 + 1, hlt4⟩ = AsmInst.AsmOp "JUMP" :=
+    prog_get_transfer (congrArg (· + 2 + 1) hpcas) hjump
+  exact ⟨as', (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2, sEnd, _, hbody,
+    termRecipeW_jnz_nottaken_of_body (condOp := Operand.Var condvar) (ifNz := ifNz)
+      (stk := as'.stack.drop 1) hbb hop hoperands hcondv hcons hphi hnonterm hthread hnothalt hw
+      hstk_c hlt hpN hoffN_lk hoffN hlt2 hji hlt3 hpZ hoffZ_lk hoffZ hlt4 hj hidxZ_lk hsucc hlk'⟩
+set_option maxHeartbeats 1000000 in
+/-- Non-empty-body DJMP block, from the block's own pc. -/
+theorem hsupplyW_regularDjmp
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat}
+    {prog : List AsmInst}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {nextLiveness : List String} {curBbLabel : String} {dem : Nat}
+    {ps0 : PlanState} {asm : AsmState} {restFuel : Nat} {ctx : VenomContext} {bb bb' : BasicBlock}
+    {front : List Instruction} {dInst hd : Instruction} {tl : List Instruction}
+    {s sEnd : VenomState} {S : List String} {selvar : String} {idx : bytes32}
+    {base : List Operand} {labelOps : List Operand} {labels : List String}
+    {hi : idx.toNat < labels.length}
+    {pre : List (List byte × String × Nat)}
+    {matb : List byte} {tName lName : String} {matoff idxTramp loff target lc : Nat}
+    (hbb : bb.instructions = front ++ [dInst]) (hop : dInst.opcode = Opcode.DJMP)
+    (hoperands : dInst.operands = Operand.Var selvar :: labelOps)
+    (hselv : evalOperand (Operand.Var selvar) sEnd = some idx)
+    (hlabels : extractLabels labelOps = some labels)
+    (hval : operandVal sEnd lo (Operand.Var selvar) = some idx)
+    (hcons : front ++ [dInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hnothalt : sEnd.halted = false)
+    (hreg : RegularBodyH lo nextLiveness o2pc prog dem front S)
+    (hsd : StackDiscH ((front.zipIdx 0).map (fun _ => dem)).sum ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel : venomAsmRel lo ps0 { s with instIdx := 0 } asm)
+    (hbLabel : asmBlockAt prog asm.pc (executePlan [StackOp.SOLabel bb.label]))
+    (hblock : asmBlockAt prog (asm.pc + 1) (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1))
+    (hseltos : (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2.stack = base ++ [Operand.Var selvar])
+    (hpsj : psOf (labels.get ⟨idx.toNat, hi⟩) = { (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2 with stack := stackPop 1 (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2.stack, labelCounter := lc })
+    (hpct : pcOf (labels.get ⟨idx.toNat, hi⟩) = target)
+    (hpre : ∀ (k : Nat) (hk : k < pre.length),
+        djmpEntryHere offsets prog ((asm.pc + 1 + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length) + 5 * k)
+          (pre.get ⟨k, hk⟩).1 (pre.get ⟨k, hk⟩).2.1 (pre.get ⟨k, hk⟩).2.2 ∧
+        idx ≠ djmpVal (pre.get ⟨k, hk⟩).1)
+    (hmatch : djmpEntryHere offsets prog ((asm.pc + 1 + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length) + 5 * pre.length) matb tName matoff)
+    (hsel : idx = djmpVal matb)
+    (hidx_lk : AssocList.lookup Nat Nat o2pc matoff = some idxTramp)
+    (ht0 : ∃ h : idxTramp < prog.length, prog.get ⟨idxTramp, h⟩ = AsmInst.AsmLabel tName)
+    (ht1 : ∃ h : idxTramp + 1 < prog.length, prog.get ⟨idxTramp + 1, h⟩ = AsmInst.AsmOp "POP")
+    (ht2 : ∃ h : idxTramp + 2 < prog.length,
+        prog.get ⟨idxTramp + 2, h⟩ = resolveInst offsets (AsmInst.AsmPushLabel lName))
+    (hl_lk : AssocList.lookup String Nat offsets lName = some loff) (hloff : loff < 2 ^ 256)
+    (ht3 : ∃ h : idxTramp + 3 < prog.length, prog.get ⟨idxTramp + 3, h⟩ = AsmInst.AsmOp "JUMP")
+    (htarget_lk : AssocList.lookup Nat Nat o2pc loff = some target)
+    (hlk : lookupBlock (labels.get ⟨idx.toNat, hi⟩) fn.blocks = some bb')
+    (hw : wOf (labels.get ⟨idx.toNat, hi⟩) + ((1 + (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length) + (5 * pre.length + 5 + 4))
+      ≤ wOf bb.label) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+      runAsm bodyLen o2pc prog asm = AsmResult.AsmOK as' ∧
+      TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' vs' bodyLen
+        (front.length + (restFuel + 1)) ctx bb s := by
+  obtain ⟨as', hbody, hrel', hpcas⟩ :=
+    labelThenBody_sim hthread hreg hsd hsv hrel hbLabel hblock
+  have hstk_c : as'.stack = idx :: as'.stack.drop 1 :=
+    venomAsmRel_asmStack_top1_var hrel' hseltos hval
+  have hsucc : venomAsmRel lo (psOf (labels.get ⟨idx.toNat, hi⟩)) sEnd
+      { as' with stack := as'.stack.drop 1 } := by
+    rw [hpsj]; exact venomAsmRel_pop_tos hrel' hstk_c
+  have hdispatch := djmp_switch_sim_state (offsetToPc := o2pc) pre as' hstk_c
+    (by intro k hk; rw [hpcas]; exact hpre k hk)
+    (by rw [hpcas]; exact hmatch) hsel hidx_lk ht0 ht1 ht2 hl_lk hloff ht3 htarget_lk
+  rw [← hpct] at hdispatch
+  exact ⟨as', (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2, sEnd, _, hbody,
+    termRecipeW_djmp_of_body (selectorOp := Operand.Var selvar) (labelOps := labelOps) (hi := hi)
+      (rest := as'.stack.drop 1) (chainLen := 5 * pre.length + 5 + 4)
+      hbb hop hoperands hselv hlabels hcons hphi hnonterm hthread hnothalt hw hdispatch hsucc hlk⟩
+
+set_option maxHeartbeats 1000000 in
+/-- **Generic `hsupply` for an empty-body SELFDESTRUCT whose operand is DEAD** — i.e. already on the
+    plan stack and consumed in place, which is what the real generator emits at a terminator
+    (`nextLive = []` there, so `emitInputPlan` produces NO ops — no DUP). The emit-segment slices
+    (`termRecipeW_selfdestruct_HSVP` et al.) go through `emitInputPlan_single_var_sim`, whose
+    `hliveaddr : nl.contains addrv = true` forces the *live* (DUP) variant, so they cannot be applied to a
+    real halting block. Here the block's whole asm is `[JUMPDEST ; SELFDESTRUCT]`: the SOLabel step, then the
+    operand is already on top (derived from the entry relation via `venomAsmRel_asmStack_top1_var`). -/
+theorem hsupplyW_emptySelfdestructDead {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {asm : AsmState} {ps : PlanState} {k : Nat}
+    {ctx : VenomContext} {bb : BasicBlock} {s : VenomState} {sdInst : Instruction}
+    {addrv : String} {waddr : bytes32} {base : List Operand}
+    (hbb : bb.instructions = [sdInst]) (hop : sdInst.opcode = Opcode.SELFDESTRUCT)
+    (hoperands : sdInst.operands = [Operand.Var addrv])
+    (heval : evalOperand (Operand.Var addrv) { s with instIdx := 0 } = some waddr)
+    (hval : operandVal { s with instIdx := 0 } lo (Operand.Var addrv) = some waddr)
+    (hstack : ps.stack = base ++ [Operand.Var addrv])
+    (hrel : venomAsmRel lo ps { s with instIdx := 0 } asm)
+    (hbLabel : asmBlockAt prog asm.pc (executePlan [StackOp.SOLabel bb.label]))
+    (hsdpc : asm.pc + 1 < prog.length)
+    (hsd : prog.get ⟨asm.pc + 1, hsdpc⟩ = AsmInst.AsmOp "SELFDESTRUCT")
+    (hw : 1 + 1 ≤ wOf bb.label) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+      runAsm bodyLen o2pc prog asm = AsmResult.AsmOK as' ∧
+      TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' vs' bodyLen (k + 1) ctx bb s := by
+  obtain ⟨as1, hrun1, hrel1, hpc1⟩ :=
+    soLabel_sim (offsetToPc := o2pc) lo ps { s with instIdx := 0 } asm prog bb.label hrel hbLabel
+  have hlen1 : (executePlan [StackOp.SOLabel bb.label]).length = 1 := rfl
+  have hpc1' : as1.pc = asm.pc + 1 := by rw [hlen1] at hpc1; exact hpc1
+  have hlt : as1.pc < prog.length := by rw [hpc1']; exact hsdpc
+  have hst : prog.get ⟨as1.pc, hlt⟩ = AsmInst.AsmOp "SELFDESTRUCT" := by
+    conv_lhs => rw [show (⟨as1.pc, hlt⟩ : Fin _) = ⟨asm.pc + 1, hsdpc⟩ from Fin.ext hpc1']
+    exact hsd
+  have htop : as1.stack = waddr :: as1.stack.drop 1 :=
+    venomAsmRel_asmStack_top1_var hrel1 hstack hval
+  rw [hlen1] at hrun1
+  refine ⟨as1, ps, { s with instIdx := 0 }, 1, hrun1, ?_⟩
+  have hfuel : k + 1 = ([] : List Instruction).length + (k + 1) := by simp
+  rw [hfuel]
+  exact termRecipeW_selfdestruct_of_body (front := []) (sdInst := sdInst) (hd := sdInst) (tl := [])
+    (restFuel := k) (addrOp := Operand.Var addrv) (addr := waddr) (stk := as1.stack.drop 1)
+    (by simpa using hbb) hop hoperands heval (by simp) (by rw [hop]; decide)
+    (by intro i hi; cases hi) (by simp [execBodyThread]) hrel1 hw hlt hst htop
+
+set_option maxHeartbeats 1000000 in
+/-- **Generic `hsupply` for an empty-body RETURN whose operands are DEAD** — the two-operand sibling of
+    `hsupplyW_emptySelfdestructDead`, and the piece that completes the dead-operand family. At a real
+    terminator `nextLive = []`, so `emitInputPlan` emits NOTHING and the operands must already sit on the plan
+    stack in terminator order (`hstack` — `szv` then `offv`, so `offv` ends on top). The `_HSVP` slices cannot
+    serve this case: their `hliveoff`/`hliveszv` force the live (DUP) variant. Memory coverage is stated about
+    the ENTRY asm state and transferred across the JUMPDEST step by `runAsm_memory_size_mono` (an asm run only
+    grows memory); `fnEom` is untouched by the label step. -/
+theorem hsupplyW_emptyReturnDead {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {asm : AsmState} {ps : PlanState} {k : Nat}
+    {ctx : VenomContext} {bb : BasicBlock} {s : VenomState} {tInst : Instruction}
+    {offv szv : String} {woff wsz : bytes32} {base : List Operand}
+    (hbb : bb.instructions = [tInst]) (hop : tInst.opcode = Opcode.RETURN)
+    (hoperands : tInst.operands = [Operand.Var offv, Operand.Var szv])
+    (hevaloff : evalOperand (Operand.Var offv) { s with instIdx := 0 } = some woff)
+    (hevalsz : evalOperand (Operand.Var szv) { s with instIdx := 0 } = some wsz)
+    (hvoff : operandVal { s with instIdx := 0 } lo (Operand.Var offv) = some woff)
+    (hvsz : operandVal { s with instIdx := 0 } lo (Operand.Var szv) = some wsz)
+    (hstack : ps.stack = base ++ [Operand.Var szv, Operand.Var offv])
+    (hrel : venomAsmRel lo ps { s with instIdx := 0 } asm)
+    (hbLabel : asmBlockAt prog asm.pc (executePlan [StackOp.SOLabel bb.label]))
+    (htpc : asm.pc + 1 < prog.length)
+    (hget : prog.get ⟨asm.pc + 1, htpc⟩ = AsmInst.AsmOp "RETURN")
+    (hcov0 : wsz.toNat = 0 ∨ ((woff.toNat + wsz.toNat + 31) / 32) * 32 ≤ asm.memory.size)
+    (hbelow : woff.toNat + wsz.toNat ≤ ps.alloc.fnEom) (hlenu : wsz.toNat < USize.size)
+    (hw : 1 + 1 ≤ wOf bb.label) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+      runAsm bodyLen o2pc prog asm = AsmResult.AsmOK as' ∧
+      TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' vs' bodyLen (k + 1) ctx bb s := by
+  obtain ⟨as1, hrun1, hrel1, hpc1⟩ :=
+    soLabel_sim (offsetToPc := o2pc) lo ps { s with instIdx := 0 } asm prog bb.label hrel hbLabel
+  have hlen1 : (executePlan [StackOp.SOLabel bb.label]).length = 1 := rfl
+  have hpc1' : as1.pc = asm.pc + 1 := by rw [hlen1] at hpc1; exact hpc1
+  have hlt : as1.pc < prog.length := by rw [hpc1']; exact htpc
+  have hst : prog.get ⟨as1.pc, hlt⟩ = AsmInst.AsmOp "RETURN" := by
+    conv_lhs => rw [show (⟨as1.pc, hlt⟩ : Fin _) = ⟨asm.pc + 1, htpc⟩ from Fin.ext hpc1']
+    exact hget
+  have htop : as1.stack = woff :: wsz :: as1.stack.drop 2 :=
+    venomAsmRel_asmStack_top2_var hrel1 hstack hvoff hvsz
+  rw [hlen1] at hrun1
+  have hcov : wsz.toNat = 0 ∨ ((woff.toNat + wsz.toNat + 31) / 32) * 32 ≤ as1.memory.size := by
+    rcases hcov0 with h | h
+    · exact Or.inl h
+    · exact Or.inr (le_trans h (runAsm_memory_size_mono hrun1))
+  refine ⟨as1, ps, { s with instIdx := 0 }, 1, hrun1, ?_⟩
+  have hfuel : k + 1 = ([] : List Instruction).length + (k + 1) := by simp
+  rw [hfuel]
+  exact termRecipeW_return_of_body (front := []) (retInst := tInst) (hd := tInst) (tl := [])
+    (restFuel := k) (offOp := Operand.Var offv) (szOp := Operand.Var szv) (off := woff) (sz := wsz)
+    (rest := as1.stack.drop 2)
+    (by simpa using hbb) hop hoperands hevaloff hevalsz (by simp) (by rw [hop]; decide)
+    (by intro i hi; cases hi) (by simp [execBodyThread]) hrel1 hw hlt hst htop hcov hbelow hlenu
+
+
+
+set_option maxHeartbeats 1000000 in
+/-- **Generic `hsupply` for an empty-body REVERT whose operands are DEAD** — the two-operand sibling of
+    `hsupplyW_emptySelfdestructDead`, and the piece that completes the dead-operand family. At a real
+    terminator `nextLive = []`, so `emitInputPlan` emits NOTHING and the operands must already sit on the plan
+    stack in terminator order (`hstack` — `szv` then `offv`, so `offv` ends on top). The `_HSVP` slices cannot
+    serve this case: their `hliveoff`/`hliveszv` force the live (DUP) variant. Memory coverage is stated about
+    the ENTRY asm state and transferred across the JUMPDEST step by `runAsm_memory_size_mono` (an asm run only
+    grows memory); `fnEom` is untouched by the label step. -/
+theorem hsupplyW_emptyRevertDead {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {asm : AsmState} {ps : PlanState} {k : Nat}
+    {ctx : VenomContext} {bb : BasicBlock} {s : VenomState} {tInst : Instruction}
+    {offv szv : String} {woff wsz : bytes32} {base : List Operand}
+    (hbb : bb.instructions = [tInst]) (hop : tInst.opcode = Opcode.REVERT)
+    (hoperands : tInst.operands = [Operand.Var offv, Operand.Var szv])
+    (hevaloff : evalOperand (Operand.Var offv) { s with instIdx := 0 } = some woff)
+    (hevalsz : evalOperand (Operand.Var szv) { s with instIdx := 0 } = some wsz)
+    (hvoff : operandVal { s with instIdx := 0 } lo (Operand.Var offv) = some woff)
+    (hvsz : operandVal { s with instIdx := 0 } lo (Operand.Var szv) = some wsz)
+    (hstack : ps.stack = base ++ [Operand.Var szv, Operand.Var offv])
+    (hrel : venomAsmRel lo ps { s with instIdx := 0 } asm)
+    (hbLabel : asmBlockAt prog asm.pc (executePlan [StackOp.SOLabel bb.label]))
+    (htpc : asm.pc + 1 < prog.length)
+    (hget : prog.get ⟨asm.pc + 1, htpc⟩ = AsmInst.AsmOp "REVERT")
+    (hcov0 : wsz.toNat = 0 ∨ ((woff.toNat + wsz.toNat + 31) / 32) * 32 ≤ asm.memory.size)
+    (hbelow : woff.toNat + wsz.toNat ≤ ps.alloc.fnEom) (hlenu : wsz.toNat < USize.size)
+    (hw : 1 + 1 ≤ wOf bb.label) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+      runAsm bodyLen o2pc prog asm = AsmResult.AsmOK as' ∧
+      TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' vs' bodyLen (k + 1) ctx bb s := by
+  obtain ⟨as1, hrun1, hrel1, hpc1⟩ :=
+    soLabel_sim (offsetToPc := o2pc) lo ps { s with instIdx := 0 } asm prog bb.label hrel hbLabel
+  have hlen1 : (executePlan [StackOp.SOLabel bb.label]).length = 1 := rfl
+  have hpc1' : as1.pc = asm.pc + 1 := by rw [hlen1] at hpc1; exact hpc1
+  have hlt : as1.pc < prog.length := by rw [hpc1']; exact htpc
+  have hst : prog.get ⟨as1.pc, hlt⟩ = AsmInst.AsmOp "REVERT" := by
+    conv_lhs => rw [show (⟨as1.pc, hlt⟩ : Fin _) = ⟨asm.pc + 1, htpc⟩ from Fin.ext hpc1']
+    exact hget
+  have htop : as1.stack = woff :: wsz :: as1.stack.drop 2 :=
+    venomAsmRel_asmStack_top2_var hrel1 hstack hvoff hvsz
+  rw [hlen1] at hrun1
+  have hcov : wsz.toNat = 0 ∨ ((woff.toNat + wsz.toNat + 31) / 32) * 32 ≤ as1.memory.size := by
+    rcases hcov0 with h | h
+    · exact Or.inl h
+    · exact Or.inr (le_trans h (runAsm_memory_size_mono hrun1))
+  refine ⟨as1, ps, { s with instIdx := 0 }, 1, hrun1, ?_⟩
+  have hfuel : k + 1 = ([] : List Instruction).length + (k + 1) := by simp
+  rw [hfuel]
+  exact termRecipeW_revert_of_body (front := []) (revInst := tInst) (hd := tInst) (tl := [])
+    (restFuel := k) (offOp := Operand.Var offv) (szOp := Operand.Var szv) (off := woff) (sz := wsz)
+    (rest := as1.stack.drop 2)
+    (by simpa using hbb) hop hoperands hevaloff hevalsz (by simp) (by rw [hop]; decide)
+    (by intro i hi; cases hi) (by simp [execBodyThread]) hrel1 hw hlt hst htop hcov hbelow hlenu
+
+
+
+set_option maxHeartbeats 1000000 in
+/-- **The first REORDER-aware slice.** Fact 7 says this family covers reorder-free blocks because no slice
+    models `reorderOps`. This one does: an empty-body RETURN whose terminator segment is a REORDER, composed
+    as `soLabel_sim` (the JUMPDEST) → `reorderPlan_sim` (`PlanSim.lean:1663`, the reorder, its per-operand
+    residual `hstep` supplied by the caller from `reorderOne_sim_{swap,positioned}`) →
+    `termRecipeW_return_of_body`, joined by `runAsm_add_ok`. After the reorder the operands are positioned
+    (`hstack'`), so the emit is empty and `venomAsmRel_asmStack_top2_var` gives the recipe its stack fact.
+    Memory coverage is stated about the ENTRY asm state and transferred across the whole composed run by
+    `runAsm_memory_size_mono`. This is the shape fact 7 named as the one extension left:
+    `[SOLabel] ++ reorderOps ++ emitOps` rather than `[SOLabel] ++ emitOps`. -/
+theorem hsupplyW_emptyReturnReorder {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {asm : AsmState} {ps ps' : PlanState} {rops : List StackOp} {k : Nat}
+    {ctx : VenomContext} {bb : BasicBlock} {s : VenomState} {tInst : Instruction}
+    {offv szv : String} {woff wsz : bytes32} {base perm : List Operand}
+    (hbb : bb.instructions = [tInst]) (hop : tInst.opcode = Opcode.RETURN)
+    (hoperands : tInst.operands = [Operand.Var offv, Operand.Var szv])
+    (hevaloff : evalOperand (Operand.Var offv) { s with instIdx := 0 } = some woff)
+    (hevalsz : evalOperand (Operand.Var szv) { s with instIdx := 0 } = some wsz)
+    (hvoff : operandVal { s with instIdx := 0 } lo (Operand.Var offv) = some woff)
+    (hvsz : operandVal { s with instIdx := 0 } lo (Operand.Var szv) = some wsz)
+    (hrel : venomAsmRel lo ps { s with instIdx := 0 } asm)
+    (hbLabel : asmBlockAt prog asm.pc (executePlan [StackOp.SOLabel bb.label]))
+    -- the terminator's REORDER segment, on the bounded reachable-state route (no ∀-p `hstep`)
+    (hperm : List.Perm perm [Operand.Var szv, Operand.Var offv])
+    (hpsstk : ps.stack = base ++ perm)
+    (hbound : (base ++ perm).length ≤ 17)
+    (hnospill : ∀ o, alookup' ps.spilled o = none)
+    (hreorder : reorderPlan [Operand.Var szv, Operand.Var offv] ps = (rops, ps'))
+    (hblockR : asmBlockAt prog (asm.pc + 1) (executePlan rops))
+    (hpc : asm.pc + 1 + (executePlan rops).length < prog.length)
+    (hget : prog.get ⟨asm.pc + 1 + (executePlan rops).length, hpc⟩ = AsmInst.AsmOp "RETURN")
+    (hcov0 : wsz.toNat = 0 ∨ ((woff.toNat + wsz.toNat + 31) / 32) * 32 ≤ asm.memory.size)
+    (hbelow : woff.toNat + wsz.toNat ≤ ps'.alloc.fnEom) (hlenu : wsz.toNat < USize.size)
+    (hw : 1 + (executePlan rops).length + 1 ≤ wOf bb.label) :
+    ∃ (as' : AsmState) (ps'' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+      runAsm bodyLen o2pc prog asm = AsmResult.AsmOK as' ∧
+      TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps'' vs' bodyLen (k + 1) ctx bb s := by
+  obtain ⟨as1, hrun1, hrel1, hpc1⟩ :=
+    soLabel_sim (offsetToPc := o2pc) lo ps { s with instIdx := 0 } asm prog bb.label hrel hbLabel
+  have hlen1 : (executePlan [StackOp.SOLabel bb.label]).length = 1 := rfl
+  have hpc1' : as1.pc = asm.pc + 1 := by rw [hlen1] at hpc1; exact hpc1
+  rw [hlen1] at hrun1
+  have hblockR1 : asmBlockAt prog as1.pc (executePlan rops) := by rw [hpc1']; exact hblockR
+  obtain ⟨as2, hrun2, hrel2, hstack2, hpc2⟩ :=
+    reorderPlan_join_bounded (offsetToPc := o2pc) hperm hpsstk hbound hnospill hreorder hrel1 hblockR1
+  have hpc2' : as2.pc = asm.pc + 1 + (executePlan rops).length := by rw [hpc2, hpc1']
+  have hlt : as2.pc < prog.length := by rw [hpc2']; exact hpc
+  have hst : prog.get ⟨as2.pc, hlt⟩ = AsmInst.AsmOp "RETURN" := prog_get_transfer hpc2' hget
+  have htop : as2.stack = woff :: wsz :: as2.stack.drop 2 :=
+    venomAsmRel_asmStack_top2_var hrel2 hstack2 hvoff hvsz
+  have hbody : runAsm (1 + (executePlan rops).length) o2pc prog asm = AsmResult.AsmOK as2 := by
+    rw [runAsm_add_ok hrun1]; exact hrun2
+  have hcov : wsz.toNat = 0 ∨ ((woff.toNat + wsz.toNat + 31) / 32) * 32 ≤ as2.memory.size := by
+    rcases hcov0 with h | h
+    · exact Or.inl h
+    · exact Or.inr (le_trans h (runAsm_memory_size_mono hbody))
+  refine ⟨as2, ps', { s with instIdx := 0 }, 1 + (executePlan rops).length, hbody, ?_⟩
+  have hfuel : k + 1 = ([] : List Instruction).length + (k + 1) := by simp
+  rw [hfuel]
+  exact termRecipeW_return_of_body (front := []) (retInst := tInst) (hd := tInst) (tl := [])
+    (restFuel := k) (offOp := Operand.Var offv) (szOp := Operand.Var szv) (off := woff) (sz := wsz)
+    (rest := as2.stack.drop 2)
+    (by simpa using hbb) hop hoperands hevaloff hevalsz (by simp) (by rw [hop]; decide)
+    (by intro i hi; cases hi) (by simp [execBodyThread]) hrel2 hw hlt hst htop hcov hbelow hlenu
+
+set_option maxHeartbeats 1000000 in
+/-- **The REVERT twin of `hsupplyW_emptyReturnReorder`** — same composition
+    (`soLabel_sim` → `reorderPlan_sim` → `termRecipeW_revert_of_body`), `AsmRevert` instead of `AsmHalt`.
+    With this, both operand-carrying halting terminators that the generator reorders are covered. -/
+theorem hsupplyW_emptyRevertReorder {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {asm : AsmState} {ps ps' : PlanState} {rops : List StackOp} {k : Nat}
+    {ctx : VenomContext} {bb : BasicBlock} {s : VenomState} {tInst : Instruction}
+    {offv szv : String} {woff wsz : bytes32} {base perm : List Operand}
+    (hbb : bb.instructions = [tInst]) (hop : tInst.opcode = Opcode.REVERT)
+    (hoperands : tInst.operands = [Operand.Var offv, Operand.Var szv])
+    (hevaloff : evalOperand (Operand.Var offv) { s with instIdx := 0 } = some woff)
+    (hevalsz : evalOperand (Operand.Var szv) { s with instIdx := 0 } = some wsz)
+    (hvoff : operandVal { s with instIdx := 0 } lo (Operand.Var offv) = some woff)
+    (hvsz : operandVal { s with instIdx := 0 } lo (Operand.Var szv) = some wsz)
+    (hrel : venomAsmRel lo ps { s with instIdx := 0 } asm)
+    (hbLabel : asmBlockAt prog asm.pc (executePlan [StackOp.SOLabel bb.label]))
+    -- the terminator's REORDER segment, on the bounded reachable-state route (no ∀-p `hstep`)
+    (hperm : List.Perm perm [Operand.Var szv, Operand.Var offv])
+    (hpsstk : ps.stack = base ++ perm)
+    (hbound : (base ++ perm).length ≤ 17)
+    (hnospill : ∀ o, alookup' ps.spilled o = none)
+    (hreorder : reorderPlan [Operand.Var szv, Operand.Var offv] ps = (rops, ps'))
+    (hblockR : asmBlockAt prog (asm.pc + 1) (executePlan rops))
+    (hpc : asm.pc + 1 + (executePlan rops).length < prog.length)
+    (hget : prog.get ⟨asm.pc + 1 + (executePlan rops).length, hpc⟩ = AsmInst.AsmOp "REVERT")
+    (hcov0 : wsz.toNat = 0 ∨ ((woff.toNat + wsz.toNat + 31) / 32) * 32 ≤ asm.memory.size)
+    (hbelow : woff.toNat + wsz.toNat ≤ ps'.alloc.fnEom) (hlenu : wsz.toNat < USize.size)
+    (hw : 1 + (executePlan rops).length + 1 ≤ wOf bb.label) :
+    ∃ (as' : AsmState) (ps'' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+      runAsm bodyLen o2pc prog asm = AsmResult.AsmOK as' ∧
+      TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps'' vs' bodyLen (k + 1) ctx bb s := by
+  obtain ⟨as1, hrun1, hrel1, hpc1⟩ :=
+    soLabel_sim (offsetToPc := o2pc) lo ps { s with instIdx := 0 } asm prog bb.label hrel hbLabel
+  have hlen1 : (executePlan [StackOp.SOLabel bb.label]).length = 1 := rfl
+  have hpc1' : as1.pc = asm.pc + 1 := by rw [hlen1] at hpc1; exact hpc1
+  rw [hlen1] at hrun1
+  have hblockR1 : asmBlockAt prog as1.pc (executePlan rops) := by rw [hpc1']; exact hblockR
+  obtain ⟨as2, hrun2, hrel2, hstack2, hpc2⟩ :=
+    reorderPlan_join_bounded (offsetToPc := o2pc) hperm hpsstk hbound hnospill hreorder hrel1 hblockR1
+  have hpc2' : as2.pc = asm.pc + 1 + (executePlan rops).length := by rw [hpc2, hpc1']
+  have hlt : as2.pc < prog.length := by rw [hpc2']; exact hpc
+  have hst : prog.get ⟨as2.pc, hlt⟩ = AsmInst.AsmOp "REVERT" := prog_get_transfer hpc2' hget
+  have htop : as2.stack = woff :: wsz :: as2.stack.drop 2 :=
+    venomAsmRel_asmStack_top2_var hrel2 hstack2 hvoff hvsz
+  have hbody : runAsm (1 + (executePlan rops).length) o2pc prog asm = AsmResult.AsmOK as2 := by
+    rw [runAsm_add_ok hrun1]; exact hrun2
+  have hcov : wsz.toNat = 0 ∨ ((woff.toNat + wsz.toNat + 31) / 32) * 32 ≤ as2.memory.size := by
+    rcases hcov0 with h | h
+    · exact Or.inl h
+    · exact Or.inr (le_trans h (runAsm_memory_size_mono hbody))
+  refine ⟨as2, ps', { s with instIdx := 0 }, 1 + (executePlan rops).length, hbody, ?_⟩
+  have hfuel : k + 1 = ([] : List Instruction).length + (k + 1) := by simp
+  rw [hfuel]
+  exact termRecipeW_revert_of_body (front := []) (revInst := tInst) (hd := tInst) (tl := [])
+    (restFuel := k) (offOp := Operand.Var offv) (szOp := Operand.Var szv) (off := woff) (sz := wsz)
+    (rest := as2.stack.drop 2)
+    (by simpa using hbb) hop hoperands hevaloff hevalsz (by simp) (by rw [hop]; decide)
+    (by intro i hi; cases hi) (by simp [execBodyThread]) hrel2 hw hlt hst htop hcov hbelow hlenu
+
+/-! ### ⚠️ The reorder slices are built on the WRONG lemma (`hstep` is undischargeable for genuine swaps)
+
+`hsupplyW_empty{Return,Revert}Reorder` compose `reorderPlan_sim` (`PlanSim.lean:1663`) and carry its `hstep`
+as a caller obligation. That is a mistake, and this repo already documents why:
+`GenBlockSimComp.lean:2965-2966` states that `reorderPlan_sim`'s `∀ p` `hstep` is **"undischargeable for
+genuine swaps"** — its `∀ p` ranges over ARBITRARY plan states, where the swap-distance bounds
+`reorderOne_sim_swap` needs (`dist ≤ 16`, `< ps.stack.length`) simply do not hold. So for the very case those
+slices exist to cover — a real `SWAP1` — the hypothesis cannot be met. They are SOUND (nothing false is
+proved) and their statements stand, but they cannot be instantiated on a genuine reorder, exactly the
+`_HSVP` situation of fact 5 one level down.
+
+The right foundation is **`reorderPlan_join_bounded`** (`GenBlockSimComp.lean:2967`), which discharges the
+per-`reorderOne` step INTERNALLY — no carried `hstep` — via the reachable-state invariant
+(`foldl_ops_sim_inv`: stack length fixed + no spills ⇒ every swap distance `≤ 16`), fed
+`reorderOne_asm_bounded`, with `reorderPlan_perm` for the plan-stack result. Its inputs are
+`hperm`/`hpsstk`/`hbound (≤ 17)`/`hnospill`/`hreorder`/`hrel` — all facts about the ACTUAL state, not a `∀ p`.
+Rebuilding the two slices on it is the fix; the composition around it (`soLabel_sim` → reorder →
+`termRecipeW_*_of_body`, joined by `runAsm_add_ok`) is unchanged, so this is a swap of one call, not a
+redesign.
+
+Recorded rather than silently fixed because the slices as committed look applicable and are not. -/
+
+/-! ### Which blocks the body fold can actually reach (and why `addStopFn` cannot)
+
+`codegen_correct_cvJmp_recipeW` below now combines BOTH a real `generateFnPlan` program AND a non-empty body
+through the body fold, so this is no longer an open gap. What follows is the map of what the fold reaches —
+each fact checked against the source, and each one a constraint that shaped that capstone:
+
+**1. The body fold covers VAR-operand instructions only.** Every disjunct of `RegularStep` / `RegularStepG` /
+`RegularStepH` binds its operands as `Operand.Var …` (`GenBlockSimComp.lean:17909` / `:18026` / `:18724`); the
+sole `Operand.Lit` anywhere in the family is LOG's topic count. A literal-operand instruction is therefore not
+a `RegularStepH` at all.
+
+**2. Hence `addStopFn` — the only real function here with a non-empty body — is out of reach of this route.**
+Its body is `addInst = ADD (Lit 5) (Lit 3)` (literal operands), so `RegularBodyH [addInst]` is unprovable, and
+`hsupplyW_regularStop` cannot apply to it. That is exactly why its existing capstone
+(`codegen_correct_canonical_addStop`) hand-rolls `addStop_runAsm_core` rather than using the body fold. Do not
+try to wire `addStopFn` through `hsupplyW_regularStop`.
+
+**3. The body-fold's `nextLiveness` is a PARAMETER, not the real liveness — and that is what makes halting
+blocks reachable.** Every value-producing disjunct requires `nextLiveness.contains out = true`, and the
+store/copy disjuncts require their inputs live (`GenBlockSimComp.lean:17911`, `:18034`, `:18732`). After a
+halting terminator nothing is live, so those hypotheses are false of the REAL `liveVarsAt`. But nothing
+demands they be: `nextLiveness` only has to make `hblock` true, i.e. make the fold's plan agree with the
+generator's. For a HALTING block, marking the outputs live achieves exactly that — see fact 4 — and
+`codegen_correct_cvStop_recipeW` is the witness (`entry: %a = CALLVALUE ; STOP`, output dead, real program).
+(An earlier version of this note claimed the opposite; it was wrong.)
+
+**4. `bodyPlanRIP` hardcodes `isHalting := false`, and that is only sound where the outputs are live.**
+`generateBlockPlan` passes the block's real `bbIsHalting` (`CodegenPipeline.lean:466`), and `isHalting`
+controls exactly one thing: `if ¬ isHalting then popmanyPlan (dead outputs) else ([], ps)`
+(`CodegenPipeline.lean:355-359`). So the hardcoded `false` agrees with the generator precisely when
+`dead = []`, i.e. when every output is in `nextLiveness` — which the covered disjuncts already demand. Concretely, for a HALTING block the generator suppresses the pop via `isHalting = true` while the fold
+suppresses it via `dead = []`: same plan, opposite reasons — which is why marking a dead output live is sound
+here rather than a fudge. It also hardcodes `nextIsTerminator := true` (right for a body whose next
+instruction IS the terminator) and uses ONE uniform `nextLiveness`, whereas `generateBlockPlan` recomputes
+`liveVarsAt` per instruction (`:462-465`).
+
+That last difference is NOT the barrier it looks like, for the same reason as fact 3: `nextLiveness` only has
+to make `hblock` true. Checked on the real generator for `entry: %s = CALLVALUE ; %o = CALLVALUE ; JMP next` —
+the uniform `nextLiveness := ["s","o"]` yields `[CALLVALUE, CALLVALUE]`, exactly the body the generator emits,
+because marking BOTH outputs live makes `dead = []` at each step just as the real per-instruction `nextLive`
+does. **So the fold is not limited to single-instruction bodies.** (An earlier version of this note said it
+was; that was wrong, and wrong the same way fact 3 was.)
+
+**5. The emit-segment (`_HSVP`) slices cannot be applied to a REAL terminator.** They go through
+`emitInputPlan_{single,pair}_var_sim`, whose `hliveaddr`/`hliveoff`/`hliveszv` (`nl.contains v = true`) force
+the LIVE variant, which emits a DUP. But a terminator's real `nextLive` is `[]` (nothing is live after it), and
+`emitInputPlan` then emits NOTHING — the operand is consumed in place. Checked on the real generator:
+`emitInputPlan SELFDESTRUCT [Var "a"] [] …` = `[]` while `… ["a"] …` = `[DUP1]`. So those slices are sound and
+satisfiable but not instantiable at the generator's own liveness. The dead case is served by
+`emitOneInput_sim_var_noop` (`nextLiveness.contains v = false` ⇒ no ops), and the resulting slices are
+`hsupplyW_empty{Selfdestruct,Return,Revert}Dead` — all three halting operand-carrying terminators, each
+instantiable at the generator's own liveness. `hsupplyW_emptySelfdestructDead` is what the capstone's
+successor block uses. Their precondition is that the operands already sit on the plan stack in terminator
+order, which is exactly what a predecessor that computed them leaves behind.
+
+**6. What is left, and what it costs.** The slices without a capstone are so for two different reasons, and
+the distinction matters:
+* `hsupplyW_empty{Return,Revert}Dead` — **the obstacle is the terminator's REORDER, not the body.** They
+  require the terminator's emitted segment to be empty, i.e. the operands already on the plan stack in exactly
+  terminator order. A nil reorder IS possible in general — `reorderPlan_pair_var_nil` proves
+  `reorderPlan [Var x, Var y] ps = ([], ps)` when `ps.stack = base ++ [Var x, Var y]` — so this is a question
+  of arranging the arrival order, not an impossibility. But the obvious predecessor shape does not arrange it:
+  on `entry: <two CALLVALUEs> ; JMP next` / `next: RETURN _ _`, all FOUR combinations of body order × operand
+  order emit `[… LABEL next; SWAP1; RETURN]` (checked). That `SWAP1` is a `reorderOps`, which
+  `generateRegularInstPlan` emits before `emitOps` (`CodegenPipeline.lean:353`) and which none of these slices
+  model — EXCEPT `hsupplyW_empty{Return,Revert}Reorder` (below), which model exactly that. So the segment is
+  `[SWAP1]` — matched by neither the dead slice (`[]`) nor `_HSVP` (`[DUP1]`, fact 5), but handled by the
+  reorder slices, and BOTH operand-carrying halting terminators the generator reorders are now covered. What
+  remains is a capstone for either, and the target is already identified rather than hypothetical:
+  `entry: %s = CALLVALUE ; %o = CALLVALUE ; JMP next` / `next: RETURN %s %o` compiles to
+  `[LABEL entry; CALLVALUE; CALLVALUE; PUSHLBL next; JUMP; LABEL next; SWAP1; RETURN]` — checked. Its `next`
+  block is `[SOLabel] ++ [SWAP1] ++ RETURN`, exactly `hsupplyW_emptyReturnReorder`'s shape, and its `entry`
+  block is the reorder-free two-instruction body that `hsupplyW_regularJmp` handles (fact 4's witness). So the
+  capstone is: `RegularBodyH … [cvS, cvO] []` (two state-read disjuncts, `s ∉ []` then `o ∉ ["s"]`, both live
+  in `["s","o"]`) for the entry, plus `hreorder`/`hstack'` (concrete, `rfl`-shaped) and `hstep` (from
+  `reorderOne_sim_{swap,positioned}`) for the successor.
+
+  **One caveat, checked rather than assumed** (an earlier version of this paragraph called it "no missing
+  lemma", which was too fast): RETURN's `hbelow : off + sz ≤ ps'.alloc.fnEom` bites. `initPlanState 0` sets
+  `alloc.fnEom = 0` (`PlanTypes.lean:50-55`) and `reorderPlan` never touches `alloc`, so `hbelow` forces
+  `off = sz = 0` — while CALLVALUE is symbolic. The capstone is therefore only provable under an explicit
+  precondition (`vs.callCtx.callvalue = 0`, which also gives `hcov0` its left disjunct), exactly the way
+  `genBlockSimulation_calldatacopy_example` carries `hmemsafe` as its one honest runtime hypothesis. That is a
+  real capstone, not a vacuous one — zero call value is the common case — but it is narrower than the
+  unconditional statement the other capstones prove, and worth knowing before starting. **CORRECTED later
+  (`tFn_prog_indep_fnEom` and the note "Why `tFn`/`rFn` are narrow"): `hbelow` is NOT what makes a symbolic
+  size hard.** `fnEom` is a free parameter of `generateFnPlan` — raising it to 32 leaves the emitted program
+  byte-identical — so `hbelow` can be given arbitrary room with NO allocating function. The binding
+  constraint is `hcov0`'s asm-memory disjunct, which needs `Inv : VenomState → AsmState → Prop`.
+
+  And `hstep` is a genuine caller obligation, not something a wrapper hands over: `reorderPlan_join_sim`
+  (`GenBlockSimComp.lean:2855`) takes it too, adding only the permutation/stack facts around it. Discharging
+  it means casing each `(i, op)` of `targetOps.enum` into `reorderOne_sim_positioned` (already at its target
+  depth ⇒ no ops) or `reorderOne_sim_swap` (`GenInstSim.lean:2786,2816`) — which is what "discharged at the
+  call site" means in that family's docstrings. For the pinned two-operand target that is two cases, with
+  `reorderPlan_swapped_pair_var` (`:5462`) giving the plan-level equation.
+  **Every other input to that capstone is checked on the real generator**, so the assembly starts from facts:
+  the program is `[L entry(0); CALLVALUE(1); CALLVALUE(2); PL next(3); JUMP(4); L next(5); SWAP1(6);
+  RETURN(7)]` with `pcOf next = 5`, `length = 8`; `wOf entry = 8`, `wOf next = 3`; the entry's `hw` is
+  `3 + ((1+2)+2) = 8 ≤ 8` and the successor's is `1+1+1 = 3 ≤ 3` — both tight, so the layout admits no slack;
+  `hps` (the body fold's plan state IS `psOf "next"`) closes by `rfl`; and `reorderPlan [Var o, Var s]
+  (psOf "next")` emits exactly ONE op, so `rops.length = 1` and the RETURN lands at `5+1+1 = 7`. What is left
+  is `hstep` (two cases, above) and the `callvalue = 0` precondition. NB `bodyPlanRIP` is `private`, so a probe
+  in another file must write the fold longhand.
+
+  Two ways in, then, and BOTH are open. **(a) Arrange the arrival order.** For a non-commutative terminator
+  `generateRegularInstPlan` reorders towards `operands' = computeOperands inst = inst.operands.reverse`
+  (`CodegenPipeline.lean:341,343`), so `RETURN off sz` targets `[Var sz, Var off]` and
+  `reorderPlan_pair_var_nil` fires exactly when `ps.stack = base ++ [Var sz, Var off]` — `off` on top. None of
+  the four shapes tried reach it, and the reason is instructive: the PREDECESSOR's JMP block emits its own
+  reorder (`SWAP1` before `PUSHLBL next` in two of the four), so what `next` receives is not simply what the
+  body pushed. Whether some predecessor exits in the required order is untested — not refuted.
+  **(b) Add a reorder-segment slice** — and this is assembly rather than new machinery, checked rather than
+  assumed: the fold-level `reorderPlan_sim` is already proved (`PlanSim.lean:1663`), and its per-operand
+  residual is discharged by `reorderOne_sim_{swap,positioned}` (`GenInstSim.lean:2786,2816`), whose shape is
+  exactly the one the slices already compose — given `hblock` at `as.pc` it returns the asm run, the relation
+  at the reorder's resulting plan state, and `as'.pc = as.pc + len`, i.e. the `soLabel_sim` /
+  `emitInputPlan_*_sim` interface, joinable by `runAsm_add_ok`. So the missing slice is
+  `[SOLabel] ++ body ++ reorderOps ++ emitOps` instead of `[SOLabel] ++ body ++ emitOps`. What is NOT the obstacle: per-instruction liveness
+  (fact 4 refutes that diagnosis).
+* `hsupplyW_regularDjmp` — **reachable, merely expensive.** DJMP's selector is a body-produced variable
+  consumed by the terminator, so it satisfies fact 3 exactly as JNZ does. The cost is the dispatch chain: for
+  `entry: %a = CALLVALUE ; DJMP %a t0 t1` the generator emits 27 instructions — 5-op scan entries
+  `[DUP1; PUSHn; EQ; PUSHLBL tramp; JUMPI]` per label, then 4-op trampolines `[LABEL tramp; POP; PUSHLBL t;
+  JUMP]`, with a `revert` fall-through. A symbolic selector forces a THREE-way split (`= 0` → t0, `= 1` → t1,
+  otherwise the block errors and the driver's error arm applies), each needing the full `djmpEntryHere`
+  structure. Nothing unknown, just long.
+* The `_regular` cores and `termRecipeW_{return,revert}_HSVP` are 0-consumer BY DESIGN — see fact 5 and the
+  wrapper note.
+
+**7. The unifying statement: the family COVERED reorder-free blocks; modelling `reorderOps` lifts that, and the
+first such slice now exists.** `bodyPlanRIP` models a block's
+plan as label ++ per-instruction plans, and none of the slices model `reorderOps` — which
+`generateRegularInstPlan` emits between the join and the emit (`CodegenPipeline.lean:353`). So whenever the
+generator reorders, the block is outside this family, and that is the single condition behind the scattered
+observations above. Checked on the two-CALLVALUE shape: with `next: RETURN %s %o` the entry block emits
+`[LABEL; CALLVALUE; CALLVALUE; PUSHLBL next; JUMP]` and the fold reproduces its body exactly, so
+`hsupplyW_regularJmp` applies (fact 4); with `next: RETURN %o %s` the entry block emits
+`[LABEL; CALLVALUE; CALLVALUE; SWAP1; PUSHLBL next; JUMP]` while the fold still yields
+`[CALLVALUE, CALLVALUE]` — the `PUSHLBL` the slice expects at `pc+1+bodyLen` is a `SWAP1`, so the slice does
+NOT apply. Body length is irrelevant to this; the reorder is what decides. Note the mismatch is DETECTED, not
+unsound: the slice's `hblock`/`hpush` simply cannot be discharged.
+
+**⇒ The shape that fits is a CONTINUING block.** Facts 3 and 4 point the same way, and the capstone below is
+built on exactly that: `entry: %a = CALLVALUE ; JMP next` with `next: SELFDESTRUCT %a`. The entry block
+continues (`bbIsHalting = false`, matching `bodyPlanRIP`) and `a` is live at the JMP because the successor
+consumes it, so the state-read disjunct of `RegularStepG` (`:18068`, `∃ out name fV fA`, `operands = []`)
+applies to the body against the REAL liveness. `hsupplyW_regularJmp` takes the entry block;
+`hsupplyW_emptySelfdestructDead` (not the `_HSVP` slice — see fact 5) takes the successor.
+
+Note `RegularBodyH` takes NO liveness/dfg/cfg parameters, so the existing var-operand instances
+(`cdc_regularBodyH`, `addVar_regularBodyG`, `sstore_regularBodyG'`) are already valid for the REAL analyses;
+what is hand-written about them is the PROGRAM they are stated against (`cdcProg` etc., built with the dummy
+`exLiveness`/`exCfg`). So the remaining work is concentrated in `hblock`: showing the real generator's emitted
+plan for such a body is the asm the block sim expects. Existing pattern for that half: prove
+`generated = handwritten` (cf. `(asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1 = jmpProg`)
+and transfer. -/
+
+
+namespace Example
+
+/-- **The first NON-EMPTY-body `hsupply` — on a REAL block.** For `entry: CALLDATACOPY a b c ; STOP`
+    (compiled to `[JUMPDEST ; DUP1 ; DUP3 ; DUP5 ; CALLDATACOPY ; STOP]`), the driver's per-block
+    obligation is discharged end to end: the body is a genuine memory-touching instruction whose
+    `RegularBodyH` comes from `cdc_regularBodyH`, and the plan the generator emits for it really is those
+    four asm ops. Every earlier capstone had EMPTY-bodied blocks (the only instruction was the
+    terminator), so the nine non-empty-body slices had no consumer; this exercises the chain
+    `hsupplyW_regularStop → genBlockBodyH_sim_inv → termRecipeW_stop_of_body` on a real body. `hmemsafe`
+    is the one honest runtime precondition CALLDATACOPY carries. -/
+theorem hsupplyW_cdcStop {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat}
+    {offsets : AssocList String Nat} {pcOf : String → Nat} {psOf : String → PlanState}
+    {wOf : String → Nat} {ctx : VenomContext} {restFuel : Nat}
+    {vs : VenomState} {va vb vc : bytes32}
+    (hadef : lookupVar "a" vs = some va) (hbdef : lookupVar "b" vs = some vb)
+    (hcdef : lookupVar "c" vs = some vc)
+    (hmemsafe : ∀ (p : PlanState) (v : VenomState) (s : AsmState) wa wc,
+        venomAsmRel lo p v s → lookupVar "a" v = some wa → lookupVar "c" v = some wc →
+        wa.toNat ≤ v.memory.size ∧ ((wa.toNat + wc.toNat + 31) / 32) * 32 ≤ s.memory.size ∧
+        wa.toNat + wc.toNat ≤ p.alloc.fnEom ∧ 0 < wc.toNat ∧ wc.toNat < USize.size)
+    (hw : 6 ≤ wOf cdcBB.label) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+      runAsm bodyLen offsetToPc cdcProg
+        ({ asmOfVenom { vs with instIdx := 0 } with
+            stack := asmStackOf { vs with instIdx := 0 } lo (["a","b","c"].map Operand.Var) })
+        = AsmResult.AsmOK as' ∧
+      TermRecipeW dummyFn lo pcOf psOf wOf offsetToPc offsets cdcProg as' ps' vs' bodyLen
+        (([cdcInst] : List Instruction).length + (restFuel + 1)) ctx cdcBB vs := by
+  have hadef' : lookupVar "a" { vs with instIdx := 0 } = some va := hadef
+  have hbdef' : lookupVar "b" { vs with instIdx := 0 } = some vb := hbdef
+  have hcdef' : lookupVar "c" { vs with instIdx := 0 } = some vc := hcdef
+  set sEnd : VenomState :=
+    { writeMemoryWithExpansion va.toNat
+        ((⟨vs.callCtx.calldata.toArray⟩ : ByteArray).readWithPadding vb.toNat vc.toNat)
+        { vs with instIdx := 0 } with instIdx := 1 } with hsEnd
+  have hthread : execBodyThread [cdcInst] 0 { vs with instIdx := 0 } = some sEnd := by
+    rw [hsEnd]; simp only [execBodyThread, cdcInst, stepInstBase, evalOperand, hadef', hbdef', hcdef']
+  have hnonterm : ∀ inst ∈ [cdcInst], isTerminator inst.opcode = false := by
+    intro i hi; simp only [List.mem_singleton] at hi; subst hi; decide
+  have hdef : ∀ z ∈ ["a","b","c"], ∃ w, lookupVar z vs = some w := by
+    intro z hz; simp only [List.mem_cons, List.not_mem_nil, or_false] at hz
+    rcases hz with h | h | h
+    · subst h; exact ⟨va, hadef⟩
+    · subst h; exact ⟨vb, hbdef⟩
+    · subst h; exact ⟨vc, hcdef⟩
+  have hlenS : (["a","b","c"] : List String).length
+      + (([cdcInst].zipIdx 0).map (fun _ => 1)).sum ≤ 15 := by decide
+  have hlt5 : ({ asmOfVenom { vs with instIdx := 0 } with
+        stack := asmStackOf { vs with instIdx := 0 } lo (["a","b","c"].map Operand.Var) }).pc + 1
+      + (executePlan (bodyPlanRIP exLiveness DfgAnalysis.empty exCfg dummyFn ["a","b","c"] "entry" [cdcInst]
+          { initPlanState 0 with stack := (["a","b","c"].map Operand.Var) }).1).length
+      < cdcProg.length := by
+    show (0:Nat) + 1 + 4 < cdcProg.length
+    decide
+  have hget5 : cdcProg.get ⟨({ asmOfVenom { vs with instIdx := 0 } with
+        stack := asmStackOf { vs with instIdx := 0 } lo (["a","b","c"].map Operand.Var) }).pc + 1
+      + (executePlan (bodyPlanRIP exLiveness DfgAnalysis.empty exCfg dummyFn ["a","b","c"] "entry" [cdcInst]
+          { initPlanState 0 with stack := (["a","b","c"].map Operand.Var) }).1).length, hlt5⟩
+      = AsmInst.AsmOp "STOP" := by
+    rw [show (⟨_, hlt5⟩ : Fin cdcProg.length) = ⟨5, by decide⟩ from Fin.ext (by rfl)]
+    rfl
+  have hbLabel : asmBlockAt cdcProg
+      ({ asmOfVenom { vs with instIdx := 0 } with
+          stack := asmStackOf { vs with instIdx := 0 } lo (["a","b","c"].map Operand.Var) }).pc
+      (executePlan [StackOp.SOLabel cdcBB.label]) := by
+    refine ⟨by show (0:Nat) + 1 ≤ cdcProg.length; decide, fun j hj => ?_⟩
+    have hj' : j < 1 := hj; interval_cases j; rfl
+  have hblock : asmBlockAt cdcProg
+      (({ asmOfVenom { vs with instIdx := 0 } with
+          stack := asmStackOf { vs with instIdx := 0 } lo (["a","b","c"].map Operand.Var) }).pc + 1)
+      (executePlan (bodyPlanRIP exLiveness DfgAnalysis.empty exCfg dummyFn ["a","b","c"] "entry" [cdcInst]
+        { initPlanState 0 with stack := (["a","b","c"].map Operand.Var) }).1) := by
+    refine ⟨by show (0:Nat) + 1 + 4 ≤ cdcProg.length; decide, fun j hj => ?_⟩
+    have hj' : j < 4 := hj; interval_cases j <;> rfl
+  exact hsupplyW_regularStop (liveness := exLiveness) (dfg := DfgAnalysis.empty) (cfg := exCfg)
+    (fn := dummyFn) (front := [cdcInst]) (stopInst := stopInst) (hd := cdcInst) (tl := [stopInst])
+    (nextLiveness := ["a","b","c"]) (curBbLabel := "entry") (dem := 1) (S := ["a","b","c"])
+    (ps0 := { initPlanState 0 with stack := (["a","b","c"].map Operand.Var) })
+    (sEnd := sEnd) (bb := cdcBB) (prog := cdcProg) (o2pc := offsetToPc) (lo := lo)
+    (restFuel := restFuel) (ctx := ctx) (offsets := offsets) (pcOf := pcOf) (psOf := psOf) (wOf := wOf)
+    (asm := { asmOfVenom { vs with instIdx := 0 } with
+              stack := asmStackOf { vs with instIdx := 0 } lo (["a","b","c"].map Operand.Var) })
+    (hbb := rfl) (hstopop := rfl) (hcons := rfl) (hphi := by decide) (hnonterm := hnonterm)
+    (hthread := hthread) (hreg := cdc_regularBodyH hmemsafe)
+    (hsd := stackDiscH_varStack hlenS hdef) (hsv := stackIsVars_varStack)
+    (hrel := venomAsmRel_varStack hdef)
+    (hbLabel := hbLabel) (hblock := hblock) (hpc := hlt5) (hstop := hget5) (hw := hw)
+
+/-! ### The frontier witness: a REAL generated program with a NON-EMPTY body
+
+`entry: %a = CALLVALUE ; JMP next` / `next: SELFDESTRUCT %a`. The entry block's body is a genuine
+instruction, and `a` is live at the JMP precisely because the successor consumes it — which is what makes
+the body-fold's `nextLiveness.contains out = true` true against the REAL liveness (see the note above).
+`generateFnPlan` emits `[LABEL entry; CALLVALUE; PUSHLBL next; JUMP; LABEL next; SELFDESTRUCT]` — note the
+absence of a POP after CALLVALUE (the output is live) and of a DUP before SELFDESTRUCT (the operand is dead
+there, so it is consumed in place). -/
+
+def cvInst2 : Instruction :=
+  { id := 0, opcode := Opcode.CALLVALUE, operands := [], outputs := ["a"] }
+def jmpNextInst : Instruction :=
+  { id := 1, opcode := Opcode.JMP, operands := [Operand.Label "next"], outputs := [] }
+def sdAInst : Instruction :=
+  { id := 2, opcode := Opcode.SELFDESTRUCT, operands := [Operand.Var "a"], outputs := [] }
+def cvEntryBB : BasicBlock := { label := "entry", instructions := [cvInst2, jmpNextInst] }
+def sdNextBB  : BasicBlock := { label := "next",  instructions := [sdAInst] }
+def cvJmpFn : IrFunction := { name := "main", blocks := [cvEntryBB, sdNextBB] }
+def cvJmpCtx : VenomContext := { functions := [cvJmpFn], entry := some "main" }
+
+def cvProg : List AsmInst :=
+  [AsmInst.AsmLabel "entry", AsmInst.AsmOp "CALLVALUE",
+   AsmInst.AsmPush (padBytes symbolSize (encodeNumBytes 6)), AsmInst.AsmOp "JUMP",
+   AsmInst.AsmLabel "next", AsmInst.AsmOp "SELFDESTRUCT"]
+
+theorem cv_prog : (asmResolve (executePlan (generateFnPlan cvJmpFn 0 0).get!.1)).1 = cvProg := by rfl
+
+def tS : Instruction := { id := 0, opcode := Opcode.CALLVALUE, operands := [], outputs := ["s"] }
+def tO : Instruction := { id := 1, opcode := Opcode.CALLVALUE, operands := [], outputs := ["o"] }
+def tJ : Instruction := { id := 2, opcode := Opcode.JMP, operands := [Operand.Label "next"], outputs := [] }
+def tR : Instruction :=
+  { id := 3, opcode := Opcode.RETURN, operands := [Operand.Var "s", Operand.Var "o"], outputs := [] }
+def tEntry : BasicBlock := { label := "entry", instructions := [tS, tO, tJ] }
+def tNext  : BasicBlock := { label := "next",  instructions := [tR] }
+def tFn : IrFunction := { name := "main", blocks := [tEntry, tNext] }
+def tCtx : VenomContext := { functions := [tFn], entry := some "main" }
+
+/-! ### A two-instruction body, and the reusable state-read step
+
+The four `cv*_regularBodyH` above each inline the same state-read disjunct. `cv_step` states it once, for ANY
+CALLVALUE instruction, output var and ambient `S` — so a body of several state-reads is a fold of it. -/
+
+/-- **A single CALLVALUE step as a `RegularStepH`**, parameterised by its output var and the ambient `S`:
+    the 6th disjunct of `RegularStepG` (`operands = []`, output live), lifted by `RegularStepH`'s first arm.
+    `fV`/`fA` both read `callCtx.callvalue`, and their agreement IS `venomAsmRel`'s callCtx equality. -/
+theorem cv_step {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat}
+    {prog : List AsmInst} {out : String} {S nl : List String} {i : Instruction} {n : Nat}
+    (hi : i = { id := n, opcode := Opcode.CALLVALUE, operands := [], outputs := [out] })
+    (hnot : out ∉ S) (hlive : nl.contains out = true) :
+    RegularStepH lo nl offsetToPc prog 1 i S := by
+  subst hi
+  left
+  refine ⟨?_, by simp⟩
+  right; right; right; right; right; left
+  refine ⟨out, "CALLVALUE", (fun v : VenomState => v.callCtx.callvalue),
+    (fun s : AsmState => s.callCtx.callvalue),
+    rfl, by simp, rfl, rfl, rfl, hnot, hlive, ?_, ?_, ?_⟩
+  · intro v; rfl
+  · intro s h hget
+    simp only [asmStep, hget]
+    split
+    · rfl
+    · rename_i hbad; exact absurd h hbad
+  · intro p v s hrel
+    obtain ⟨_, _, _, _, _, _, _, hcc, _, _, _, _⟩ := hrel
+    show s.callCtx.callvalue = v.callCtx.callvalue
+    rw [hcc]
+
+/-- **A TWO-instruction body as a `RegularBodyH`** — `%s = CALLVALUE ; %o = CALLVALUE`, threading `S` from
+    `[]` to `["s"]`, both outputs live in `["s","o"]`. Concrete evidence for fact 4: the fold handles a body
+    longer than one instruction. -/
+theorem tBody_regularBodyH {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat} :
+    RegularBodyH lo ["s","o"] offsetToPc
+      (asmResolve (executePlan (generateFnPlan tFn 0 0).get!.1)).1 1 [tS, tO] [] := by
+  refine ⟨cv_step (out := "s") (S := []) rfl (by decide) (by decide), ?_, trivial⟩
+  exact cv_step (out := "o") (S := [] ++ tS.outputs) rfl (by decide) (by decide)
+
+/-- The walk invariant for `tFn`. -/
+def tInv (s : VenomState) : Prop :=
+  s.halted = false ∧ s.callCtx.callvalue = EvmYul.UInt256.ofNat 0 ∧
+  (s.currentBb = "next" → lookupVar "s" s = some (EvmYul.UInt256.ofNat 0)
+                        ∧ lookupVar "o" s = some (EvmYul.UInt256.ofNat 0))
+
+/-- The body-end state of `tEntry` (after both CALLVALUEs). -/
+abbrev tSEnd (s : VenomState) : VenomState :=
+  { updateVar "o" s.callCtx.callvalue { updateVar "s" s.callCtx.callvalue { s with instIdx := 0 }
+      with instIdx := 1 } with instIdx := 2 }
+
+theorem tEntry_thread (s : VenomState) :
+    execBodyThread [tS, tO] 0 { s with instIdx := 0 } = some (tSEnd s) := by
+  simp [execBodyThread, tS, tO, stepInstBase, execRead0, updateVar]
+
+/-- `tEntry`'s OK result is `jumpTo "next"` of the body-end state. -/
+theorem tEntry_runBlock (s : VenomState) (j : Nat) (hnh : s.halted = false) :
+    runBlock (2 + (j+1)) tCtx tEntry s = ExecResult.OK (jumpTo "next" (tSEnd s)) :=
+  runBlock_body_jmp tCtx tEntry j [tS, tO] tJ tS [tO, tJ] s (tSEnd s) "next"
+    rfl rfl rfl rfl (by decide) (by intro i hi; simp only [List.mem_cons, List.not_mem_nil, or_false] at hi
+                                    rcases hi with rfl | rfl <;> decide)
+    (tEntry_thread s) (by simpa [updateVar] using hnh)
+
+
+/-- **`tInv` survives every block of `tFn`.** For `tEntry`: fuel < 3 gives `Error`, and at `2+(j+1)` the
+    result is `jumpTo "next" (tSEnd s)` — whose vars `s`/`o` are the (zero) call value, which is exactly what
+    the successor's RETURN recipe needs. For `tNext`: RETURN never yields `OK`, so the obligation is vacuous. -/
+theorem tInv_pres : ∀ bb ∈ tFn.blocks, ∀ (s s' : VenomState) (f' : Nat),
+    tInv s → runBlock f' tCtx bb s = ExecResult.OK s' → tInv s' := by
+  intro bb hbb s s' f' hinv hrun
+  obtain ⟨hnh, hcv, _⟩ := hinv
+  simp only [tFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+  rcases hbb with rfl | rfl
+  · -- tEntry: needs fuel >= 3; then s' = jumpTo "next" (tSEnd s)
+    match f' with
+    | 0 => simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, tEntry, tS,
+             stepInstBase, execRead0, isTerminator] at hrun
+    | 1 => simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, tEntry, tS,
+             stepInstBase, execRead0, isTerminator] at hrun
+    | 2 => simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, tEntry, tS, tO,
+             stepInstBase, execRead0, isTerminator] at hrun
+    | (j+3) =>
+      rw [show j+3 = 2+(j+1) from by omega, tEntry_runBlock s j hnh] at hrun
+      injection hrun with h; subst h
+      refine ⟨by simpa [jumpTo, updateVar] using hnh, by simp [jumpTo, updateVar, hcv], fun _ => ?_⟩
+      have hs : lookupVar "s" (jumpTo "next" (tSEnd s)) = some (EvmYul.UInt256.ofNat 0) := by
+        show lookupVar "s" (updateVar "o" s.callCtx.callvalue
+          { updateVar "s" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 })
+          = some (EvmYul.UInt256.ofNat 0)
+        rw [lookupVar_updateVar_ne _ _ _ _ (by decide)]
+        show lookupVar "s" (updateVar "s" s.callCtx.callvalue { s with instIdx := 0 })
+          = some (EvmYul.UInt256.ofNat 0)
+        rw [lookupVar_updateVar_self, hcv]
+      have ho : lookupVar "o" (jumpTo "next" (tSEnd s)) = some (EvmYul.UInt256.ofNat 0) := by
+        show lookupVar "o" (updateVar "o" s.callCtx.callvalue
+          { updateVar "s" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 })
+          = some (EvmYul.UInt256.ofNat 0)
+        rw [lookupVar_updateVar_self, hcv]
+      exact ⟨hs, ho⟩
+  · -- tNext: RETURN never yields OK. Characterise the block with `runBlock_body_return` (the route that
+    -- worked for entry) instead of reducing `runBlock` by hand.
+    match f' with
+    | 0 => simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, tNext, tR,
+             stepInstBase, isTerminator] at hrun
+    | (j+1) =>
+      rcases hls : lookupVar "s" s with _ | ws
+      · -- "s" undefined: RETURN errors. Characterise with `runBlock_error`, don't reduce.
+        have hstep : stepInstBase tR { s with instIdx := 0 } = ExecResult.Error "return: undefined operand" := by
+          have hls' : lookupVar "s" { s with instIdx := 0 } = none := hls
+          simp [tR, stepInstBase, evalOperand, hls']
+        have hrb := runBlock_error tCtx tNext j [] tR tR [] s { s with instIdx := 0 }
+          "return: undefined operand" rfl rfl (by decide) (by intro i hi; cases hi)
+          (by simp [execBodyThread]) hstep (by decide) (by decide)
+        rw [show j+1 = ([] : List Instruction).length + (j+1) from by simp, hrb] at hrun
+        exact absurd hrun (by simp)
+      · rcases hlo : lookupVar "o" s with _ | wo
+        · -- "o" undefined: same.
+          have hstep : stepInstBase tR { s with instIdx := 0 } = ExecResult.Error "return: undefined operand" := by
+            have hls' : lookupVar "s" { s with instIdx := 0 } = some ws := hls
+            have hlo' : lookupVar "o" { s with instIdx := 0 } = none := hlo
+            simp [tR, stepInstBase, evalOperand, hls', hlo']
+          have hrb := runBlock_error tCtx tNext j [] tR tR [] s { s with instIdx := 0 }
+            "return: undefined operand" rfl rfl (by decide) (by intro i hi; cases hi)
+            (by simp [execBodyThread]) hstep (by decide) (by decide)
+          rw [show j+1 = ([] : List Instruction).length + (j+1) from by simp, hrb] at hrun
+          exact absurd hrun (by simp)
+        · have hrb := runBlock_body_return tCtx tNext j [] tR tR [] s { s with instIdx := 0 }
+            (Operand.Var "s") (Operand.Var "o") ws wo rfl rfl rfl hls hlo rfl (by decide)
+            (by intro i hi; cases hi) (by simp [execBodyThread])
+          rw [show j+1 = ([] : List Instruction).length + (j+1) from by simp] at hrun
+          rw [hrb] at hrun
+          exact absurd hrun (by simp)
+
+
+set_option maxHeartbeats 4000000 in
+/-- **The  capstone**:  / ,
+    end to end against the real generated program, through the INVARIANT-carrying driver. Exercises, in one
+    function: a TWO-instruction body, a genuine terminator REORDER (the ), and a value-dependent
+    recipe (RETURN's ) that the plain ∀-s driver could never supply. -/
+theorem codegen_correct_tFn_recipeW {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    (hvshalt : vs.halted = false) (hzero : vs.callCtx.callvalue = EvmYul.UInt256.ofNat 0)
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    (match runContext 10 tCtx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan tFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan tFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan tFn 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan tFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan tFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan tFn 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan tFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan tFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan tFn 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  have hfnready : ∀ bb ∈ tFn.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst := by
+    intro bb hbb inst hinst
+    simp only [tFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    rcases hbb with rfl | rfl
+    · simp only [tEntry, List.mem_cons, List.not_mem_nil, or_false] at hinst
+      rcases hinst with rfl | rfl | rfl <;> (unfold codegenReadyInst; decide)
+    · simp only [tNext, List.mem_singleton] at hinst; subst hinst; unfold codegenReadyInst; decide
+  have hgen : generateFnPlan tFn 0 0 = some ((generateFnPlan tFn 0 0).get!.1, (generateFnPlan tFn 0 0).get!.2) := rfl
+  have hpsE : psOfFn (fnPlanFuel tFn) tFn 0 0 "entry" = initPlanState 0 :=
+    psOfFn_entry rfl hfnready (by simp only [fnPlanFuel]; omega)
+  refine codegen_correct_ofBlocks_recipeW_inv tInv
+    (lo := lo) (pcOf := pcOfLabel (asmResolve (executePlan (generateFnPlan tFn 0 0).get!.1)).1) (psOf := psOfFn (fnPlanFuel tFn) tFn 0 0)
+    (wOf := fun l => (asmResolve (executePlan (generateFnPlan tFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan tFn 0 0).get!.1)).1 l)
+    (offsets := (computeLabelOffsets (executePlan (generateFnPlan tFn 0 0).get!.1)).2)
+    (fuel := 10) (ctx := tCtx) (fn := tFn) (fnEom := 0) (lblCtr := 0)
+    (entryName := "main") (entryLbl := "entry")
+    (ops := (generateFnPlan tFn 0 0).get!.1) (psFinal := (generateFnPlan tFn 0 0).get!.2)
+    hgen rfl rfl rfl ?_ ?_ tInv_pres ?_ ⟨by simpa using hvshalt, by simpa using hzero, by simp⟩
+  case _ =>
+    intro bb hbb s
+    simp only [tFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    rcases hbb with rfl | rfl
+    · simp [runBlock, evalPhis, execBlock, tEntry, tS]
+    · simp [runBlock, evalPhis, execBlock, tNext, tR]
+  case _ =>
+    intro bb hbb s asm N k hE hinv hlbleq
+    obtain ⟨⟨bb0, hlk_s, hvrel, hpc_asm⟩, hwN, hhalt⟩ := hE
+    simp only [tFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    rcases hbb with rfl | rfl
+    · -- entry: two CALLVALUEs + JMP
+      have hlbl : s.currentBb = "entry" := hlbleq
+      rw [hlbl] at hvrel hpc_asm
+      have hpc0 : asm.pc = 0 := by rw [hpc_asm]; exact pcOfLabel_entry_zero rfl hfnready hgen
+      match k with
+      | 0 => exact Or.inl ⟨"out of fuel", by simp [runBlock, evalPhis, phiPrefixLength, execBlock,
+               getInstruction, tEntry, tS, stepInstBase, execRead0, isTerminator]⟩
+      | 1 => exact Or.inl ⟨"out of fuel", by simp [runBlock, evalPhis, phiPrefixLength, execBlock,
+               getInstruction, tEntry, tS, tO, stepInstBase, execRead0, isTerminator]⟩
+      | (j+2) =>
+      rw [show j+2+1 = ([tS, tO] : List Instruction).length + (j+1) from by
+        simp only [List.length_cons, List.length_nil]; omega]
+      refine Or.inr (hsupplyW_regularJmp
+        (liveness := exLiveness) (dfg := DfgAnalysis.empty) (cfg := exCfg) (restFuel := j)
+        (front := [tS, tO]) (jmpInst := tJ) (hd := tS) (tl := [tO, tJ])
+        (nextLiveness := ["s","o"]) (curBbLabel := "entry") (dem := 1) (S := [])
+        (ps0 := initPlanState 0) (lbl := "next") (off := 7) (bb' := tNext) (sEnd := tSEnd s)
+        (hbb := rfl) (hjmpop := rfl) (hoperands := rfl) (hcons := rfl) (hphi := by decide)
+        (hnonterm := by intro i hi; simp only [List.mem_cons, List.not_mem_nil, or_false] at hi
+                        rcases hi with rfl | rfl <;> decide)
+        (hthread := tEntry_thread s) (hnothalt := by simpa [updateVar] using hhalt)
+        (hreg := tBody_regularBodyH)
+        (hsd := ⟨by intro op; rfl, by simp [initPlanState], by intro z hz; simp [initPlanState] at hz⟩)
+        (hsv := by simp [StackIsVars, initPlanState])
+        (hrel := by rw [hpsE] at hvrel; exact hvrel)
+        (hbLabel := by rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
+                       have hj' : j < 1 := hj; interval_cases j; rfl)
+        (hblock := by rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
+                      have hj' : j < 2 := hj; interval_cases j <;> rfl)
+        (hps := rfl) (hpc := by rw [hpc0]; decide) (hpush := by simp only [hpc0]; rfl)
+        (hoff_lk := ?_) (hoff := ?_) (hpc2 := by rw [hpc0]; decide)
+        (hjump := by simp only [hpc0]; rfl) (hidx_lk := ?_) (hlk' := rfl) (hw := by decide))
+      · decide
+      · decide
+      · decide
+    · -- next: RETURN with the SWAP1 reorder; the invariant supplies the operand VALUES
+      have hlbl : s.currentBb = "next" := hlbleq
+      rw [hlbl] at hvrel hpc_asm
+      have hpc5 : asm.pc = 5 := by rw [hpc_asm]; decide
+      obtain ⟨_, _, hvals⟩ := hinv
+      obtain ⟨hs0, ho0⟩ := hvals hlbl
+      refine Or.inr (hsupplyW_emptyReturnReorder (tInst := tR) (offv := "s") (szv := "o")
+        (woff := EvmYul.UInt256.ofNat 0) (wsz := EvmYul.UInt256.ofNat 0) (base := [])
+        (perm := [Operand.Var "s", Operand.Var "o"])
+        (ps := psOfFn (fnPlanFuel tFn) tFn 0 0 "next")
+        (hbb := rfl) (hop := rfl) (hoperands := rfl)
+        (hevaloff := hs0) (hevalsz := ho0) (hvoff := hs0) (hvsz := ho0)
+        (hrel := hvrel)
+        (hbLabel := by rw [hpc5]; refine ⟨by decide, fun j hj => ?_⟩
+                       have hj' : j < 1 := hj; interval_cases j; rfl)
+        (hperm := by decide) (hpsstk := by decide) (hbound := by decide)
+        (hnospill := by intro o; rfl) (hreorder := rfl)
+        (hblockR := by rw [hpc5]; refine ⟨by decide, fun j hj => ?_⟩
+                       have hj' : j < 1 := hj; interval_cases j; rfl)
+        (hpc := by rw [hpc5]; decide) (hget := by simp only [hpc5]; rfl)
+        (hcov0 := Or.inl (by simp [EvmYul.uint256_ofNat_toNat]))
+        (hbelow := by simp [EvmYul.uint256_ofNat_toNat])
+        (hlenu := by simp [EvmYul.uint256_ofNat_toNat]) (hw := by decide))
+  case _ =>
+    refine ⟨⟨tEntry, rfl, ?_, ?_⟩, ?_, hvshalt⟩
+    · show venomAsmRel lo (psOfFn (fnPlanFuel tFn) tFn 0 0 "entry") _ as
+      rw [hpsE]; exact hrel
+    · show as.pc = pcOfLabel (asmResolve (executePlan (generateFnPlan tFn 0 0).get!.1)).1 "entry"
+      rw [haspc]; exact (pcOfLabel_entry_zero rfl hfnready hgen).symm
+    · show (asmResolve (executePlan (generateFnPlan tFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan tFn 0 0).get!.1)).1 "entry" ≤ (asmResolve (executePlan (generateFnPlan tFn 0 0).get!.1)).1.length
+      omega
+
+
+
+/-! ### ✅ The REVERT capstone — `codegen_correct_rFn_recipeW` (terminator coverage 7/8 → 8/8)
+
+REVERT was the last codegen terminator kind with a per-block slice but no whole-function capstone. `rFn`
+reuses `tFn`'s entry verbatim (`entry: %s = CALLVALUE ; %o = CALLVALUE ; JMP next`) and swaps the successor's
+RETURN for a REVERT (`next: REVERT %s %o`). The generator emits the same 8-instruction shape,
+`[L entry; CALLVALUE; CALLVALUE; PUSH next; JUMP; L next; SWAP1; REVERT]` (entry@0, next@5,
+`offsets "next" = 7`), so `next` is again exactly the reorder slice's shape and
+`hsupplyW_emptyRevertReorder` applies where `hsupplyW_emptyReturnReorder` did — the whole capstone is the
+RETURN one with the terminator swapped, which is what a good slice family should buy.
+
+Like `tFn`, the recipe is value-dependent: with `fnEom` instantiated at `0`, REVERT's
+`hbelow : off + sz ≤ ps'.alloc.fnEom` forces `off = sz = 0`, which the invariant supplies from
+`callvalue = 0` — so the statement carries that hypothesis, exactly as the RETURN twin does. **But `hbelow`
+is not what BLOCKS a symbolic size**: `fnEom` is a free parameter and `rFn_prog_indep_fnEom` shows raising it
+to 32 leaves the program byte-identical, so `hbelow` can be given arbitrary room with no allocating function.
+The binding constraint is `hcov0`'s asm-memory disjunct — see "Why `tFn`/`rFn` are narrow" below.
+
+NON-VACUITY is a THEOREM here, not an `#eval` (`rFn_reverts`). `djFn`'s witness could be evaluated because
+its blocks only STOP; `rFn` cannot — REVERT reads memory, so evaluation hits `ffi.ByteArray.zeroes`, which
+has no native implementation (it is an M1 FFI axiom). Proving it instead turned out STRONGER than the
+`#eval` would have been: `rFn_reverts` shows `runContext 10 rCtx vs = Abort RevertAbort vs'` for EVERY `vs`
+the capstone's own hypotheses admit, so the `Abort RevertAbort` arm — not the `| _ => True` catch-all — is
+the one that fires, universally rather than at a single sample point. It needs no FFI axiom at all
+(`[propext, Classical.choice, Quot.sound]`), since the reverting state is never inspected. -/
+
+def rR : Instruction :=
+  { id := 3, opcode := Opcode.REVERT, operands := [Operand.Var "s", Operand.Var "o"], outputs := [] }
+def rNext : BasicBlock := { label := "next", instructions := [rR] }
+def rFn : IrFunction := { name := "main", blocks := [tEntry, rNext] }
+def rCtx : VenomContext := { functions := [rFn], entry := some "main" }
+
+theorem rBody_regularBodyH {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat} :
+    RegularBodyH lo ["s","o"] offsetToPc
+      (asmResolve (executePlan (generateFnPlan rFn 0 0).get!.1)).1 1 [tS, tO] [] := by
+  refine ⟨cv_step (out := "s") (S := []) rfl (by decide) (by decide), ?_, trivial⟩
+  exact cv_step (out := "o") (S := [] ++ tS.outputs) rfl (by decide) (by decide)
+
+theorem rEntry_runBlock (s : VenomState) (j : Nat) (hnh : s.halted = false) :
+    runBlock (2 + (j+1)) rCtx tEntry s = ExecResult.OK (jumpTo "next" (tSEnd s)) :=
+  runBlock_body_jmp rCtx tEntry j [tS, tO] tJ tS [tO, tJ] s (tSEnd s) "next"
+    rfl rfl rfl rfl (by decide) (by intro i hi; simp only [List.mem_cons, List.not_mem_nil, or_false] at hi
+                                    rcases hi with rfl | rfl <;> decide)
+    (tEntry_thread s) (by simpa [updateVar] using hnh)
+
+/-- **The REVERT arm really fires** — the non-vacuity witness for `codegen_correct_rFn_recipeW`. Unlike the
+    STOP-only `djFn`, `rFn` cannot be `#eval`ed (REVERT touches memory ⇒ the M1 `ffi.ByteArray.zeroes` has
+    no native impl under `lake env lean`), so the witness is symbolic instead: whenever `rInv` holds at
+    `next`, `rNext` aborts with `RevertAbort`. Composed with `rEntry_runBlock`, the capstone's
+    `Abort RevertAbort` arm is the one that fires — not the `| _ => True` catch-all. -/
+theorem rNext_reverts (s : VenomState) (j : Nat)
+    (hs : lookupVar "s" s = some (EvmYul.UInt256.ofNat 0))
+    (ho : lookupVar "o" s = some (EvmYul.UInt256.ofNat 0)) :
+    runBlock (0 + (j+1)) rCtx rNext s = ExecResult.Abort AbortType.RevertAbort
+      (revertState (setReturndata (readMemory (EvmYul.UInt256.ofNat 0).toNat
+        (EvmYul.UInt256.ofNat 0).toNat { s with instIdx := 0 }) { s with instIdx := 0 })) :=
+  runBlock_body_revert rCtx rNext j [] rR rR [] s { s with instIdx := 0 }
+    (Operand.Var "s") (Operand.Var "o") _ _ rfl rfl rfl hs ho rfl (by decide)
+    (by intro i hi; cases hi) (by simp [execBodyThread])
+
+theorem rInv_pres : ∀ bb ∈ rFn.blocks, ∀ (s s' : VenomState) (f' : Nat),
+    tInv s → runBlock f' rCtx bb s = ExecResult.OK s' → tInv s' := by
+  intro bb hbb s s' f' hinv hrun
+  obtain ⟨hnh, hcv, _⟩ := hinv
+  simp only [rFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+  rcases hbb with rfl | rfl
+  · match f' with
+    | 0 => simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, tEntry, tS,
+             stepInstBase, execRead0, isTerminator] at hrun
+    | 1 => simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, tEntry, tS,
+             stepInstBase, execRead0, isTerminator] at hrun
+    | 2 => simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, tEntry, tS, tO,
+             stepInstBase, execRead0, isTerminator] at hrun
+    | (j+3) =>
+      rw [show j+3 = 2+(j+1) from by omega, rEntry_runBlock s j hnh] at hrun
+      injection hrun with h; subst h
+      refine ⟨by simpa [jumpTo, updateVar] using hnh, by simp [jumpTo, updateVar, hcv], fun _ => ?_⟩
+      have hs : lookupVar "s" (jumpTo "next" (tSEnd s)) = some (EvmYul.UInt256.ofNat 0) := by
+        show lookupVar "s" (updateVar "o" s.callCtx.callvalue
+          { updateVar "s" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 })
+          = some (EvmYul.UInt256.ofNat 0)
+        rw [lookupVar_updateVar_ne _ _ _ _ (by decide)]
+        show lookupVar "s" (updateVar "s" s.callCtx.callvalue { s with instIdx := 0 })
+          = some (EvmYul.UInt256.ofNat 0)
+        rw [lookupVar_updateVar_self, hcv]
+      have ho : lookupVar "o" (jumpTo "next" (tSEnd s)) = some (EvmYul.UInt256.ofNat 0) := by
+        show lookupVar "o" (updateVar "o" s.callCtx.callvalue
+          { updateVar "s" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 })
+          = some (EvmYul.UInt256.ofNat 0)
+        rw [lookupVar_updateVar_self, hcv]
+      exact ⟨hs, ho⟩
+  · match f' with
+    | 0 => simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, rNext, rR,
+             stepInstBase, isTerminator] at hrun
+    | (j+1) =>
+      rcases hls : lookupVar "s" s with _ | ws
+      · have hstep : stepInstBase rR { s with instIdx := 0 } = ExecResult.Error "revert: undefined operand" := by
+          have hls' : lookupVar "s" { s with instIdx := 0 } = none := hls
+          simp [rR, stepInstBase, evalOperand, hls']
+        have hrb := runBlock_error rCtx rNext j [] rR rR [] s { s with instIdx := 0 }
+          "revert: undefined operand" rfl rfl (by decide) (by intro i hi; cases hi)
+          (by simp [execBodyThread]) hstep (by decide) (by decide)
+        rw [show j+1 = ([] : List Instruction).length + (j+1) from by simp, hrb] at hrun
+        exact absurd hrun (by simp)
+      · rcases hlo : lookupVar "o" s with _ | wo
+        · have hstep : stepInstBase rR { s with instIdx := 0 } = ExecResult.Error "revert: undefined operand" := by
+            have hls' : lookupVar "s" { s with instIdx := 0 } = some ws := hls
+            have hlo' : lookupVar "o" { s with instIdx := 0 } = none := hlo
+            simp [rR, stepInstBase, evalOperand, hls', hlo']
+          have hrb := runBlock_error rCtx rNext j [] rR rR [] s { s with instIdx := 0 }
+            "revert: undefined operand" rfl rfl (by decide) (by intro i hi; cases hi)
+            (by simp [execBodyThread]) hstep (by decide) (by decide)
+          rw [show j+1 = ([] : List Instruction).length + (j+1) from by simp, hrb] at hrun
+          exact absurd hrun (by simp)
+        · have hrb := runBlock_body_revert rCtx rNext j [] rR rR [] s { s with instIdx := 0 }
+            (Operand.Var "s") (Operand.Var "o") ws wo rfl rfl rfl hls hlo rfl (by decide)
+            (by intro i hi; cases hi) (by simp [execBodyThread])
+          rw [show j+1 = ([] : List Instruction).length + (j+1) from by simp] at hrun
+          rw [hrb] at hrun
+          exact absurd hrun (by simp)
+
+set_option maxRecDepth 100000 in
+set_option maxHeartbeats 4000000 in
+theorem codegen_correct_rFn_recipeW {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    (hvshalt : vs.halted = false) (hzero : vs.callCtx.callvalue = EvmYul.UInt256.ofNat 0)
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    (match runContext 10 rCtx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan rFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan rFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan rFn 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan rFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan rFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan rFn 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan rFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan rFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan rFn 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  have hfnready : ∀ bb ∈ rFn.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst := by
+    intro bb hbb inst hinst
+    simp only [rFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    rcases hbb with rfl | rfl
+    · simp only [tEntry, List.mem_cons, List.not_mem_nil, or_false] at hinst
+      rcases hinst with rfl | rfl | rfl <;> (unfold codegenReadyInst; decide)
+    · simp only [rNext, List.mem_singleton] at hinst; subst hinst; unfold codegenReadyInst; decide
+  have hgen : generateFnPlan rFn 0 0 = some ((generateFnPlan rFn 0 0).get!.1, (generateFnPlan rFn 0 0).get!.2) := rfl
+  have hpsE : psOfFn (fnPlanFuel rFn) rFn 0 0 "entry" = initPlanState 0 :=
+    psOfFn_entry rfl hfnready (by simp only [fnPlanFuel]; omega)
+  refine codegen_correct_ofBlocks_recipeW_inv tInv
+    (lo := lo) (pcOf := pcOfLabel (asmResolve (executePlan (generateFnPlan rFn 0 0).get!.1)).1) (psOf := psOfFn (fnPlanFuel rFn) rFn 0 0)
+    (wOf := fun l => (asmResolve (executePlan (generateFnPlan rFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan rFn 0 0).get!.1)).1 l)
+    (offsets := (computeLabelOffsets (executePlan (generateFnPlan rFn 0 0).get!.1)).2)
+    (fuel := 10) (ctx := rCtx) (fn := rFn) (fnEom := 0) (lblCtr := 0)
+    (entryName := "main") (entryLbl := "entry")
+    (ops := (generateFnPlan rFn 0 0).get!.1) (psFinal := (generateFnPlan rFn 0 0).get!.2)
+    hgen rfl rfl rfl ?_ ?_ rInv_pres ?_ ⟨by simpa using hvshalt, by simpa using hzero, by simp⟩
+  case _ =>
+    intro bb hbb s
+    simp only [rFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    rcases hbb with rfl | rfl
+    · simp [runBlock, evalPhis, execBlock, tEntry, tS]
+    · simp [runBlock, evalPhis, execBlock, rNext, rR]
+  case _ =>
+    intro bb hbb s asm N k hE hinv hlbleq
+    obtain ⟨⟨bb0, hlk_s, hvrel, hpc_asm⟩, hwN, hhalt⟩ := hE
+    simp only [rFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    rcases hbb with rfl | rfl
+    · -- entry: two CALLVALUEs + JMP
+      have hlbl : s.currentBb = "entry" := hlbleq
+      rw [hlbl] at hvrel hpc_asm
+      have hpc0 : asm.pc = 0 := by rw [hpc_asm]; exact pcOfLabel_entry_zero rfl hfnready hgen
+      match k with
+      | 0 => exact Or.inl ⟨"out of fuel", by simp [runBlock, evalPhis, phiPrefixLength, execBlock,
+               getInstruction, tEntry, tS, stepInstBase, execRead0, isTerminator]⟩
+      | 1 => exact Or.inl ⟨"out of fuel", by simp [runBlock, evalPhis, phiPrefixLength, execBlock,
+               getInstruction, tEntry, tS, tO, stepInstBase, execRead0, isTerminator]⟩
+      | (j+2) =>
+      rw [show j+2+1 = ([tS, tO] : List Instruction).length + (j+1) from by
+        simp only [List.length_cons, List.length_nil]; omega]
+      refine Or.inr (hsupplyW_regularJmp
+        (liveness := exLiveness) (dfg := DfgAnalysis.empty) (cfg := exCfg) (restFuel := j)
+        (front := [tS, tO]) (jmpInst := tJ) (hd := tS) (tl := [tO, tJ])
+        (nextLiveness := ["s","o"]) (curBbLabel := "entry") (dem := 1) (S := [])
+        (ps0 := initPlanState 0) (lbl := "next") (off := 7) (bb' := rNext) (sEnd := tSEnd s)
+        (hbb := rfl) (hjmpop := rfl) (hoperands := rfl) (hcons := rfl) (hphi := by decide)
+        (hnonterm := by intro i hi; simp only [List.mem_cons, List.not_mem_nil, or_false] at hi
+                        rcases hi with rfl | rfl <;> decide)
+        (hthread := tEntry_thread s) (hnothalt := by simpa [updateVar] using hhalt)
+        (hreg := rBody_regularBodyH)
+        (hsd := ⟨by intro op; rfl, by simp [initPlanState], by intro z hz; simp [initPlanState] at hz⟩)
+        (hsv := by simp [StackIsVars, initPlanState])
+        (hrel := by rw [hpsE] at hvrel; exact hvrel)
+        (hbLabel := by rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
+                       have hj' : j < 1 := hj; interval_cases j; rfl)
+        (hblock := by rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
+                      have hj' : j < 2 := hj; interval_cases j <;> rfl)
+        (hps := rfl) (hpc := by rw [hpc0]; decide) (hpush := by simp only [hpc0]; rfl)
+        (hoff_lk := ?_) (hoff := ?_) (hpc2 := by rw [hpc0]; decide)
+        (hjump := by simp only [hpc0]; rfl) (hidx_lk := ?_) (hlk' := rfl) (hw := by decide))
+      · decide
+      · decide
+      · decide
+    · -- next: RETURN with the SWAP1 reorder; the invariant supplies the operand VALUES
+      have hlbl : s.currentBb = "next" := hlbleq
+      rw [hlbl] at hvrel hpc_asm
+      have hpc5 : asm.pc = 5 := by rw [hpc_asm]; decide
+      obtain ⟨_, _, hvals⟩ := hinv
+      obtain ⟨hs0, ho0⟩ := hvals hlbl
+      refine Or.inr (hsupplyW_emptyRevertReorder (tInst := rR) (offv := "s") (szv := "o")
+        (woff := EvmYul.UInt256.ofNat 0) (wsz := EvmYul.UInt256.ofNat 0) (base := [])
+        (perm := [Operand.Var "s", Operand.Var "o"])
+        (ps := psOfFn (fnPlanFuel rFn) rFn 0 0 "next")
+        (hbb := rfl) (hop := rfl) (hoperands := rfl)
+        (hevaloff := hs0) (hevalsz := ho0) (hvoff := hs0) (hvsz := ho0)
+        (hrel := hvrel)
+        (hbLabel := by rw [hpc5]; refine ⟨by decide, fun j hj => ?_⟩
+                       have hj' : j < 1 := hj; interval_cases j; rfl)
+        (hperm := by decide) (hpsstk := by decide) (hbound := by decide)
+        (hnospill := by intro o; rfl) (hreorder := rfl)
+        (hblockR := by rw [hpc5]; refine ⟨by decide, fun j hj => ?_⟩
+                       have hj' : j < 1 := hj; interval_cases j; rfl)
+        (hpc := by rw [hpc5]; decide) (hget := by simp only [hpc5]; rfl)
+        (hcov0 := Or.inl (by simp [EvmYul.uint256_ofNat_toNat]))
+        (hbelow := by simp [EvmYul.uint256_ofNat_toNat])
+        (hlenu := by simp [EvmYul.uint256_ofNat_toNat]) (hw := by decide))
+  case _ =>
+    refine ⟨⟨tEntry, rfl, ?_, ?_⟩, ?_, hvshalt⟩
+    · show venomAsmRel lo (psOfFn (fnPlanFuel rFn) rFn 0 0 "entry") _ as
+      rw [hpsE]; exact hrel
+    · show as.pc = pcOfLabel (asmResolve (executePlan (generateFnPlan rFn 0 0).get!.1)).1 "entry"
+      rw [haspc]; exact (pcOfLabel_entry_zero rfl hfnready hgen).symm
+    · show (asmResolve (executePlan (generateFnPlan rFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan rFn 0 0).get!.1)).1 "entry" ≤ (asmResolve (executePlan (generateFnPlan rFn 0 0).get!.1)).1.length
+      omega
+
+
+/-- **The `Abort RevertAbort` arm really is the one that fires** — `codegen_correct_rFn_recipeW`'s statement
+    has a `| _ => True` catch-all (the shape that made the retracted `codegen_correct_ofRecipes` vacuous), so
+    the arm must be exhibited, not assumed. `rFn` cannot be `#eval`ed the way `djFn` was: REVERT reads memory,
+    so evaluation hits `ffi.ByteArray.zeroes`, which has no native implementation (it is an M1 FFI axiom).
+    The witness is therefore symbolic — and it is stronger than an `#eval`, being universally quantified over
+    every state the capstone's own hypotheses admit. -/
+theorem rFn_reverts (vs : VenomState) (hnh : vs.halted = false)
+    (hcv : vs.callCtx.callvalue = EvmYul.UInt256.ofNat 0) :
+    ∃ vs', runContext 10 rCtx vs = ExecResult.Abort AbortType.RevertAbort vs' := by
+  have h0 : runContext 10 rCtx vs
+      = runBlocks 10 rCtx rFn { vs with prevBb := none, currentBb := "entry", instIdx := 0 } := by
+    simp [runContext, runFunction, rCtx, rFn, lookupFunction, fnEntryLabel, tEntry]
+  set s0 : VenomState := { vs with prevBb := none, currentBb := "entry", instIdx := 0 } with hs0
+  have hnh0 : s0.halted = false := by simpa [hs0] using hnh
+  have hcv0 : s0.callCtx.callvalue = EvmYul.UInt256.ofNat 0 := by simpa [hs0] using hcv
+  -- entry: two CALLVALUEs then JMP "next"
+  have hentry : runBlock 9 rCtx tEntry s0 = ExecResult.OK (jumpTo "next" (tSEnd s0)) := by
+    rw [show (9 : Nat) = 2 + (6 + 1) from by omega]; exact rEntry_runBlock s0 6 hnh0
+  have hlk0 : lookupBlock s0.currentBb rFn.blocks = some tEntry := rfl
+  have hjh : (jumpTo "next" (tSEnd s0)).halted = false := by
+    simpa [jumpTo, updateVar] using hnh0
+  have hstep : runBlocks 10 rCtx rFn s0 = runBlocks 9 rCtx rFn (jumpTo "next" (tSEnd s0)) :=
+    runBlocks_step_of_block (fuel := 9) hlk0 hentry hjh
+  -- next: REVERT, with both operands the (zero) call value
+  have hs : lookupVar "s" (jumpTo "next" (tSEnd s0)) = some (EvmYul.UInt256.ofNat 0) := by
+    show lookupVar "s" (updateVar "o" s0.callCtx.callvalue
+      { updateVar "s" s0.callCtx.callvalue { s0 with instIdx := 0 } with instIdx := 1 })
+      = some (EvmYul.UInt256.ofNat 0)
+    rw [lookupVar_updateVar_ne _ _ _ _ (by decide)]
+    show lookupVar "s" (updateVar "s" s0.callCtx.callvalue { s0 with instIdx := 0 })
+      = some (EvmYul.UInt256.ofNat 0)
+    rw [lookupVar_updateVar_self, hcv0]
+  have ho : lookupVar "o" (jumpTo "next" (tSEnd s0)) = some (EvmYul.UInt256.ofNat 0) := by
+    show lookupVar "o" (updateVar "o" s0.callCtx.callvalue
+      { updateVar "s" s0.callCtx.callvalue { s0 with instIdx := 0 } with instIdx := 1 })
+      = some (EvmYul.UInt256.ofNat 0)
+    rw [lookupVar_updateVar_self, hcv0]
+  have hlk1 : lookupBlock (jumpTo "next" (tSEnd s0)).currentBb rFn.blocks = some rNext := rfl
+  have hrev := rNext_reverts (jumpTo "next" (tSEnd s0)) 7 hs ho
+  rw [show (0 : Nat) + (7 + 1) = 8 from by omega] at hrev
+  rw [h0, hstep]
+  exact ⟨_, runBlocks_abort_of_block hlk1 hrev⟩
+
+/-! ### The DJMP capstone's foundation — and why the invariant collapses its case-split
+
+`hsupplyW_regularDjmp` is the last slice without a capstone. The feared cost was a THREE-way split on a
+symbolic selector (`= 0` → `t0`, `= 1` → `t1`, out-of-range → the block errors). The invariant driver removes
+it: with `djInv`'s `callvalue = 0` the selector is ALWAYS `0`, so the FIRST switch entry matches, `pre = []`,
+and `hpre` is vacuous — ONE case. Same trick as `tFn` (the invariant buys away a value case-split).
+
+`generateFnPlan djFn 0 0` emits 27 instructions (checked): `L entry(0) · CALLVALUE(1) · DUP1(2) · PUSH0(3) ·
+EQ(4) · PUSH2 tramp1(5) · JUMPI(6) · DUP1(7) · PUSH1(8) · EQ(9) · PUSH2 tramp2(10) · JUMPI(11) · POP(12) ·
+PUSH2 revert(13) · JUMP(14) · L tramp1(15) · POP(16) · PUSH2 t0(17) · JUMP(18) · L tramp2(19) · POP(20) ·
+PUSH2 t1(21) · JUMP(22) · L t1(23) · STOP(24) · L t0(25) · STOP(26)`, with
+`offsets = [(t0,36),(t1,34),(tramp2,28),(tramp1,22),(entry,0)]` and `o2pc = [(36,25),(34,23),(28,19),(22,15),
+(0,0)]`. So the body plan is `[CALLVALUE]` (`bodyLen = 1+1 = 2`, chain starts at `as'.pc = 2`), `chainLen =
+5*0+5+4 = 9`, and `hw : (27-25) + (2+9) = 13 ≤ 27`. Every `djmpEntryHere` leg is a concrete placement fact
+(`GenBlockSimComp.lean:3354`) ⇒ `⟨by decide, rfl⟩`; note the scan entry's `PUSH0` is `AsmInst.AsmPush []`, so
+`hsel : idx = djmpVal []` holds at `idx = 0`. What remains is assembling those inputs. -/
+
+def djS : Instruction := { id := 0, opcode := Opcode.CALLVALUE, operands := [], outputs := ["a"] }
+def djD : Instruction :=
+  { id := 1, opcode := Opcode.DJMP,
+    operands := [Operand.Var "a", Operand.Label "t0", Operand.Label "t1"], outputs := [] }
+def djEntry : BasicBlock := { label := "entry", instructions := [djS, djD] }
+def djT0' : BasicBlock := { label := "t0", instructions := [stopInst] }
+def djT1' : BasicBlock := { label := "t1", instructions := [stopInst] }
+def djFn : IrFunction := { name := "main", blocks := [djEntry, djT0', djT1'] }
+def djCtx : VenomContext := { functions := [djFn], entry := some "main" }
+
+/-- The walk invariant for `djFn`: zero call value ⇒ the DJMP selector is `0` ⇒ the FIRST switch entry
+    matches ⇒ `pre = []`, collapsing the scan to a single case. -/
+def djInv (s : VenomState) : Prop :=
+  s.halted = false ∧ s.callCtx.callvalue = EvmYul.UInt256.ofNat 0
+
+/-- The CALLVALUE body of `djEntry` as a `RegularBodyH`, via the shared `cv_step`. -/
+theorem djBody_regularBodyH {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat} :
+    RegularBodyH lo ["a"] offsetToPc
+      (asmResolve (executePlan (generateFnPlan djFn 0 0).get!.1)).1 1 [djS] [] :=
+  ⟨cv_step (out := "a") (S := []) rfl (by decide) (by decide), trivial⟩
+
+/-- `djEntry`'s body threads to the CALLVALUE state. -/
+theorem djEntry_thread (s : VenomState) :
+    execBodyThread [djS] 0 { s with instIdx := 0 }
+      = some { updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 } := by
+  simp [execBodyThread, djS, stepInstBase, execRead0]
+
+/-- With a zero call value the selector is `0`, so the switch takes its FIRST entry. -/
+theorem djEntry_sel (s : VenomState) (hcv : s.callCtx.callvalue = EvmYul.UInt256.ofNat 0) :
+    evalOperand (Operand.Var "a")
+      { updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 }
+      = some (EvmYul.UInt256.ofNat 0) := by
+  show lookupVar "a" (updateVar "a" s.callCtx.callvalue { s with instIdx := 0 })
+    = some (EvmYul.UInt256.ofNat 0)
+  rw [lookupVar_updateVar_self, hcv]
+
+theorem djLabels : extractLabels [Operand.Label "t0", Operand.Label "t1"] = some ["t0", "t1"] := by rfl
+
+abbrev djSEnd (s : VenomState) : VenomState :=
+  { updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 }
+
+theorem djIdx_lt : (EvmYul.UInt256.ofNat 0).toNat < (["t0","t1"] : List String).length := by
+  simp [EvmYul.uint256_ofNat_toNat]
+
+/-- `djEntry`'s OK result: with a zero call value the selector picks `t0`. -/
+theorem djEntry_runBlock (s : VenomState) (j : Nat) (hnh : s.halted = false)
+    (hcv : s.callCtx.callvalue = EvmYul.UInt256.ofNat 0) :
+    runBlock (1 + (j+1)) djCtx djEntry s
+      = ExecResult.OK (jumpTo ((["t0","t1"] : List String).get ⟨_, djIdx_lt⟩) (djSEnd s)) :=
+  runBlock_body_djmp djCtx djEntry j [djS] djD djS [djD] s (djSEnd s) (Operand.Var "a")
+    [Operand.Label "t0", Operand.Label "t1"] (EvmYul.UInt256.ofNat 0) ["t0","t1"] djIdx_lt
+    rfl rfl rfl (djEntry_sel s hcv) djLabels rfl (by decide)
+    (by intro i hi; simp only [List.mem_singleton] at hi; subst hi; decide)
+    (djEntry_thread s) (by simpa [updateVar] using hnh)
+
+/-- `djInv` survives every block of `djFn`. -/
+theorem djInv_pres : ∀ bb ∈ djFn.blocks, ∀ (s s' : VenomState) (f' : Nat),
+    djInv s → runBlock f' djCtx bb s = ExecResult.OK s' → djInv s' := by
+  intro bb hbb s s' f' hinv hrun
+  obtain ⟨hnh, hcv⟩ := hinv
+  simp only [djFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+  rcases hbb with rfl | rfl | rfl
+  · match f' with
+    | 0 => simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, djEntry, djS,
+             stepInstBase, execRead0, isTerminator] at hrun
+    | 1 => simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, djEntry, djS,
+             stepInstBase, execRead0, isTerminator] at hrun
+    | (j+2) =>
+      rw [show j+2 = 1+(j+1) from by omega, djEntry_runBlock s j hnh hcv] at hrun
+      injection hrun with h; subst h
+      exact ⟨by simpa [jumpTo, updateVar] using hnh, by simp [jumpTo, updateVar, hcv]⟩
+  · match f' with
+    | 0 => simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, djT0', stopInst,
+             stepInstBase, isTerminator] at hrun
+    | (j+1) =>
+      have hrb := runBlock_body_stop djCtx djT0' j [] stopInst stopInst [] s { s with instIdx := 0 }
+        rfl rfl rfl (by decide) (by intro i hi; cases hi) (by simp [execBodyThread])
+      rw [show j+1 = ([] : List Instruction).length + (j+1) from by simp, hrb] at hrun
+      exact absurd hrun (by simp)
+  · match f' with
+    | 0 => simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, djT1', stopInst,
+             stepInstBase, isTerminator] at hrun
+    | (j+1) =>
+      have hrb := runBlock_body_stop djCtx djT1' j [] stopInst stopInst [] s { s with instIdx := 0 }
+        rfl rfl rfl (by decide) (by intro i hi; cases hi) (by simp [execBodyThread])
+      rw [show j+1 = ([] : List Instruction).length + (j+1) from by simp, hrb] at hrun
+      exact absurd hrun (by simp)
+
+/-- **The CALLVALUE body is a `RegularBodyH`** — the 0-input state-read disjunct of `RegularStepG`
+    (`operands = []`, output live). Both sides read `callCtx.callvalue`; the agreement conjunct
+    `fA s = fV v` is exactly `venomAsmRel`'s callCtx equality. -/
+theorem cv_regularBodyH {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat} :
+    RegularBodyH lo ["a"] offsetToPc
+      (asmResolve (executePlan (generateFnPlan cvJmpFn 0 0).get!.1)).1 1 [cvInst2] [] := by
+  exact ⟨cv_step (out := "a") (S := []) rfl (by decide) (by decide), trivial⟩
+
+
+-- hps? the body fold's resulting plan state vs psOfFn "next"
+example : ((([cvInst2].zipIdx 0)).foldl
+  (fun acc x => (acc.1 ++ (generateRegularInstPlan exLiveness DfgAnalysis.empty exCfg cvJmpFn x.1
+      ["a"] false true "entry" acc.2).1,
+    (generateRegularInstPlan exLiveness DfgAnalysis.empty exCfg cvJmpFn x.1 ["a"] false true
+      "entry" acc.2).2)) ([], initPlanState 0)).2
+    = psOfFn (fnPlanFuel cvJmpFn) cvJmpFn 0 0 "next" := by rfl
+
+-- what does next's SELFDESTRUCT emit segment look like?
+set_option maxHeartbeats 4000000 in
+
+/-! ### Branching, on a real generated program with a real body
+
+`entry: %a = CALLVALUE ; JNZ %a then else` / `then: STOP` / `else: STOP`. Same two constraints as
+`cvJmpFn` (the entry block continues, and `a` is live at the JNZ because the terminator consumes it), but the
+condition is now a value the BODY produced, and it is SYMBOLIC — so the proof genuinely case-splits on
+`callvalue = 0` and drives both JNZ arms. -/
+
+
+/-! ### A HALTING block with a real body, on the real generated program
+
+`entry: %a = CALLVALUE ; STOP`. The output `a` is DEAD at the STOP, yet the generator emits NO `POP`, because
+`isHalting = true` suppresses it (`CodegenPipeline.lean:355-359`). `bodyPlanRIP` hardcodes `isHalting := false`
+and so would pop a dead output — but its `nextLiveness` is a PARAMETER, not required to be the real liveness:
+it only has to make `hblock` true. Passing `["a"]` makes `dead = []`, suppressing the pop for the opposite
+reason and reproducing the generator's plan exactly. (Checked both ways on the real generator: `["a"]` emits
+`[CALLVALUE]` = the real body, while `[]` emits `[CALLVALUE, POP]` — a pop the generator never wrote.)
+
+So a halting block's body IS reachable, and the constraint is narrower than "the successor must consume it":
+the body fold's plan must merely agree with the generator's, which a live-marked `nextLiveness` achieves
+whenever the block halts. -/
+
+def cvStopBB : BasicBlock := { label := "entry", instructions := [cvInst2, stopInst] }
+def cvStopFn : IrFunction := { name := "main", blocks := [cvStopBB] }
+def cvStopCtx : VenomContext := { functions := [cvStopFn], entry := some "main" }
+
+/-- The CALLVALUE body as a `RegularBodyH` against `cvStopFn`'s generated program. -/
+theorem cvStop_regularBodyH {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat} :
+    RegularBodyH lo ["a"] offsetToPc (asmResolve (executePlan (generateFnPlan cvStopFn 0 0).get!.1)).1 1 [cvInst2] [] := by
+  exact ⟨cv_step (out := "a") (S := []) rfl (by decide) (by decide), trivial⟩
+
+set_option maxHeartbeats 4000000 in
+/-- **Halting capstone with a real body: `codegen_correct` for `entry: %a = CALLVALUE ; STOP`.** Single
+    block, non-empty body, on the real generated `[JUMPDEST ; CALLVALUE ; STOP]`, via
+    `hsupplyW_regularStop` — giving that slice its first REAL-program consumer (`hsupplyW_cdcStop` exercises
+    it against a hand-written program). See the note above for why a dead output is no obstacle here. -/
+theorem codegen_correct_cvStop_recipeW {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    (hvshalt : vs.halted = false)
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    (match runContext 10 cvStopCtx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan cvStopFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan cvStopFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan cvStopFn 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan cvStopFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan cvStopFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan cvStopFn 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan cvStopFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan cvStopFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan cvStopFn 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  have hfnready : ∀ bb ∈ cvStopFn.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst := by
+    intro bb hbb inst hinst
+    simp only [cvStopFn, List.mem_singleton] at hbb; subst hbb
+    simp only [cvStopBB, List.mem_cons, List.not_mem_nil, or_false] at hinst
+    rcases hinst with rfl | rfl <;> (unfold codegenReadyInst; decide)
+  have hgen : generateFnPlan cvStopFn 0 0
+      = some ((generateFnPlan cvStopFn 0 0).get!.1, (generateFnPlan cvStopFn 0 0).get!.2) := rfl
+  have hpsE : psOfFn (fnPlanFuel cvStopFn) cvStopFn 0 0 "entry" = initPlanState 0 :=
+    psOfFn_entry rfl hfnready (by simp only [fnPlanFuel]; omega)
+  refine codegen_correct_ofBlocks_recipeW
+    (lo := lo) (pcOf := pcOfLabel (asmResolve (executePlan (generateFnPlan cvStopFn 0 0).get!.1)).1)
+    (psOf := psOfFn (fnPlanFuel cvStopFn) cvStopFn 0 0)
+    (wOf := fun l => (asmResolve (executePlan (generateFnPlan cvStopFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan cvStopFn 0 0).get!.1)).1 l)
+    (offsets := (computeLabelOffsets (executePlan (generateFnPlan cvStopFn 0 0).get!.1)).2)
+    (fuel := 10) (ctx := cvStopCtx) (fn := cvStopFn) (fnEom := 0) (lblCtr := 0)
+    (entryName := "main") (entryLbl := "entry")
+    (ops := (generateFnPlan cvStopFn 0 0).get!.1) (psFinal := (generateFnPlan cvStopFn 0 0).get!.2)
+    hgen rfl rfl rfl ?_ ?_ ?_
+  case _ =>
+    intro bb hbb s
+    simp only [cvStopFn, List.mem_singleton] at hbb; subst hbb
+    simp [runBlock, evalPhis, execBlock, cvStopBB, cvInst2]
+  case _ =>
+    intro bb hbb s asm N k hE hlbleq
+    obtain ⟨⟨bb0, hlk_s, hvrel, hpc_asm⟩, hwN, hhalt⟩ := hE
+    simp only [cvStopFn, List.mem_singleton] at hbb; subst hbb
+    have hlbl : s.currentBb = "entry" := hlbleq
+    rw [hlbl] at hvrel hpc_asm
+    have hpc0 : asm.pc = 0 := by rw [hpc_asm]; exact pcOfLabel_entry_zero rfl hfnready hgen
+    cases k with
+    | zero =>
+      exact Or.inl ⟨"out of fuel", by simp [runBlock, evalPhis, phiPrefixLength, execBlock,
+        getInstruction, cvStopBB, cvInst2, stepInstBase, execRead0, isTerminator]⟩
+    | succ j =>
+    rw [show j + 1 + 1 = ([cvInst2] : List Instruction).length + (j + 1) from by
+      simp only [List.length_singleton]; omega]
+    refine Or.inr (hsupplyW_regularStop
+      (liveness := exLiveness) (dfg := DfgAnalysis.empty) (cfg := exCfg) (restFuel := j)
+      (front := [cvInst2]) (stopInst := stopInst) (hd := cvInst2) (tl := [stopInst])
+      (nextLiveness := ["a"]) (curBbLabel := "entry") (dem := 1) (S := []) (ps0 := initPlanState 0)
+      (sEnd := { updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 })
+      (hbb := rfl) (hstopop := rfl) (hcons := rfl) (hphi := by decide)
+      (hnonterm := by intro i hi; simp only [List.mem_singleton] at hi; subst hi; decide)
+      (hthread := by simp [execBodyThread, cvInst2, stepInstBase, execRead0])
+      (hreg := cvStop_regularBodyH)
+      (hsd := ⟨by intro op; rfl, by simp [initPlanState], by intro z hz; simp [initPlanState] at hz⟩)
+      (hsv := by simp [StackIsVars, initPlanState])
+      (hrel := by rw [hpsE] at hvrel; exact hvrel)
+      (hbLabel := by
+        rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
+        have hj' : j < 1 := hj; interval_cases j; rfl)
+      (hblock := by
+        rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
+        have hj' : j < 1 := hj; interval_cases j; rfl)
+      (hpc := by rw [hpc0]; decide) (hstop := by simp only [hpc0]; rfl) (hw := by decide))
+  case _ =>
+    refine ⟨⟨cvStopBB, rfl, ?_, ?_⟩, ?_, hvshalt⟩
+    · show venomAsmRel lo (psOfFn (fnPlanFuel cvStopFn) cvStopFn 0 0 "entry") _ as
+      rw [hpsE]; exact hrel
+    · show as.pc = pcOfLabel (asmResolve (executePlan (generateFnPlan cvStopFn 0 0).get!.1)).1 "entry"
+      rw [haspc]; exact (pcOfLabel_entry_zero rfl hfnready hgen).symm
+    · show (asmResolve (executePlan (generateFnPlan cvStopFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan cvStopFn 0 0).get!.1)).1 "entry" ≤ (asmResolve (executePlan (generateFnPlan cvStopFn 0 0).get!.1)).1.length
+      omega
+
+
+def invInst2 : Instruction := { id := 3, opcode := Opcode.INVALID, operands := [], outputs := [] }
+def cvInvBB : BasicBlock := { label := "entry", instructions := [cvInst2, invInst2] }
+def cvInvFn : IrFunction := { name := "main", blocks := [cvInvBB] }
+def cvInvCtx : VenomContext := { functions := [cvInvFn], entry := some "main" }
+
+/-- The CALLVALUE body as a `RegularBodyH` against `cvInvFn`'s generated program. -/
+theorem cvInv_regularBodyH {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat} :
+    RegularBodyH lo ["a"] offsetToPc (asmResolve (executePlan (generateFnPlan cvInvFn 0 0).get!.1)).1 1 [cvInst2] [] := by
+  exact ⟨cv_step (out := "a") (S := []) rfl (by decide) (by decide), trivial⟩
+
+set_option maxHeartbeats 4000000 in
+/-- **Aborting capstone with a real body: `entry: %a = CALLVALUE ; INVALID`.** The `AsmFault` twin of
+    `codegen_correct_cvStop_recipeW`, on the real generated `[JUMPDEST ; CALLVALUE ; INVALID]`, via
+    `hsupplyW_regularInvalid` — its first consumer. Same reason the dead output is no obstacle (fact 3). -/
+theorem codegen_correct_cvInv_recipeW {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    (hvshalt : vs.halted = false)
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    (match runContext 10 cvInvCtx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan cvInvFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan cvInvFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan cvInvFn 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan cvInvFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan cvInvFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan cvInvFn 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan cvInvFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan cvInvFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan cvInvFn 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  have hfnready : ∀ bb ∈ cvInvFn.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst := by
+    intro bb hbb inst hinst
+    simp only [cvInvFn, List.mem_singleton] at hbb; subst hbb
+    simp only [cvInvBB, List.mem_cons, List.not_mem_nil, or_false] at hinst
+    rcases hinst with rfl | rfl <;> (unfold codegenReadyInst; decide)
+  have hgen : generateFnPlan cvInvFn 0 0
+      = some ((generateFnPlan cvInvFn 0 0).get!.1, (generateFnPlan cvInvFn 0 0).get!.2) := rfl
+  have hpsE : psOfFn (fnPlanFuel cvInvFn) cvInvFn 0 0 "entry" = initPlanState 0 :=
+    psOfFn_entry rfl hfnready (by simp only [fnPlanFuel]; omega)
+  refine codegen_correct_ofBlocks_recipeW
+    (lo := lo) (pcOf := pcOfLabel (asmResolve (executePlan (generateFnPlan cvInvFn 0 0).get!.1)).1)
+    (psOf := psOfFn (fnPlanFuel cvInvFn) cvInvFn 0 0)
+    (wOf := fun l => (asmResolve (executePlan (generateFnPlan cvInvFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan cvInvFn 0 0).get!.1)).1 l)
+    (offsets := (computeLabelOffsets (executePlan (generateFnPlan cvInvFn 0 0).get!.1)).2)
+    (fuel := 10) (ctx := cvInvCtx) (fn := cvInvFn) (fnEom := 0) (lblCtr := 0)
+    (entryName := "main") (entryLbl := "entry")
+    (ops := (generateFnPlan cvInvFn 0 0).get!.1) (psFinal := (generateFnPlan cvInvFn 0 0).get!.2)
+    hgen rfl rfl rfl ?_ ?_ ?_
+  case _ =>
+    intro bb hbb s
+    simp only [cvInvFn, List.mem_singleton] at hbb; subst hbb
+    simp [runBlock, evalPhis, execBlock, cvInvBB, cvInst2]
+  case _ =>
+    intro bb hbb s asm N k hE hlbleq
+    obtain ⟨⟨bb0, hlk_s, hvrel, hpc_asm⟩, hwN, hhalt⟩ := hE
+    simp only [cvInvFn, List.mem_singleton] at hbb; subst hbb
+    have hlbl : s.currentBb = "entry" := hlbleq
+    rw [hlbl] at hvrel hpc_asm
+    have hpc0 : asm.pc = 0 := by rw [hpc_asm]; exact pcOfLabel_entry_zero rfl hfnready hgen
+    cases k with
+    | zero =>
+      exact Or.inl ⟨"out of fuel", by simp [runBlock, evalPhis, phiPrefixLength, execBlock,
+        getInstruction, cvInvBB, cvInst2, stepInstBase, execRead0, isTerminator]⟩
+    | succ j =>
+    rw [show j + 1 + 1 = ([cvInst2] : List Instruction).length + (j + 1) from by
+      simp only [List.length_singleton]; omega]
+    refine Or.inr (hsupplyW_regularInvalid
+      (liveness := exLiveness) (dfg := DfgAnalysis.empty) (cfg := exCfg) (restFuel := j)
+      (front := [cvInst2]) (invInst := invInst2) (hd := cvInst2) (tl := [invInst2])
+      (nextLiveness := ["a"]) (curBbLabel := "entry") (dem := 1) (S := []) (ps0 := initPlanState 0)
+      (sEnd := { updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 })
+      (hbb := rfl) (hinvop := rfl) (hcons := rfl) (hphi := by decide)
+      (hnonterm := by intro i hi; simp only [List.mem_singleton] at hi; subst hi; decide)
+      (hthread := by simp [execBodyThread, cvInst2, stepInstBase, execRead0])
+      (hreg := cvInv_regularBodyH)
+      (hsd := ⟨by intro op; rfl, by simp [initPlanState], by intro z hz; simp [initPlanState] at hz⟩)
+      (hsv := by simp [StackIsVars, initPlanState])
+      (hrel := by rw [hpsE] at hvrel; exact hvrel)
+      (hbLabel := by
+        rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
+        have hj' : j < 1 := hj; interval_cases j; rfl)
+      (hblock := by
+        rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
+        have hj' : j < 1 := hj; interval_cases j; rfl)
+      (hpc := by rw [hpc0]; decide) (hinv := by simp only [hpc0]; rfl) (hw := by decide))
+  case _ =>
+    refine ⟨⟨cvInvBB, rfl, ?_, ?_⟩, ?_, hvshalt⟩
+    · show venomAsmRel lo (psOfFn (fnPlanFuel cvInvFn) cvInvFn 0 0 "entry") _ as
+      rw [hpsE]; exact hrel
+    · show as.pc = pcOfLabel (asmResolve (executePlan (generateFnPlan cvInvFn 0 0).get!.1)).1 "entry"
+      rw [haspc]; exact (pcOfLabel_entry_zero rfl hfnready hgen).symm
+    · show (asmResolve (executePlan (generateFnPlan cvInvFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan cvInvFn 0 0).get!.1)).1 "entry" ≤ (asmResolve (executePlan (generateFnPlan cvInvFn 0 0).get!.1)).1.length
+      omega
+
+def cvJnzInst : Instruction :=
+  { id := 1, opcode := Opcode.JNZ,
+    operands := [Operand.Var "a", Operand.Label "then", Operand.Label "else"], outputs := [] }
+def cvJnzEntry : BasicBlock := { label := "entry", instructions := [cvInst2, cvJnzInst] }
+def cvThenBB : BasicBlock := { label := "then", instructions := [stopInst] }
+def cvElseBB : BasicBlock := { label := "else", instructions := [stopInst] }
+def cvJnzFn : IrFunction := { name := "main", blocks := [cvJnzEntry, cvThenBB, cvElseBB] }
+def cvJnzCtx : VenomContext := { functions := [cvJnzFn], entry := some "main" }
+
+/-- The CALLVALUE body as a `RegularBodyH` against `cvJnzFn`'s generated program (same disjunct and same
+    proof as `cv_regularBodyH`; only the program and `fn` differ). -/
+theorem cvJnz_regularBodyH {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat} :
+    RegularBodyH lo ["a"] offsetToPc
+      (asmResolve (executePlan (generateFnPlan cvJnzFn 0 0).get!.1)).1 1 [cvInst2] [] := by
+  exact ⟨cv_step (out := "a") (S := []) rfl (by decide) (by decide), trivial⟩
+
+/-- **The frontier capstone: whole-function `codegen_correct` on a REAL generated program with a NON-EMPTY
+    body, via the recipe route.** Every earlier recipe-route capstone had empty-bodied blocks (only
+    instruction = terminator); the one existing non-empty-body capstone (`codegen_correct_canonical_addStop`)
+    hand-rolls its asm run because its body is literal-operand and so outside the body fold entirely.
+
+    Here `entry: %a = CALLVALUE ; JMP next` goes through the generic chain — `hsupplyW_regularJmp` →
+    `soLabel_sim` ∘ `genBlockBodyH_sim_inv` ∘ `termRecipeW_jmp_of_body` — with the body's `RegularBodyH`
+    supplied by `cv_regularBodyH`, and `next: SELFDESTRUCT %a` through `hsupplyW_emptySelfdestructDead`.
+    Both blocks are discharged against the program the compiler actually emits.
+
+    Two things make it fit where the obvious candidates do not: the entry block CONTINUES (so
+    `bbIsHalting = false`, matching `bodyPlanRIP`'s hardcoded `isHalting`), and `a` is live at the JMP
+    because the successor consumes it (so the state-read disjunct's `nextLiveness.contains out = true` holds
+    of the REAL liveness). The successor-recording obligation `hps` — the body fold's resulting plan state IS
+    `psOfFn "next"` — closes by `rfl` on the real generator. -/
+theorem codegen_correct_cvJmp_recipeW {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    (hvshalt : vs.halted = false)
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    (match runContext 10 cvJmpCtx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan cvJmpFn 0 0).get!.1)).1.length
+         (asmResolve (executePlan (generateFnPlan cvJmpFn 0 0).get!.1)).2
+         (asmResolve (executePlan (generateFnPlan cvJmpFn 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan cvJmpFn 0 0).get!.1)).1.length
+         (asmResolve (executePlan (generateFnPlan cvJmpFn 0 0).get!.1)).2
+         (asmResolve (executePlan (generateFnPlan cvJmpFn 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan cvJmpFn 0 0).get!.1)).1.length
+         (asmResolve (executePlan (generateFnPlan cvJmpFn 0 0).get!.1)).2
+         (asmResolve (executePlan (generateFnPlan cvJmpFn 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  have hfnready : ∀ bb ∈ cvJmpFn.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst := by
+    intro bb hbb inst hinst
+    simp only [cvJmpFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    rcases hbb with rfl | rfl
+    · simp only [cvEntryBB, List.mem_cons, List.not_mem_nil, or_false] at hinst
+      rcases hinst with rfl | rfl <;> (unfold codegenReadyInst; decide)
+    · simp only [sdNextBB, List.mem_singleton] at hinst; subst hinst; unfold codegenReadyInst; decide
+  have hgen : generateFnPlan cvJmpFn 0 0
+      = some ((generateFnPlan cvJmpFn 0 0).get!.1, (generateFnPlan cvJmpFn 0 0).get!.2) := rfl
+  have hpsE : psOfFn (fnPlanFuel cvJmpFn) cvJmpFn 0 0 "entry" = initPlanState 0 :=
+    psOfFn_entry rfl hfnready (by simp only [fnPlanFuel]; omega)
+  refine codegen_correct_ofBlocks_recipeW
+    (lo := lo)
+    (pcOf := pcOfLabel (asmResolve (executePlan (generateFnPlan cvJmpFn 0 0).get!.1)).1)
+    (psOf := psOfFn (fnPlanFuel cvJmpFn) cvJmpFn 0 0)
+    (wOf := fun l => (asmResolve (executePlan (generateFnPlan cvJmpFn 0 0).get!.1)).1.length
+      - pcOfLabel (asmResolve (executePlan (generateFnPlan cvJmpFn 0 0).get!.1)).1 l)
+    (offsets := (computeLabelOffsets (executePlan (generateFnPlan cvJmpFn 0 0).get!.1)).2)
+    (fuel := 10) (ctx := cvJmpCtx) (fn := cvJmpFn) (fnEom := 0) (lblCtr := 0)
+    (entryName := "main") (entryLbl := "entry")
+    (ops := (generateFnPlan cvJmpFn 0 0).get!.1) (psFinal := (generateFnPlan cvJmpFn 0 0).get!.2)
+    hgen rfl rfl rfl ?_ ?_ ?_
+  case _ =>
+    intro bb hbb s
+    simp only [cvJmpFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    rcases hbb with rfl | rfl
+    · simp [runBlock, evalPhis, execBlock, cvEntryBB, cvInst2]
+    · simp [runBlock, evalPhis, execBlock, sdNextBB, sdAInst]
+  case _ =>
+    intro bb hbb s asm N k hE hlbleq
+    obtain ⟨⟨bb0, hlk_s, hvrel, hpc_asm⟩, hwN, hhalt⟩ := hE
+    have hbb2 : bb = cvEntryBB ∨ bb = sdNextBB := by
+      simp only [cvJmpFn, List.mem_cons, List.not_mem_nil, or_false] at hbb; exact hbb
+    rcases hbb2 with hbb | hbb <;> subst hbb
+    · -- entry: CALLVALUE body + JMP  (the NON-EMPTY body, on the REAL generated program)
+      have hlbl : s.currentBb = "entry" := hlbleq
+      rw [hlbl] at hvrel hpc_asm
+      have hpc0 : asm.pc = 0 := by rw [hpc_asm]; exact pcOfLabel_entry_zero rfl hfnready hgen
+      -- the 2-instruction block (CALLVALUE ; JMP) needs fuel ≥ 2; at k = 0 the driver takes the error arm
+      cases k with
+      | zero =>
+        exact Or.inl ⟨"out of fuel", by simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction,
+          cvEntryBB, cvInst2, stepInstBase, execRead0, isTerminator]⟩
+      | succ j =>
+      rw [show j + 1 + 1 = ([cvInst2] : List Instruction).length + (j + 1) from by simp only [List.length_singleton]; omega]
+      refine Or.inr (hsupplyW_regularJmp
+        (restFuel := j)
+        (liveness := exLiveness) (dfg := DfgAnalysis.empty) (cfg := exCfg)
+        (front := [cvInst2]) (jmpInst := jmpNextInst) (hd := cvInst2) (tl := [jmpNextInst])
+        (nextLiveness := ["a"]) (curBbLabel := "entry") (dem := 1) (S := [])
+        (ps0 := initPlanState 0) (lbl := "next") (off := 6) (bb' := sdNextBB)
+        (sEnd := { updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 })
+        (hbb := rfl) (hjmpop := rfl) (hoperands := rfl) (hcons := rfl) (hphi := by decide)
+        (hnonterm := by intro i hi; simp only [List.mem_singleton] at hi; subst hi; decide)
+        (hthread := ?_) (hnothalt := ?_) (hreg := cv_regularBodyH)
+        (hsd := ?_) (hsv := by simp [StackIsVars, initPlanState]) (hrel := ?_)
+        (hbLabel := ?_) (hblock := ?_) (hps := ?_) (hpc := ?_) (hpush := ?_)
+        (hoff_lk := ?_) (hoff := ?_) (hpc2 := ?_) (hjump := ?_)
+        (hidx_lk := ?_) (hlk' := rfl) (hw := ?_))
+      · -- hthread
+        simp [execBodyThread, cvInst2, stepInstBase, execRead0]
+      · -- hnothalt
+        simpa [updateVar] using hhalt
+      · -- hsd
+        exact ⟨by intro op; rfl, by simp [initPlanState], by intro z hz; simp [initPlanState] at hz⟩
+      · -- hrel
+        rw [hpsE] at hvrel; exact hvrel
+      · -- hbLabel
+        rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
+        have hj' : j < 1 := hj; interval_cases j; rfl
+      · -- hblock
+        rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
+        have hj' : j < 1 := hj; interval_cases j; rfl
+      · -- hps
+        rfl
+      · -- hpc
+        rw [hpc0]; decide
+      · -- hpush
+        simp only [hpc0]; rfl
+      · -- hoff_lk
+        decide
+      · -- hoff
+        decide
+      · -- hpc2
+        rw [hpc0]; decide
+      · -- hjump
+        simp only [hpc0]; rfl
+      · -- hidx_lk
+        decide
+      · -- hw
+        decide
+    · -- next: SELFDESTRUCT %a (operand dead ⇒ consumed in place)
+      have hlbl : s.currentBb = "next" := hlbleq
+      rw [hlbl] at hvrel hpc_asm
+      have hpc4 : asm.pc = 4 := by rw [hpc_asm]; decide
+      obtain ⟨waddr, hwa⟩ := venomAsmRel_stack_defined hvrel "a" (by decide)
+      refine Or.inr (hsupplyW_emptySelfdestructDead (sdInst := sdAInst) (addrv := "a")
+        (waddr := waddr) (base := []) (ps := psOfFn (fnPlanFuel cvJmpFn) cvJmpFn 0 0 "next")
+        rfl rfl rfl hwa hwa rfl hvrel ?_ ?_ ?_ (by decide))
+      · rw [hpc4]; refine ⟨by decide, fun j hj => ?_⟩
+        have hj' : j < 1 := hj; interval_cases j; rfl
+      · rw [hpc4]; decide
+      · have e : asm.pc + 1 = 5 := by rw [hpc4]
+        conv_lhs => rw [show (⟨asm.pc + 1, by rw [hpc4]; decide⟩ : Fin _) = ⟨5, by decide⟩ from Fin.ext e]
+        rfl
+  case _ =>
+    refine ⟨⟨cvEntryBB, rfl, ?_, ?_⟩, ?_, hvshalt⟩
+    · show venomAsmRel lo (psOfFn (fnPlanFuel cvJmpFn) cvJmpFn 0 0 "entry") _ as
+      rw [hpsE]; exact hrel
+    · show as.pc = pcOfLabel (asmResolve (executePlan (generateFnPlan cvJmpFn 0 0).get!.1)).1 "entry"
+      rw [haspc]; exact (pcOfLabel_entry_zero rfl hfnready hgen).symm
+    · show (asmResolve (executePlan (generateFnPlan cvJmpFn 0 0).get!.1)).1.length
+          - pcOfLabel (asmResolve (executePlan (generateFnPlan cvJmpFn 0 0).get!.1)).1 "entry"
+          ≤ (asmResolve (executePlan (generateFnPlan cvJmpFn 0 0).get!.1)).1.length
+      omega
+
+
+set_option maxHeartbeats 4000000 in
+/-- **Branching capstone: `codegen_correct` on a real generated program with a real body, both JNZ arms.**
+    `entry: %a = CALLVALUE ; JNZ %a then else` / `then: STOP` / `else: STOP`, emitted as
+    `[LABEL entry; CALLVALUE; PUSHLBL then; JUMPI; PUSHLBL else; JUMP; LABEL else; STOP; LABEL then; STOP]`.
+    The condition is a value the BODY produced and is SYMBOLIC, so the proof case-splits on
+    `callvalue = 0` and drives BOTH `hsupplyW_regularJnz{Taken,Nottaken}` — the taken arm through the 2-op
+    tail, the fall-through arm through the 4-op tail. The successors are empty-bodied STOPs
+    (`hsupplyW_emptyStop`). -/
+theorem codegen_correct_cvJnz_recipeW {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    (hvshalt : vs.halted = false)
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    (match runContext 10 cvJnzCtx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan cvJnzFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan cvJnzFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan cvJnzFn 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan cvJnzFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan cvJnzFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan cvJnzFn 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan cvJnzFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan cvJnzFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan cvJnzFn 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  have hfnready : ∀ bb ∈ cvJnzFn.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst := by
+    intro bb hbb inst hinst
+    simp only [cvJnzFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    rcases hbb with rfl | rfl | rfl
+    · simp only [cvJnzEntry, List.mem_cons, List.not_mem_nil, or_false] at hinst
+      rcases hinst with rfl | rfl <;> (unfold codegenReadyInst; decide)
+    · simp only [cvThenBB, List.mem_singleton] at hinst; subst hinst; unfold codegenReadyInst; decide
+    · simp only [cvElseBB, List.mem_singleton] at hinst; subst hinst; unfold codegenReadyInst; decide
+  have hgen : generateFnPlan cvJnzFn 0 0
+      = some ((generateFnPlan cvJnzFn 0 0).get!.1, (generateFnPlan cvJnzFn 0 0).get!.2) := rfl
+  have hpsE : psOfFn (fnPlanFuel cvJnzFn) cvJnzFn 0 0 "entry" = initPlanState 0 :=
+    psOfFn_entry rfl hfnready (by simp only [fnPlanFuel]; omega)
+  refine codegen_correct_ofBlocks_recipeW
+    (lo := lo) (pcOf := pcOfLabel (asmResolve (executePlan (generateFnPlan cvJnzFn 0 0).get!.1)).1)
+    (psOf := psOfFn (fnPlanFuel cvJnzFn) cvJnzFn 0 0)
+    (wOf := fun l => (asmResolve (executePlan (generateFnPlan cvJnzFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan cvJnzFn 0 0).get!.1)).1 l)
+    (offsets := (computeLabelOffsets (executePlan (generateFnPlan cvJnzFn 0 0).get!.1)).2)
+    (fuel := 10) (ctx := cvJnzCtx) (fn := cvJnzFn) (fnEom := 0) (lblCtr := 0)
+    (entryName := "main") (entryLbl := "entry")
+    (ops := (generateFnPlan cvJnzFn 0 0).get!.1) (psFinal := (generateFnPlan cvJnzFn 0 0).get!.2)
+    hgen rfl rfl rfl ?_ ?_ ?_
+  case _ =>
+    intro bb hbb s
+    simp only [cvJnzFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    rcases hbb with rfl | rfl | rfl
+    · simp [runBlock, evalPhis, execBlock, cvJnzEntry, cvInst2]
+    · simp [runBlock, evalPhis, execBlock, cvThenBB, stopInst]
+    · simp [runBlock, evalPhis, execBlock, cvElseBB, stopInst]
+  case _ =>
+    intro bb hbb s asm N k hE hlbleq
+    obtain ⟨⟨bb0, hlk_s, hvrel, hpc_asm⟩, hwN, hhalt⟩ := hE
+    have hbb3 : bb = cvJnzEntry ∨ bb = cvThenBB ∨ bb = cvElseBB := by
+      simp only [cvJnzFn, List.mem_cons, List.not_mem_nil, or_false] at hbb; exact hbb
+    rcases hbb3 with hbb | hbb | hbb <;> subst hbb
+    · -- entry: CALLVALUE body + JNZ on the produced value
+      have hlbl : s.currentBb = "entry" := hlbleq
+      rw [hlbl] at hvrel hpc_asm
+      have hpc0 : asm.pc = 0 := by rw [hpc_asm]; exact pcOfLabel_entry_zero rfl hfnready hgen
+      cases k with
+      | zero =>
+        exact Or.inl ⟨"out of fuel", by simp [runBlock, evalPhis, phiPrefixLength, execBlock,
+          getInstruction, cvJnzEntry, cvInst2, stepInstBase, execRead0, isTerminator]⟩
+      | succ j =>
+      rw [show j + 1 + 1 = ([cvInst2] : List Instruction).length + (j + 1) from by
+        simp only [List.length_singleton]; omega]
+      have hsd : StackDiscH ((([cvInst2] : List Instruction).zipIdx 0).map (fun _ => 1)).sum
+          (initPlanState 0) { s with instIdx := 0 } :=
+        ⟨by intro op; rfl, by simp [initPlanState], by intro z hz; simp [initPlanState] at hz⟩
+      have hrel0 : venomAsmRel lo (initPlanState 0) { s with instIdx := 0 } asm := by
+        rw [hpsE] at hvrel; exact hvrel
+      have hthread : execBodyThread [cvInst2] 0 { s with instIdx := 0 }
+          = some { updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 } := by
+        simp [execBodyThread, cvInst2, stepInstBase, execRead0]
+      have hbLabel : asmBlockAt (asmResolve (executePlan (generateFnPlan cvJnzFn 0 0).get!.1)).1 asm.pc (executePlan [StackOp.SOLabel cvJnzEntry.label]) := by
+        rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
+        have hj' : j < 1 := hj; interval_cases j; rfl
+      have hblock : asmBlockAt (asmResolve (executePlan (generateFnPlan cvJnzFn 0 0).get!.1)).1 (asm.pc + 1)
+          (executePlan (bodyPlanRIP exLiveness DfgAnalysis.empty exCfg cvJnzFn ["a"] "entry" [cvInst2]
+            (initPlanState 0)).1) := by
+        rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
+        have hj' : j < 1 := hj; interval_cases j; rfl
+      have hva : lookupVar "a" { updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with
+          instIdx := 1 } = some s.callCtx.callvalue := by
+        rw [show lookupVar "a" { updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with
+          instIdx := 1 } = lookupVar "a" (updateVar "a" s.callCtx.callvalue { s with instIdx := 0 })
+          from rfl, lookupVar_updateVar_self]
+      by_cases hz : s.callCtx.callvalue = EvmYul.UInt256.ofNat 0
+      · -- fall-through arm: condition is zero
+        refine Or.inr (hsupplyW_regularJnzNottaken
+          (liveness := exLiveness) (dfg := DfgAnalysis.empty) (cfg := exCfg) (restFuel := j)
+          (front := [cvInst2]) (jnzInst := cvJnzInst) (hd := cvInst2) (tl := [cvJnzInst])
+          (nextLiveness := ["a"]) (curBbLabel := "entry") (dem := 1) (S := []) (base := [])
+          (ps0 := initPlanState 0) (condvar := "a") (ifNz := "then") (ifZ := "else")
+          (offN := 12) (offZ := 10) (bb' := cvElseBB)
+          (sEnd := { updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 })
+          (hbb := rfl) (hop := rfl) (hoperands := rfl)
+          (hcondv := hva.trans (by rw [hz]; rfl)) (hval := hva.trans (by rw [hz]))
+          (hcons := rfl) (hphi := by decide)
+          (hnonterm := by intro i hi; simp only [List.mem_singleton] at hi; subst hi; decide)
+          (hthread := hthread) (hnothalt := by simpa [updateVar] using hhalt)
+          (hreg := cvJnz_regularBodyH) (hsd := hsd) (hsv := by simp [StackIsVars, initPlanState])
+          (hrel := hrel0) (hbLabel := hbLabel) (hblock := hblock) (hcondtos := rfl) (hpsj := rfl)
+          (hpc := by rw [hpc0]; decide) (hpushN := by simp only [hpc0]; rfl)
+          (hoffN_lk := ?_) (hoffN := ?_) (hpc2 := by rw [hpc0]; decide)
+          (hjumpi := by simp only [hpc0]; rfl) (hpc3 := by rw [hpc0]; decide)
+          (hpushZ := by simp only [hpc0]; rfl) (hoffZ_lk := ?_) (hoffZ := ?_)
+          (hpc4 := by rw [hpc0]; decide) (hjump := by simp only [hpc0]; rfl)
+          (hidxZ_lk := ?_) (hlk' := rfl) (hw := by decide))
+        · decide
+        · decide
+        · decide
+        · decide
+        · decide
+      · -- taken arm: condition is non-zero
+        refine Or.inr (hsupplyW_regularJnzTaken
+          (liveness := exLiveness) (dfg := DfgAnalysis.empty) (cfg := exCfg) (restFuel := j)
+          (front := [cvInst2]) (jnzInst := cvJnzInst) (hd := cvInst2) (tl := [cvJnzInst])
+          (nextLiveness := ["a"]) (curBbLabel := "entry") (dem := 1) (S := []) (base := [])
+          (ps0 := initPlanState 0) (condvar := "a") (ifNz := "then") (ifZ := "else")
+          (cond := s.callCtx.callvalue) (off := 12) (bb' := cvThenBB)
+          (sEnd := { updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 })
+          (hbb := rfl) (hop := rfl) (hoperands := rfl) (hcondv := hva) (hcond_ne := hz) (hval := hva)
+          (hcons := rfl) (hphi := by decide)
+          (hnonterm := by intro i hi; simp only [List.mem_singleton] at hi; subst hi; decide)
+          (hthread := hthread) (hnothalt := by simpa [updateVar] using hhalt)
+          (hreg := cvJnz_regularBodyH) (hsd := hsd) (hsv := by simp [StackIsVars, initPlanState])
+          (hrel := hrel0) (hbLabel := hbLabel) (hblock := hblock) (hcondtos := rfl) (hpsj := rfl)
+          (hpc := by rw [hpc0]; decide) (hpush := by simp only [hpc0]; rfl)
+          (hoff_lk := ?_) (hoff := ?_) (hpc2 := by rw [hpc0]; decide)
+          (hjumpi := by simp only [hpc0]; rfl) (hidx_lk := ?_) (hlk' := rfl) (hw := by decide))
+        · decide
+        · decide
+        · decide
+    · -- then: STOP
+      have hlbl : s.currentBb = "then" := hlbleq
+      rw [hlbl] at hvrel hpc_asm
+      have hpc8 : asm.pc = 8 := by rw [hpc_asm]; decide
+      have hbLabel : asmBlockAt (asmResolve (executePlan (generateFnPlan cvJnzFn 0 0).get!.1)).1 asm.pc (executePlan [StackOp.SOLabel cvThenBB.label]) := by
+        rw [hpc8]; refine ⟨by decide, fun j hj => ?_⟩
+        have hj' : j < 1 := hj; interval_cases j; rfl
+      have hlt : asm.pc + 1 < (asmResolve (executePlan (generateFnPlan cvJnzFn 0 0).get!.1)).1.length := by rw [hpc8]; decide
+      have hstop : (asmResolve (executePlan (generateFnPlan cvJnzFn 0 0).get!.1)).1.get ⟨asm.pc + 1, hlt⟩ = AsmInst.AsmOp "STOP" := by
+        simp only [hpc8]; rfl
+      exact Or.inr (hsupplyW_emptyStop (stopInst := stopInst)
+        (ps := psOfFn (fnPlanFuel cvJnzFn) cvJnzFn 0 0 "then") rfl rfl hvrel hbLabel hlt hstop (by decide))
+    · -- else: STOP
+      have hlbl : s.currentBb = "else" := hlbleq
+      rw [hlbl] at hvrel hpc_asm
+      have hpc6 : asm.pc = 6 := by rw [hpc_asm]; decide
+      have hbLabel : asmBlockAt (asmResolve (executePlan (generateFnPlan cvJnzFn 0 0).get!.1)).1 asm.pc (executePlan [StackOp.SOLabel cvElseBB.label]) := by
+        rw [hpc6]; refine ⟨by decide, fun j hj => ?_⟩
+        have hj' : j < 1 := hj; interval_cases j; rfl
+      have hlt : asm.pc + 1 < (asmResolve (executePlan (generateFnPlan cvJnzFn 0 0).get!.1)).1.length := by rw [hpc6]; decide
+      have hstop : (asmResolve (executePlan (generateFnPlan cvJnzFn 0 0).get!.1)).1.get ⟨asm.pc + 1, hlt⟩ = AsmInst.AsmOp "STOP" := by
+        simp only [hpc6]; rfl
+      exact Or.inr (hsupplyW_emptyStop (stopInst := stopInst)
+        (ps := psOfFn (fnPlanFuel cvJnzFn) cvJnzFn 0 0 "else") rfl rfl hvrel hbLabel hlt hstop (by decide))
+  case _ =>
+    refine ⟨⟨cvJnzEntry, rfl, ?_, ?_⟩, ?_, hvshalt⟩
+    · show venomAsmRel lo (psOfFn (fnPlanFuel cvJnzFn) cvJnzFn 0 0 "entry") _ as
+      rw [hpsE]; exact hrel
+    · show as.pc = pcOfLabel (asmResolve (executePlan (generateFnPlan cvJnzFn 0 0).get!.1)).1 "entry"
+      rw [haspc]; exact (pcOfLabel_entry_zero rfl hfnready hgen).symm
+    · show (asmResolve (executePlan (generateFnPlan cvJnzFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan cvJnzFn 0 0).get!.1)).1 "entry" ≤ (asmResolve (executePlan (generateFnPlan cvJnzFn 0 0).get!.1)).1.length
+      omega
+
+/-! ### ✅ The DJMP capstone — `codegen_correct_djFn_recipeW`
+
+The eighth and last terminator kind reaches a whole-function `codegen_correct` on REAL generated output.
+`djFn` is `entry: a = CALLVALUE ; DJMP a [t0, t1]` with `t0: STOP` and `t1: STOP`; the generator emits the
+27-instruction switch below, and with `callvalue = 0` the selector picks `t0`.
+
+Two things had to be fixed to apply `hsupplyW_regularDjmp` to the REAL generator (both found by TESTING the
+lemma against generated output rather than reading it):
+
+1. **`hpsj` was unsatisfiable here.** It demanded the successor's plan state equal the BODY plan state with
+   the selector popped — on the nose, `labelCounter` included. But a DJMP emits one trampoline per target,
+   and each bumps `labelCounter`: the real `psOfFn … "t0"` has `labelCounter = 2` while the body plan has `0`
+   (`stack`/`spilled`/`alloc` all agree — the counter was the ONLY difference). Since `venomAsmRel` reads only
+   `ps.stack`, `ps.spilled` and `ps.alloc` (`CodegenRel.lean:436-440`), the counter is irrelevant to the
+   conclusion, so `hpsj` now takes an ARBITRARY `lc`. Both proofs went through unchanged — the obliviousness
+   is definitional. Left as it was, `hsupplyW_regularDjmp` was sound but applied to NO real DJMP block.
+
+2. **Layout facts need `decide +kernel`, not `decide`.** `computeLabelOffsets`/`asmResolve` on `djFn` do not
+   reduce in the elaborator, so plain `decide`/`rfl` get stuck — and because a lookup compares the key against
+   EVERY entry, one irreducible trampoline key (`"djmp_tramp" ++ "_" ++ toString …`) blocks even the lookup of
+   a plain block label like `"t0"`. The kernel reduces all of it. (`decide +kernel` is kernel reduction — it
+   adds no axiom, unlike `native_decide`.) `AsmInst` derives only `Inhabited`, so the equalities on program
+   instructions need a `DecidableEq` instance; it is derived here, proof-side, rather than in `AsmIR.lean`.
+
+The verified layout (`#eval`-checked, then proved by `decide +kernel`):
+
+```
+ 0 AsmLabel entry     5 PUSH [0,22] (=djmp_tramp_1)  10 PUSH [0,28]  15 AsmLabel djmp_tramp_1
+ 1 CALLVALUE          6 JUMPI                        11 JUMPI        16 POP
+ 2 DUP1               7 DUP1                         12 POP          17 PUSH [0,36] (=t0)
+ 3 PUSH []  (=0)      8 PUSH [1]                     13 PUSH [0,0]   18 JUMP
+ 4 EQ                 9 EQ                           14 JUMP         …  t1@23, t0@25
+```
+`offsets "djmp_tramp_1" = 22`, `o2pc 22 = 15`, `offsets "t0" = 36`, `o2pc 36 = 25`, `|prog| = 27`.
+
+NON-VACUITY (`| _ => True` catch-all — the arm that fires must be checked, cf. the retracted
+`codegen_correct_ofRecipes`): for `vs0 := { default with currentBb := "entry", halted := false }` the
+hypotheses hold (`vs0.callCtx.callvalue = 0` is `true`) and `runContext 10 djCtx vs0` is `Halt` — the REAL
+arm, not the catch-all — with `runAsm … = AsmHalt` on the asm side. The conclusion has content. -/
+
+-- `AsmInst` derives only `Inhabited` (`AsmIR.lean:28`); the layout facts above are equalities on program
+-- instructions discharged by kernel reduction, which needs a `Decidable` instance. Derived proof-side so
+-- no compiler file changes.
+deriving instance DecidableEq for AsmInst
+
+set_option maxRecDepth 100000 in
+set_option maxHeartbeats 4000000 in
+theorem codegen_correct_djFn_recipeW {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    (hvshalt : vs.halted = false) (hzero : vs.callCtx.callvalue = EvmYul.UInt256.ofNat 0)
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    (match runContext 10 djCtx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan djFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan djFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan djFn 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan djFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan djFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan djFn 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan djFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan djFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan djFn 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  have hfnready : ∀ bb ∈ djFn.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst := by
+    intro bb hbb inst hinst
+    simp only [djFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    rcases hbb with rfl | rfl | rfl
+    · simp only [djEntry, List.mem_cons, List.not_mem_nil, or_false] at hinst
+      rcases hinst with rfl | rfl <;> (unfold codegenReadyInst; decide)
+    · simp only [djT0', List.mem_singleton] at hinst; subst hinst; unfold codegenReadyInst; decide
+    · simp only [djT1', List.mem_singleton] at hinst; subst hinst; unfold codegenReadyInst; decide
+  have hgen : generateFnPlan djFn 0 0 = some ((generateFnPlan djFn 0 0).get!.1, (generateFnPlan djFn 0 0).get!.2) := rfl
+  have hpsE : psOfFn (fnPlanFuel djFn) djFn 0 0 "entry" = initPlanState 0 :=
+    psOfFn_entry rfl hfnready (by simp only [fnPlanFuel]; omega)
+  refine codegen_correct_ofBlocks_recipeW_inv djInv
+    (lo := lo) (pcOf := pcOfLabel (asmResolve (executePlan (generateFnPlan djFn 0 0).get!.1)).1) (psOf := psOfFn (fnPlanFuel djFn) djFn 0 0)
+    (wOf := fun l => (asmResolve (executePlan (generateFnPlan djFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan djFn 0 0).get!.1)).1 l)
+    (offsets := (computeLabelOffsets (executePlan (generateFnPlan djFn 0 0).get!.1)).2)
+    (fuel := 10) (ctx := djCtx) (fn := djFn) (fnEom := 0) (lblCtr := 0)
+    (entryName := "main") (entryLbl := "entry")
+    (ops := (generateFnPlan djFn 0 0).get!.1) (psFinal := (generateFnPlan djFn 0 0).get!.2)
+    hgen rfl rfl rfl ?_ ?_ djInv_pres ?_ ⟨by simpa using hvshalt, by simpa using hzero⟩
+  case _ =>
+    intro bb hbb s
+    simp only [djFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    rcases hbb with rfl | rfl | rfl
+    · simp [runBlock, evalPhis, execBlock, djEntry, djS]
+    · simp [runBlock, evalPhis, execBlock, djT0', stopInst]
+    · simp [runBlock, evalPhis, execBlock, djT1', stopInst]
+  case _ =>
+    intro bb hbb s asm N k hE hinv hlbleq
+    obtain ⟨⟨bb0, hlk_s, hvrel, hpc_asm⟩, hwN, hhalt⟩ := hE
+    obtain ⟨hnh, hcv⟩ := hinv
+    simp only [djFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    rcases hbb with rfl | rfl | rfl
+    · have hlbl : s.currentBb = "entry" := hlbleq
+      rw [hlbl] at hvrel hpc_asm
+      have hpc0 : asm.pc = 0 := by rw [hpc_asm]; exact pcOfLabel_entry_zero rfl hfnready hgen
+      match k with
+      | 0 => exact Or.inl ⟨"out of fuel", by simp [runBlock, evalPhis, phiPrefixLength, execBlock,
+               getInstruction, djEntry, djS, stepInstBase, execRead0, isTerminator]⟩
+      | (j+1) =>
+      rw [show j+1+1 = ([djS] : List Instruction).length + (j+1) from by
+        simp only [List.length_cons, List.length_nil]; omega]
+      refine Or.inr (hsupplyW_regularDjmp
+        (liveness := exLiveness) (dfg := DfgAnalysis.empty) (cfg := exCfg) (restFuel := j)
+        (front := [djS]) (dInst := djD) (hd := djS) (tl := [djD])
+        (nextLiveness := ["a"]) (curBbLabel := "entry") (dem := 1) (S := []) (base := [])
+        (ps0 := initPlanState 0) (selvar := "a") (idx := EvmYul.UInt256.ofNat 0)
+        (labelOps := [Operand.Label "t0", Operand.Label "t1"]) (labels := ["t0","t1"]) (hi := djIdx_lt)
+        (pre := []) (matb := []) (tName := "djmp_tramp_1") (lName := "t0")
+        (matoff := 22) (idxTramp := 15) (loff := 36) (target := 25) (lc := 2)
+        (bb' := djT0') (sEnd := djSEnd s)
+        (hbb := rfl) (hop := rfl) (hoperands := rfl) (hselv := djEntry_sel s hcv)
+        (hlabels := djLabels) (hval := djEntry_sel s hcv) (hcons := rfl) (hphi := by decide)
+        (hnonterm := by intro i hi; simp only [List.mem_singleton] at hi; subst hi; decide)
+        (hthread := djEntry_thread s) (hnothalt := by simpa [updateVar] using hnh)
+        (hreg := djBody_regularBodyH)
+        (hsd := ⟨by intro op; rfl, by simp [initPlanState], by intro z hz; simp [initPlanState] at hz⟩)
+        (hsv := by simp [StackIsVars, initPlanState])
+        (hrel := by rw [hpsE] at hvrel; exact hvrel)
+        (hbLabel := by rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
+                       have hj' : j < 1 := hj; interval_cases j; rfl)
+        (hblock := by rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
+                      have hj' : j < 1 := hj; interval_cases j; rfl)
+        (hseltos := rfl) (hpsj := by decide +kernel) (hpct := ?hpct)
+        (hpre := by intro k hk; exact absurd hk (by simp))
+        (hmatch := ?hmatch) (hsel := ?hsel) (hidx_lk := ?hidx_lk)
+        (ht0 := ?ht0) (ht1 := ?ht1) (ht2 := ?ht2)
+        (hl_lk := ?hl_lk) (hloff := ?hloff) (ht3 := ?ht3)
+        (htarget_lk := ?htarget_lk) (hlk := rfl) (hw := ?hw))
+      case hpct => decide +kernel
+      case hmatch =>
+        rw [hpc0]
+        refine ⟨⟨by decide +kernel, ?_⟩, ⟨by decide +kernel, ?_⟩, ⟨by decide +kernel, ?_⟩,
+                ⟨by decide +kernel, ?_⟩, by decide +kernel, by decide,
+                ⟨by decide +kernel, ?_⟩⟩ <;> decide +kernel
+      case hsel => decide +kernel
+      case hidx_lk => decide +kernel
+      case ht0 => exact ⟨by decide +kernel, by decide +kernel⟩
+      case ht1 => exact ⟨by decide +kernel, by decide +kernel⟩
+      case ht2 => exact ⟨by decide +kernel, by decide +kernel⟩
+      case hl_lk => decide +kernel
+      case hloff => decide
+      case ht3 => exact ⟨by decide +kernel, by decide +kernel⟩
+      case htarget_lk => decide +kernel
+      case hw => decide +kernel
+    · have hlbl : s.currentBb = "t0" := hlbleq
+      rw [hlbl] at hvrel hpc_asm
+      have hpc25 : asm.pc = 25 := by rw [hpc_asm]; decide +kernel
+      exact Or.inr (hsupplyW_emptyStop (stopInst := stopInst)
+        (ps := psOfFn (fnPlanFuel djFn) djFn 0 0 "t0") rfl rfl hvrel
+        (by rw [hpc25]; refine ⟨by decide, fun j hj => ?_⟩
+            have hj' : j < 1 := hj; interval_cases j; rfl)
+        (by rw [hpc25]; decide +kernel) (by simp only [hpc25]; rfl) (by decide +kernel))
+    · have hlbl : s.currentBb = "t1" := hlbleq
+      rw [hlbl] at hvrel hpc_asm
+      have hpc23 : asm.pc = 23 := by rw [hpc_asm]; decide +kernel
+      exact Or.inr (hsupplyW_emptyStop (stopInst := stopInst)
+        (ps := psOfFn (fnPlanFuel djFn) djFn 0 0 "t1") rfl rfl hvrel
+        (by rw [hpc23]; refine ⟨by decide, fun j hj => ?_⟩
+            have hj' : j < 1 := hj; interval_cases j; rfl)
+        (by rw [hpc23]; decide +kernel) (by simp only [hpc23]; rfl) (by decide +kernel))
+  case _ =>
+    refine ⟨⟨djEntry, rfl, ?_, ?_⟩, ?_, hvshalt⟩
+    · show venomAsmRel lo (psOfFn (fnPlanFuel djFn) djFn 0 0 "entry") _ as
+      rw [hpsE]; exact hrel
+    · show as.pc = pcOfLabel (asmResolve (executePlan (generateFnPlan djFn 0 0).get!.1)).1 "entry"
+      rw [haspc]; exact (pcOfLabel_entry_zero rfl hfnready hgen).symm
+    · show (asmResolve (executePlan (generateFnPlan djFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan djFn 0 0).get!.1)).1 "entry" ≤ (asmResolve (executePlan (generateFnPlan djFn 0 0).get!.1)).1.length
+      omega
+
+/-! ### What "the recipe route models 8 terminator kinds" actually means — RET and SINK
+
+`isTerminator` admits TEN opcodes; `TermRecipeW`'s nine arms model EIGHT of them (JNZ takes two arms:
+taken and not-taken). The remaining two are NOT a uniform "out of scope" — they are excluded for two
+completely different reasons, and the difference is worth pinning down rather than asserting, since it is
+what the coverage claim rests on:
+
+* **SINK is excluded UPSTREAM.** `isPreCodegenOpcode SINK = true` (`CodegenPipeline.lean:37`), so
+  `codegenReadyInst` REJECTS it — `sink_not_codegenReady` below. Every capstone assumes `codegenReadyInst`,
+  so no admissible function can contain a SINK: earlier passes are required to have eliminated it. This is a
+  genuine, documented precondition.
+
+* **RET is NOT excluded — the statement simply says nothing about it.** `retA_codegenReady` proves RET IS
+  codegen-ready, `retA_isTerminator` that it is a real terminator, and the compiler really does emit code for
+  it (`CodegenPipeline.lean:228`: `SOEmit "JUMP"`, jumping to the return address INVOKE pushed). But RET's
+  semantics is `ExecResult.IntRet` (`Semantics.lean:389`) — an intra-contract return to an INVOKE caller —
+  and `IntRet` is routed to a trivial arm at EVERY layer: `runBlocks` propagates it unchanged
+  (`Exec.lean:171`), `HbsimMatch` sends it to `| _ => True`, `TermRecipeW` has no arm for it, and the
+  capstones' own statement matches only `Halt`/`Abort Revert`/`Abort ExHalt` with `| _ => True` catching the
+  rest. So for a function whose reachable terminator is RET, `codegen_correct` is VACUOUSLY TRUE.
+
+`codegen_correct_retFn_vacuous` makes that checkable instead of merely stated: it discharges the full
+capstone-shaped claim for `retFn` (`entry: RET 7`) using NO codegen machinery whatsoever — just
+`rw [retFn_intret]; trivial`. Its axioms are `[propext, Classical.choice, Quot.sound]`: not one fact about
+`generateFnPlan`, `asmResolve` or `runAsm` is needed, because the statement asserts nothing about them here.
+
+So the honest reading of "8/8": the eight modelled kinds are **exactly the terminator kinds for which
+`codegen_correct` has any content at all**. Of the other two, SINK cannot occur in an admissible function,
+and RET can — but produces a claim with no content. Covering RET for real means a DIFFERENT statement, one
+relating `IntRet`'s returned values to the asm side at the INVOKE boundary; that is not a missing recipe
+arm, it is a missing theorem shape. -/
+
+theorem runBlock_body_ret (ctx : VenomContext) (bb : BasicBlock) (restFuel : Nat)
+    (front : List Instruction) (retInst hd : Instruction) (tl : List Instruction)
+    (s sEnd : VenomState) (ops : List Operand) (vals : List bytes32)
+    (hbb : bb.instructions = front ++ [retInst]) (hop : retInst.opcode = Opcode.RET)
+    (hoperands : retInst.operands = ops) (hvals : evalOperands ops sEnd = some vals)
+    (hcons : front ++ [retInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd) :
+    runBlock (front.length + (restFuel + 1)) ctx bb s = ExecResult.IntRet vals sEnd := by
+  refine runBlock_body_term ctx bb restFuel front retInst hd tl s sEnd _ hbb hcons hphi hnonterm
+    hthread ?_
+  intro inst hget
+  simp only [execBlock, getInstruction_bodyEnd hbb hthread, stepInstBase, hop, hoperands, hvals]
+
+def retA : Instruction :=
+  { id := 0, opcode := Opcode.RET, operands := [Operand.Lit (EvmYul.UInt256.ofNat 7)], outputs := [] }
+def retEntry : BasicBlock := { label := "entry", instructions := [retA] }
+def retFn : IrFunction := { name := "main", blocks := [retEntry] }
+def retCtx : VenomContext := { functions := [retFn], entry := some "main" }
+
+/-- RET is **codegen-ready** — it is NOT excluded upstream. -/
+theorem retA_codegenReady : codegenReadyInst retA := by unfold codegenReadyInst; decide
+
+/-- RET is a genuine terminator, and the compiler really emits code for it
+    (`CodegenPipeline.lean:228`: `SOEmit "JUMP"`). -/
+theorem retA_isTerminator : isTerminator retA.opcode = true := by decide
+
+/-- SINK, by contrast, IS excluded upstream: `isPreCodegenOpcode SINK = true`. -/
+theorem sink_not_codegenReady :
+    ¬ codegenReadyInst { id := 0, opcode := Opcode.SINK, operands := [], outputs := [] } := by
+  unfold codegenReadyInst; decide
+
+theorem retEntry_intret (s : VenomState) (j : Nat) :
+    runBlock (0 + (j + 1)) retCtx retEntry s
+      = ExecResult.IntRet [EvmYul.UInt256.ofNat 7] { s with instIdx := 0 } :=
+  runBlock_body_ret retCtx retEntry j [] retA retA [] s { s with instIdx := 0 }
+    [Operand.Lit (EvmYul.UInt256.ofNat 7)] [EvmYul.UInt256.ofNat 7]
+    rfl rfl rfl rfl rfl (by decide) (by intro i hi; cases hi) (by simp [execBodyThread])
+
+theorem retFn_intret (vs : VenomState) :
+    runContext 10 retCtx vs
+      = ExecResult.IntRet [EvmYul.UInt256.ofNat 7]
+          { vs with prevBb := none, currentBb := "entry", instIdx := 0 } := by
+  have h0 : runContext 10 retCtx vs
+      = runBlocks 10 retCtx retFn { vs with prevBb := none, currentBb := "entry", instIdx := 0 } := by
+    simp [runContext, runFunction, retCtx, retFn, lookupFunction, fnEntryLabel, retEntry]
+  have hlk : lookupBlock ({ vs with prevBb := none, currentBb := "entry", instIdx := 0 } : VenomState).currentBb
+      retFn.blocks = some retEntry := rfl
+  have hb := retEntry_intret { vs with prevBb := none, currentBb := "entry", instIdx := 0 } 8
+  rw [show (0 : Nat) + (8 + 1) = 9 from by omega] at hb
+  rw [h0]
+  have := runBlocks_intret_of_block (fuel := 9) hlk hb
+  simpa using this
+
+/-- **The `codegen_correct`-shaped claim for `retFn` is TRUE and EMPTY.** No codegen reasoning is used:
+    RET's result is `IntRet`, which the statement routes to `| _ => True`. This is what "the recipe route
+    models 8 kinds" actually means — the other codegen-ready terminator, RET, is one the theorem SAYS
+    NOTHING ABOUT, rather than one it gets wrong or one that is excluded upstream. -/
+theorem codegen_correct_retFn_vacuous {vs : VenomState} {as : AsmState} :
+    (match runContext 10 retCtx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan retFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan retFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan retFn 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan retFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan retFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan retFn 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan retFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan retFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan retFn 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  rw [retFn_intret vs]
+  trivial
+
+/-! ### Why `tFn`/`rFn` are narrow — it is NOT `fnEom`, and NOT a missing allocating function
+
+The RETURN/REVERT capstones carry `callvalue = 0`, forced by REVERT/RETURN's two side conditions:
+
+    hbelow : off + sz ≤ ps'.alloc.fnEom
+    hcov0  : sz.toNat = 0 ∨ ((off.toNat + sz.toNat + 31) / 32) * 32 ≤ asm.memory.size
+
+I recorded the cause as "`fnEom = 0` (`PlanTypes.lean:50-55`) forces `off = sz = 0`; a symbolic-size capstone
+needs a function whose plan actually ALLOCATES". **That diagnosis is wrong, and the theorems below refute
+it.** `fnEom` is a plain PARAMETER of `generateFnPlan` — `generateFnPlan fn fnEom lblCtr`, reaching
+`initPlanState fnEom` — and I had simply been instantiating it at `0` in every capstone. Raising it costs
+nothing: `tFn_prog_indep_fnEom`/`rFn_prog_indep_fnEom` show the emitted program at `fnEom = 32` is
+BYTE-IDENTICAL to the one at `fnEom = 0` (`fnEom` only seeds the spill allocator's `nextOffset`, and these
+functions spill nothing), while `tFn_next_fnEom`/`rFn_next_fnEom` show the value really does reach the
+SUCCESSOR's allocator — which is exactly what `hbelow` reads. So `hbelow` can be given as much room as one
+likes, on the same program, with no allocating function anywhere.
+
+**The binding constraint is `hcov0`**, and it is of a different KIND: `hbelow` is a fact about the PLAN,
+whereas `hcov0` is a fact about the ASM state's memory. With `sz ≠ 0` the left disjunct dies and one must
+prove `((off + sz + 31) / 32) * 32 ≤ asm.memory.size` — a property of the AsmState the driver hands to each
+block. `codegen_correct_ofBlocks_recipeW_inv` carries `Inv : VenomState → Prop`, which **cannot state it**.
+Note also that `memoryRel` (`CodegenRel.lean:412-414`) is byte-agreement outside the spill window and says
+NOTHING about `ByteArray.size`, so the relation does not supply it either.
+
+So the real shape of this gap: generalise the driver's invariant to `Inv : VenomState → AsmState → Prop`
+(the same move that `HbsimMatch_and_inv` already made for the VenomState-only `Inv`, since `Entry` is
+`VenomState → AsmState → Nat → Prop` and already carries the AsmState), and thread a memory-size lower
+bound across blocks. That is a driver generalisation, NOT a new example function — and it would also be the
+first invariant in this development to constrain the asm side. -/
+
+theorem tFn_prog_indep_fnEom :
+    (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).1
+      = (asmResolve (executePlan (generateFnPlan tFn 0 0).get!.1)).1 := by decide +kernel
+theorem rFn_prog_indep_fnEom :
+    (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).1
+      = (asmResolve (executePlan (generateFnPlan rFn 0 0).get!.1)).1 := by decide +kernel
+theorem tFn_next_fnEom : (psOfFn (fnPlanFuel tFn) tFn 32 0 "next").alloc.fnEom = 32 := by decide +kernel
+theorem rFn_next_fnEom : (psOfFn (fnPlanFuel rFn) rFn 32 0 "next").alloc.fnEom = 32 := by decide +kernel
+
+/-! ### ✅ SYMBOLIC-SIZE REVERT — `codegen_correct_rFn_symbolic`, and the first asm-side invariant
+
+Every previous RETURN/REVERT capstone pinned `callvalue = 0`. This one only BOUNDS it
+(`callvalue.toNat ≤ 16`), so the REVERT's offset and size are genuinely SYMBOLIC and can be non-zero.
+
+Two things made it possible, and both corrected an earlier belief of mine:
+* **`fnEom` is a free parameter** (see "Why `tFn`/`rFn` are narrow"): instantiating at `32` instead of `0`
+  gives `hbelow : off + sz ≤ 32` room on a BYTE-IDENTICAL program. `hbelow` was never the blocker.
+* **`hcov0` was the real blocker, and it needs an ASM fact** — `((off+sz+31)/32)*32 ≤ asm.memory.size` — which
+  `Inv : VenomState → Prop` cannot state. `mInv` therefore carries `64 ≤ a.memory.size`, threaded through the
+  JMP successor by `runAsm_memory_size_mono` (EVM memory only grows, so a LOWER bound is free). `mInv`'s
+  third component is the `tInv` trick (condition on `currentBb`, vacuous at entry) supplying the operands'
+  VALUES; dropping the old `hcv` rewrite from that proof is exactly what lets the value stay symbolic.
+
+No dispatcher change was needed: `HbsimMatch`'s Halt/Abort arms never mention `Entry`, so the REVERT block
+works for any invariant, and only the JMP arm had to be generalised.
+
+NON-VACUITY: `rFn_reverts_sym` proves `runContext 10 rCtx vs = Abort RevertAbort vs'` for EVERY non-halted
+`vs` — no call-value constraint at all — so the `Abort RevertAbort` arm is the one that fires, not the
+`| _ => True` catch-all, across the whole symbolic range. -/
+
+def mInv (s : VenomState) (a : AsmState) : Prop :=
+  s.callCtx.callvalue.toNat ≤ 16 ∧ 64 ≤ a.memory.size ∧
+  (s.currentBb = "next" → lookupVar "s" s = some s.callCtx.callvalue
+                        ∧ lookupVar "o" s = some s.callCtx.callvalue)
+
+theorem rBody_regularBodyH32 {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat} :
+    RegularBodyH lo ["s","o"] offsetToPc
+      (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).1 1 [tS, tO] [] := by
+  refine ⟨cv_step (out := "s") (S := []) rfl (by decide) (by decide), ?_, trivial⟩
+  exact cv_step (out := "o") (S := [] ++ tS.outputs) rfl (by decide) (by decide)
+
+-- layout at fnEom := 32 (program is byte-identical to fnEom := 0, see tFn_prog_indep_fnEom)
+theorem r32_entry_pc : pcOfLabel (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).1 "entry" = 0 := by
+  decide +kernel
+theorem r32_next_pc : pcOfLabel (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).1 "next" = 5 := by
+  decide +kernel
+theorem r32_len : (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).1.length = 8 := by
+  decide +kernel
+theorem r32_psE : psOfFn (fnPlanFuel rFn) rFn 32 0 "entry" = initPlanState 32 := by
+  decide +kernel
+
+theorem codegen_correct_rFn_symbolic {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    (hvshalt : vs.halted = false)
+    (hcv : vs.callCtx.callvalue.toNat ≤ 16)
+    (hmem : 64 ≤ as.memory.size)
+    (hrel : venomAsmRel lo (initPlanState 32) vs as) (haspc : as.pc = 0) :
+    (match runContext 10 rCtx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  refine codegen_correct_ofBlocks_HbsimMatch
+    (Entry := fun s a n => CanonEntryWH rFn lo (pcOfLabel (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).1)
+        (psOfFn (fnPlanFuel rFn) rFn 32 0) (fun l => (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).1 l) s a n ∧ mInv s a)
+    (fnEom := 32) (lblCtr := 0) (ctx := rCtx) (fn := rFn) (fuel := 10)
+    (entryName := "main") (entryLbl := "entry")
+    (ops := (generateFnPlan rFn 32 0).get!.1) (psFinal := (generateFnPlan rFn 32 0).get!.2)
+    rfl rfl rfl rfl ?_ ?_
+  case _ =>
+    intro bb hbb s asm N f' hE hlbleq
+    obtain ⟨⟨⟨bb0, hlk_s, hvrel, hpc_asm⟩, hwN, hhalt⟩, hcvS, hmemS, hvarS⟩ := hE
+    simp only [rFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    rcases hbb with rfl | rfl
+    · -- entry : %s = CALLVALUE ; %o = CALLVALUE ; JMP next
+      have hlbl : s.currentBb = "entry" := hlbleq
+      rw [hlbl] at hvrel hpc_asm hwN
+      have hpc0 : asm.pc = 0 := by rw [hpc_asm]; exact r32_entry_pc
+      match f' with
+      | 0 => rw [show runBlock 0 rCtx tEntry s = ExecResult.Error "out of fuel" from by
+               simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, tEntry, tS,
+                 stepInstBase, execRead0, isTerminator]]
+             simp [HbsimMatch]
+      | 1 => rw [show runBlock 1 rCtx tEntry s = ExecResult.Error "out of fuel" from by
+               simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, tEntry, tS,
+                 stepInstBase, execRead0, isTerminator]]
+             simp [HbsimMatch]
+      | 2 => rw [show runBlock 2 rCtx tEntry s = ExecResult.Error "out of fuel" from by
+               simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, tEntry, tS, tO,
+                 stepInstBase, execRead0, isTerminator]]
+             simp [HbsimMatch]
+      | (j+3) =>
+        obtain ⟨as', hbody, hrel', hpcas⟩ :=
+          labelThenBody_sim (liveness := exLiveness) (dfg := DfgAnalysis.empty) (cfg := exCfg)
+            (fn := rFn) (nextLiveness := ["s","o"]) (curBbLabel := "entry") (dem := 1)
+            (ps0 := initPlanState 32) (S := []) (bb := tEntry) (front := [tS, tO]) (sEnd := tSEnd s)
+            (tEntry_thread s) rBody_regularBodyH32
+            ⟨by intro op; rfl, by simp [initPlanState], by intro z hz; simp [initPlanState] at hz⟩
+            (by simp [StackIsVars, initPlanState])
+            (by rw [r32_psE] at hvrel; exact hvrel)
+            (by rw [hpc0]; refine ⟨by decide +kernel, fun k hk => ?_⟩
+                have hk' : k < 1 := hk; interval_cases k; rfl)
+            (by rw [hpc0]; refine ⟨by decide +kernel, fun k hk => ?_⟩
+                have hk' : k < 2 := hk; interval_cases k <;> rfl)
+        have has'pc : as'.pc = 3 := by rw [hpcas, hpc0]; rfl
+        have hp1 : as'.pc < (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).1.length := by rw [has'pc]; decide +kernel
+        have hp2 : as'.pc + 1 < (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).1.length := by rw [has'pc]; decide +kernel
+        have hgetP : (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).1.get ⟨as'.pc, hp1⟩
+            = resolveInst (computeLabelOffsets (executePlan (generateFnPlan rFn 32 0).get!.1)).2
+                (AsmInst.AsmPushLabel "next") := by
+          conv_lhs => rw [show (⟨as'.pc, hp1⟩ : Fin _) = ⟨3, by decide +kernel⟩ from Fin.ext has'pc]
+          rfl
+        have hgetJ : (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).1.get ⟨as'.pc + 1, hp2⟩ = AsmInst.AsmOp "JUMP" := by
+          conv_lhs => rw [show (⟨as'.pc + 1, hp2⟩ : Fin _) = ⟨4, by decide +kernel⟩ from
+            Fin.ext (show as'.pc + 1 = 4 by rw [has'pc])]
+          rfl
+        rw [show j+3 = 2+(j+1) from by omega]
+        refine HbsimMatch_jmp_from_body_canonWH_invA (bb' := rNext) (target := "next") (off := 7)
+          (rEntry_runBlock s j (by simpa using hhalt)) (by simpa [updateVar] using hhalt)
+          hbody hrel' rfl hp1 hgetP (by decide +kernel) (by decide) hp2 hgetJ
+          (by decide +kernel) rfl
+          (by decide +kernel) hwN ?_
+        refine ⟨?_, ?_, ?_⟩
+        · show (jumpTo "next" (tSEnd s)).callCtx.callvalue.toNat ≤ 16
+          simpa [jumpTo, tSEnd, updateVar] using hcvS
+        · show 64 ≤ as'.memory.size
+          exact le_trans hmemS (runAsm_memory_size_mono hbody)
+        · intro _
+          have hcvj : (jumpTo "next" (tSEnd s)).callCtx.callvalue = s.callCtx.callvalue := by
+            simp [jumpTo, tSEnd, updateVar]
+          rw [hcvj]
+          constructor
+          · show lookupVar "s" (updateVar "o" s.callCtx.callvalue
+              { updateVar "s" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 })
+              = some s.callCtx.callvalue
+            rw [lookupVar_updateVar_ne _ _ _ _ (by decide)]
+            show lookupVar "s" (updateVar "s" s.callCtx.callvalue { s with instIdx := 0 })
+              = some s.callCtx.callvalue
+            rw [lookupVar_updateVar_self]
+          · show lookupVar "o" (updateVar "o" s.callCtx.callvalue
+              { updateVar "s" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 })
+              = some s.callCtx.callvalue
+            rw [lookupVar_updateVar_self]
+    · -- next : REVERT %s %o, with SYMBOLIC operands
+      have hlbl : s.currentBb = "next" := hlbleq
+      rw [hlbl] at hvrel hpc_asm hwN
+      have hpc5 : asm.pc = 5 := by rw [hpc_asm]; exact r32_next_pc
+      obtain ⟨hs, ho⟩ := hvarS hlbl
+      have hs' : evalOperand (Operand.Var "s") { s with instIdx := 0 }
+          = some s.callCtx.callvalue := hs
+      have ho' : evalOperand (Operand.Var "o") { s with instIdx := 0 }
+          = some s.callCtx.callvalue := ho
+      match f' with
+      | 0 => rw [show runBlock 0 rCtx rNext s = ExecResult.Error "out of fuel" from by
+               simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, rNext, rR,
+                 stepInstBase, isTerminator]]
+             simp [HbsimMatch]
+      | (j+1) =>
+        obtain ⟨as', ps'', vs'', bodyLen, hbody, hrecipe⟩ :=
+          hsupplyW_emptyRevertReorder (fn := rFn) (lo := lo) (k := j)
+            (pcOf := pcOfLabel (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).1) (psOf := psOfFn (fnPlanFuel rFn) rFn 32 0)
+            (wOf := fun l => (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).1 l)
+            (o2pc := (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).2) (offsets := (computeLabelOffsets (executePlan (generateFnPlan rFn 32 0).get!.1)).2)
+            (prog := (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).1) (asm := asm) (ctx := rCtx) (bb := rNext) (s := s) (tInst := rR)
+            (offv := "s") (szv := "o")
+            (woff := s.callCtx.callvalue) (wsz := s.callCtx.callvalue) (base := [])
+            (perm := [Operand.Var "s", Operand.Var "o"])
+            (ps := psOfFn (fnPlanFuel rFn) rFn 32 0 "next")
+            (hbb := rfl) (hop := rfl) (hoperands := rfl)
+            (hevaloff := hs') (hevalsz := ho') (hvoff := hs') (hvsz := ho')
+            (hrel := hvrel)
+            (hbLabel := by rw [hpc5]; refine ⟨by decide +kernel, fun k hk => ?_⟩
+                           have hk' : k < 1 := hk; interval_cases k; rfl)
+            (hperm := by decide) (hpsstk := by decide +kernel) (hbound := by decide +kernel)
+            (hnospill := by intro o; rfl) (hreorder := rfl)
+            (hblockR := by rw [hpc5]; refine ⟨by decide +kernel, fun k hk => ?_⟩
+                           have hk' : k < 1 := hk; interval_cases k; rfl)
+            (hpc := by rw [hpc5]; decide +kernel) (hget := by simp only [hpc5]; rfl)
+            (hcov0 := Or.inr (by
+              have h2 : s.callCtx.callvalue.toNat + s.callCtx.callvalue.toNat ≤ 32 := by omega
+              omega))
+            (hbelow := by
+              show s.callCtx.callvalue.toNat + s.callCtx.callvalue.toNat ≤ 32
+              omega)
+            (hlenu := by
+              have : s.callCtx.callvalue.toNat ≤ 16 := hcvS
+              have hus : (16 : Nat) < USize.size := by
+                have := USize.size_eq; omega
+              omega)
+            (hw := by decide +kernel)
+        have hrb : runBlock (j+1) rCtx rNext s
+            = ExecResult.Abort AbortType.RevertAbort
+                (revertState (setReturndata (readMemory s.callCtx.callvalue.toNat
+                  s.callCtx.callvalue.toNat { s with instIdx := 0 }) { s with instIdx := 0 })) := by
+          have := runBlock_body_revert rCtx rNext j [] rR rR [] s { s with instIdx := 0 }
+            (Operand.Var "s") (Operand.Var "o") s.callCtx.callvalue s.callCtx.callvalue
+            rfl rfl rfl hs' ho' rfl (by decide) (by intro i hi; cases hi) (by simp [execBodyThread])
+          simpa using this
+        have h := HbsimMatch_dispatchW hbody hwN hrecipe
+        rw [hrb] at h ⊢
+        simp only [HbsimMatch] at h ⊢
+        exact h
+  case _ =>
+    refine ⟨⟨⟨tEntry, rfl, ?_, ?_⟩, ?_, hvshalt⟩, ?_, ?_, ?_⟩
+    · show venomAsmRel lo (psOfFn (fnPlanFuel rFn) rFn 32 0 "entry") _ as
+      rw [r32_psE]; exact hrel
+    · show as.pc = pcOfLabel (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).1 "entry"
+      rw [haspc, r32_entry_pc]
+    · show (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).1 "entry" ≤ (asmResolve (executePlan (generateFnPlan rFn 32 0).get!.1)).1.length
+      omega
+    · simpa using hcv
+    · simpa using hmem
+    · intro hcontra; exact absurd hcontra (by simp)
+
+
+/-- **Non-vacuity for the SYMBOLIC statement**: the `Abort RevertAbort` arm fires for EVERY state the
+    capstone's hypotheses admit — including a NON-ZERO call value. Same shape as `rFn_reverts`, but the
+    call value is only BOUNDED, never pinned. -/
+theorem rFn_reverts_sym (vs : VenomState) (hnh : vs.halted = false) :
+    ∃ vs', runContext 10 rCtx vs = ExecResult.Abort AbortType.RevertAbort vs' := by
+  have h0 : runContext 10 rCtx vs
+      = runBlocks 10 rCtx rFn { vs with prevBb := none, currentBb := "entry", instIdx := 0 } := by
+    simp [runContext, runFunction, rCtx, rFn, lookupFunction, fnEntryLabel, tEntry]
+  set s0 : VenomState := { vs with prevBb := none, currentBb := "entry", instIdx := 0 } with hs0
+  have hnh0 : s0.halted = false := by simpa [hs0] using hnh
+  have hentry : runBlock 9 rCtx tEntry s0 = ExecResult.OK (jumpTo "next" (tSEnd s0)) := by
+    rw [show (9 : Nat) = 2 + (6 + 1) from by omega]; exact rEntry_runBlock s0 6 hnh0
+  have hlk0 : lookupBlock s0.currentBb rFn.blocks = some tEntry := rfl
+  have hjh : (jumpTo "next" (tSEnd s0)).halted = false := by simpa [jumpTo, updateVar] using hnh0
+  have hstep : runBlocks 10 rCtx rFn s0 = runBlocks 9 rCtx rFn (jumpTo "next" (tSEnd s0)) :=
+    runBlocks_step_of_block (fuel := 9) hlk0 hentry hjh
+  have hs : lookupVar "s" (jumpTo "next" (tSEnd s0)) = some s0.callCtx.callvalue := by
+    show lookupVar "s" (updateVar "o" s0.callCtx.callvalue
+      { updateVar "s" s0.callCtx.callvalue { s0 with instIdx := 0 } with instIdx := 1 })
+      = some s0.callCtx.callvalue
+    rw [lookupVar_updateVar_ne _ _ _ _ (by decide)]
+    show lookupVar "s" (updateVar "s" s0.callCtx.callvalue { s0 with instIdx := 0 })
+      = some s0.callCtx.callvalue
+    rw [lookupVar_updateVar_self]
+  have ho : lookupVar "o" (jumpTo "next" (tSEnd s0)) = some s0.callCtx.callvalue := by
+    show lookupVar "o" (updateVar "o" s0.callCtx.callvalue
+      { updateVar "s" s0.callCtx.callvalue { s0 with instIdx := 0 } with instIdx := 1 })
+      = some s0.callCtx.callvalue
+    rw [lookupVar_updateVar_self]
+  have hlk1 : lookupBlock (jumpTo "next" (tSEnd s0)).currentBb rFn.blocks = some rNext := rfl
+  have hrev := runBlock_body_revert rCtx rNext 7 [] rR rR [] (jumpTo "next" (tSEnd s0))
+    { (jumpTo "next" (tSEnd s0)) with instIdx := 0 } (Operand.Var "s") (Operand.Var "o")
+    s0.callCtx.callvalue s0.callCtx.callvalue rfl rfl rfl hs ho rfl (by decide)
+    (by intro i hi; cases hi) (by simp [execBodyThread])
+  rw [show ([] : List Instruction).length + (7 + 1) = 8 from by simp] at hrev
+  rw [h0, hstep]
+  exact ⟨_, runBlocks_abort_of_block hlk1 hrev⟩
+
+
+/-! ### ✅ SYMBOLIC-SIZE RETURN — `codegen_correct_tFn_symbolic`, the halting twin
+
+The RETURN counterpart of `codegen_correct_rFn_symbolic`, and a near-mechanical transfer of it: `tFn` and
+`rFn` share an entry block and differ only in the terminator, so `hsupplyW_emptyReturnReorder` slots in where
+the REVERT one did and `mInv` is reused verbatim. The differences are entirely in the RESULT: RETURN yields
+`Halt (haltState (setReturndata (readMemory off sz sEnd) sEnd))` rather than `Abort RevertAbort`, so the
+walk composes with `runBlocks_haltDirect_of_block` (RETURN halts DIRECTLY — it is not `OK` + `halted := true`,
+which is what `runBlocks_halt_of_block` is for) and the capstone's `Halt` arm fires.
+
+With this, BOTH memory-returning terminators are proved at symbolic size: the call value is only bounded
+(`≤ 16`), never pinned, so `off`/`sz` may be non-zero. `tFn_returns_sym` witnesses non-vacuity — every
+non-halted `vs` reaches `Halt`, with no call-value constraint. -/
+
+theorem tBody_regularBodyH32 {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat} :
+    RegularBodyH lo ["s","o"] offsetToPc
+      (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).1 1 [tS, tO] [] := by
+  refine ⟨cv_step (out := "s") (S := []) rfl (by decide) (by decide), ?_, trivial⟩
+  exact cv_step (out := "o") (S := [] ++ tS.outputs) rfl (by decide) (by decide)
+
+-- layout at fnEom := 32 (program is byte-identical to fnEom := 0, see tFn_prog_indep_fnEom)
+theorem t32_entry_pc : pcOfLabel (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).1 "entry" = 0 := by
+  decide +kernel
+theorem t32_next_pc : pcOfLabel (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).1 "next" = 5 := by
+  decide +kernel
+theorem t32_len : (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).1.length = 8 := by
+  decide +kernel
+theorem t32_psE : psOfFn (fnPlanFuel tFn) tFn 32 0 "entry" = initPlanState 32 := by
+  decide +kernel
+
+theorem codegen_correct_tFn_symbolic {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    (hvshalt : vs.halted = false)
+    (hcv : vs.callCtx.callvalue.toNat ≤ 16)
+    (hmem : 64 ≤ as.memory.size)
+    (hrel : venomAsmRel lo (initPlanState 32) vs as) (haspc : as.pc = 0) :
+    (match runContext 10 tCtx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  refine codegen_correct_ofBlocks_HbsimMatch
+    (Entry := fun s a n => CanonEntryWH tFn lo (pcOfLabel (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).1)
+        (psOfFn (fnPlanFuel tFn) tFn 32 0) (fun l => (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).1 l) s a n ∧ mInv s a)
+    (fnEom := 32) (lblCtr := 0) (ctx := tCtx) (fn := tFn) (fuel := 10)
+    (entryName := "main") (entryLbl := "entry")
+    (ops := (generateFnPlan tFn 32 0).get!.1) (psFinal := (generateFnPlan tFn 32 0).get!.2)
+    rfl rfl rfl rfl ?_ ?_
+  case _ =>
+    intro bb hbb s asm N f' hE hlbleq
+    obtain ⟨⟨⟨bb0, hlk_s, hvrel, hpc_asm⟩, hwN, hhalt⟩, hcvS, hmemS, hvarS⟩ := hE
+    simp only [tFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    rcases hbb with rfl | rfl
+    · -- entry : %s = CALLVALUE ; %o = CALLVALUE ; JMP next
+      have hlbl : s.currentBb = "entry" := hlbleq
+      rw [hlbl] at hvrel hpc_asm hwN
+      have hpc0 : asm.pc = 0 := by rw [hpc_asm]; exact t32_entry_pc
+      match f' with
+      | 0 => rw [show runBlock 0 tCtx tEntry s = ExecResult.Error "out of fuel" from by
+               simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, tEntry, tS,
+                 stepInstBase, execRead0, isTerminator]]
+             simp [HbsimMatch]
+      | 1 => rw [show runBlock 1 tCtx tEntry s = ExecResult.Error "out of fuel" from by
+               simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, tEntry, tS,
+                 stepInstBase, execRead0, isTerminator]]
+             simp [HbsimMatch]
+      | 2 => rw [show runBlock 2 tCtx tEntry s = ExecResult.Error "out of fuel" from by
+               simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, tEntry, tS, tO,
+                 stepInstBase, execRead0, isTerminator]]
+             simp [HbsimMatch]
+      | (j+3) =>
+        obtain ⟨as', hbody, hrel', hpcas⟩ :=
+          labelThenBody_sim (liveness := exLiveness) (dfg := DfgAnalysis.empty) (cfg := exCfg)
+            (fn := tFn) (nextLiveness := ["s","o"]) (curBbLabel := "entry") (dem := 1)
+            (ps0 := initPlanState 32) (S := []) (bb := tEntry) (front := [tS, tO]) (sEnd := tSEnd s)
+            (tEntry_thread s) tBody_regularBodyH32
+            ⟨by intro op; rfl, by simp [initPlanState], by intro z hz; simp [initPlanState] at hz⟩
+            (by simp [StackIsVars, initPlanState])
+            (by rw [t32_psE] at hvrel; exact hvrel)
+            (by rw [hpc0]; refine ⟨by decide +kernel, fun k hk => ?_⟩
+                have hk' : k < 1 := hk; interval_cases k; rfl)
+            (by rw [hpc0]; refine ⟨by decide +kernel, fun k hk => ?_⟩
+                have hk' : k < 2 := hk; interval_cases k <;> rfl)
+        have has'pc : as'.pc = 3 := by rw [hpcas, hpc0]; rfl
+        have hp1 : as'.pc < (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).1.length := by rw [has'pc]; decide +kernel
+        have hp2 : as'.pc + 1 < (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).1.length := by rw [has'pc]; decide +kernel
+        have hgetP : (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).1.get ⟨as'.pc, hp1⟩
+            = resolveInst (computeLabelOffsets (executePlan (generateFnPlan tFn 32 0).get!.1)).2
+                (AsmInst.AsmPushLabel "next") := by
+          conv_lhs => rw [show (⟨as'.pc, hp1⟩ : Fin _) = ⟨3, by decide +kernel⟩ from Fin.ext has'pc]
+          rfl
+        have hgetJ : (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).1.get ⟨as'.pc + 1, hp2⟩ = AsmInst.AsmOp "JUMP" := by
+          conv_lhs => rw [show (⟨as'.pc + 1, hp2⟩ : Fin _) = ⟨4, by decide +kernel⟩ from
+            Fin.ext (show as'.pc + 1 = 4 by rw [has'pc])]
+          rfl
+        rw [show j+3 = 2+(j+1) from by omega]
+        refine HbsimMatch_jmp_from_body_canonWH_invA (bb' := tNext) (target := "next") (off := 7)
+          (tEntry_runBlock s j (by simpa using hhalt)) (by simpa [updateVar] using hhalt)
+          hbody hrel' rfl hp1 hgetP (by decide +kernel) (by decide) hp2 hgetJ
+          (by decide +kernel) rfl
+          (by decide +kernel) hwN ?_
+        refine ⟨?_, ?_, ?_⟩
+        · show (jumpTo "next" (tSEnd s)).callCtx.callvalue.toNat ≤ 16
+          simpa [jumpTo, tSEnd, updateVar] using hcvS
+        · show 64 ≤ as'.memory.size
+          exact le_trans hmemS (runAsm_memory_size_mono hbody)
+        · intro _
+          have hcvj : (jumpTo "next" (tSEnd s)).callCtx.callvalue = s.callCtx.callvalue := by
+            simp [jumpTo, tSEnd, updateVar]
+          rw [hcvj]
+          constructor
+          · show lookupVar "s" (updateVar "o" s.callCtx.callvalue
+              { updateVar "s" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 })
+              = some s.callCtx.callvalue
+            rw [lookupVar_updateVar_ne _ _ _ _ (by decide)]
+            show lookupVar "s" (updateVar "s" s.callCtx.callvalue { s with instIdx := 0 })
+              = some s.callCtx.callvalue
+            rw [lookupVar_updateVar_self]
+          · show lookupVar "o" (updateVar "o" s.callCtx.callvalue
+              { updateVar "s" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 })
+              = some s.callCtx.callvalue
+            rw [lookupVar_updateVar_self]
+    · -- next : REVERT %s %o, with SYMBOLIC operands
+      have hlbl : s.currentBb = "next" := hlbleq
+      rw [hlbl] at hvrel hpc_asm hwN
+      have hpc5 : asm.pc = 5 := by rw [hpc_asm]; exact t32_next_pc
+      obtain ⟨hs, ho⟩ := hvarS hlbl
+      have hs' : evalOperand (Operand.Var "s") { s with instIdx := 0 }
+          = some s.callCtx.callvalue := hs
+      have ho' : evalOperand (Operand.Var "o") { s with instIdx := 0 }
+          = some s.callCtx.callvalue := ho
+      match f' with
+      | 0 => rw [show runBlock 0 tCtx tNext s = ExecResult.Error "out of fuel" from by
+               simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, tNext, tR,
+                 stepInstBase, isTerminator]]
+             simp [HbsimMatch]
+      | (j+1) =>
+        obtain ⟨as', ps'', vs'', bodyLen, hbody, hrecipe⟩ :=
+          hsupplyW_emptyReturnReorder (fn := tFn) (lo := lo) (k := j)
+            (pcOf := pcOfLabel (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).1) (psOf := psOfFn (fnPlanFuel tFn) tFn 32 0)
+            (wOf := fun l => (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).1 l)
+            (o2pc := (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).2) (offsets := (computeLabelOffsets (executePlan (generateFnPlan tFn 32 0).get!.1)).2)
+            (prog := (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).1) (asm := asm) (ctx := tCtx) (bb := tNext) (s := s) (tInst := tR)
+            (offv := "s") (szv := "o")
+            (woff := s.callCtx.callvalue) (wsz := s.callCtx.callvalue) (base := [])
+            (perm := [Operand.Var "s", Operand.Var "o"])
+            (ps := psOfFn (fnPlanFuel tFn) tFn 32 0 "next")
+            (hbb := rfl) (hop := rfl) (hoperands := rfl)
+            (hevaloff := hs') (hevalsz := ho') (hvoff := hs') (hvsz := ho')
+            (hrel := hvrel)
+            (hbLabel := by rw [hpc5]; refine ⟨by decide +kernel, fun k hk => ?_⟩
+                           have hk' : k < 1 := hk; interval_cases k; rfl)
+            (hperm := by decide) (hpsstk := by decide +kernel) (hbound := by decide +kernel)
+            (hnospill := by intro o; rfl) (hreorder := rfl)
+            (hblockR := by rw [hpc5]; refine ⟨by decide +kernel, fun k hk => ?_⟩
+                           have hk' : k < 1 := hk; interval_cases k; rfl)
+            (hpc := by rw [hpc5]; decide +kernel) (hget := by simp only [hpc5]; rfl)
+            (hcov0 := Or.inr (by
+              have h2 : s.callCtx.callvalue.toNat + s.callCtx.callvalue.toNat ≤ 32 := by omega
+              omega))
+            (hbelow := by
+              show s.callCtx.callvalue.toNat + s.callCtx.callvalue.toNat ≤ 32
+              omega)
+            (hlenu := by
+              have : s.callCtx.callvalue.toNat ≤ 16 := hcvS
+              have hus : (16 : Nat) < USize.size := by
+                have := USize.size_eq; omega
+              omega)
+            (hw := by decide +kernel)
+        have hrb : runBlock (j+1) tCtx tNext s
+            = ExecResult.Halt
+                (haltState (setReturndata (readMemory s.callCtx.callvalue.toNat
+                  s.callCtx.callvalue.toNat { s with instIdx := 0 }) { s with instIdx := 0 })) := by
+          have := runBlock_body_return tCtx tNext j [] tR tR [] s { s with instIdx := 0 }
+            (Operand.Var "s") (Operand.Var "o") s.callCtx.callvalue s.callCtx.callvalue
+            rfl rfl rfl hs' ho' rfl (by decide) (by intro i hi; cases hi) (by simp [execBodyThread])
+          simpa using this
+        have h := HbsimMatch_dispatchW hbody hwN hrecipe
+        rw [hrb] at h ⊢
+        simp only [HbsimMatch] at h ⊢
+        exact h
+  case _ =>
+    refine ⟨⟨⟨tEntry, rfl, ?_, ?_⟩, ?_, hvshalt⟩, ?_, ?_, ?_⟩
+    · show venomAsmRel lo (psOfFn (fnPlanFuel tFn) tFn 32 0 "entry") _ as
+      rw [t32_psE]; exact hrel
+    · show as.pc = pcOfLabel (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).1 "entry"
+      rw [haspc, t32_entry_pc]
+    · show (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).1 "entry" ≤ (asmResolve (executePlan (generateFnPlan tFn 32 0).get!.1)).1.length
+      omega
+    · simpa using hcv
+    · simpa using hmem
+    · intro hcontra; exact absurd hcontra (by simp)
+
+
+/-- **Non-vacuity for the SYMBOLIC statement**: the `Abort RevertAbort` arm fires for EVERY state the
+    capstone's hypotheses admit — including a NON-ZERO call value. Same shape as `tFn_reverts`, but the
+    call value is only BOUNDED, never pinned. -/
+theorem tFn_returns_sym (vs : VenomState) (hnh : vs.halted = false) :
+    ∃ vs', runContext 10 tCtx vs = ExecResult.Halt vs' := by
+  have h0 : runContext 10 tCtx vs
+      = runBlocks 10 tCtx tFn { vs with prevBb := none, currentBb := "entry", instIdx := 0 } := by
+    simp [runContext, runFunction, tCtx, tFn, lookupFunction, fnEntryLabel, tEntry]
+  set s0 : VenomState := { vs with prevBb := none, currentBb := "entry", instIdx := 0 } with hs0
+  have hnh0 : s0.halted = false := by simpa [hs0] using hnh
+  have hentry : runBlock 9 tCtx tEntry s0 = ExecResult.OK (jumpTo "next" (tSEnd s0)) := by
+    rw [show (9 : Nat) = 2 + (6 + 1) from by omega]; exact tEntry_runBlock s0 6 hnh0
+  have hlk0 : lookupBlock s0.currentBb tFn.blocks = some tEntry := rfl
+  have hjh : (jumpTo "next" (tSEnd s0)).halted = false := by simpa [jumpTo, updateVar] using hnh0
+  have hstep : runBlocks 10 tCtx tFn s0 = runBlocks 9 tCtx tFn (jumpTo "next" (tSEnd s0)) :=
+    runBlocks_step_of_block (fuel := 9) hlk0 hentry hjh
+  have hs : lookupVar "s" (jumpTo "next" (tSEnd s0)) = some s0.callCtx.callvalue := by
+    show lookupVar "s" (updateVar "o" s0.callCtx.callvalue
+      { updateVar "s" s0.callCtx.callvalue { s0 with instIdx := 0 } with instIdx := 1 })
+      = some s0.callCtx.callvalue
+    rw [lookupVar_updateVar_ne _ _ _ _ (by decide)]
+    show lookupVar "s" (updateVar "s" s0.callCtx.callvalue { s0 with instIdx := 0 })
+      = some s0.callCtx.callvalue
+    rw [lookupVar_updateVar_self]
+  have ho : lookupVar "o" (jumpTo "next" (tSEnd s0)) = some s0.callCtx.callvalue := by
+    show lookupVar "o" (updateVar "o" s0.callCtx.callvalue
+      { updateVar "s" s0.callCtx.callvalue { s0 with instIdx := 0 } with instIdx := 1 })
+      = some s0.callCtx.callvalue
+    rw [lookupVar_updateVar_self]
+  have hlk1 : lookupBlock (jumpTo "next" (tSEnd s0)).currentBb tFn.blocks = some tNext := rfl
+  have hrev := runBlock_body_return tCtx tNext 7 [] tR tR [] (jumpTo "next" (tSEnd s0))
+    { (jumpTo "next" (tSEnd s0)) with instIdx := 0 } (Operand.Var "s") (Operand.Var "o")
+    s0.callCtx.callvalue s0.callCtx.callvalue rfl rfl rfl hs ho rfl (by decide)
+    (by intro i hi; cases hi) (by simp [execBodyThread])
+  rw [show ([] : List Instruction).length + (7 + 1) = 8 from by simp] at hrev
+  rw [h0, hstep]
+  exact ⟨_, runBlocks_haltDirect_of_block hlk1 hrev⟩
+
+end Example
+
+/-- **Non-vacuity: a bare STOP block drives the full dispatcher** (STOP arm; empty body). -/
+theorem HbsimMatch_dispatch_nonvacuous {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {as0 : AsmState} {ps : PlanState} {N f' : Nat}
+    {ctx : VenomContext} {bb : BasicBlock} {s : VenomState} {stopInst : Instruction}
+    (hbb : bb.instructions = [stopInst]) (hstopop : stopInst.opcode = Opcode.STOP)
+    (hrel : venomAsmRel lo ps { s with instIdx := 0 } as0)
+    (hstoppc : as0.pc < prog.length) (hstop : prog.get ⟨as0.pc, hstoppc⟩ = AsmInst.AsmOp "STOP")
+    (hle : 0 + 1 ≤ N) :
+    HbsimMatch (CanonEntry fn lo pcOf psOf) o2pc prog as0 N
+      (runBlock (f' + 1) ctx bb { s with instIdx := 0 }) := by
+  have hrb : runBlock (f' + 1) ctx bb { s with instIdx := 0 }
+      = ExecResult.Halt (haltState { s with instIdx := 0 }) := by
+    simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, hbb, hstopop, stepInstBase]
+  refine HbsimMatch_dispatch (bodyLen := 0) (as' := as0) (ps' := ps) (vs' := { s with instIdx := 0 })
+    (offsets := offsets) (by simp [runAsm]) ?_
+  exact Or.inl ⟨hrel, hle, hrb, hstoppc, hstop⟩
+
+/-- **Non-vacuity: a JMP disjunct is also reachable** — the continuing branch is not dead. A block whose
+    body sim lands on `PUSH target; JUMP` at `as'.pc`, with the recorded plan matching the target and the
+    successor block present, drives the JMP arm. -/
+theorem HbsimMatch_dispatch_jmp_nonvacuous {fn : IrFunction} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {as0 as' : AsmState} {ps' : PlanState} {bodyLen N f' off : Nat}
+    {ctx : VenomContext} {bb bb' : BasicBlock} {s vs' : VenomState} {target : String}
+    (hbody : runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as')
+    (hrel' : venomAsmRel lo ps' vs' as') (hps : ps' = psOf target)
+    (hnh : vs'.halted = false)
+    (hrb : runBlock f' ctx bb s = ExecResult.OK (jumpTo target vs'))
+    (hp1 : as'.pc < prog.length)
+    (hpush : prog.get ⟨as'.pc, hp1⟩ = resolveInst offsets (AsmInst.AsmPushLabel target))
+    (hoff_lk : AssocList.lookup String Nat offsets target = some off) (hoff : off < 2 ^ 256)
+    (hp2 : as'.pc + 1 < prog.length) (hjump : prog.get ⟨as'.pc + 1, hp2⟩ = AsmInst.AsmOp "JUMP")
+    (hidx_lk : AssocList.lookup Nat Nat o2pc off = some (pcOf target))
+    (hlk' : lookupBlock target fn.blocks = some bb') (hle : bodyLen + 2 ≤ N) :
+    HbsimMatch (CanonEntry fn lo pcOf psOf) o2pc prog as0 N (runBlock f' ctx bb s) :=
+  HbsimMatch_dispatch (offsets := offsets) hbody
+    (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl
+      ⟨target, off, bb', hrel', hps, hle, hnh, hrb, ⟨hp1, hpush⟩, hoff_lk, hoff, ⟨hp2, hjump⟩,
+        hidx_lk, hlk'⟩))))))
+
+/-! ## ⚠️ RETRACTED: `codegen_correct_ofRecipes` + `termRecipe_stop_inhabited` (VACUOUS — unconstrained ∀-N)
+
+A naive top-level composition `codegen_correct_ofRecipes` (dispatcher ∘ `codegen_correct_ofBlocks_HbsimMatch`
+with `Entry := CanonEntry`) was retracted here: it was VACUOUS.  `codegen_correct_ofBlocks_HbsimMatch`'s
+`hstep` is `∀ N`, and `CanonEntry` does NOT constrain `N`.  For a halting block at `N = 0` (or any
+`N < blockLen`) with `f' ≥ 1`, `runBlock = Halt` but `HbsimMatch (Halt) N` needs `runAsm N … = AsmHalt`,
+which is FALSE for `N < blockLen` — and no terminator recipe (whose `hle : bodyLen + K ≤ N` fails) nor a
+fuel/IntRet escape hatch (the result is `Halt`, not `Error`) can cover it.  So the recipe hypothesis was
+unsatisfiable for such `(N, f')`, which `CanonEntry` admits.  `termRecipe_stop_inhabited` "witnessed" only
+a single `f' + 1` / `N ≥ 1` instance, NOT the `∀ N` premise, so it did not establish non-vacuity (honesty
+lesson: a witness for one instantiation of a `∀`-hypothesis does not witness the whole `∀`).
+
+The working concrete route (`codegen_correct_singleBlockHalt`) shows the fix: the `Entry` must CONSTRAIN
+`N` (there, `N = (asmResolve (executePlan ops)).1.length`), so small-`N` states never satisfy the entry
+invariant; the general case additionally threads `N' = N − blockLen` to successors (what the established
+`codegen_correct_{sched,fuel}` drivers already do for the hstep family).  The recipe route is SOUND and
+COMPLETE at the per-block level — `HbsimMatch_dispatch` (`TermRecipe` → `HbsimMatch`) plus the eight
+`termRecipe_*` producers (`RegularBodyH`/emit-segment → `TermRecipe`) — and connects to the top level via
+an N-constrained Entry, which is the remaining assembly work, not a per-block gap. -/
+
+
+/-- **`HbsimMatch` is Entry-independent on any non-`OK` result.** Only the `OK`-continuing arm mentions
+    `Entry` (it must state the successor invariant); the `Halt`/`Abort`/`IntRet`/`Error` arms do not. So a
+    halting/aborting block's `HbsimMatch`, proved for one `Entry`, transfers to any other. This is the fact
+    that lets a recipe-produced `HbsimMatch` (`HbsimMatch_dispatch` gives it for `CanonEntry`) feed a driver
+    using a *different*, N-constrained `Entry` — the halting half of the top-level connection sketched in
+    the retraction note above (the continuing half additionally needs the successor recorded against the
+    N-constrained Entry). -/
+theorem HbsimMatch_entry_irrel {E1 E2 : VenomState → AsmState → Nat → Prop}
+    {o2pc : AssocList Nat Nat} {prog : List AsmInst} {asm : AsmState} {N : Nat} {r : ExecResult}
+    (hr : ∀ s', r ≠ ExecResult.OK s') :
+    HbsimMatch E1 o2pc prog asm N r → HbsimMatch E2 o2pc prog asm N r := by
+  cases r with
+  | OK s' => exact absurd rfl (hr s')
+  | Halt s' => exact id
+  | Abort a s' => cases a <;> exact id
+  | IntRet _ _ => exact id
+  | Error _ => exact id
+
+/-- Non-vacuity: a halting result exercises the transfer between two genuinely different `Entry`s. -/
+theorem HbsimMatch_entry_irrel_nonvacuous
+    {o2pc : AssocList Nat Nat} {prog : List AsmInst} {asm : AsmState} {N : Nat} {s' : VenomState}
+    (h : HbsimMatch (fun _ _ _ => True) o2pc prog asm N (ExecResult.Halt s')) :
+    HbsimMatch (fun _ _ _ => False) o2pc prog asm N (ExecResult.Halt s') :=
+  HbsimMatch_entry_irrel (by intro s' h; cases h) h
+
+/-- **Prepend one OK asm step to a `HbsimMatch`.** If the block's `HbsimMatch` holds at the post-SOLabel
+    state `as0` with budget `N`, and one asm step from `asm` lands at `as0` (`runAsm 1 … asm = AsmOK as0` —
+    e.g. stepping over the block's `JUMPDEST`/SOLabel), then it holds at `asm` with budget `1 + N`. Every
+    arm references `runAsm _ … asm`, and `runAsm (1+N) … asm = runAsm N … as0` (`runAsm_add_ok`), so each
+    arm transfers unchanged. This is the SOLabel step of the top-level connection: the walk enters a block
+    at its SOLabel, but a recipe operates one step later. -/
+theorem HbsimMatch_prepend_ok_step {E : VenomState → AsmState → Nat → Prop}
+    {o2pc : AssocList Nat Nat} {prog : List AsmInst} {asm as0 : AsmState} {N : Nat} {r : ExecResult}
+    (hstep : runAsm 1 o2pc prog asm = AsmResult.AsmOK as0)
+    (h : HbsimMatch E o2pc prog as0 N r) :
+    HbsimMatch E o2pc prog asm (1 + N) r := by
+  have hc : runAsm (1 + N) o2pc prog asm = runAsm N o2pc prog as0 := runAsm_add_ok hstep
+  unfold HbsimMatch at h ⊢
+  cases r with
+  | OK s' => simp only [hc]; exact h
+  | Halt s' => simp only [hc]; exact h
+  | Abort a s' => cases a <;> (simp only [hc]; exact h)
+  | IntRet _ _ => exact h
+  | Error _ => exact h
+
+/-- **Entry-transferring SOLabel connector for a halting/aborting block** (`r` not `OK`). The recipe's
+    `HbsimMatch` at the post-SOLabel state `as0` — which `HbsimMatch_dispatch` produces for the recipe's own
+    `Entry` — transfers to ANY Entry `E2` (`HbsimMatch_entry_irrel`, the halt arm is Entry-free) and prepends
+    the SOLabel step (`HbsimMatch_prepend_ok_step`), yielding a `HbsimMatch` at the block's SOLabel entry
+    `asm` for a driver's own Entry.
+
+    NB this serves the *Entry-transfer* driver shape and is not on the route actually shipped: the
+    single-block halting capstones go through `hasm_from_recipe_solabel` (recipe → `hasm` →
+    `Example.codegen_correct_singleBlockHalt`), and the multi-block driver
+    `codegen_correct_ofBlocks_recipeW` absorbs the SOLabel step into `bodyLen` instead. Kept as the general
+    fact for that alternative shape. -/
+theorem HbsimMatch_halting_at_solabel {E1 E2 : VenomState → AsmState → Nat → Prop}
+    {o2pc : AssocList Nat Nat} {prog : List AsmInst} {asm as0 : AsmState} {N : Nat} {r : ExecResult}
+    (hr : ∀ s', r ≠ ExecResult.OK s')
+    (hstep : runAsm 1 o2pc prog asm = AsmResult.AsmOK as0)
+    (h : HbsimMatch E1 o2pc prog as0 N r) :
+    HbsimMatch E2 o2pc prog asm (1 + N) r :=
+  HbsimMatch_prepend_ok_step hstep (HbsimMatch_entry_irrel hr h)
+
+/-- **The recipe → `hasm` bridge.** From a halting block's `HbsimMatch` at the post-SOLabel state `as0`
+    (`HbsimMatch_dispatch` produces it from the block's `TermRecipe`), one SOLabel step
+    (`runAsm 1 … asm = AsmOK as0`), and a budget `1 + N ≤ M`, derive the whole-block asm-halt fact
+    `∃ asm', runAsm M … asm = AsmHalt asm' ∧ venomAsmTerminalRel s' asm'` — exactly the `hasm` hypothesis
+    `codegen_correct_singleBlockHalt` consumes. So the recipe route reaches a whole-function
+    `codegen_correct` for a single-block halting function by feeding this into the existing driver
+    (`HbsimMatch_prepend_ok_step` prepends the SOLabel step; `runAsm_le_of_ne_ok` lifts to `M`, `AsmHalt`
+    being sticky). -/
+theorem hasm_from_recipe_solabel {E : VenomState → AsmState → Nat → Prop}
+    {o2pc : AssocList Nat Nat} {prog : List AsmInst} {asm as0 : AsmState} {N M : Nat} {s' : VenomState}
+    (hsolabel : runAsm 1 o2pc prog asm = AsmResult.AsmOK as0)
+    (hrec : HbsimMatch E o2pc prog as0 N (ExecResult.Halt s')) (hbudget : 1 + N ≤ M) :
+    ∃ asm', runAsm M o2pc prog asm = AsmResult.AsmHalt asm' ∧ venomAsmTerminalRel s' asm' := by
+  have h1 := HbsimMatch_prepend_ok_step hsolabel hrec
+  simp only [HbsimMatch] at h1
+  obtain ⟨asm', hrun, hrel⟩ := h1
+  exact ⟨asm', runAsm_le_of_ne_ok (fun s => by simp) hbudget hrun, hrel⟩
+
+/-- **A single-block halting function's `codegen_correct`, via the recipe route.** Composes the existing
+    driver `Example.codegen_correct_singleBlockHalt` with the recipe → `hasm` bridge
+    `hasm_from_recipe_solabel`: given, per arriving state, the SOLabel step and the block's
+    `HbsimMatch (Halt)` at the post-SOLabel state (which `HbsimMatch_dispatch` produces from the block's
+    `TermRecipe`), plus a budget, the whole function's `codegen_correct` holds. The recipe route reaching a
+    whole-function `codegen_correct` — the halting single-block case — with the constrained `N` handled
+    entirely by the driver's `Entry` (which bakes `N = programLength`). -/
+theorem codegen_correct_singleBlockHalt_viaRecipe
+    {fuel : Nat} {ctx : VenomContext} {fn : IrFunction} {fnEom lblCtr : Nat}
+    {ops : List StackOp} {psFinal : PlanState} {vs : VenomState} {as : AsmState}
+    {entryName entryLbl : String} {bb : BasicBlock}
+    {lo : AssocList String Nat} {haltFn : VenomState → VenomState}
+    {E : VenomState → AsmState → Nat → Prop} {N : Nat}
+    (hplan : generateFnPlan fn fnEom lblCtr = some (ops, psFinal))
+    (hent : ctx.entry = some entryName)
+    (hlk : lookupFunction entryName ctx.functions = some fn)
+    (hlbl : fnEntryLabel fn = some entryLbl)
+    (hblocks : fn.blocks = [bb])
+    (hrunHalt : ∀ (k : Nat) (s : VenomState), runBlock (k+1) ctx bb s = ExecResult.Halt (haltFn s))
+    (hrun0 : ∀ (s : VenomState), runBlock 0 ctx bb s = ExecResult.Error "out of fuel")
+    (hstep : ∀ (s : VenomState) (asm : AsmState),
+        venomAsmRel lo (initPlanState 0) s asm → asm.pc = 0 →
+        ∃ as0, runAsm 1 (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 asm
+                 = AsmResult.AsmOK as0 ∧
+               HbsimMatch E (asmResolve (executePlan ops)).2 (asmResolve (executePlan ops)).1 as0 N
+                 (ExecResult.Halt (haltFn s)))
+    (hbudget : 1 + N ≤ (asmResolve (executePlan ops)).1.length)
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    (match runContext fuel ctx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length (asmResolve (executePlan ops)).2
+         (asmResolve (executePlan ops)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length (asmResolve (executePlan ops)).2
+         (asmResolve (executePlan ops)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan ops)).1.length (asmResolve (executePlan ops)).2
+         (asmResolve (executePlan ops)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  refine Example.codegen_correct_singleBlockHalt hplan hent hlk hlbl hblocks hrunHalt hrun0 ?_ hrel haspc
+  intro s asm hv hp
+  obtain ⟨as0, hsolabel, hrec⟩ := hstep s asm hv hp
+  exact hasm_from_recipe_solabel hsolabel hrec hbudget
+
+namespace Example
+
+/-- **The recipe route reaches `codegen_correct` for `stopCtx`, non-vacuously.** Witnesses
+    `codegen_correct_singleBlockHalt_viaRecipe`: `stopFn`'s generated program `[JUMPDEST "entry"; STOP]`
+    discharges the recipe `hstep` — the SOLabel step (`asmStep_label_ok`) lands at the post-SOLabel state,
+    the block's `HbsimMatch (Halt)` there is the STOP step (`asmStep_stop_ok`) plus the entry-derived
+    terminal relation (`venomAsmRel_terminal`) — and the budget `1 + 1 ≤ 2`. Exhibits the full
+    recipe → `hasm` → driver chain end-to-end (same result as the direct `codegen_correct_stop`, via the
+    recipe machinery — the exhibit-a-witness discipline the retracted `codegen_correct_ofRecipes` skipped). -/
+theorem codegen_correct_stop_viaRecipe {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    (match runContext 10 stopCtx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan stopFn 0 0).get!.1)).1.length
+         (asmResolve (executePlan (generateFnPlan stopFn 0 0).get!.1)).2
+         (asmResolve (executePlan (generateFnPlan stopFn 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan stopFn 0 0).get!.1)).1.length
+         (asmResolve (executePlan (generateFnPlan stopFn 0 0).get!.1)).2
+         (asmResolve (executePlan (generateFnPlan stopFn 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan stopFn 0 0).get!.1)).1.length
+         (asmResolve (executePlan (generateFnPlan stopFn 0 0).get!.1)).2
+         (asmResolve (executePlan (generateFnPlan stopFn 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  refine codegen_correct_singleBlockHalt_viaRecipe (fuel := 10) (ctx := stopCtx) (fn := stopFn) (bb := stopBB)
+    (entryName := "main") (entryLbl := "entry")
+    (haltFn := fun s => haltState { s with instIdx := 0 })
+    (E := fun _ _ _ => True) (N := 1)
+    (ops := (generateFnPlan stopFn 0 0).get!.1) (psFinal := (generateFnPlan stopFn 0 0).get!.2)
+    rfl rfl rfl rfl rfl ?_ ?_ ?_ ?_ hrel haspc
+  · intro k s; simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, stopBB, stopInst, stepInstBase]
+  · intro s; simp [runBlock, evalPhis, execBlock, stopBB, stopInst]
+  · -- hstep: SOLabel (JUMPDEST) step + STOP HbsimMatch (Halt) at the post-SOLabel state
+    intro s asm hv hp
+    have hpc0 : asm.pc < (asmResolve (executePlan (generateFnPlan stopFn 0 0).get!.1)).1.length := by
+      rw [hp]; decide
+    have hpc1 : (asmNext asm).pc < (asmResolve (executePlan (generateFnPlan stopFn 0 0).get!.1)).1.length := by
+      show asm.pc + 1 < _; rw [hp]; decide
+    have hget0 : (asmResolve (executePlan (generateFnPlan stopFn 0 0).get!.1)).1.get ⟨asm.pc, hpc0⟩
+        = AsmInst.AsmLabel "entry" := by
+      rw [show (⟨asm.pc, hpc0⟩ : Fin _) = ⟨0, by decide⟩ from Fin.ext hp]; rfl
+    have hget1 : (asmResolve (executePlan (generateFnPlan stopFn 0 0).get!.1)).1.get ⟨(asmNext asm).pc, hpc1⟩
+        = AsmInst.AsmOp "STOP" := by
+      rw [show (⟨(asmNext asm).pc, hpc1⟩ : Fin _) = ⟨1, by decide⟩ from
+            Fin.ext (by show asm.pc + 1 = 1; rw [hp])]; rfl
+    refine ⟨asmNext asm, ?_, ?_⟩
+    · -- JUMPDEST step
+      show runAsm 1 _ _ asm = AsmResult.AsmOK (asmNext asm)
+      rw [show (1 : Nat) = 0 + 1 from rfl, runAsm_succ_ok hpc0 (asmStep_label_ok hpc0 hget0)]
+      rfl
+    · -- HbsimMatch (Halt) at (asmNext asm), budget 1
+      show HbsimMatch (fun _ _ _ => True) _ _ (asmNext asm) 1 (ExecResult.Halt (haltState { s with instIdx := 0 }))
+      unfold HbsimMatch
+      refine ⟨asmNext (asmNext asm), ?_, ?_⟩
+      · -- STOP step
+        show runAsm 1 _ _ (asmNext asm) = AsmResult.AsmHalt (asmNext (asmNext asm))
+        unfold runAsm
+        rw [asmStep_stop_ok hpc1 hget1]
+      · -- terminal relation
+        exact venomAsmRel_terminal lo (initPlanState 0) s asm hv
+  · -- budget: 1 + 1 ≤ programLength (= 2)
+    decide
+
+/-- **The recipe route reaches `codegen_correct` for `stopCtx`, with the `HbsimMatch` produced by the
+    dispatcher.** Where `codegen_correct_stop_viaRecipe` hand-constructs the STOP step, this discharges the
+    reduction's `hstep` `HbsimMatch (Halt)` through the *actual* recipe dispatcher
+    `HbsimMatch_halting_dispatch_nonvacuous` (STOP arm, empty body). So the whole recipe route is exhibited
+    end-to-end via the real machinery: recipe dispatcher (`HaltingTermRecipe` → `HbsimMatch`) → reduction
+    (`viaRecipe`) → whole-function `codegen_correct`. The dispatcher's `hrel` at the post-SOLabel state is
+    `venomAsmRel_setPc` of the entry relation (`venomAsmRel` ignores both pc and `instIdx`). Depends on the
+    M1 `ffi_zeroes` axioms — inherited from the dispatcher, whose per-terminator connectors thread the
+    machine-memory relation; those axioms are the development's allowed FFI boundary. (The hand-constructed
+    `viaRecipe`/`_stop_viaRecipe` stay base-axiom by extracting only the terminal relation.) -/
+theorem codegen_correct_stop_viaDispatch {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    (match runContext 10 stopCtx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan stopFn 0 0).get!.1)).1.length
+         (asmResolve (executePlan (generateFnPlan stopFn 0 0).get!.1)).2
+         (asmResolve (executePlan (generateFnPlan stopFn 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan stopFn 0 0).get!.1)).1.length
+         (asmResolve (executePlan (generateFnPlan stopFn 0 0).get!.1)).2
+         (asmResolve (executePlan (generateFnPlan stopFn 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan stopFn 0 0).get!.1)).1.length
+         (asmResolve (executePlan (generateFnPlan stopFn 0 0).get!.1)).2
+         (asmResolve (executePlan (generateFnPlan stopFn 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  refine codegen_correct_singleBlockHalt_viaRecipe (fuel := 10) (ctx := stopCtx) (fn := stopFn) (bb := stopBB)
+    (entryName := "main") (entryLbl := "entry")
+    (haltFn := fun s => haltState { s with instIdx := 0 })
+    (E := fun _ _ _ => True) (N := 1)
+    (ops := (generateFnPlan stopFn 0 0).get!.1) (psFinal := (generateFnPlan stopFn 0 0).get!.2)
+    rfl rfl rfl rfl rfl ?_ ?_ ?_ ?_ hrel haspc
+  · intro k s; simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, stopBB, stopInst, stepInstBase]
+  · intro s; simp [runBlock, evalPhis, execBlock, stopBB, stopInst]
+  · -- hstep: SOLabel (JUMPDEST) step + STOP HbsimMatch (Halt) via the dispatcher
+    intro s asm hv hp
+    have hpc0 : asm.pc < (asmResolve (executePlan (generateFnPlan stopFn 0 0).get!.1)).1.length := by
+      rw [hp]; decide
+    have hpc1 : (asmNext asm).pc < (asmResolve (executePlan (generateFnPlan stopFn 0 0).get!.1)).1.length := by
+      show asm.pc + 1 < _; rw [hp]; decide
+    have hget0 : (asmResolve (executePlan (generateFnPlan stopFn 0 0).get!.1)).1.get ⟨asm.pc, hpc0⟩
+        = AsmInst.AsmLabel "entry" := by
+      rw [show (⟨asm.pc, hpc0⟩ : Fin _) = ⟨0, by decide⟩ from Fin.ext hp]; rfl
+    have hget1 : (asmResolve (executePlan (generateFnPlan stopFn 0 0).get!.1)).1.get ⟨(asmNext asm).pc, hpc1⟩
+        = AsmInst.AsmOp "STOP" := by
+      rw [show (⟨(asmNext asm).pc, hpc1⟩ : Fin _) = ⟨1, by decide⟩ from
+            Fin.ext (by show asm.pc + 1 = 1; rw [hp])]; rfl
+    have hrb : runBlock 1 stopCtx stopBB { s with instIdx := 0 }
+        = ExecResult.Halt (haltState { s with instIdx := 0 }) := by
+      simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, stopBB, stopInst, stepInstBase]
+    refine ⟨asmNext asm, ?_, ?_⟩
+    · -- JUMPDEST step
+      show runAsm 1 _ _ asm = AsmResult.AsmOK (asmNext asm)
+      rw [show (1 : Nat) = 0 + 1 from rfl, runAsm_succ_ok hpc0 (asmStep_label_ok hpc0 hget0)]
+      rfl
+    · -- HbsimMatch (Halt) via the dispatcher (STOP arm, empty body)
+      have hdisp := HbsimMatch_halting_dispatch_nonvacuous
+        (Entry := fun _ _ _ => True)
+        (o2pc := (asmResolve (executePlan (generateFnPlan stopFn 0 0).get!.1)).2)
+        (ctx := stopCtx) (bb := stopBB) (s := s) (f' := 0) (stopInst := stopInst)
+        (rfl) (rfl) (venomAsmRel_setPc hv) hpc1 hget1 (le_refl 1)
+      rw [hrb] at hdisp
+      exact hdisp
+  · -- budget: 1 + 1 ≤ programLength (= 2)
+    decide
+
+set_option maxHeartbeats 1600000 in
+/-- **Body-carrying recipe route: `codegen_correct` for `sdCtx` via the dispatcher.** The first
+    single-block halting witness with a NON-empty body (`bodyLen = 1`): `sdFn`'s generated program
+    `[JUMPDEST "entry"; PUSH0; SELFDESTRUCT]` runs SOLabel → PUSH0 (the SELFDESTRUCT operand
+    materialization) → SELFDESTRUCT. The reduction's `hstep` `HbsimMatch (Halt)` is produced by the recipe
+    dispatcher `HbsimMatch_halting_dispatch` (SELFDESTRUCT arm) with `bodyLen = 1`, so the dispatcher's
+    `bodyLen > 0` path and its state-mutating SELFDESTRUCT arm are exercised end-to-end to
+    `codegen_correct`. The body-end relation `hrel'` is `planStackRel_push` of the entry relation (the
+    materialized literal `0`), the other 11 `venomAsmRel` conjuncts carrying over (PUSH touches only pc and
+    stack, `venomAsmRel` reads neither for them). The dispatcher's `ps'` is a free variable, so the
+    constructed plan state is sound — the produced `HbsimMatch (Halt)` (asm-halt + terminal relation) is
+    `ps'`-independent. Inherits the M1 axioms via the dispatcher's memory machinery. -/
+theorem codegen_correct_selfdestruct_viaDispatch {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    (match runContext 10 sdCtx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan sdFn 0 0).get!.1)).1.length
+         (asmResolve (executePlan (generateFnPlan sdFn 0 0).get!.1)).2
+         (asmResolve (executePlan (generateFnPlan sdFn 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan sdFn 0 0).get!.1)).1.length
+         (asmResolve (executePlan (generateFnPlan sdFn 0 0).get!.1)).2
+         (asmResolve (executePlan (generateFnPlan sdFn 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan sdFn 0 0).get!.1)).1.length
+         (asmResolve (executePlan (generateFnPlan sdFn 0 0).get!.1)).2
+         (asmResolve (executePlan (generateFnPlan sdFn 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  refine codegen_correct_singleBlockHalt_viaRecipe (fuel := 10) (ctx := sdCtx) (fn := sdFn) (bb := sdBB)
+    (entryName := "main") (entryLbl := "entry")
+    (haltFn := fun s => haltState (selfdestruct (UInt256.ofNat 0) { s with instIdx := 0 }))
+    (E := fun _ _ _ => True) (N := 2)
+    (ops := (generateFnPlan sdFn 0 0).get!.1) (psFinal := (generateFnPlan sdFn 0 0).get!.2)
+    rfl rfl rfl rfl rfl ?_ ?_ ?_ ?_ hrel haspc
+  · intro k s
+    have hstep : stepInstBase { id := 0, opcode := Opcode.SELFDESTRUCT, operands := [Operand.Lit (UInt256.ofNat 0)], outputs := [] } { s with instIdx := 0 } = ExecResult.Halt (haltState (selfdestruct (UInt256.ofNat 0) { s with instIdx := 0 })) := stepInstBase_selfdestruct rfl rfl rfl
+    simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, sdBB, sdInst, hstep]
+  · intro s; simp [runBlock, evalPhis, execBlock, sdBB, sdInst]
+  · -- hstep: SOLabel + PUSH0 body + SELFDESTRUCT via the dispatcher
+    intro s asm hv hp
+    set prog := (asmResolve (executePlan (generateFnPlan sdFn 0 0).get!.1)).1 with hprogdef
+    set o2pc := (asmResolve (executePlan (generateFnPlan sdFn 0 0).get!.1)).2 with ho2pcdef
+    set v := wordOfBytes (List.toByteArray (List.replicate (32 - (encodeNumBytes 0).length) (0 : byte)
+                ++ encodeNumBytes 0)) with hvdef
+    have hv0 : v = UInt256.ofNat 0 := by
+      have h : v.toNat = 0 := by rw [hvdef]; exact pushed_offset_toNat 0 (by norm_num)
+      exact congrArg UInt256.mk (Fin.ext (by
+        show v.toNat = (UInt256.ofNat 0).toNat; rw [h, uint256_ofNat_toNat]; omega))
+    set s1 : AsmState := asmNext asm with hs1
+    set s2 : AsmState := { asmNext s1 with stack := v :: s1.stack } with hs2
+    have p1 : s1.pc = 1 := by rw [hs1]; show asm.pc + 1 = 1; rw [hp]
+    have p2 : s2.pc = 2 := by rw [hs2]; show s1.pc + 1 = 2; rw [p1]
+    have hb0 : asm.pc < prog.length := by rw [hp]; decide
+    have hb1 : s1.pc < prog.length := by rw [p1]; decide
+    have hb2 : s2.pc < prog.length := by rw [p2]; decide
+    have g0 : prog.get ⟨asm.pc, hb0⟩ = AsmInst.AsmLabel "entry" := by
+      rw [show (⟨asm.pc, hb0⟩ : Fin _) = ⟨0, by decide⟩ from Fin.ext hp]; rfl
+    have g1 : prog.get ⟨s1.pc, hb1⟩ = AsmInst.AsmPush (encodeNumBytes 0) := by
+      rw [show (⟨s1.pc, hb1⟩ : Fin _) = ⟨1, by decide⟩ from Fin.ext p1]; rfl
+    have g2 : prog.get ⟨s2.pc, hb2⟩ = AsmInst.AsmOp "SELFDESTRUCT" := by
+      rw [show (⟨s2.pc, hb2⟩ : Fin _) = ⟨2, by decide⟩ from Fin.ext p2]; rfl
+    have e0 : asmStep o2pc prog asm = AsmResult.AsmOK s1 := asmStep_label_ok hb0 g0
+    have e1 : asmStep o2pc prog s1 = AsmResult.AsmOK s2 := by rw [asmStep_push_ok hb1 g1]; rfl
+    have hrb : runBlock 1 sdCtx sdBB { s with instIdx := 0 }
+        = ExecResult.Halt (haltState (selfdestruct (UInt256.ofNat 0) { s with instIdx := 0 })) := by
+      have hstep : stepInstBase { id := 0, opcode := Opcode.SELFDESTRUCT, operands := [Operand.Lit (UInt256.ofNat 0)], outputs := [] } { s with instIdx := 0 } = ExecResult.Halt (haltState (selfdestruct (UInt256.ofNat 0) { s with instIdx := 0 })) := stepInstBase_selfdestruct rfl rfl rfl
+      simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, sdBB, sdInst, hstep]
+    -- body-end relation via planStackRel_push
+    obtain ⟨hStk, hSpill, hMem, hAcc, hTrans, hRet, hLog, hCall, hTx, hBlk, hCode, hPrev⟩ := hv
+    have hrel' : venomAsmRel lo { initPlanState 0 with stack := stackPush (Operand.Lit v) (initPlanState 0).stack }
+        { s with instIdx := 0 } s2 :=
+      ⟨planStackRel_push hStk rfl, hSpill, hMem, hAcc, hTrans, hRet, hLog, hCall, hTx, hBlk, hCode, hPrev⟩
+    refine ⟨s1, ?_, ?_⟩
+    · -- SOLabel step
+      show runAsm 1 o2pc prog asm = AsmResult.AsmOK s1
+      rw [show (1 : Nat) = 0 + 1 from rfl, runAsm_succ_ok hb0 e0]; rfl
+    · -- HbsimMatch (Halt) via the dispatcher, SELFDESTRUCT arm, bodyLen = 1
+      have hdisp := HbsimMatch_halting_dispatch
+        (Entry := fun _ _ _ => True) (o2pc := o2pc) (prog := prog)
+        (as0 := s1) (as' := s2) (f' := 1) (bodyLen := 1) (N := 2)
+        (ps' := { initPlanState 0 with stack := stackPush (Operand.Lit v) (initPlanState 0).stack })
+        (ctx := sdCtx) (bb := sdBB) (s := { s with instIdx := 0 }) (vs' := { s with instIdx := 0 })
+        (by rw [show (1 : Nat) = 0 + 1 from rfl, runAsm_succ_ok hb1 e1]; rfl)
+        hrel' (le_refl 2)
+        (Or.inr (Or.inr (Or.inr (Or.inr ⟨UInt256.ofNat 0, s1.stack, ?_, ⟨hb2, g2⟩, ?_⟩))))
+      · rw [hrb] at hdisp; exact hdisp
+      · -- runBlock result matches the SELFDESTRUCT arm
+        rw [hrb]
+      · -- stack: s2.stack = (UInt256.ofNat 0) :: s1.stack
+        rw [hs2, hv0]
+  · -- budget: 1 + 2 ≤ programLength (= 3)
+    decide
+
+def invInst : Instruction := { id := 0, opcode := Opcode.INVALID, operands := [], outputs := [] }
+def invBB : BasicBlock := { label := "entry", instructions := [invInst] }
+def invFn : IrFunction := { name := "main", blocks := [invBB] }
+def invCtx : VenomContext := { functions := [invFn], entry := some "main" }
+
+set_option maxHeartbeats 1600000 in
+/-- **Aborting recipe route: `codegen_correct` for `invCtx` (`main: INVALID`).** The recipe route reaching
+    `codegen_correct` for a single-block ABORTING function — previous witnesses all HALT (STOP/SELFDESTRUCT).
+    `invFn`'s generated program `[JUMPDEST "entry"; INVALID]` runs JUMPDEST → INVALID (an exceptional halt,
+    `Abort ExHaltAbort`). The per-block obligation of `codegen_correct_ofBlocks_HbsimMatch` is discharged by
+    the INVALID recipe connector `HbsimMatch_invalid_from_body` with `bodyLen = 1` (the JUMPDEST as the
+    body), landing at the INVALID op with `venomAsmRel` carried by `venomAsmRel_setPc`. Exercises the
+    dispatcher's INVALID arm and the `Abort ExHaltAbort → AsmFault` `HbsimMatch` arm end-to-end. Base axioms
+    — the INVALID connector extracts only the terminal relation, so no memory machinery (contrast the
+    M1-dependent SELFDESTRUCT/dispatch witnesses). -/
+theorem codegen_correct_invalid {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    (match runContext 10 invCtx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).1.length
+         (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).2
+         (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).1.length
+         (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).2
+         (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).1.length
+         (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).2
+         (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  refine codegen_correct_ofBlocks_HbsimMatch
+    (Entry := fun s asm N => venomAsmRel lo (initPlanState 0) s asm ∧ asm.pc = 0 ∧
+       N = (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).1.length)
+    (fuel := 10) (ctx := invCtx) (fn := invFn) (fnEom := 0) (lblCtr := 0)
+    (entryName := "main") (entryLbl := "entry")
+    (ops := (generateFnPlan invFn 0 0).get!.1) (psFinal := (generateFnPlan invFn 0 0).get!.2)
+    rfl rfl rfl rfl ?_ ⟨hrel, haspc, rfl⟩
+  intro bb hbb s asm N f' hE hlbleq
+  obtain ⟨hvrel, hpc, hN⟩ := hE
+  have hbbeq : bb = invBB := by
+    simp only [invFn, List.mem_cons, List.not_mem_nil, or_false] at hbb; exact hbb
+  subst hbbeq
+  set prog := (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).1 with hprogdef
+  set o2pc := (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).2 with ho2pcdef
+  cases f' with
+  | zero => simp [runBlock, evalPhis, execBlock, invBB, invInst, HbsimMatch]
+  | succ k =>
+    have hrb : runBlock (k+1) invCtx invBB s
+        = ExecResult.Abort AbortType.ExHaltAbort (haltState (setReturndata ByteArray.empty { s with instIdx := 0 })) := by
+      simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, invBB, invInst, stepInstBase]
+    have hpc0 : asm.pc < prog.length := by rw [hpc]; decide
+    have hpc1 : (asmNext asm).pc < prog.length := by show asm.pc + 1 < _; rw [hpc]; decide
+    have g0 : prog.get ⟨asm.pc, hpc0⟩ = AsmInst.AsmLabel "entry" := by
+      rw [show (⟨asm.pc, hpc0⟩ : Fin _) = ⟨0, by decide⟩ from Fin.ext hpc]; rfl
+    have g1 : prog.get ⟨(asmNext asm).pc, hpc1⟩ = AsmInst.AsmOp "INVALID" := by
+      rw [show (⟨(asmNext asm).pc, hpc1⟩ : Fin _) = ⟨1, by decide⟩ from
+            Fin.ext (by show asm.pc + 1 = 1; rw [hpc])]; rfl
+    have hbody : runAsm 1 o2pc prog asm = AsmResult.AsmOK (asmNext asm) := by
+      rw [show (1 : Nat) = 0 + 1 from rfl, runAsm_succ_ok hpc0 (asmStep_label_ok hpc0 g0)]; rfl
+    refine HbsimMatch_invalid_from_body hrb hbody (venomAsmRel_setPc hvrel) hpc1 g1 ?_
+    rw [hN]; decide
+
+
+set_option maxHeartbeats 3200000 in
+/-- **`codegen_correct` for `entry: INVALID` via the generic driver.** The aborting single-block function on
+    the recipe route: `codegen_correct_ofBlocks_recipeW` + `hsupplyW_emptyInvalid`, against the real generated
+    `[JUMPDEST ; INVALID]`. (`codegen_correct_invalid` above proves the same statement through the older
+    dispatch route; this one exercises the generic `hsupply` slice instead, giving it its first consumer.) -/
+theorem codegen_correct_invalid_recipeW {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    (hvshalt : vs.halted = false)
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    (match runContext 10 invCtx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  have hfnready : ∀ bb ∈ invFn.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst := by
+    intro bb hbb inst hinst
+    simp only [invFn, List.mem_singleton] at hbb; subst hbb
+    simp only [invBB, List.mem_singleton] at hinst; subst hinst
+    unfold codegenReadyInst; decide
+  have hgen : generateFnPlan invFn 0 0
+      = some ((generateFnPlan invFn 0 0).get!.1, (generateFnPlan invFn 0 0).get!.2) := rfl
+  have hpsE : psOfFn (fnPlanFuel invFn) invFn 0 0 "entry" = initPlanState 0 :=
+    psOfFn_entry rfl hfnready (by simp only [fnPlanFuel]; omega)
+  refine codegen_correct_ofBlocks_recipeW
+    (lo := lo) (pcOf := pcOfLabel (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).1)
+    (psOf := psOfFn (fnPlanFuel invFn) invFn 0 0)
+    (wOf := fun l => (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).1 l)
+    (offsets := (computeLabelOffsets (executePlan (generateFnPlan invFn 0 0).get!.1)).2)
+    (fuel := 10) (ctx := invCtx) (fn := invFn) (fnEom := 0) (lblCtr := 0)
+    (entryName := "main") (entryLbl := "entry")
+    (ops := (generateFnPlan invFn 0 0).get!.1) (psFinal := (generateFnPlan invFn 0 0).get!.2)
+    hgen rfl rfl rfl ?_ ?_ ?_
+  case _ =>
+    intro bb hbb s
+    simp only [invFn, List.mem_singleton] at hbb; subst hbb
+    simp [runBlock, evalPhis, execBlock, invBB, invInst]
+  case _ =>
+    intro bb hbb s asm N k hE hlbleq
+    obtain ⟨⟨bb0, hlk_s, hvrel, hpc_asm⟩, hwN, hhalt⟩ := hE
+    simp only [invFn, List.mem_singleton] at hbb; subst hbb
+    have hlbl : s.currentBb = "entry" := hlbleq
+    rw [hlbl] at hvrel hpc_asm
+    have hpc0 : asm.pc = 0 := by rw [hpc_asm]; exact pcOfLabel_entry_zero rfl hfnready hgen
+    have hbLabel : asmBlockAt (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).1 asm.pc (executePlan [StackOp.SOLabel invBB.label]) := by
+      rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
+      have hj' : j < 1 := hj; interval_cases j; rfl
+    have hlt : asm.pc + 1 < (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).1.length := by rw [hpc0]; decide
+    have hinv : (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).1.get ⟨asm.pc + 1, hlt⟩ = AsmInst.AsmOp "INVALID" := by
+      simp only [hpc0]; rfl
+    exact Or.inr (hsupplyW_emptyInvalid (invInst := invInst)
+      (ps := psOfFn (fnPlanFuel invFn) invFn 0 0 "entry") rfl rfl hvrel hbLabel hlt hinv (by decide))
+  case _ =>
+    refine ⟨⟨invBB, rfl, ?_, ?_⟩, ?_, hvshalt⟩
+    · show venomAsmRel lo (psOfFn (fnPlanFuel invFn) invFn 0 0 "entry") _ as
+      rw [hpsE]; exact hrel
+    · show as.pc = pcOfLabel (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).1 "entry"
+      rw [haspc]; exact (pcOfLabel_entry_zero rfl hfnready hgen).symm
+    · show (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).1 "entry" ≤ (asmResolve (executePlan (generateFnPlan invFn 0 0).get!.1)).1.length
+      omega
+
+/-- **First MULTI-BLOCK `codegen_correct` via the recipe route** (`jmpStopFn`, `entry: JMP next ; next: STOP`).
+    Discharges the two-block driver `codegen_correct_ofBlocks_HbsimMatch` with the N-constrained walk Entry
+    `CanonEntryWH`: the JMP block via `HbsimMatch_jmp_from_body_canonWH` (continuing arm, threading wOf and
+    halted to `next`), the STOP block via `HbsimMatch_stop_from_body`. Recipe framing of the existing
+    non-recipe capstone `codegen_correct_canonical_jmpStop`. -/
+
+theorem codegen_correct_jmpStop_viaRecipe {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    (hvshalt : vs.halted = false)
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    (match runContext 10 jmpStopCtx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.length
+         (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).2
+         (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.length
+         (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).2
+         (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.length
+         (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).2
+         (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  have hfnready : ∀ bb ∈ jmpStopFn.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst := by
+    intro bb hbb inst hinst
+    simp only [jmpStopFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    rcases hbb with rfl | rfl
+    · simp only [jmpEntryBB, List.mem_singleton] at hinst; subst hinst; unfold codegenReadyInst; decide
+    · simp only [stopNextBB, List.mem_singleton] at hinst; subst hinst; unfold codegenReadyInst; decide
+  have hgen : generateFnPlan jmpStopFn 0 0
+      = some ((generateFnPlan jmpStopFn 0 0).get!.1, (generateFnPlan jmpStopFn 0 0).get!.2) := rfl
+  refine codegen_correct_ofBlocks_HbsimMatch
+    (Entry := CanonEntryWH jmpStopFn lo
+      (pcOfLabel (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1)
+      (psOfFn (fnPlanFuel jmpStopFn) jmpStopFn 0 0)
+      (fun l => (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.length
+        - pcOfLabel (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1 l))
+    (fuel := 10) (ctx := jmpStopCtx) (fn := jmpStopFn) (fnEom := 0) (lblCtr := 0)
+    (entryName := "main") (entryLbl := "entry")
+    (ops := (generateFnPlan jmpStopFn 0 0).get!.1) (psFinal := (generateFnPlan jmpStopFn 0 0).get!.2)
+    hgen rfl rfl rfl ?_ ?_
+  case _ =>
+    -- hstep : per-block
+    intro bb hbb s asm N f' hE hlbleq
+    obtain ⟨⟨bb0, hlk_s, hvrel, hpc_asm⟩, hwN, hhalt⟩ := hE
+    have hbb2 : bb = jmpEntryBB ∨ bb = stopNextBB := by
+      simp only [jmpStopFn, List.mem_cons, List.not_mem_nil, or_false] at hbb; exact hbb
+    rcases hbb2 with hbb | hbb <;> subst hbb
+    · -- entry block: JMP
+      have hlbl : s.currentBb = "entry" := hlbleq
+      rw [hlbl] at hvrel hpc_asm hwN
+      have hpsE : psOfFn (fnPlanFuel jmpStopFn) jmpStopFn 0 0 "entry" = initPlanState 0 :=
+        psOfFn_entry rfl hfnready (by simp only [fnPlanFuel]; omega)
+      have hpsN : psOfFn (fnPlanFuel jmpStopFn) jmpStopFn 0 0 "next" = initPlanState 0 := rfl
+      have hpc0 : asm.pc = 0 := by rw [hpc_asm]; exact pcOfLabel_entry_zero rfl hfnready hgen
+      cases f' with
+      | zero => simp [runBlock, evalPhis, execBlock, jmpEntryBB, jmpInst, HbsimMatch]
+      | succ k =>
+        have hrb : runBlock (k+1) jmpStopCtx jmpEntryBB s
+            = ExecResult.OK (jumpTo "next" { s with instIdx := 0 }) := by
+          simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, jmpEntryBB, jmpInst,
+            stepInstBase, isTerminator, jumpTo, hhalt]
+        have hnh : ({ s with instIdx := 0 } : VenomState).halted = false := by simpa using hhalt
+        have hbLabel : asmBlockAt (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1 asm.pc
+            (executePlan [StackOp.SOLabel "entry"]) := by
+          rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩; have hj' : j < 1 := hj; interval_cases j; rfl
+        obtain ⟨as1, hrun1, hrel1, hpc1'⟩ :=
+          soLabel_sim (offsetToPc := (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).2) lo
+            (psOfFn (fnPlanFuel jmpStopFn) jmpStopFn 0 0 "entry") s asm _ "entry" (by rw [hpsE]; exact hvrel) hbLabel
+        have hpc1'' : as1.pc = 1 := by rw [hpc1', hpc0]; decide
+        have hpc1lt : as1.pc < (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.length := by
+          rw [hpc1'']; decide
+        have hpush : (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.get ⟨as1.pc, hpc1lt⟩
+            = resolveInst (computeLabelOffsets (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).2 (AsmInst.AsmPushLabel "next") := by
+          conv_lhs => rw [show (⟨as1.pc, hpc1lt⟩ : Fin _) = ⟨1, by decide⟩ from Fin.ext hpc1'']
+          rfl
+        have hpc2lt : as1.pc + 1 < (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.length := by
+          rw [hpc1'']; decide
+        have e2 : as1.pc + 1 = 2 := by rw [hpc1'']
+        have hjump : (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.get ⟨as1.pc + 1, hpc2lt⟩
+            = AsmInst.AsmOp "JUMP" := by
+          conv_lhs => rw [show (⟨as1.pc + 1, hpc2lt⟩ : Fin _) = ⟨2, by decide⟩ from Fin.ext e2]
+          rfl
+        refine HbsimMatch_jmp_from_body_canonWH (target := "next") (off := 5) (bb' := stopNextBB)
+          (bodyLen := 1) (ps' := psOfFn (fnPlanFuel jmpStopFn) jmpStopFn 0 0 "next")
+          hrb hnh hrun1 (by rw [hpsN]; rw [hpsE] at hrel1; exact hrel1) rfl hpc1lt hpush
+          (by decide) (by decide) hpc2lt hjump (by decide) rfl ?_ hwN
+        show (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.length
+              - pcOfLabel (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1 "next" + (1 + 2)
+            ≤ (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.length
+              - pcOfLabel (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1 jmpEntryBB.label
+        decide
+    · -- next block: STOP
+      have hlbl : s.currentBb = "next" := hlbleq
+      rw [hlbl] at hvrel hpc_asm hwN
+      have hpsN : psOfFn (fnPlanFuel jmpStopFn) jmpStopFn 0 0 "next" = initPlanState 0 := rfl
+      have hpc3 : asm.pc = 3 := by rw [hpc_asm]; decide
+      cases f' with
+      | zero => simp [runBlock, evalPhis, execBlock, stopNextBB, stopInst, HbsimMatch]
+      | succ k =>
+        have hrb : runBlock (k+1) jmpStopCtx stopNextBB s
+            = ExecResult.Halt (haltState { s with instIdx := 0 }) := by
+          simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, stopNextBB, stopInst, stepInstBase]
+        have hbLabel : asmBlockAt (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1 asm.pc
+            (executePlan [StackOp.SOLabel "next"]) := by
+          rw [hpc3]; refine ⟨by decide, fun j hj => ?_⟩; have hj' : j < 1 := hj; interval_cases j; rfl
+        obtain ⟨as1, hrun1, hrel1, hpc1'⟩ :=
+          soLabel_sim (offsetToPc := (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).2) lo
+            (psOfFn (fnPlanFuel jmpStopFn) jmpStopFn 0 0 "next") s asm _ "next" (by rw [hpsN]; exact hvrel) hbLabel
+        have hpc1'' : as1.pc = 4 := by rw [hpc1', hpc3]; decide
+        have hlt4 : as1.pc < (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.length := by
+          rw [hpc1'']; decide
+        have hstop : (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.get ⟨as1.pc, hlt4⟩
+            = AsmInst.AsmOp "STOP" := by
+          conv_lhs => rw [show (⟨as1.pc, hlt4⟩ : Fin _) = ⟨4, by decide⟩ from Fin.ext hpc1'']
+          rfl
+        have hle2 : (1 : Nat) + 1 ≤ N := by
+          have hw : (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.length
+              - pcOfLabel (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1 "next" ≤ N := hwN
+          have hval : (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.length
+              - pcOfLabel (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1 "next" = 2 := by decide
+          omega
+        exact HbsimMatch_stop_from_body (bodyLen := 1) hrb hrun1 (by rw [hpsN] at hrel1; exact hrel1) hlt4 hstop hle2
+  case _ =>
+    -- hentry : CanonEntryWH at the entry state
+    have hpsE : psOfFn (fnPlanFuel jmpStopFn) jmpStopFn 0 0 "entry" = initPlanState 0 :=
+      psOfFn_entry rfl hfnready (by simp only [fnPlanFuel]; omega)
+    refine ⟨⟨jmpEntryBB, rfl, ?_, ?_⟩, ?_, hvshalt⟩
+    · show venomAsmRel lo (psOfFn (fnPlanFuel jmpStopFn) jmpStopFn 0 0 "entry") _ as
+      rw [hpsE]; exact hrel
+    · show as.pc = pcOfLabel (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1 "entry"
+      rw [haspc]; exact (pcOfLabel_entry_zero rfl hfnready hgen).symm
+    · show (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.length
+          - pcOfLabel (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1 "entry"
+          ≤ (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.length
+      omega
+
+
+set_option maxHeartbeats 3200000 in
+/-- **Non-vacuity of the generic recipe driver**: `jmpStopFn` (`entry: JMP next ; next: STOP`) driven by
+    `codegen_correct_ofBlocks_recipeW`. Discharges `hrun0` (both blocks) and `hsupply` (JMP `TermRecipeW`
+    for the entry block, STOP `TermRecipeW` for `next`) — exhibiting a real function the generic driver
+    applies to, so the driver is not vacuous. -/
+theorem codegen_correct_jmpStop_recipeW {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    (hvshalt : vs.halted = false)
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    (match runContext 10 jmpStopCtx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.length
+         (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).2
+         (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.length
+         (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).2
+         (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.length
+         (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).2
+         (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  have hfnready : ∀ bb ∈ jmpStopFn.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst := by
+    intro bb hbb inst hinst
+    simp only [jmpStopFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    rcases hbb with rfl | rfl
+    · simp only [jmpEntryBB, List.mem_singleton] at hinst; subst hinst; unfold codegenReadyInst; decide
+    · simp only [stopNextBB, List.mem_singleton] at hinst; subst hinst; unfold codegenReadyInst; decide
+  have hgen : generateFnPlan jmpStopFn 0 0
+      = some ((generateFnPlan jmpStopFn 0 0).get!.1, (generateFnPlan jmpStopFn 0 0).get!.2) := rfl
+  refine codegen_correct_ofBlocks_recipeW
+    (lo := lo)
+    (pcOf := pcOfLabel (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1)
+    (psOf := psOfFn (fnPlanFuel jmpStopFn) jmpStopFn 0 0)
+    (wOf := fun l => (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.length
+      - pcOfLabel (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1 l)
+    (offsets := (computeLabelOffsets (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).2)
+    (fuel := 10) (ctx := jmpStopCtx) (fn := jmpStopFn) (fnEom := 0) (lblCtr := 0)
+    (entryName := "main") (entryLbl := "entry")
+    (ops := (generateFnPlan jmpStopFn 0 0).get!.1) (psFinal := (generateFnPlan jmpStopFn 0 0).get!.2)
+    hgen rfl rfl rfl ?_ ?_ ?_
+  case _ =>
+    -- hrun0
+    intro bb hbb s
+    simp only [jmpStopFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    rcases hbb with rfl | rfl
+    · simp [runBlock, evalPhis, execBlock, jmpEntryBB, jmpInst]
+    · simp [runBlock, evalPhis, execBlock, stopNextBB, stopInst]
+  case _ =>
+    -- hsupply
+    intro bb hbb s asm N k hE hlbleq
+    obtain ⟨⟨bb0, hlk_s, hvrel, hpc_asm⟩, hwN, hhalt⟩ := hE
+    have hbb2 : bb = jmpEntryBB ∨ bb = stopNextBB := by
+      simp only [jmpStopFn, List.mem_cons, List.not_mem_nil, or_false] at hbb; exact hbb
+    have hpsN : psOfFn (fnPlanFuel jmpStopFn) jmpStopFn 0 0 "next" = initPlanState 0 := rfl
+    have hpsE : psOfFn (fnPlanFuel jmpStopFn) jmpStopFn 0 0 "entry" = initPlanState 0 :=
+      psOfFn_entry rfl hfnready (by simp only [fnPlanFuel]; omega)
+    rcases hbb2 with hbb | hbb <;> subst hbb
+    · -- entry block: JMP recipe — discharged by the GENERIC empty-body slice, not inline
+      have hlbl : s.currentBb = "entry" := hlbleq
+      rw [hlbl] at hvrel hpc_asm
+      have hpc0 : asm.pc = 0 := by rw [hpc_asm]; exact pcOfLabel_entry_zero rfl hfnready hgen
+      have hbLabel : asmBlockAt (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1 asm.pc
+          (executePlan [StackOp.SOLabel jmpEntryBB.label]) := by
+        rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩; have hj' : j < 1 := hj; interval_cases j; rfl
+      have hlt1 : asm.pc + 1 < (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.length := by
+        rw [hpc0]; decide
+      have e1 : asm.pc + 1 = 1 := by rw [hpc0]
+      have hpush : (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.get ⟨asm.pc + 1, hlt1⟩
+          = resolveInst (computeLabelOffsets (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).2
+              (AsmInst.AsmPushLabel "next") := by
+        conv_lhs => rw [show (⟨asm.pc + 1, hlt1⟩ : Fin _) = ⟨1, by decide⟩ from Fin.ext e1]
+        rfl
+      have hlt2 : asm.pc + 1 + 1 < (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.length := by
+        rw [hpc0]; decide
+      have e2 : asm.pc + 1 + 1 = 2 := by rw [hpc0]
+      have hjump : (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.get ⟨asm.pc + 1 + 1, hlt2⟩
+          = AsmInst.AsmOp "JUMP" := by
+        conv_lhs => rw [show (⟨asm.pc + 1 + 1, hlt2⟩ : Fin _) = ⟨2, by decide⟩ from Fin.ext e2]
+        rfl
+      refine Or.inr (hsupplyW_emptyJmp (jmpInst := jmpInst) (lbl := "next") (off := 5) (bb' := stopNextBB)
+        rfl rfl rfl hhalt hvrel (by rw [hpsE, hpsN]) hbLabel hlt1 hpush (by decide) (by decide)
+        hlt2 hjump (by decide) rfl ?_)
+      show (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.length
+            - pcOfLabel (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1 "next" + (1 + 2)
+          ≤ (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.length
+            - pcOfLabel (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1 jmpEntryBB.label
+      decide
+    · -- next block: STOP recipe — discharged by the GENERIC empty-body slice, not inline
+      have hlbl : s.currentBb = "next" := hlbleq
+      rw [hlbl] at hvrel hpc_asm
+      have hpc3 : asm.pc = 3 := by rw [hpc_asm]; decide
+      have hbLabel : asmBlockAt (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1 asm.pc
+          (executePlan [StackOp.SOLabel stopNextBB.label]) := by
+        rw [hpc3]; refine ⟨by decide, fun j hj => ?_⟩; have hj' : j < 1 := hj; interval_cases j; rfl
+      have hlt4 : asm.pc + 1 < (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.length := by
+        rw [hpc3]; decide
+      have e4 : asm.pc + 1 = 4 := by rw [hpc3]
+      have hstop : (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.get ⟨asm.pc + 1, hlt4⟩
+          = AsmInst.AsmOp "STOP" := by
+        conv_lhs => rw [show (⟨asm.pc + 1, hlt4⟩ : Fin _) = ⟨4, by decide⟩ from Fin.ext e4]
+        rfl
+      exact Or.inr (hsupplyW_emptyStop (stopInst := stopInst)
+        (ps := psOfFn (fnPlanFuel jmpStopFn) jmpStopFn 0 0 "next") rfl rfl hvrel hbLabel hlt4 hstop (by decide))
+  case _ =>
+    -- hentry
+    have hpsE : psOfFn (fnPlanFuel jmpStopFn) jmpStopFn 0 0 "entry" = initPlanState 0 :=
+      psOfFn_entry rfl hfnready (by simp only [fnPlanFuel]; omega)
+    refine ⟨⟨jmpEntryBB, rfl, ?_, ?_⟩, ?_, hvshalt⟩
+    · show venomAsmRel lo (psOfFn (fnPlanFuel jmpStopFn) jmpStopFn 0 0 "entry") _ as
+      rw [hpsE]; exact hrel
+    · show as.pc = pcOfLabel (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1 "entry"
+      rw [haspc]; exact (pcOfLabel_entry_zero rfl hfnready hgen).symm
+    · show (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.length
+          - pcOfLabel (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1 "entry"
+          ≤ (asmResolve (executePlan (generateFnPlan jmpStopFn 0 0).get!.1)).1.length
+      omega
+
+
+
+def jnzCtxR : VenomContext := { functions := [jnzStopFnR], entry := some "main" }
+
+/-- **Every single-byte literal evaluates.** `encodeNumBytes` recurses on `n / 256` — non-structural, so Lean
+    compiles it by well-founded recursion and the KERNEL CANNOT REDUCE IT (`WF.fix` is opaque to `whnf`).
+    Hence `rfl`/`decide` get stuck on any asm carrying a pushed literal, and `#eval` (compiled) disagrees with
+    the kernel. Its EQUATION LEMMAS can still evaluate it, which is what unblocks the generated-program facts.
+    (`encodeNumBytes 0 = []` is the exception that reduces natively — the `n = 0` guard returns before the
+    recursion — which is why `PUSH0` programs like `sdFn` never hit this.) -/
+theorem encodeNumBytes_lt256 {n : Nat} (h0 : n ≠ 0) (h : n < 256) :
+    encodeNumBytes n = [UInt8.ofNat n] := by
+  rw [encodeNumBytes]
+  simp only [h0, if_false, Nat.div_eq_of_lt h, Nat.mod_eq_of_lt h]
+  rw [encodeNumBytes]
+  simp
+
+/-- The instance the `jnzStopFnR` condition literal needs. -/
+theorem encodeNumBytes_one : encodeNumBytes 1 = [(1 : byte)] := by
+  rw [encodeNumBytes_lt256] <;> decide
+
+set_option maxHeartbeats 2000000 in
+/-- The unresolved asm for `jnzStopFnR`, stated so the stuck `encodeNumBytes 1` term survives verbatim: the
+    list spine reduces around it, so this closes by `rfl`. Rewriting with this and `encodeNumBytes_one` turns
+    the generated program into a ground literal that `decide` can evaluate. -/
+theorem jnz_unresolved_asm : executePlan (generateFnPlan jnzStopFnR 0 0).get!.1 =
+    [AsmInst.AsmLabel "entry", AsmInst.AsmPush (encodeNumBytes 1),
+     AsmInst.AsmPushLabel "then", AsmInst.AsmOp "JUMPI",
+     AsmInst.AsmPushLabel "else", AsmInst.AsmOp "JUMP",
+     AsmInst.AsmLabel "else", AsmInst.AsmOp "STOP",
+     AsmInst.AsmLabel "then", AsmInst.AsmOp "STOP"] := by rfl
+
+set_option maxHeartbeats 12000000 in
+/-- **Branching multi-block recipe route: `codegen_correct` for `jnzCtxR` via the generic driver.** The
+    3-block conditional `entry: JNZ 1 then else ; then: STOP ; else: STOP`, driven by
+    `codegen_correct_ofBlocks_recipeW`. Exercises the dispatcher's **JNZ-taken** arm (the condition literal
+    `1 ≠ 0` selects `then`) — the first branching witness; every prior one used JMP or a halting terminator.
+    The generated program is `[LABEL entry; PUSH 1; PUSH then; JUMPI; PUSH else; JUMP; LABEL else; STOP;
+    LABEL then; STOP]` (pcOf entry=0, else=6, then=8). Per block: `entry` supplies the JNZ-taken
+    `TermRecipeW` (bodyLen=2 — JUMPDEST + the condition push — landing at the `PUSH then`, with the
+    condition-dropped successor relation for `then`); `then`/`else` supply STOP `TermRecipeW`s. -/
+theorem codegen_correct_jnzStop_recipeW {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    (hvshalt : vs.halted = false)
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    (match runContext 10 jnzCtxR vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1.length
+         (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).2
+         (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1.length
+         (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).2
+         (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1.length
+         (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).2
+         (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  have hfnready : ∀ bb ∈ jnzStopFnR.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst := by
+    intro bb hbb inst hinst
+    simp only [jnzStopFnR, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    rcases hbb with rfl | rfl | rfl
+    · simp only [jnzEntryR, List.mem_singleton] at hinst; subst hinst; unfold codegenReadyInst; decide
+    · simp only [thenBB, List.mem_singleton] at hinst; subst hinst; unfold codegenReadyInst; decide
+    · simp only [elseBB, List.mem_singleton] at hinst; subst hinst; unfold codegenReadyInst; decide
+  have hgen : generateFnPlan jnzStopFnR 0 0
+      = some ((generateFnPlan jnzStopFnR 0 0).get!.1, (generateFnPlan jnzStopFnR 0 0).get!.2) := rfl
+  have hpsE : psOfFn (fnPlanFuel jnzStopFnR) jnzStopFnR 0 0 "entry" = initPlanState 0 :=
+    psOfFn_entry rfl hfnready (by simp only [fnPlanFuel]; omega)
+  have hpsT : psOfFn (fnPlanFuel jnzStopFnR) jnzStopFnR 0 0 "then" = initPlanState 0 := rfl
+  refine codegen_correct_ofBlocks_recipeW
+    (lo := lo)
+    (pcOf := pcOfLabel (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1)
+    (psOf := psOfFn (fnPlanFuel jnzStopFnR) jnzStopFnR 0 0)
+    (wOf := fun l => (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1.length
+      - pcOfLabel (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1 l)
+    (offsets := (computeLabelOffsets (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).2)
+    (fuel := 10) (ctx := jnzCtxR) (fn := jnzStopFnR) (fnEom := 0) (lblCtr := 0)
+    (entryName := "main") (entryLbl := "entry")
+    (ops := (generateFnPlan jnzStopFnR 0 0).get!.1) (psFinal := (generateFnPlan jnzStopFnR 0 0).get!.2)
+    hgen rfl rfl rfl ?_ ?_ ?_
+  case _ =>
+    -- hrun0
+    intro bb hbb s
+    simp only [jnzStopFnR, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    rcases hbb with rfl | rfl | rfl
+    · simp [runBlock, evalPhis, execBlock, jnzEntryR, jnzInstR]
+    · simp [runBlock, evalPhis, execBlock, thenBB, stopInst]
+    · simp [runBlock, evalPhis, execBlock, elseBB, stopInst]
+  case _ =>
+    -- hsupply
+    intro bb hbb s asm N k hE hlbleq
+    obtain ⟨⟨bb0, hlk_s, hvrel, hpc_asm⟩, hwN, hhalt⟩ := hE
+    have hbb3 : bb = jnzEntryR ∨ bb = thenBB ∨ bb = elseBB := by
+      simp only [jnzStopFnR, List.mem_cons, List.not_mem_nil, or_false] at hbb; exact hbb
+    rcases hbb3 with hbb | hbb | hbb <;> subst hbb
+    · -- entry: JNZ (taken, cond = 1)
+      have hlbl : s.currentBb = "entry" := hlbleq
+      rw [hlbl] at hvrel hpc_asm
+      have hpc0 : asm.pc = 0 := by rw [hpc_asm]; exact pcOfLabel_entry_zero rfl hfnready hgen
+      set cond : bytes32 := wordOfBytes (List.toByteArray
+        (List.replicate (32 - (encodeNumBytes 1).length) (0 : byte) ++ encodeNumBytes 1)) with hcondd
+      have hct : cond.toNat = 1 := by rw [hcondd]; exact pushed_offset_toNat 1 (by norm_num)
+      have hcondne : cond ≠ EvmYul.UInt256.ofNat 0 := by
+        intro h; rw [h, EvmYul.uint256_ofNat_toNat] at hct; simp at hct
+      set s1 : AsmState := asmNext asm with hs1
+      set s2 : AsmState := { asmNext s1 with stack := cond :: s1.stack } with hs2
+      have p1 : s1.pc = 1 := by rw [hs1]; show asm.pc + 1 = 1; rw [hpc0]
+      have p2 : s2.pc = 2 := by rw [hs2]; show s1.pc + 1 = 2; rw [p1]
+      have hb0 : asm.pc < (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1.length := by
+        rw [hpc0]; decide
+      have hb1 : s1.pc < (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1.length := by
+        rw [p1]; decide
+      have hb2 : s2.pc < (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1.length := by
+        rw [p2]; decide
+      have hb3 : s2.pc + 1 < (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1.length := by
+        rw [p2]; decide
+      have g0 : (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1.get ⟨asm.pc, hb0⟩
+          = AsmInst.AsmLabel "entry" := by
+        rw [show (⟨asm.pc, hb0⟩ : Fin _) = ⟨0, by decide⟩ from Fin.ext hpc0]; rfl
+      have g1 : (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1.get ⟨s1.pc, hb1⟩
+          = AsmInst.AsmPush (encodeNumBytes 1) := by
+        rw [show (⟨s1.pc, hb1⟩ : Fin _) = ⟨1, by decide⟩ from Fin.ext p1]; rfl
+      have hpush : (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1.get ⟨s2.pc, hb2⟩
+          = resolveInst (computeLabelOffsets (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).2
+              (AsmInst.AsmPushLabel "then") := by
+        rw [show (⟨s2.pc, hb2⟩ : Fin _) = ⟨2, by decide⟩ from Fin.ext p2]; rfl
+      have e3 : s2.pc + 1 = 3 := by rw [p2]
+      have hjumpi : (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1.get ⟨s2.pc + 1, hb3⟩
+          = AsmInst.AsmOp "JUMPI" := by
+        conv_lhs => rw [show (⟨s2.pc + 1, hb3⟩ : Fin _) = ⟨3, by decide⟩ from Fin.ext e3]
+        rfl
+      have hpushstep : asmStep (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).2
+          (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1 s1 = AsmResult.AsmOK s2 := by
+        rw [asmStep_push_ok hb1 g1]; rfl
+      have hbody : runAsm 2 (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).2
+          (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1 asm = AsmResult.AsmOK s2 := by
+        rw [show (2 : Nat) = 1 + 1 from rfl, runAsm_succ_ok hb0 (asmStep_label_ok hb0 g0)]
+        rw [show (1 : Nat) = 0 + 1 from rfl, runAsm_succ_ok hb1 hpushstep]; rfl
+      have hone : (EvmYul.UInt256.ofNat 1 : EvmYul.UInt256) ≠ { val := 0 } := by decide
+      have hpcThen : pcOfLabel (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1 "then" = 8 := by
+        decide
+      have hrb : runBlock (k+1) jnzCtxR jnzEntryR s
+          = ExecResult.OK (jumpTo "then" { s with instIdx := 0 }) := by
+        simp [runBlock, evalPhis, phiPrefixLength, execBlock, getInstruction, jnzEntryR, jnzInstR,
+          stepInstBase, isTerminator, jumpTo, evalOperand, hhalt, hone]
+      have hnh : ({ s with instIdx := 0 } : VenomState).halted = false := by simpa using hhalt
+      refine Or.inr ⟨s2, psOfFn (fnPlanFuel jnzStopFnR) jnzStopFnR 0 0 "then", { s with instIdx := 0 }, 2, hbody, ?_⟩
+      refine Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl
+        ⟨"then", 13, cond, s1.stack, thenBB, ?_, hnh, hrb, rfl, hcondne, ⟨hb2, hpush⟩, (by rw [jnz_unresolved_asm, encodeNumBytes_one]; decide), (by norm_num),
+          ⟨hb3, hjumpi⟩, (by rw [jnz_unresolved_asm, encodeNumBytes_one]; decide), ?_, rfl⟩))))))
+      · show (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1.length
+              - pcOfLabel (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1 "then" + (2 + 2)
+            ≤ (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1.length
+              - pcOfLabel (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1 jnzEntryR.label
+        decide
+      · -- successor relation: the JUMPI drops the condition, leaving the entry stack
+        show venomAsmRel lo (psOfFn (fnPlanFuel jnzStopFnR) jnzStopFnR 0 0 "then") { s with instIdx := 0 }
+          { s2 with stack := s1.stack }
+        rw [hpsT]
+        exact venomAsmRel_setPc (by rw [hpsE] at hvrel; exact hvrel)
+    · -- then: STOP — discharged by the GENERIC empty-body slice, not inline
+      have hlbl : s.currentBb = "then" := hlbleq
+      rw [hlbl] at hvrel hpc_asm
+      have hpc8 : asm.pc = 8 := by rw [hpc_asm]; decide
+      have hbLabel : asmBlockAt (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1 asm.pc
+          (executePlan [StackOp.SOLabel thenBB.label]) := by
+        rw [hpc8]; refine ⟨by decide, fun j hj => ?_⟩; have hj' : j < 1 := hj; interval_cases j; rfl
+      have hlt9 : asm.pc + 1 < (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1.length := by
+        rw [hpc8]; decide
+      have e9 : asm.pc + 1 = 9 := by rw [hpc8]
+      have hstop : (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1.get ⟨asm.pc + 1, hlt9⟩
+          = AsmInst.AsmOp "STOP" := by
+        conv_lhs => rw [show (⟨asm.pc + 1, hlt9⟩ : Fin _) = ⟨9, by decide⟩ from Fin.ext e9]
+        rfl
+      exact Or.inr (hsupplyW_emptyStop (stopInst := stopInst)
+        (ps := psOfFn (fnPlanFuel jnzStopFnR) jnzStopFnR 0 0 "then") rfl rfl hvrel hbLabel hlt9 hstop
+        (by decide))
+    · -- else: STOP — likewise
+      have hlbl : s.currentBb = "else" := hlbleq
+      rw [hlbl] at hvrel hpc_asm
+      have hpc6 : asm.pc = 6 := by rw [hpc_asm]; decide
+      have hbLabel : asmBlockAt (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1 asm.pc
+          (executePlan [StackOp.SOLabel elseBB.label]) := by
+        rw [hpc6]; refine ⟨by decide, fun j hj => ?_⟩; have hj' : j < 1 := hj; interval_cases j; rfl
+      have hlt7 : asm.pc + 1 < (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1.length := by
+        rw [hpc6]; decide
+      have e7 : asm.pc + 1 = 7 := by rw [hpc6]
+      have hstop : (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1.get ⟨asm.pc + 1, hlt7⟩
+          = AsmInst.AsmOp "STOP" := by
+        conv_lhs => rw [show (⟨asm.pc + 1, hlt7⟩ : Fin _) = ⟨7, by decide⟩ from Fin.ext e7]
+        rfl
+      exact Or.inr (hsupplyW_emptyStop (stopInst := stopInst)
+        (ps := psOfFn (fnPlanFuel jnzStopFnR) jnzStopFnR 0 0 "else") rfl rfl hvrel hbLabel hlt7 hstop
+        (by decide))
+  case _ =>
+    -- hentry
+    refine ⟨⟨jnzEntryR, rfl, ?_, ?_⟩, ?_, hvshalt⟩
+    · show venomAsmRel lo (psOfFn (fnPlanFuel jnzStopFnR) jnzStopFnR 0 0 "entry") _ as
+      rw [hpsE]; exact hrel
+    · show as.pc = pcOfLabel (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1 "entry"
+      rw [haspc]; exact (pcOfLabel_entry_zero rfl hfnready hgen).symm
+    · show (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1.length
+          - pcOfLabel (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1 "entry"
+          ≤ (asmResolve (executePlan (generateFnPlan jnzStopFnR 0 0).get!.1)).1.length
+      omega
+
+end Example
+
+/-! ## Producing a block's recipe from `RegularBodyH`: the no-emit halting terminators (STOP / INVALID)
+
+The recipe route reduces a block's `HbsimMatch` obligation to producing its `TermRecipe` (via
+`HbsimMatch_dispatch`).
+For the two **no-emit halting** terminators — STOP and INVALID — that recipe comes free from the
+per-instruction correctness layer `RegularBodyH`, with **no successor-recording and hence no var-set
+threading**: they halt, so there is no arriving-successor relation to reconcile. These two producers mirror
+`HbsimMatch_stop_regular` / `HbsimMatch_invalid_regular` (same `RegularBodyH` + structural-invariant
+hypotheses, from which their non-vacuity is inherited — witnessed for real bodies by the concrete
+copy-carrying capstones) but yield the recipe
+∃-body that `HbsimMatch_dispatch` consumes instead of producing the `HbsimMatch` directly. So a STOP/INVALID
+block of modeled opcodes has its recipe derived end-to-end from `RegularBodyH`; the remaining recipe work
+is exactly the operand/successor-carrying terminators, where var-set threading enters. -/
+
+
+
+/-- **A STOP block's terminator recipe, produced from `RegularBodyH`.** Threads
+    `bodyStepsReadyH_regular_list` → `genBlockBodyH_sim_inv` (the body sim: asm run + `venomAsmRel` at the
+    body-fold state) → `runBlock_body_stop` (the Venom-side STOP reduction), then packages the STOP arm of
+    `TermRecipe`. No successor-recording, hence no var-set threading. -/
+theorem termRecipe_stop_of_regular
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {pcOf : String → Nat} {psOf : String → PlanState}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {nextLiveness : List String} {curBbLabel : String} {dem : Nat}
+    {ps0 : PlanState} {as0 : AsmState} {N restFuel : Nat} {ctx : VenomContext} {bb : BasicBlock}
+    {front : List Instruction} {stopInst hd : Instruction} {tl : List Instruction}
+    {s sEnd : VenomState} {S : List String}
+    (hbb : bb.instructions = front ++ [stopInst]) (hstopop : stopInst.opcode = Opcode.STOP)
+    (hcons : front ++ [stopInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hreg : RegularBodyH lo nextLiveness o2pc prog dem front S)
+    (hsd : StackDiscH ((front.zipIdx 0).map (fun _ => dem)).sum ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel0 : venomAsmRel lo ps0 { s with instIdx := 0 } as0)
+    (hblock : asmBlockAt prog as0.pc
+      (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1))
+    (hpc : as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length < prog.length)
+    (hstop : prog.get ⟨as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length, hpc⟩
+      = AsmInst.AsmOp "STOP")
+    (hle : (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 1 ≤ N) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+      runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as'
+      ∧ TermRecipe fn lo pcOf psOf o2pc offsets prog as' ps' vs' bodyLen N
+          (front.length + (restFuel + 1)) ctx bb s := by
+  have hbrh := bodyStepsReadyH_regular_list (liveness := liveness) (dfg := dfg) (cfg := cfg) (fn := fn)
+    (curBbLabel := curBbLabel) front S 0 hreg
+  obtain ⟨as', hrun, hrel', hpc', _, _⟩ := genBlockBodyH_sim_inv
+    (fun z p => generateRegularInstPlan liveness dfg cfg fn z.1 nextLiveness false true curBbLabel p)
+    (fun _ => dem) (front.zipIdx 0) S ps0 { s with instIdx := 0 } as0 hbrh hsd hsv hrel0 hblock
+  have hgv : (front.zipIdx 0).foldl (fun v x => gvBodyStep x v) { s with instIdx := 0 } = sEnd :=
+    execBodyThread_eq_gvFold front 0 { s with instIdx := 0 } sEnd hthread
+  rw [hgv] at hrel'
+  have hrb := runBlock_body_stop ctx bb restFuel front stopInst hd tl s sEnd
+    hbb hstopop hcons hphi hnonterm hthread
+  have hpc_as : as'.pc < prog.length := hpc' ▸ hpc
+  have hstop_as : prog.get ⟨as'.pc, hpc_as⟩ = AsmInst.AsmOp "STOP" := by
+    rw [show (⟨as'.pc, hpc_as⟩ : Fin prog.length) = ⟨_, hpc⟩ from Fin.ext hpc']
+    exact hstop
+  exact ⟨as', _, sEnd, _, hrun, Or.inl ⟨hrel', hle, hrb, hpc_as, hstop_as⟩⟩
+
+/-- **An INVALID block's terminator recipe, produced from `RegularBodyH`.** The INVALID twin of
+    `termRecipe_stop_of_regular`: uses `runBlock_body_invalid` (fault reduction, clearing returndata) and
+    packages the INVALID arm of `TermRecipe`. No successor-recording, hence no var-set threading. -/
+theorem termRecipe_invalid_of_regular
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {pcOf : String → Nat} {psOf : String → PlanState}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {nextLiveness : List String} {curBbLabel : String} {dem : Nat}
+    {ps0 : PlanState} {as0 : AsmState} {N restFuel : Nat} {ctx : VenomContext} {bb : BasicBlock}
+    {front : List Instruction} {invInst hd : Instruction} {tl : List Instruction}
+    {s sEnd : VenomState} {S : List String}
+    (hbb : bb.instructions = front ++ [invInst]) (hinvop : invInst.opcode = Opcode.INVALID)
+    (hcons : front ++ [invInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hreg : RegularBodyH lo nextLiveness o2pc prog dem front S)
+    (hsd : StackDiscH ((front.zipIdx 0).map (fun _ => dem)).sum ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel0 : venomAsmRel lo ps0 { s with instIdx := 0 } as0)
+    (hblock : asmBlockAt prog as0.pc
+      (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1))
+    (hpc : as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length < prog.length)
+    (hinv : prog.get ⟨as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length, hpc⟩
+      = AsmInst.AsmOp "INVALID")
+    (hle : (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 1 ≤ N) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+      runAsm bodyLen o2pc prog as0 = AsmResult.AsmOK as'
+      ∧ TermRecipe fn lo pcOf psOf o2pc offsets prog as' ps' vs' bodyLen N
+          (front.length + (restFuel + 1)) ctx bb s := by
+  have hbrh := bodyStepsReadyH_regular_list (liveness := liveness) (dfg := dfg) (cfg := cfg) (fn := fn)
+    (curBbLabel := curBbLabel) front S 0 hreg
+  obtain ⟨as', hrun, hrel', hpc', _, _⟩ := genBlockBodyH_sim_inv
+    (fun z p => generateRegularInstPlan liveness dfg cfg fn z.1 nextLiveness false true curBbLabel p)
+    (fun _ => dem) (front.zipIdx 0) S ps0 { s with instIdx := 0 } as0 hbrh hsd hsv hrel0 hblock
+  have hgv : (front.zipIdx 0).foldl (fun v x => gvBodyStep x v) { s with instIdx := 0 } = sEnd :=
+    execBodyThread_eq_gvFold front 0 { s with instIdx := 0 } sEnd hthread
+  rw [hgv] at hrel'
+  have hrb := runBlock_body_invalid ctx bb restFuel front invInst hd tl s sEnd
+    hbb hinvop hcons hphi hnonterm hthread
+  have hpc_as : as'.pc < prog.length := hpc' ▸ hpc
+  have hinv_as : prog.get ⟨as'.pc, hpc_as⟩ = AsmInst.AsmOp "INVALID" := by
+    rw [show (⟨as'.pc, hpc_as⟩ : Fin prog.length) = ⟨_, hpc⟩ from Fin.ext hpc']
+    exact hinv
+  exact ⟨as', _, sEnd, _, hrun, Or.inr (Or.inl ⟨hrel', hle, hrb, hpc_as, hinv_as⟩)⟩
+
+/-! ## Producing a block's recipe from the emit segment: the operand-carrying halting terminators
+    (RETURN / REVERT / SELFDESTRUCT)
+
+Unlike STOP/INVALID (no emit), these three halting terminators run stack-arranging code between the body
+and the terminator (`emitInputPlan`, arranging their operands on top). Each recipe producer mirrors the
+existing spill-aware asm segment (`hasm_regularHSVP_{return,revert,selfdestruct}_var`) **up to the
+post-emit state** — body sim (`genBlockPrefixBodyHSVP_sim_inv`) then the operand emission
+(`emitInputPlan_{pair,single}_var_sim`) — but, instead of taking the final terminator step to `AsmHalt`/
+`AsmRevert`, packages the matching `TermRecipe` arm at that post-emit state (operands on top, terminator
+at `as'.pc`, plus the memory-safety facts the operand terminators carry). They still HALT, so there is no
+successor-recording and no var-set threading. With `termRecipe_{stop,invalid}_of_regular`, this completes
+recipe production for **all five halting terminators**; only the continuing terminators (JMP/JNZ/DJMP),
+whose successor-recording needs var-set threading, remain. Non-vacuity is inherited from the identical
+hypothesis sets of `hstep_regularHSVP_{return,revert,selfdestruct}` (all positive existence/placement
+facts — no ∀-∃ unsatisfiable shape). -/
+
+
+/-- **A SELFDESTRUCT block's recipe from the body + single-operand emit segment.** -/
+theorem termRecipe_selfdestruct_of_HSVP
+    {fn : IrFunction} {ctx : VenomContext} {offsetToPc : AssocList Nat Nat}
+    {prog : List AsmInst} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {offsets : AssocList String Nat}
+    {bb : BasicBlock} {term hd : Instruction} {tl : List Instruction}
+    {extraFuel N : Nat} (P : Nat)
+    {l : String} {gp : Instruction × Nat → PlanState → List StackOp × PlanState}
+    {lg : List ((Instruction × Nat) × List String)}
+    {front : List Instruction} {S0 : List String} {M0 M1 : AssocList Operand Nat}
+    {ps0 : PlanState} {vs0 sEnd : VenomState} {as0 : AsmState}
+    {addrv : String} {waddr : bytes32} {opc : Opcode} {nl : List String}
+    {bodyLen emitLen : Nat}
+    (hbb : bb.instructions = front ++ [term])
+    (hcons : front ++ [term] = hd :: tl)
+    (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hterm_step : stepInstBase term sEnd = ExecResult.Halt (haltState (selfdestruct waddr sEnd)))
+    (hfront : lg.map Prod.fst = front.zipIdx 0)
+    (hready : BodyStepsReadyHSVP P lo offsetToPc prog gp lg S0 M0)
+    (hsd0 : StackDiscHS (totalGain lg + P) ps0 vs0 as0)
+    (hsv0 : StackPerm S0 ps0) (hspM : ps0.spilled = M0)
+    (hrel0 : venomAsmRel lo ps0 vs0 as0)
+    (hthread : execBodyThread front 0 vs0 = some sEnd)
+    (hvs0 : vs0 = { vs0 with instIdx := 0 })
+    (haddrS : addrv ∈ S0 ++ lg.flatMap (fun e => e.2))
+    (hspMF : (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2.spilled
+      = M1)
+    (haddrM : alookup' M1 (Operand.Var addrv) = none)
+    (hliveaddr : nl.contains addrv = true)
+    (hvaddr : lookupVar addrv sEnd = some waddr)
+    (hblock : asmBlockAt prog as0.pc
+      (executePlan (([StackOp.SOLabel l] ++ (lg.foldl
+        (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).1)
+        ++ (emitInputPlan opc [Operand.Var addrv] nl
+             (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).1)))
+    (hbodyLenEq : bodyLen = (executePlan ([StackOp.SOLabel l] ++ (lg.foldl
+        (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).1)).length)
+    (hemitLenEq : emitLen = (executePlan (emitInputPlan opc [Operand.Var addrv] nl
+        (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).1).length)
+    (hlt : as0.pc + bodyLen + emitLen < prog.length)
+    (hget : prog.get ⟨as0.pc + bodyLen + emitLen, hlt⟩ = AsmInst.AsmOp "SELFDESTRUCT")
+    (hN : bodyLen + emitLen + 1 ≤ N) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen' : Nat),
+      runAsm bodyLen' offsetToPc prog as0 = AsmResult.AsmOK as'
+      ∧ TermRecipe fn lo pcOf psOf offsetToPc offsets prog as' ps' vs' bodyLen' N
+          (front.length + (extraFuel + 1)) ctx bb vs0 := by
+  rw [executePlan_append] at hblock
+  obtain ⟨hbpre, hbemit⟩ := asmBlockAt_append hblock
+  obtain ⟨asMid, hbrun, hbrel, hbpc, hbsd, hbsv⟩ :=
+    genBlockPrefixBodyHSVP_sim_inv P l gp lg front S0 M0 ps0 vs0 sEnd as0
+      hfront hready hsd0 hsv0 hspM hrel0 hthread hbpre
+  rw [← hbodyLenEq] at hbrun hbpc
+  have haddrmem := stackPerm_mem hbsv haddrS
+  have hshallow : (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2))
+      ([], ps0)).2.stack.length ≤ 15 := by have := hbsd.shallow; omega
+  obtain ⟨d, hdepth, hlen⟩ := stackGetDepth_of_mem haddrmem
+  have hsmall : d ≤ 15 := by omega
+  have hnospill := alookup_of_spilled_eq hspMF haddrM
+  have hbemit' : asmBlockAt prog asMid.pc
+      (executePlan (emitInputPlan opc [Operand.Var addrv] nl
+        (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).1) := by
+    rw [hbpc, hbodyLenEq]; exact hbemit
+  obtain ⟨asMid2, herun, herel, hepc⟩ :=
+    emitInputPlan_single_var_sim hnospill hliveaddr hdepth hsmall hbrel hlen hbemit'
+  rw [← hemitLenEq] at herun hepc
+  have hpeek : stackPeek d (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2))
+      ([], ps0)).2.stack = Operand.Var addrv := stackGetDepth_peek hdepth
+  have hemitstack : (emitInputPlan opc [Operand.Var addrv] nl
+      (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).2.stack
+      = (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2.stack
+        ++ [Operand.Var addrv] := by
+    rw [emitInputPlan_single_var_eq hnospill hliveaddr hdepth hsmall hpeek]
+  have hval : operandVal sEnd lo (Operand.Var addrv) = some waddr := hvaddr
+  have htop : asMid2.stack = waddr :: asMid2.stack.drop 1 :=
+    venomAsmRel_asmStack_top1_var herel hemitstack hval
+  have hpc' : asMid2.pc < prog.length := by rw [hepc, hbpc]; omega
+  have hget' : prog.get ⟨asMid2.pc, hpc'⟩ = AsmInst.AsmOp "SELFDESTRUCT" :=
+    prog_get_transfer (by rw [hepc, hbpc]) hget
+  have hthread' : execBodyThread front 0 { vs0 with instIdx := 0 } = some sEnd := by
+    rw [← hvs0]; exact hthread
+  have hrb : runBlock (front.length + (extraFuel + 1)) ctx bb vs0
+      = ExecResult.Halt (haltState (selfdestruct waddr sEnd)) :=
+    runBlock_halt ctx bb extraFuel front term hd tl vs0 sEnd
+      (haltState (selfdestruct waddr sEnd)) hbb hcons hphi hnonterm hthread' hterm_step
+  have hbody : runAsm (bodyLen + emitLen) offsetToPc prog as0 = AsmResult.AsmOK asMid2 := by
+    rw [runAsm_add_ok hbrun]; exact herun
+  exact ⟨asMid2, _, sEnd, bodyLen + emitLen, hbody,
+    Or.inr (Or.inr (Or.inr (Or.inr (Or.inl
+      ⟨waddr, asMid2.stack.drop 1, herel, hN, hrb, ⟨hpc', hget'⟩, htop⟩))))⟩
+
+/-- **A RETURN block's recipe from the body + 2-operand emit segment** (memory-safety facts carried). -/
+theorem termRecipe_return_of_HSVP
+    {fn : IrFunction} {ctx : VenomContext} {offsetToPc : AssocList Nat Nat}
+    {prog : List AsmInst} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {offsets : AssocList String Nat}
+    {bb : BasicBlock} {term hd : Instruction} {tl : List Instruction}
+    {extraFuel N : Nat} (P : Nat)
+    {l : String} {gp : Instruction × Nat → PlanState → List StackOp × PlanState}
+    {lg : List ((Instruction × Nat) × List String)}
+    {front : List Instruction} {S0 : List String} {M0 M1 : AssocList Operand Nat}
+    {ps0 : PlanState} {vs0 sEnd : VenomState} {as0 : AsmState}
+    {offv szv : String} {woff wsz : bytes32} {opc : Opcode} {nl : List String}
+    {bodyLen emitLen : Nat}
+    (hbb : bb.instructions = front ++ [term])
+    (hcons : front ++ [term] = hd :: tl)
+    (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hterm_step : stepInstBase term sEnd
+      = ExecResult.Halt (haltState (setReturndata (readMemory woff.toNat wsz.toNat sEnd) sEnd)))
+    (hfront : lg.map Prod.fst = front.zipIdx 0)
+    (hready : BodyStepsReadyHSVP P lo offsetToPc prog gp lg S0 M0)
+    (hsd0 : StackDiscHS (totalGain lg + P) ps0 vs0 as0)
+    (hsv0 : StackPerm S0 ps0) (hspM : ps0.spilled = M0)
+    (hrel0 : venomAsmRel lo ps0 vs0 as0)
+    (hthread : execBodyThread front 0 vs0 = some sEnd)
+    (hvs0 : vs0 = { vs0 with instIdx := 0 })
+    (hoffS : offv ∈ S0 ++ lg.flatMap (fun e => e.2)) (hszS : szv ∈ S0 ++ lg.flatMap (fun e => e.2))
+    (hspMF : (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2.spilled
+      = M1)
+    (hoffM : alookup' M1 (Operand.Var offv) = none) (hszM : alookup' M1 (Operand.Var szv) = none)
+    (hliveoff : nl.contains offv = true) (hliveszv : nl.contains szv = true)
+    (hvoff : lookupVar offv sEnd = some woff) (hvsz : lookupVar szv sEnd = some wsz)
+    (hcov0 : wsz.toNat = 0 ∨ ((woff.toNat + wsz.toNat + 31) / 32) * 32 ≤ as0.memory.size)
+    (hsafe : woff.toNat + wsz.toNat ≤
+      (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2.alloc.fnEom)
+    (hlen : wsz.toNat < USize.size)
+    (hblock : asmBlockAt prog as0.pc
+      (executePlan (([StackOp.SOLabel l] ++ (lg.foldl
+        (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).1)
+        ++ (emitInputPlan opc [Operand.Var szv, Operand.Var offv] nl
+             (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).1)))
+    (hbodyLenEq : bodyLen = (executePlan ([StackOp.SOLabel l] ++ (lg.foldl
+        (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).1)).length)
+    (hemitLenEq : emitLen = (executePlan (emitInputPlan opc [Operand.Var szv, Operand.Var offv] nl
+        (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).1).length)
+    (hlt : as0.pc + bodyLen + emitLen < prog.length)
+    (hget : prog.get ⟨as0.pc + bodyLen + emitLen, hlt⟩ = AsmInst.AsmOp "RETURN")
+    (hN : bodyLen + emitLen + 1 ≤ N) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen' : Nat),
+      runAsm bodyLen' offsetToPc prog as0 = AsmResult.AsmOK as'
+      ∧ TermRecipe fn lo pcOf psOf offsetToPc offsets prog as' ps' vs' bodyLen' N
+          (front.length + (extraFuel + 1)) ctx bb vs0 := by
+  rw [executePlan_append] at hblock
+  obtain ⟨hbpre, hbemit⟩ := asmBlockAt_append hblock
+  obtain ⟨asMid, hbrun, hbrel, hbpc, hbsd, hbsv⟩ :=
+    genBlockPrefixBodyHSVP_sim_inv P l gp lg front S0 M0 ps0 vs0 sEnd as0
+      hfront hready hsd0 hsv0 hspM hrel0 hthread hbpre
+  rw [← hbodyLenEq] at hbrun hbpc
+  have hoffmem := stackPerm_mem hbsv hoffS
+  have hszmem := stackPerm_mem hbsv hszS
+  have hshallow : (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2))
+      ([], ps0)).2.stack.length ≤ 15 := by have := hbsd.shallow; omega
+  obtain ⟨d_y, d_x', hdepth_y, hsmall_y, hleny, hdepth_x', hsmall_x', hlenx'⟩ :=
+    binopVar_depths_of_shallow (x := offv) (y := szv) hshallow hoffmem hszmem
+  have hnospill_sz := alookup_of_spilled_eq hspMF hszM
+  have hnospill_off := alookup_of_spilled_eq hspMF hoffM
+  have hbemit' : asmBlockAt prog asMid.pc
+      (executePlan (emitInputPlan opc [Operand.Var szv, Operand.Var offv] nl
+        (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).1) := by
+    rw [hbpc, hbodyLenEq]; exact hbemit
+  obtain ⟨asMid2, herun, herel, hepc, hemem⟩ :=
+    emitInputPlan_pair_var_sim (offsetToPc := offsetToPc) hnospill_sz hliveszv hdepth_y hsmall_y
+      hleny hnospill_off hliveoff hdepth_x' hsmall_x' hlenx' hbrel hbemit'
+  rw [← hemitLenEq] at herun hepc
+  have hemitstack : (emitInputPlan opc [Operand.Var szv, Operand.Var offv] nl
+      (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).2.stack
+      = (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2.stack
+        ++ [Operand.Var szv, Operand.Var offv] := by
+    rw [emitInputPlan_pair_var_eq hnospill_sz hliveszv hdepth_y hsmall_y hnospill_off hliveoff
+      hdepth_x' hsmall_x']
+  have htop : asMid2.stack = woff :: wsz :: asMid2.stack.drop 2 :=
+    venomAsmRel_asmStack_top2_var herel hemitstack hvoff hvsz
+  have hpc' : asMid2.pc < prog.length := by rw [hepc, hbpc]; omega
+  have hget' : prog.get ⟨asMid2.pc, hpc'⟩ = AsmInst.AsmOp "RETURN" :=
+    prog_get_transfer (by rw [hepc, hbpc]) hget
+  have hcov : wsz.toNat = 0 ∨ ((woff.toNat + wsz.toNat + 31) / 32) * 32 ≤ asMid2.memory.size := by
+    rcases hcov0 with h | h
+    · exact Or.inl h
+    · exact Or.inr (le_trans h (by rw [hemem]; exact runAsm_memory_size_mono hbrun))
+  have hsafe' : woff.toNat + wsz.toNat ≤ (emitInputPlan opc [Operand.Var szv, Operand.Var offv] nl
+      (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).2.alloc.fnEom := by
+    rw [emitInputPlan_pair_var_eq hnospill_sz hliveszv hdepth_y hsmall_y hnospill_off hliveoff
+      hdepth_x' hsmall_x']
+    exact hsafe
+  have hthread' : execBodyThread front 0 { vs0 with instIdx := 0 } = some sEnd := by
+    rw [← hvs0]; exact hthread
+  have hrb : runBlock (front.length + (extraFuel + 1)) ctx bb vs0
+      = ExecResult.Halt (haltState (setReturndata (readMemory woff.toNat wsz.toNat sEnd) sEnd)) :=
+    runBlock_halt ctx bb extraFuel front term hd tl vs0 sEnd _ hbb hcons hphi hnonterm hthread' hterm_step
+  have hbody : runAsm (bodyLen + emitLen) offsetToPc prog as0 = AsmResult.AsmOK asMid2 := by
+    rw [runAsm_add_ok hbrun]; exact herun
+  exact ⟨asMid2, _, sEnd, bodyLen + emitLen, hbody,
+    Or.inr (Or.inr (Or.inl ⟨woff, wsz, asMid2.stack.drop 2, herel, hN, hrb, ⟨hpc', hget'⟩,
+      htop, hcov, hsafe', hlen⟩))⟩
+
+/-- **A REVERT block's recipe** — the `AsmRevert` twin of `termRecipe_return_of_HSVP` (via
+    `runBlock_abort`). -/
+theorem termRecipe_revert_of_HSVP
+    {fn : IrFunction} {ctx : VenomContext} {offsetToPc : AssocList Nat Nat}
+    {prog : List AsmInst} {lo : AssocList String Nat}
+    {pcOf : String → Nat} {psOf : String → PlanState} {offsets : AssocList String Nat}
+    {bb : BasicBlock} {term hd : Instruction} {tl : List Instruction}
+    {extraFuel N : Nat} (P : Nat)
+    {l : String} {gp : Instruction × Nat → PlanState → List StackOp × PlanState}
+    {lg : List ((Instruction × Nat) × List String)}
+    {front : List Instruction} {S0 : List String} {M0 M1 : AssocList Operand Nat}
+    {ps0 : PlanState} {vs0 sEnd : VenomState} {as0 : AsmState}
+    {offv szv : String} {woff wsz : bytes32} {opc : Opcode} {nl : List String}
+    {bodyLen emitLen : Nat}
+    (hbb : bb.instructions = front ++ [term])
+    (hcons : front ++ [term] = hd :: tl)
+    (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hterm_step : stepInstBase term sEnd
+      = ExecResult.Abort AbortType.RevertAbort
+          (revertState (setReturndata (readMemory woff.toNat wsz.toNat sEnd) sEnd)))
+    (hfront : lg.map Prod.fst = front.zipIdx 0)
+    (hready : BodyStepsReadyHSVP P lo offsetToPc prog gp lg S0 M0)
+    (hsd0 : StackDiscHS (totalGain lg + P) ps0 vs0 as0)
+    (hsv0 : StackPerm S0 ps0) (hspM : ps0.spilled = M0)
+    (hrel0 : venomAsmRel lo ps0 vs0 as0)
+    (hthread : execBodyThread front 0 vs0 = some sEnd)
+    (hvs0 : vs0 = { vs0 with instIdx := 0 })
+    (hoffS : offv ∈ S0 ++ lg.flatMap (fun e => e.2)) (hszS : szv ∈ S0 ++ lg.flatMap (fun e => e.2))
+    (hspMF : (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2.spilled
+      = M1)
+    (hoffM : alookup' M1 (Operand.Var offv) = none) (hszM : alookup' M1 (Operand.Var szv) = none)
+    (hliveoff : nl.contains offv = true) (hliveszv : nl.contains szv = true)
+    (hvoff : lookupVar offv sEnd = some woff) (hvsz : lookupVar szv sEnd = some wsz)
+    (hcov0 : wsz.toNat = 0 ∨ ((woff.toNat + wsz.toNat + 31) / 32) * 32 ≤ as0.memory.size)
+    (hsafe : woff.toNat + wsz.toNat ≤
+      (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2.alloc.fnEom)
+    (hlen : wsz.toNat < USize.size)
+    (hblock : asmBlockAt prog as0.pc
+      (executePlan (([StackOp.SOLabel l] ++ (lg.foldl
+        (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).1)
+        ++ (emitInputPlan opc [Operand.Var szv, Operand.Var offv] nl
+             (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).1)))
+    (hbodyLenEq : bodyLen = (executePlan ([StackOp.SOLabel l] ++ (lg.foldl
+        (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).1)).length)
+    (hemitLenEq : emitLen = (executePlan (emitInputPlan opc [Operand.Var szv, Operand.Var offv] nl
+        (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).1).length)
+    (hlt : as0.pc + bodyLen + emitLen < prog.length)
+    (hget : prog.get ⟨as0.pc + bodyLen + emitLen, hlt⟩ = AsmInst.AsmOp "REVERT")
+    (hN : bodyLen + emitLen + 1 ≤ N) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen' : Nat),
+      runAsm bodyLen' offsetToPc prog as0 = AsmResult.AsmOK as'
+      ∧ TermRecipe fn lo pcOf psOf offsetToPc offsets prog as' ps' vs' bodyLen' N
+          (front.length + (extraFuel + 1)) ctx bb vs0 := by
+  rw [executePlan_append] at hblock
+  obtain ⟨hbpre, hbemit⟩ := asmBlockAt_append hblock
+  obtain ⟨asMid, hbrun, hbrel, hbpc, hbsd, hbsv⟩ :=
+    genBlockPrefixBodyHSVP_sim_inv P l gp lg front S0 M0 ps0 vs0 sEnd as0
+      hfront hready hsd0 hsv0 hspM hrel0 hthread hbpre
+  rw [← hbodyLenEq] at hbrun hbpc
+  have hoffmem := stackPerm_mem hbsv hoffS
+  have hszmem := stackPerm_mem hbsv hszS
+  have hshallow : (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2))
+      ([], ps0)).2.stack.length ≤ 15 := by have := hbsd.shallow; omega
+  obtain ⟨d_y, d_x', hdepth_y, hsmall_y, hleny, hdepth_x', hsmall_x', hlenx'⟩ :=
+    binopVar_depths_of_shallow (x := offv) (y := szv) hshallow hoffmem hszmem
+  have hnospill_sz := alookup_of_spilled_eq hspMF hszM
+  have hnospill_off := alookup_of_spilled_eq hspMF hoffM
+  have hbemit' : asmBlockAt prog asMid.pc
+      (executePlan (emitInputPlan opc [Operand.Var szv, Operand.Var offv] nl
+        (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).1) := by
+    rw [hbpc, hbodyLenEq]; exact hbemit
+  obtain ⟨asMid2, herun, herel, hepc, hemem⟩ :=
+    emitInputPlan_pair_var_sim (offsetToPc := offsetToPc) hnospill_sz hliveszv hdepth_y hsmall_y
+      hleny hnospill_off hliveoff hdepth_x' hsmall_x' hlenx' hbrel hbemit'
+  rw [← hemitLenEq] at herun hepc
+  have hemitstack : (emitInputPlan opc [Operand.Var szv, Operand.Var offv] nl
+      (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).2.stack
+      = (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2.stack
+        ++ [Operand.Var szv, Operand.Var offv] := by
+    rw [emitInputPlan_pair_var_eq hnospill_sz hliveszv hdepth_y hsmall_y hnospill_off hliveoff
+      hdepth_x' hsmall_x']
+  have htop : asMid2.stack = woff :: wsz :: asMid2.stack.drop 2 :=
+    venomAsmRel_asmStack_top2_var herel hemitstack hvoff hvsz
+  have hpc' : asMid2.pc < prog.length := by rw [hepc, hbpc]; omega
+  have hget' : prog.get ⟨asMid2.pc, hpc'⟩ = AsmInst.AsmOp "REVERT" :=
+    prog_get_transfer (by rw [hepc, hbpc]) hget
+  have hcov : wsz.toNat = 0 ∨ ((woff.toNat + wsz.toNat + 31) / 32) * 32 ≤ asMid2.memory.size := by
+    rcases hcov0 with h | h
+    · exact Or.inl h
+    · exact Or.inr (le_trans h (by rw [hemem]; exact runAsm_memory_size_mono hbrun))
+  have hsafe' : woff.toNat + wsz.toNat ≤ (emitInputPlan opc [Operand.Var szv, Operand.Var offv] nl
+      (lg.foldl (fun acc x => (acc.1 ++ (gp x.1 acc.2).1, (gp x.1 acc.2).2)) ([], ps0)).2).2.alloc.fnEom := by
+    rw [emitInputPlan_pair_var_eq hnospill_sz hliveszv hdepth_y hsmall_y hnospill_off hliveoff
+      hdepth_x' hsmall_x']
+    exact hsafe
+  have hthread' : execBodyThread front 0 { vs0 with instIdx := 0 } = some sEnd := by
+    rw [← hvs0]; exact hthread
+  have hrb : runBlock (front.length + (extraFuel + 1)) ctx bb vs0
+      = ExecResult.Abort AbortType.RevertAbort
+          (revertState (setReturndata (readMemory woff.toNat wsz.toNat sEnd) sEnd)) :=
+    runBlock_abort ctx bb extraFuel front term hd tl vs0 sEnd _ AbortType.RevertAbort
+      hbb hcons hphi hnonterm hthread' hterm_step
+  have hbody : runAsm (bodyLen + emitLen) offsetToPc prog as0 = AsmResult.AsmOK asMid2 := by
+    rw [runAsm_add_ok hbrun]; exact herun
+  exact ⟨asMid2, _, sEnd, bodyLen + emitLen, hbody,
+    Or.inr (Or.inr (Or.inr (Or.inl ⟨woff, wsz, asMid2.stack.drop 2, herel, hN, hrb, ⟨hpc', hget'⟩,
+      htop, hcov, hsafe', hlen⟩)))⟩
+
+/-! ## Producing a block's recipe from `RegularBodyH`: the first continuing terminator (JMP)
+
+The continuing terminators (JMP/JNZ/DJMP) differ from the halting ones by one input: the
+**successor-recording** — the body-end plan lines up with the target block's recorded plan
+(`ps' = psOf target`). `termRecipe_jmp_of_regular` produces the JMP recipe from `RegularBodyH`
+(no-spill body) exactly like `termRecipe_stop_of_regular`, taking that successor-recording as an explicit
+input. **It is not an open gap**: `adapter_lgfold_eq_psOfFn_succ_general` derives it as
+`(lg.foldl gp).2 = psOfFn succ` (the real `psOfFn`, from the JMP-chain hypotheses), and the per-block
+`hstep_regularHSVP_jmp_canonical` already uses that exact fact with `psOf := psOfFn` (which
+`codegen_correct_{sched,fuel}` consume). So this producer isolates the single continuing-terminator input
+and shows the JMP recipe is built from `RegularBodyH` + placement + that derivable fact. -/
+
+
+/-- **A JMP block's terminator recipe from `RegularBodyH`** (no-spill body), taking the successor-recording
+    `ps' = psOf target` as an explicit (derivable — see the section note) input. -/
+theorem termRecipe_jmp_of_regular
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {pcOf : String → Nat} {psOf : String → PlanState}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {nextLiveness : List String} {curBbLabel : String} {dem : Nat}
+    {ps0 : PlanState} {as0 : AsmState} {N restFuel off : Nat} {ctx : VenomContext} {bb bb' : BasicBlock}
+    {front : List Instruction} {jmpInst hd : Instruction} {tl : List Instruction}
+    {s sEnd : VenomState} {S : List String} {target : String}
+    (hbb : bb.instructions = front ++ [jmpInst]) (hjmpop : jmpInst.opcode = Opcode.JMP)
+    (hoperands : jmpInst.operands = [Operand.Label target])
+    (hcons : front ++ [jmpInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hnothalt : sEnd.halted = false)
+    (hreg : RegularBodyH lo nextLiveness o2pc prog dem front S)
+    (hsd : StackDiscH ((front.zipIdx 0).map (fun _ => dem)).sum ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel0 : venomAsmRel lo ps0 { s with instIdx := 0 } as0)
+    (hblock : asmBlockAt prog as0.pc
+      (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1))
+    (hps : (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2 = psOf target)
+    (hp1 : as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length < prog.length)
+    (hpush : prog.get ⟨as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length, hp1⟩
+      = resolveInst offsets (AsmInst.AsmPushLabel target))
+    (hoff_lk : AssocList.lookup String Nat offsets target = some off) (hoff : off < 2 ^ 256)
+    (hp2 : as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 1 < prog.length)
+    (hjump : prog.get ⟨as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 1, hp2⟩
+      = AsmInst.AsmOp "JUMP")
+    (hidx_lk : AssocList.lookup Nat Nat o2pc off = some (pcOf target))
+    (hlk' : lookupBlock target fn.blocks = some bb')
+    (hle : (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 2 ≤ N) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen' : Nat),
+      runAsm bodyLen' o2pc prog as0 = AsmResult.AsmOK as'
+      ∧ TermRecipe fn lo pcOf psOf o2pc offsets prog as' ps' vs' bodyLen' N
+          (front.length + (restFuel + 1)) ctx bb s := by
+  have hbrh := bodyStepsReadyH_regular_list (liveness := liveness) (dfg := dfg) (cfg := cfg) (fn := fn)
+    (curBbLabel := curBbLabel) front S 0 hreg
+  obtain ⟨as', hrun, hrel', hpc', _, _⟩ := genBlockBodyH_sim_inv
+    (fun z p => generateRegularInstPlan liveness dfg cfg fn z.1 nextLiveness false true curBbLabel p)
+    (fun _ => dem) (front.zipIdx 0) S ps0 { s with instIdx := 0 } as0 hbrh hsd hsv hrel0 hblock
+  have hgv : (front.zipIdx 0).foldl (fun v x => gvBodyStep x v) { s with instIdx := 0 } = sEnd :=
+    execBodyThread_eq_gvFold front 0 { s with instIdx := 0 } sEnd hthread
+  rw [hgv] at hrel'
+  have hrb : runBlock (front.length + (restFuel + 1)) ctx bb s = ExecResult.OK (jumpTo target sEnd) :=
+    runBlock_body_jmp ctx bb restFuel front jmpInst hd tl s sEnd target
+      hbb hjmpop hoperands hcons hphi hnonterm hthread hnothalt
+  have hp1' : as'.pc < prog.length := hpc' ▸ hp1
+  have hpush' : prog.get ⟨as'.pc, hp1'⟩ = resolveInst offsets (AsmInst.AsmPushLabel target) :=
+    prog_get_transfer hpc' hpush
+  have hp2' : as'.pc + 1 < prog.length := by rw [hpc']; exact hp2
+  have hjump' : prog.get ⟨as'.pc + 1, hp2'⟩ = AsmInst.AsmOp "JUMP" :=
+    prog_get_transfer (congrArg (· + 1) hpc') hjump
+  refine ⟨as', _, sEnd, _, hrun,
+    Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl
+      ⟨target, off, bb', hrel', hps, hle, hnothalt, hrb, ⟨hp1', hpush'⟩, hoff_lk, hoff,
+        ⟨hp2', hjump'⟩, hidx_lk, hlk'⟩)))))⟩
+
+/-! ## Producing a block's recipe from `RegularBodyH`: JNZ (both branches)
+
+JNZ carries the branch condition ON THE STACK, so beyond `termRecipe_jmp_of_regular` two facts about the
+existential body-end `as'` are DERIVED from the body-sim relation rather than taken raw: the asm condition
+on top (`venomAsmRel_asmStack_top1_var`, given the plan-TOS is the condition var) and the condition-dropped
+successor relation (`venomAsmRel_pop_tos`, given the successor plan is the body-fold with the condition
+popped — the JNZ successor-recording, an explicit plan input). `venomAsmRel_pop_tos` is the reusable
+building block: only `planStackRel` reads the stacks, so a shared-TOS pop is `planStackRel_pop` on that one
+component. -/
+
+
+
+/-- **A JNZ (taken) block's terminator recipe from `RegularBodyH`** (no-spill body); the condition-on-top
+    and the condition-dropped successor relation are derived from the body-sim relation. -/
+theorem termRecipe_jnz_taken_of_regular
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {pcOf : String → Nat} {psOf : String → PlanState}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {nextLiveness : List String} {curBbLabel : String} {dem : Nat}
+    {ps0 : PlanState} {as0 : AsmState} {N restFuel off : Nat} {ctx : VenomContext} {bb bb' : BasicBlock}
+    {front : List Instruction} {jnzInst hd : Instruction} {tl : List Instruction}
+    {s sEnd : VenomState} {S : List String} {condvar ifNz ifZ : String} {cond : bytes32}
+    {base : List Operand}
+    (hbb : bb.instructions = front ++ [jnzInst]) (hop : jnzInst.opcode = Opcode.JNZ)
+    (hoperands : jnzInst.operands = [Operand.Var condvar, Operand.Label ifNz, Operand.Label ifZ])
+    (hcondv : evalOperand (Operand.Var condvar) sEnd = some cond)
+    (hcond_ne : cond ≠ EvmYul.UInt256.ofNat 0)
+    (hval : operandVal sEnd lo (Operand.Var condvar) = some cond)
+    (hcons : front ++ [jnzInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hnothalt : sEnd.halted = false)
+    (hreg : RegularBodyH lo nextLiveness o2pc prog dem front S)
+    (hsd : StackDiscH ((front.zipIdx 0).map (fun _ => dem)).sum ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel0 : venomAsmRel lo ps0 { s with instIdx := 0 } as0)
+    (hblock : asmBlockAt prog as0.pc
+      (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1))
+    (hcondtos : (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2.stack
+      = base ++ [Operand.Var condvar])
+    (hpsj : psOf ifNz = { (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2 with
+      stack := stackPop 1 (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2.stack })
+    (hp1 : as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length < prog.length)
+    (hpush : prog.get ⟨as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length, hp1⟩
+      = resolveInst offsets (AsmInst.AsmPushLabel ifNz))
+    (hoff_lk : AssocList.lookup String Nat offsets ifNz = some off) (hoff : off < 2 ^ 256)
+    (hp2 : as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 1 < prog.length)
+    (hjumpi : prog.get ⟨as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 1, hp2⟩
+      = AsmInst.AsmOp "JUMPI")
+    (hidx_lk : AssocList.lookup Nat Nat o2pc off = some (pcOf ifNz))
+    (hlk' : lookupBlock ifNz fn.blocks = some bb')
+    (hle : (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 2 ≤ N) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen' : Nat),
+      runAsm bodyLen' o2pc prog as0 = AsmResult.AsmOK as'
+      ∧ TermRecipe fn lo pcOf psOf o2pc offsets prog as' ps' vs' bodyLen' N
+          (front.length + (restFuel + 1)) ctx bb s := by
+  have hbrh := bodyStepsReadyH_regular_list (liveness := liveness) (dfg := dfg) (cfg := cfg) (fn := fn)
+    (curBbLabel := curBbLabel) front S 0 hreg
+  obtain ⟨as', hrun, hrel', hpc', _, _⟩ := genBlockBodyH_sim_inv
+    (fun z p => generateRegularInstPlan liveness dfg cfg fn z.1 nextLiveness false true curBbLabel p)
+    (fun _ => dem) (front.zipIdx 0) S ps0 { s with instIdx := 0 } as0 hbrh hsd hsv hrel0 hblock
+  have hgv : (front.zipIdx 0).foldl (fun v x => gvBodyStep x v) { s with instIdx := 0 } = sEnd :=
+    execBodyThread_eq_gvFold front 0 { s with instIdx := 0 } sEnd hthread
+  rw [hgv] at hrel'
+  have hstk_c : as'.stack = cond :: as'.stack.drop 1 :=
+    venomAsmRel_asmStack_top1_var hrel' hcondtos hval
+  have hsucc : venomAsmRel lo (psOf ifNz) sEnd { as' with stack := as'.stack.drop 1 } := by
+    rw [hpsj]; exact venomAsmRel_pop_tos hrel' hstk_c
+  have hrb : runBlock (front.length + (restFuel + 1)) ctx bb s = ExecResult.OK (jumpTo ifNz sEnd) :=
+    runBlock_body_jnz_taken ctx bb restFuel front jnzInst hd tl s sEnd (Operand.Var condvar) ifNz ifZ cond
+      hbb hop hoperands hcondv hcond_ne hcons hphi hnonterm hthread hnothalt
+  have hp1' : as'.pc < prog.length := hpc' ▸ hp1
+  have hpush' : prog.get ⟨as'.pc, hp1'⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifNz) :=
+    prog_get_transfer hpc' hpush
+  have hp2' : as'.pc + 1 < prog.length := by rw [hpc']; exact hp2
+  have hjumpi' : prog.get ⟨as'.pc + 1, hp2'⟩ = AsmInst.AsmOp "JUMPI" :=
+    prog_get_transfer (congrArg (· + 1) hpc') hjumpi
+  refine ⟨as', (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2, sEnd, _, hrun,
+    Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl
+      ⟨ifNz, off, cond, as'.stack.drop 1, bb', hle, hnothalt, hrb, hstk_c, hcond_ne,
+        ⟨hp1', hpush'⟩, hoff_lk, hoff, ⟨hp2', hjumpi'⟩, hidx_lk, hsucc, hlk'⟩))))))⟩
+
+/-- **A JNZ (not taken) block's terminator recipe from `RegularBodyH`** (condition zero; 4-op tail). -/
+theorem termRecipe_jnz_nottaken_of_regular
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {pcOf : String → Nat} {psOf : String → PlanState}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {nextLiveness : List String} {curBbLabel : String} {dem : Nat}
+    {ps0 : PlanState} {as0 : AsmState} {N restFuel offN offZ : Nat} {ctx : VenomContext}
+    {bb bb' : BasicBlock}
+    {front : List Instruction} {jnzInst hd : Instruction} {tl : List Instruction}
+    {s sEnd : VenomState} {S : List String} {condvar ifNz ifZ : String} {base : List Operand}
+    (hbb : bb.instructions = front ++ [jnzInst]) (hop : jnzInst.opcode = Opcode.JNZ)
+    (hoperands : jnzInst.operands = [Operand.Var condvar, Operand.Label ifNz, Operand.Label ifZ])
+    (hcondv : evalOperand (Operand.Var condvar) sEnd = some (EvmYul.UInt256.ofNat 0))
+    (hval : operandVal sEnd lo (Operand.Var condvar) = some (EvmYul.UInt256.ofNat 0))
+    (hcons : front ++ [jnzInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hnothalt : sEnd.halted = false)
+    (hreg : RegularBodyH lo nextLiveness o2pc prog dem front S)
+    (hsd : StackDiscH ((front.zipIdx 0).map (fun _ => dem)).sum ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel0 : venomAsmRel lo ps0 { s with instIdx := 0 } as0)
+    (hblock : asmBlockAt prog as0.pc
+      (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1))
+    (hcondtos : (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2.stack
+      = base ++ [Operand.Var condvar])
+    (hpsj : psOf ifZ = { (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2 with
+      stack := stackPop 1 (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2.stack })
+    (hp1 : as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length < prog.length)
+    (hpushN : prog.get ⟨as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length, hp1⟩
+      = resolveInst offsets (AsmInst.AsmPushLabel ifNz))
+    (hoffN_lk : AssocList.lookup String Nat offsets ifNz = some offN) (hoffN : offN < 2 ^ 256)
+    (hp2 : as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 1 < prog.length)
+    (hjumpi : prog.get ⟨as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 1, hp2⟩
+      = AsmInst.AsmOp "JUMPI")
+    (hp3 : as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 2 < prog.length)
+    (hpushZ : prog.get ⟨as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 2, hp3⟩
+      = resolveInst offsets (AsmInst.AsmPushLabel ifZ))
+    (hoffZ_lk : AssocList.lookup String Nat offsets ifZ = some offZ) (hoffZ : offZ < 2 ^ 256)
+    (hp4 : as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 2 + 1 < prog.length)
+    (hjump : prog.get ⟨as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 2 + 1, hp4⟩
+      = AsmInst.AsmOp "JUMP")
+    (hidxZ_lk : AssocList.lookup Nat Nat o2pc offZ = some (pcOf ifZ))
+    (hlk' : lookupBlock ifZ fn.blocks = some bb')
+    (hle : (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length + 4 ≤ N) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen' : Nat),
+      runAsm bodyLen' o2pc prog as0 = AsmResult.AsmOK as'
+      ∧ TermRecipe fn lo pcOf psOf o2pc offsets prog as' ps' vs' bodyLen' N
+          (front.length + (restFuel + 1)) ctx bb s := by
+  have hbrh := bodyStepsReadyH_regular_list (liveness := liveness) (dfg := dfg) (cfg := cfg) (fn := fn)
+    (curBbLabel := curBbLabel) front S 0 hreg
+  obtain ⟨as', hrun, hrel', hpc', _, _⟩ := genBlockBodyH_sim_inv
+    (fun z p => generateRegularInstPlan liveness dfg cfg fn z.1 nextLiveness false true curBbLabel p)
+    (fun _ => dem) (front.zipIdx 0) S ps0 { s with instIdx := 0 } as0 hbrh hsd hsv hrel0 hblock
+  have hgv : (front.zipIdx 0).foldl (fun v x => gvBodyStep x v) { s with instIdx := 0 } = sEnd :=
+    execBodyThread_eq_gvFold front 0 { s with instIdx := 0 } sEnd hthread
+  rw [hgv] at hrel'
+  have hstk_c : as'.stack = EvmYul.UInt256.ofNat 0 :: as'.stack.drop 1 :=
+    venomAsmRel_asmStack_top1_var hrel' hcondtos hval
+  have hsucc : venomAsmRel lo (psOf ifZ) sEnd { as' with stack := as'.stack.drop 1 } := by
+    rw [hpsj]; exact venomAsmRel_pop_tos hrel' hstk_c
+  have hrb : runBlock (front.length + (restFuel + 1)) ctx bb s = ExecResult.OK (jumpTo ifZ sEnd) :=
+    runBlock_body_jnz_nottaken ctx bb restFuel front jnzInst hd tl s sEnd (Operand.Var condvar) ifNz ifZ
+      hbb hop hoperands hcondv hcons hphi hnonterm hthread hnothalt
+  have hp1' : as'.pc < prog.length := hpc' ▸ hp1
+  have hpushN' : prog.get ⟨as'.pc, hp1'⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifNz) :=
+    prog_get_transfer hpc' hpushN
+  have hp2' : as'.pc + 1 < prog.length := by rw [hpc']; exact hp2
+  have hjumpi' : prog.get ⟨as'.pc + 1, hp2'⟩ = AsmInst.AsmOp "JUMPI" :=
+    prog_get_transfer (congrArg (· + 1) hpc') hjumpi
+  have hp3' : as'.pc + 2 < prog.length := by rw [hpc']; exact hp3
+  have hpushZ' : prog.get ⟨as'.pc + 2, hp3'⟩ = resolveInst offsets (AsmInst.AsmPushLabel ifZ) :=
+    prog_get_transfer (congrArg (· + 2) hpc') hpushZ
+  have hp4' : as'.pc + 2 + 1 < prog.length := by rw [hpc']; exact hp4
+  have hjump' : prog.get ⟨as'.pc + 2 + 1, hp4'⟩ = AsmInst.AsmOp "JUMP" :=
+    prog_get_transfer (congrArg (· + 2 + 1) hpc') hjump
+  refine ⟨as', (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2, sEnd, _, hrun,
+    Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl
+      ⟨ifNz, ifZ, offN, offZ, as'.stack.drop 1, bb', hle, hnothalt, hrb, hstk_c,
+        ⟨hp1', hpushN'⟩, hoffN_lk, hoffN, ⟨hp2', hjumpi'⟩, ⟨hp3', hpushZ'⟩, hoffZ_lk, hoffZ,
+        ⟨hp4', hjump'⟩, hidxZ_lk, hsucc, hlk'⟩)))))))⟩
+
+/-! ## Producing a block's recipe from `RegularBodyH`: DJMP (the last terminator; recipe coverage 8/8)
+
+DJMP is the dynamic-jump analogue of JNZ: the selector is on the stack (extracted from the body-sim
+relation), the selector-dropped successor relation comes from `venomAsmRel_pop_tos`, and the dispatch run
+comes from `djmp_switch_sim_state` (the `pre`-list of non-matching entries + the trampoline placement,
+threaded from the caller; only the scan/match positions are relative to the body-end pc, so they transfer
+via `hpc'`, while the trampoline ops sit at an absolute index). With this, every one of the eight codegen
+terminators has a `RegularBodyH`-to-`TermRecipe` producer. -/
+
+
+/-- **A DJMP block's terminator recipe from `RegularBodyH`.** The dynamic-jump analogue: the selector is
+    on the stack (extracted from the body-sim relation), the dispatch run comes from `djmp_switch_sim_state`
+    (the `pre`-list of non-matching entries + trampoline placement, threaded from the caller), and the
+    selector-dropped successor relation from `venomAsmRel_pop_tos`. The last terminator's recipe. -/
+theorem termRecipe_djmp_of_regular
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {pcOf : String → Nat} {psOf : String → PlanState}
+    {o2pc : AssocList Nat Nat} {offsets : AssocList String Nat} {prog : List AsmInst}
+    {nextLiveness : List String} {curBbLabel : String} {dem : Nat}
+    {ps0 : PlanState} {as0 : AsmState} {N restFuel : Nat} {ctx : VenomContext} {bb bb' : BasicBlock}
+    {front : List Instruction} {dInst hd : Instruction} {tl : List Instruction}
+    {s sEnd : VenomState} {S : List String} {selvar : String} {idx : bytes32} {base : List Operand}
+    {labelOps : List Operand} {labels : List String} {hi : idx.toNat < labels.length}
+    -- dispatch structure (threaded to djmp_switch_sim_state)
+    {pre : List (List byte × String × Nat)}
+    {matb : List byte} {tName lName : String} {matoff idxTramp loff target lc : Nat}
+    (hbb : bb.instructions = front ++ [dInst]) (hop : dInst.opcode = Opcode.DJMP)
+    (hoperands : dInst.operands = Operand.Var selvar :: labelOps)
+    (hselv : evalOperand (Operand.Var selvar) sEnd = some idx)
+    (hlabels : extractLabels labelOps = some labels)
+    (hval : operandVal sEnd lo (Operand.Var selvar) = some idx)
+    (hcons : front ++ [dInst] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hnothalt : sEnd.halted = false)
+    (hreg : RegularBodyH lo nextLiveness o2pc prog dem front S)
+    (hsd : StackDiscH ((front.zipIdx 0).map (fun _ => dem)).sum ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel0 : venomAsmRel lo ps0 { s with instIdx := 0 } as0)
+    (hblock : asmBlockAt prog as0.pc
+      (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1))
+    (hseltos : (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2.stack
+      = base ++ [Operand.Var selvar])
+    (hpsj : psOf (labels.get ⟨idx.toNat, hi⟩)
+      = { (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2 with
+          stack := stackPop 1 (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2.stack, labelCounter := lc })
+    (hpct : pcOf (labels.get ⟨idx.toNat, hi⟩) = target)
+    -- dispatch placement (about as0.pc+bodyLen for the scan/match; absolute idxTramp for the trampoline)
+    (hpre : ∀ (k : Nat) (hk : k < pre.length),
+        djmpEntryHere offsets prog ((as0.pc + (executePlan
+            (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length) + 5 * k)
+          (pre.get ⟨k, hk⟩).1 (pre.get ⟨k, hk⟩).2.1 (pre.get ⟨k, hk⟩).2.2 ∧
+        idx ≠ djmpVal (pre.get ⟨k, hk⟩).1)
+    (hmatch : djmpEntryHere offsets prog ((as0.pc + (executePlan
+        (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length) + 5 * pre.length)
+        matb tName matoff)
+    (hsel : idx = djmpVal matb)
+    (hidx_lk : AssocList.lookup Nat Nat o2pc matoff = some idxTramp)
+    (ht0 : ∃ h : idxTramp < prog.length, prog.get ⟨idxTramp, h⟩ = AsmInst.AsmLabel tName)
+    (ht1 : ∃ h : idxTramp + 1 < prog.length, prog.get ⟨idxTramp + 1, h⟩ = AsmInst.AsmOp "POP")
+    (ht2 : ∃ h : idxTramp + 2 < prog.length,
+        prog.get ⟨idxTramp + 2, h⟩ = resolveInst offsets (AsmInst.AsmPushLabel lName))
+    (hl_lk : AssocList.lookup String Nat offsets lName = some loff) (hloff : loff < 2 ^ 256)
+    (ht3 : ∃ h : idxTramp + 3 < prog.length, prog.get ⟨idxTramp + 3, h⟩ = AsmInst.AsmOp "JUMP")
+    (htarget_lk : AssocList.lookup Nat Nat o2pc loff = some target)
+    (hlk : lookupBlock (labels.get ⟨idx.toNat, hi⟩) fn.blocks = some bb')
+    (hle : (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length
+      + (5 * pre.length + 5 + 4) ≤ N) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen' : Nat),
+      runAsm bodyLen' o2pc prog as0 = AsmResult.AsmOK as'
+      ∧ TermRecipe fn lo pcOf psOf o2pc offsets prog as' ps' vs' bodyLen' N
+          (front.length + (restFuel + 1)) ctx bb s := by
+  have hbrh := bodyStepsReadyH_regular_list (liveness := liveness) (dfg := dfg) (cfg := cfg) (fn := fn)
+    (curBbLabel := curBbLabel) front S 0 hreg
+  obtain ⟨as', hrun, hrel', hpc', _, _⟩ := genBlockBodyH_sim_inv
+    (fun z p => generateRegularInstPlan liveness dfg cfg fn z.1 nextLiveness false true curBbLabel p)
+    (fun _ => dem) (front.zipIdx 0) S ps0 { s with instIdx := 0 } as0 hbrh hsd hsv hrel0 hblock
+  have hgv : (front.zipIdx 0).foldl (fun v x => gvBodyStep x v) { s with instIdx := 0 } = sEnd :=
+    execBodyThread_eq_gvFold front 0 { s with instIdx := 0 } sEnd hthread
+  rw [hgv] at hrel'
+  have hstk_c : as'.stack = idx :: as'.stack.drop 1 :=
+    venomAsmRel_asmStack_top1_var hrel' hseltos hval
+  have hsucc : venomAsmRel lo (psOf (labels.get ⟨idx.toNat, hi⟩)) sEnd
+      { as' with stack := as'.stack.drop 1 } := by
+    rw [hpsj]; exact venomAsmRel_pop_tos hrel' hstk_c
+  have hrb : runBlock (front.length + (restFuel + 1)) ctx bb s
+      = ExecResult.OK (jumpTo (labels.get ⟨idx.toNat, hi⟩) sEnd) :=
+    runBlock_body_djmp ctx bb restFuel front dInst hd tl s sEnd (Operand.Var selvar) labelOps idx labels
+      hi hbb hop hoperands hselv hlabels hcons hphi hnonterm hthread hnothalt
+  -- the dispatch run
+  have hdispatch := djmp_switch_sim_state (offsetToPc := o2pc) pre as' hstk_c
+    (by intro k hk; rw [hpc']; exact hpre k hk)
+    (by rw [hpc']; exact hmatch) hsel hidx_lk ht0 ht1 ht2 hl_lk hloff ht3 htarget_lk
+  rw [← hpct] at hdispatch
+  exact ⟨as', (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).2, sEnd,
+    (executePlan (bodyPlanRIP liveness dfg cfg fn nextLiveness curBbLabel front ps0).1).length, hrun,
+    Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr
+      ⟨labels.get ⟨idx.toNat, hi⟩, 5 * pre.length + 5 + 4, as'.stack.drop 1, bb', hle, hnothalt, hrb,
+        hdispatch, hsucc, hlk⟩)))))))⟩
 
 end EvmYul.Venom.Hol.Codegen

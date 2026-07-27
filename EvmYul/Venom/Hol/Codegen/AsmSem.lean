@@ -488,7 +488,7 @@ def asmStep (offsetToPc : AssocList Nat Nat) (instructions : List AsmInst) (s : 
     | AsmInst.AsmOp "RETURN"   => asmReturnOp s
     | AsmInst.AsmOp "REVERT"   => asmRevertOp s
     | AsmInst.AsmOp "STOP"     => AsmResult.AsmHalt (asmNext s)
-    | AsmInst.AsmOp "INVALID"  => AsmResult.AsmFault (asmNext s)
+    | AsmInst.AsmOp "INVALID"  => AsmResult.AsmFault { asmNext s with returndata := ByteArray.empty }
     | AsmInst.AsmOp "SELFDESTRUCT" => asmSelfdestruct s
     -- Push
     | AsmInst.AsmPush bytes =>

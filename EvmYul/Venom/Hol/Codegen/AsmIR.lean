@@ -41,7 +41,7 @@ inductive StackOp where
   | SOLabel     : String → StackOp          -- JUMPDEST label
   | SOPushLabel : String → StackOp          -- push label address
   | SOPushOfst  : String → Nat → StackOp    -- push (label + offset)
-  deriving Inhabited
+  deriving Inhabited, DecidableEq
 
 /- ===== Venom Opcode → EVM Name Mapping ===== -/
 
