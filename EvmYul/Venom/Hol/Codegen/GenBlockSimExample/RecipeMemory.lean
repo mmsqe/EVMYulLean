@@ -4075,4 +4075,871 @@ theorem codegen_correct_mtpFn_recipeW {lo : AssocList String Nat} {vs : VenomSta
 
 end Example
 
+
+/-! ## f1a stage 1: the buried-consume plan decompositions (`deadBuriedFn`)
+
+The concrete plan-level equations for the swap-threading route (status.md f1a; see the
+f1a memory scoping): the third CALLVALUE's non-noop `optimisticSwapPlan`, the buried
+pair's two-swap reorder (and the losing branch of the cheaper-order comparison), and
+the two consuming decompositions `d = ADD %a %b` / `SSTORE %c %d` they feed. The sim
+layer (doSwap_sim-based fold steps) and the `deadBuriedFn` capstone build on these. -/
+
+namespace Example
+
+/-- The real dataflow analysis of `deadBuriedFn` (the optimistic-swap oracle). -/
+def dbDfg : DfgAnalysis := DfgAnalysis.buildFunction deadBuriedFn
+
+/-- **The third CALLVALUE's optimistic swap fires** — output `c` differs from the next
+    scheduled var `b` (`operandEquiv` decides on the concrete dfg), which sits at depth 1, so
+    the generator pre-positions it with one `SWAP1`. The concrete non-noop `optimisticSwapPlan`
+    equation the f1a fold steps consume in place of the usual `hoptnoop`. -/
+theorem optimisticSwapPlan_dCv0 (ps : PlanState)
+    (hstack : ps.stack = [Operand.Var "a", Operand.Var "b", Operand.Var "c"]) :
+    optimisticSwapPlan dbDfg dCv0 ["c", "a", "b"] false ps
+      = ([StackOp.SOSwap 1], { ps with stack := [Operand.Var "a", Operand.Var "c", Operand.Var "b"] }) := by
+  have hd : stackGetDepth (Operand.Var "b") ps.stack = some 1 := by rw [hstack]; rfl
+  have hsw : stackSwap 1 ps.stack = [Operand.Var "a", Operand.Var "c", Operand.Var "b"] := by
+    rw [hstack]; rfl
+  unfold optimisticSwapPlan
+  simp [show dCv0.outputs.isEmpty = false from rfl, hd, doSwap, hsw]
+  decide
+
+/-- **The buried-pair reorder** — targets `[b, a]` on the post-optimism stack `[a, c, b]`:
+    `b` (TOS) goes to depth 1 (`SWAP1`), then `a` (depth 2) comes to the top (`SWAP2`), leaving
+    `[c, b, a]` with the pair positioned for a bare consume. Cost 2. -/
+theorem reorderPlan_dbBuried (ps : PlanState)
+    (hstack : ps.stack = [Operand.Var "a", Operand.Var "c", Operand.Var "b"]) :
+    reorderPlan [Operand.Var "b", Operand.Var "a"] ps
+      = ([StackOp.SOSwap 1, StackOp.SOSwap 2], { ps with stack := [Operand.Var "c", Operand.Var "b", Operand.Var "a"] }) := by
+  have hstep0 : reorderOne () [Operand.Var "b", Operand.Var "a"] 0 (Operand.Var "b") ps
+      = ([StackOp.SOSwap 1], { ps with stack := [Operand.Var "a", Operand.Var "b", Operand.Var "c"] }) := by
+    have hd : stackGetDepth (Operand.Var "b") ps.stack = some 0 := by rw [hstack]; rfl
+    have hsw : stackSwap 1 ps.stack = [Operand.Var "a", Operand.Var "b", Operand.Var "c"] := by
+      rw [hstack]; rfl
+    unfold reorderOne
+    simp [hd, doSwap, hsw]
+    try rfl
+  have hstep1 : reorderOne () [Operand.Var "b", Operand.Var "a"] 1 (Operand.Var "a")
+      ({ ps with stack := [Operand.Var "a", Operand.Var "b", Operand.Var "c"] } : PlanState)
+      = ([StackOp.SOSwap 2], { ps with stack := [Operand.Var "c", Operand.Var "b", Operand.Var "a"] }) := by
+    have hd : stackGetDepth (Operand.Var "a")
+        (({ ps with stack := [Operand.Var "a", Operand.Var "b", Operand.Var "c"] } : PlanState)).stack = some 2 := rfl
+    unfold reorderOne
+    simp [hd, doSwap]
+    try rfl
+  unfold reorderPlan
+  have henum : ([Operand.Var "b", Operand.Var "a"] : List Operand).enum
+      = [(0, Operand.Var "b"), (1, Operand.Var "a")] := rfl
+  rw [henum]
+  simp only [List.foldl_cons, List.foldl_nil, hstep0, hstep1, List.nil_append]
+  try rfl
+
+/-- **The losing branch of the commutative cheaper-order choice** — targets `[a, b]` on
+    `[a, c, b]` cost 3 (`SWAP2;SWAP1;SWAP2`), so the generator's `reorderCost` comparison
+    (2 < 3) picks the `computeOperands` order `[b, a]` and hence the TRUE evaluation order. -/
+theorem reorderPlan_dbBuried_swapped (ps : PlanState)
+    (hstack : ps.stack = [Operand.Var "a", Operand.Var "c", Operand.Var "b"]) :
+    reorderPlan [Operand.Var "a", Operand.Var "b"] ps
+      = ([StackOp.SOSwap 2, StackOp.SOSwap 1, StackOp.SOSwap 2], { ps with stack := [Operand.Var "c", Operand.Var "a", Operand.Var "b"] }) := by
+  have hstep0 : reorderOne () [Operand.Var "a", Operand.Var "b"] 0 (Operand.Var "a") ps
+      = ([StackOp.SOSwap 2, StackOp.SOSwap 1], { ps with stack := [Operand.Var "b", Operand.Var "a", Operand.Var "c"] }) := by
+    have hd : stackGetDepth (Operand.Var "a") ps.stack = some 2 := by rw [hstack]; rfl
+    have hsw2 : stackSwap 2 ps.stack = [Operand.Var "b", Operand.Var "c", Operand.Var "a"] := by
+      rw [hstack]; rfl
+    unfold reorderOne
+    simp [hd, doSwap, hsw2]
+    try rfl
+  have hstep1 : reorderOne () [Operand.Var "a", Operand.Var "b"] 1 (Operand.Var "b")
+      ({ ps with stack := [Operand.Var "b", Operand.Var "a", Operand.Var "c"] } : PlanState)
+      = ([StackOp.SOSwap 2], { ps with stack := [Operand.Var "c", Operand.Var "a", Operand.Var "b"] }) := by
+    have hd : stackGetDepth (Operand.Var "b")
+        (({ ps with stack := [Operand.Var "b", Operand.Var "a", Operand.Var "c"] } : PlanState)).stack = some 2 := rfl
+    unfold reorderOne
+    simp [hd, doSwap]
+    try rfl
+  unfold reorderPlan
+  have henum : ([Operand.Var "a", Operand.Var "b"] : List Operand).enum
+      = [(0, Operand.Var "a"), (1, Operand.Var "b")] := rfl
+  rw [henum]
+  simp only [List.foldl_cons, List.foldl_nil, hstep0, hstep1, List.nil_append]
+  try rfl
+
+/-- **The buried commutative consume, decomposed** — `d = ADD %a %b` on the post-optimism stack
+    `[a, c, b]`, both operands dead-unspilled: emission is empty, the cheaper-order comparison
+    picks `computeOperands` (`[b, a]`, cost 2 vs 3 — TRUE evaluation order, no `hfcomm`), the
+    reorder is `SWAP1;SWAP2`, and the consume leaves `[c, d]`. The buried sibling of
+    `genRegularInstPlan_commBinopPair_eq`, with the reorder resolved by `reorderPlan_dbBuried`
+    instead of `reorderPlan_pair_nil`. -/
+theorem genRegularInstPlan_dAdd_buried_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {isHalting nextIsTerminator : Bool} {curBbLabel : String} {ps : PlanState}
+    (hstack : ps.stack = [Operand.Var "a", Operand.Var "c", Operand.Var "b"])
+    (hnsa : alookup' ps.spilled (Operand.Var "a") = none)
+    (hnsb : alookup' ps.spilled (Operand.Var "b") = none) :
+    generateRegularInstPlan liveness dfg cfg fn dAdd ["c", "d"] isHalting nextIsTerminator curBbLabel ps
+      = ([StackOp.SOSwap 1, StackOp.SOSwap 2, StackOp.SOEmit "ADD"]
+           ++ (optimisticSwapPlan dfg dAdd ["c", "d"] nextIsTerminator { ps with stack := [Operand.Var "c", Operand.Var "d"] }).1,
+         releaseDeadSpills ["c", "d"]
+           (optimisticSwapPlan dfg dAdd ["c", "d"] nextIsTerminator { ps with stack := [Operand.Var "c", Operand.Var "d"] }).2) := by
+  have hemit : emitInputPlan Opcode.ADD [Operand.Var "b", Operand.Var "a"] ["c", "d"] ps = ([], ps) :=
+    emitInputPlan_pair_dead_eq hnsb (by decide) hnsa (by decide)
+  have hro := reorderPlan_dbBuried ps hstack
+  have hro2 := reorderPlan_dbBuried_swapped ps hstack
+  unfold generateRegularInstPlan
+  cases isHalting <;>
+    simp [show computeOperands dAdd = [Operand.Var "b", Operand.Var "a"] from rfl,
+      show dAdd.opcode = Opcode.ADD from rfl, show dAdd.outputs = ["d"] from rfl,
+      hemit, hro, hro2, reorderCost, popmanyPlan_nil, stackPop, stackPush,
+      generateEmitOps_evmName (show opcodeToEvmName dAdd.opcode = some "ADD" from rfl),
+      isCommutative]
+
+/-- **The swapped dead SSTORE, decomposed** — `SSTORE %c %d` on `[c, d]`, both dead-unspilled,
+    empty next-liveness: emission empty, the (non-commutative) reorder to `[d, c]` is one
+    `SWAP1` (`reorderPlan_swapped_pair`), the store consumes both. -/
+theorem genRegularInstPlan_dStore_swapped_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {isHalting nextIsTerminator : Bool} {curBbLabel : String} {ps : PlanState}
+    (hstack : ps.stack = [Operand.Var "c", Operand.Var "d"])
+    (hnsc : alookup' ps.spilled (Operand.Var "c") = none)
+    (hnsd : alookup' ps.spilled (Operand.Var "d") = none) :
+    generateRegularInstPlan liveness dfg cfg fn dStore [] isHalting nextIsTerminator curBbLabel ps
+      = ([StackOp.SOSwap 1, StackOp.SOEmit "SSTORE"], releaseDeadSpills [] { ps with stack := [] }) := by
+  have hemit : emitInputPlan Opcode.SSTORE [Operand.Var "d", Operand.Var "c"] [] ps = ([], ps) :=
+    emitInputPlan_pair_dead_eq hnsd (by decide) hnsc (by decide)
+  have hro := reorderPlan_swapped_pair [] (Operand.Var "c") (Operand.Var "d") ps (by simpa using hstack)
+  unfold generateRegularInstPlan
+  simp [show computeOperands dStore = [Operand.Var "d", Operand.Var "c"] from rfl,
+    show dStore.opcode = Opcode.SSTORE from rfl, show dStore.outputs = ([] : List String) from rfl,
+    hemit, hro, stackPop, isCommutative,
+    generateEmitOps_evmName (show opcodeToEvmName dStore.opcode = some "SSTORE" from rfl)]
+
+end Example
+
+
+namespace Example
+
+/-! ### f1a stage 2: the `deadBuriedFn` fold steps (aux layer) -/
+
+/-- The real liveness analysis of `deadBuriedFn`. -/
+abbrev dbLive : DfState (List String) := livenessAnalyzeFuel (fnPlanFuel deadBuriedFn) deadBuriedFn
+/-- The real cfg analysis of `deadBuriedFn`. -/
+abbrev dbCfg : CfgAnalysis := cfgAnalyze deadBuriedFn
+/-- Per-index next-liveness table (probed against the real generator). -/
+abbrev dbNl : Nat → List String
+  | 0 => ["a"] | 1 => ["a", "b"] | 2 => ["c", "a", "b"] | 3 => ["c", "d"] | _ => []
+/-- Per-index next-is-terminator table (the STOP follows index 4). -/
+abbrev dbNt : Nat → Bool := fun i => decide (i = 4)
+/-- The per-index fold step: the REAL generator call, per-instruction liveness included. -/
+abbrev dbGp : Instruction × Nat → PlanState → List StackOp × PlanState :=
+  fun z p => generateRegularInstPlan dbLive dbDfg dbCfg deadBuriedFn z.1 (dbNl z.2) true (dbNt z.2) "entry" p
+
+/-- `isHalting` only gates the dead-output pop; with the single output LIVE both branches are
+    nil, so the halting flag is irrelevant to the generated plan. -/
+theorem gRIP_halting_live_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nl : List String} {nt : Bool} {lbl : String} {p : PlanState} {out : String}
+    (houts : inst.outputs = [out]) (hlive : nl.contains out = true) :
+    generateRegularInstPlan liveness dfg cfg fn inst nl true nt lbl p
+      = generateRegularInstPlan liveness dfg cfg fn inst nl false nt lbl p := by
+  have hmem : out ∈ nl := by simpa using hlive
+  unfold generateRegularInstPlan
+  simp [houts, hlive, hmem, popmanyPlan_nil]
+
+/-- CV#1's optimistic swap is a no-op (`a` is both the output and the next scheduled var). -/
+theorem optimisticSwapPlan_dCv1_noop (p : PlanState) :
+    optimisticSwapPlan dbDfg dCv1 ["a"] false p = ([], p) := by
+  unfold optimisticSwapPlan
+  simp [show dCv1.outputs.getLast?.getD "" = "a" from rfl,
+    show operandEquiv dbDfg (Operand.Var "a") (Operand.Var "a") = true from by decide,
+    show dCv1.outputs.isEmpty = false from rfl]
+
+/-- CV#2's optimistic swap is a no-op (`b` is both the output and the next scheduled var). -/
+theorem optimisticSwapPlan_dCv2_noop (p : PlanState) :
+    optimisticSwapPlan dbDfg dCv2 ["a", "b"] false p = ([], p) := by
+  unfold optimisticSwapPlan
+  simp [show dCv2.outputs.getLast?.getD "" = "b" from rfl,
+    show operandEquiv dbDfg (Operand.Var "b") (Operand.Var "b") = true from by decide,
+    show dCv2.outputs.isEmpty = false from rfl]
+
+/-- The ADD's optimistic swap is a no-op (`d` is both the output and the next scheduled var). -/
+theorem optimisticSwapPlan_dAdd_noop (p : PlanState) :
+    optimisticSwapPlan dbDfg dAdd ["c", "d"] false p = ([], p) := by
+  unfold optimisticSwapPlan
+  simp [show dAdd.outputs.getLast?.getD "" = "d" from rfl,
+    show operandEquiv dbDfg (Operand.Var "d") (Operand.Var "d") = true from by decide,
+    show dAdd.outputs.isEmpty = false from rfl]
+
+/-- `doSwap` at distance 1 in closed form. -/
+theorem doSwap_one_eq (p : PlanState) :
+    doSwap 1 p = ([StackOp.SOSwap 1], { p with stack := stackSwap 1 p.stack }) := by
+  unfold doSwap; simp
+
+/-- `doSwap` at distance 2 in closed form. -/
+theorem doSwap_two_eq (p : PlanState) :
+    doSwap 2 p = ([StackOp.SOSwap 2], { p with stack := stackSwap 2 p.stack }) := by
+  unfold doSwap; simp
+
+/-- **Fold step 0: `%a = CALLVALUE`** (quiet optimism). `[] ↦ ["a"]`. -/
+theorem bodyStepHTo_db0 {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat}
+    {prog : List AsmInst} :
+    BodyStepHTo lo offsetToPc prog dbGp 1 (dCv1, 0) [] ["a"] := by
+  intro p v s j hsd hsv hrel hblock
+  have hstk : p.stack = [] := hsv
+  have hplan : dbGp (dCv1, 0) p
+      = ([StackOp.SOEmit "CALLVALUE"], releaseDeadSpills ["a"] { p with stack := p.stack ++ [Operand.Var "a"] }) := by
+    show generateRegularInstPlan dbLive dbDfg dbCfg deadBuriedFn dCv1 ["a"] true false "entry" p = _
+    rw [gRIP_halting_live_eq rfl (by decide),
+        genRegularInstPlan_read0_eq rfl (by decide) rfl rfl rfl (by decide),
+        optimisticSwapPlan_dCv1_noop]
+    simp
+  rw [hplan] at hblock
+  simp only [hplan]
+  have hnos' : ∀ o, alookup' ({ p with stack := p.stack ++ [Operand.Var "a"] } : PlanState).spilled o = none :=
+    fun o => hsd.noSpill o
+  have hstepEq : stepInstBase dCv1 v = ExecResult.OK (updateVar "a" v.callCtx.callvalue v) := rfl
+  have hfield : (fun (a : AsmState) => a.callCtx.callvalue) s
+      = (fun (w : VenomState) => w.callCtx.callvalue) v := by
+    obtain ⟨_, _, _, _, _, _, _, hCall, _, _, _, _⟩ := hrel
+    show s.callCtx.callvalue = _
+    rw [hCall]
+  obtain ⟨s', hrun, hrel', hpc⟩ := emit_ctx_push_sim (name := "CALLVALUE") (out := "a")
+    (fAsm := fun a => a.callCtx.callvalue) (fV := fun w => w.callCtx.callvalue)
+    hrel (by rw [hstk]; simp) (hsd.noSpill _) hblock
+    (fun h hg => asmStep_callvalue_ok h hg) hfield
+  have hrelR := releaseDeadSpills_sim (nextLiveness := ["a"]) hrel'
+  refine ⟨gvBodyStep_of_updateVar (idx := 0) (plan := [StackOp.SOEmit "CALLVALUE"]) hstepEq
+    ⟨s', hrun, hrelR, hpc⟩, ?_, ?_⟩
+  · refine ⟨?_, ?_, ?_⟩
+    · intro op
+      exact releaseDeadSpills_noSpill _ _ hnos' op
+    · show (releaseDeadSpills ["a"] { p with stack := p.stack ++ [Operand.Var "a"] }).stack.length + j ≤ 15
+      rw [releaseDeadSpills_stack]
+      have := hsd.shallow
+      simp only [hstk] at this ⊢
+      simp at this ⊢
+      omega
+    · intro z hz
+      rw [show (releaseDeadSpills ["a"] { p with stack := p.stack ++ [Operand.Var "a"] }).stack
+          = p.stack ++ [Operand.Var "a"] from releaseDeadSpills_stack _ _, hstk] at hz
+      simp only [List.nil_append, List.mem_singleton] at hz
+      injection hz with hz'
+      subst hz'
+      exact ⟨v.callCtx.callvalue, by
+        show lookupVar "a" (gvBodyStep (dCv1, 0) v) = _
+        rw [show gvBodyStep (dCv1, 0) v
+            = { updateVar "a" v.callCtx.callvalue v with instIdx := 1 } from by
+              unfold gvBodyStep; rw [hstepEq]]
+        exact lookupVar_updateVar_self _ _ _⟩
+  · show (releaseDeadSpills ["a"] { p with stack := p.stack ++ [Operand.Var "a"] }).stack = (["a"] : List String).map Operand.Var
+    rw [releaseDeadSpills_stack, hstk]
+    rfl
+
+/-- **Fold step 1: `%b = CALLVALUE`** (quiet optimism). `["a"] ↦ ["a", "b"]`. -/
+theorem bodyStepHTo_db1 {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat}
+    {prog : List AsmInst} :
+    BodyStepHTo lo offsetToPc prog dbGp 1 (dCv2, 1) ["a"] ["a", "b"] := by
+  intro p v s j hsd hsv hrel hblock
+  have hstk : p.stack = [Operand.Var "a"] := hsv
+  have hplan : dbGp (dCv2, 1) p
+      = ([StackOp.SOEmit "CALLVALUE"], releaseDeadSpills ["a", "b"] { p with stack := p.stack ++ [Operand.Var "b"] }) := by
+    show generateRegularInstPlan dbLive dbDfg dbCfg deadBuriedFn dCv2 ["a", "b"] true false "entry" p = _
+    rw [gRIP_halting_live_eq rfl (by decide),
+        genRegularInstPlan_read0_eq rfl (by decide) rfl rfl rfl (by decide),
+        optimisticSwapPlan_dCv2_noop]
+    simp
+  rw [hplan] at hblock
+  simp only [hplan]
+  have hnos' : ∀ o, alookup' ({ p with stack := p.stack ++ [Operand.Var "b"] } : PlanState).spilled o = none :=
+    fun o => hsd.noSpill o
+  have hstepEq : stepInstBase dCv2 v = ExecResult.OK (updateVar "b" v.callCtx.callvalue v) := rfl
+  have hfield : (fun (a : AsmState) => a.callCtx.callvalue) s
+      = (fun (w : VenomState) => w.callCtx.callvalue) v := by
+    obtain ⟨_, _, _, _, _, _, _, hCall, _, _, _, _⟩ := hrel
+    show s.callCtx.callvalue = _
+    rw [hCall]
+  obtain ⟨s', hrun, hrel', hpc⟩ := emit_ctx_push_sim (name := "CALLVALUE") (out := "b")
+    (fAsm := fun a => a.callCtx.callvalue) (fV := fun w => w.callCtx.callvalue)
+    hrel (by rw [hstk]; simp) (hsd.noSpill _) hblock
+    (fun h hg => asmStep_callvalue_ok h hg) hfield
+  have hrelR := releaseDeadSpills_sim (nextLiveness := ["a", "b"]) hrel'
+  refine ⟨gvBodyStep_of_updateVar (idx := 1) (plan := [StackOp.SOEmit "CALLVALUE"]) hstepEq
+    ⟨s', hrun, hrelR, hpc⟩, ?_, ?_⟩
+  · refine ⟨?_, ?_, ?_⟩
+    · intro op
+      exact releaseDeadSpills_noSpill _ _ hnos' op
+    · show (releaseDeadSpills ["a", "b"] { p with stack := p.stack ++ [Operand.Var "b"] }).stack.length + j ≤ 15
+      rw [releaseDeadSpills_stack]
+      have := hsd.shallow
+      simp only [hstk] at this ⊢
+      simp at this ⊢
+      omega
+    · intro z hz
+      rw [show (releaseDeadSpills ["a", "b"] { p with stack := p.stack ++ [Operand.Var "b"] }).stack
+          = p.stack ++ [Operand.Var "b"] from releaseDeadSpills_stack _ _, hstk] at hz
+      simp only [List.mem_append, List.mem_singleton] at hz
+      rcases hz with hz | hz
+      · injection hz with hz'
+        subst hz'
+        obtain ⟨w, hw⟩ := hsd.defined "a" (by rw [hstk]; simp)
+        exact ⟨w, by
+          show lookupVar "a" (gvBodyStep (dCv2, 1) v) = _
+          rw [show gvBodyStep (dCv2, 1) v
+              = { updateVar "b" v.callCtx.callvalue v with instIdx := 2 } from by
+                unfold gvBodyStep; rw [hstepEq]]
+          rw [show lookupVar "a" ({ updateVar "b" v.callCtx.callvalue v with instIdx := 2 } : VenomState)
+              = lookupVar "a" (updateVar "b" v.callCtx.callvalue v) from rfl,
+            lookupVar_updateVar_ne _ _ _ _ (by decide)]
+          exact hw⟩
+      · injection hz with hz'
+        subst hz'
+        exact ⟨v.callCtx.callvalue, by
+          show lookupVar "b" (gvBodyStep (dCv2, 1) v) = _
+          rw [show gvBodyStep (dCv2, 1) v
+              = { updateVar "b" v.callCtx.callvalue v with instIdx := 2 } from by
+                unfold gvBodyStep; rw [hstepEq]]
+          exact lookupVar_updateVar_self _ _ _⟩
+  · show (releaseDeadSpills ["a", "b"] { p with stack := p.stack ++ [Operand.Var "b"] }).stack = (["a", "b"] : List String).map Operand.Var
+    rw [releaseDeadSpills_stack, hstk]
+    rfl
+
+/-- **Fold step 2: `%c = CALLVALUE` with the optimistic `SWAP1`.** `["a","b"] ↦ ["a","c","b"]`. -/
+theorem bodyStepHTo_db2 {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat}
+    {prog : List AsmInst} :
+    BodyStepHTo lo offsetToPc prog dbGp 1 (dCv0, 2) ["a", "b"] ["a", "c", "b"] := by
+  intro p v s j hsd hsv hrel hblock
+  have hstk : p.stack = [Operand.Var "a", Operand.Var "b"] := hsv
+  have hpushstk : ({ p with stack := p.stack ++ [Operand.Var "c"] } : PlanState).stack
+      = [Operand.Var "a", Operand.Var "b", Operand.Var "c"] := by
+    show p.stack ++ [Operand.Var "c"] = _
+    rw [hstk]
+    rfl
+  have hplan : dbGp (dCv0, 2) p
+      = ([StackOp.SOEmit "CALLVALUE", StackOp.SOSwap 1],
+         releaseDeadSpills ["c", "a", "b"] { p with stack := [Operand.Var "a", Operand.Var "c", Operand.Var "b"] }) := by
+    show generateRegularInstPlan dbLive dbDfg dbCfg deadBuriedFn dCv0 ["c", "a", "b"] true false "entry" p = _
+    rw [gRIP_halting_live_eq rfl (by decide),
+        genRegularInstPlan_read0_eq rfl (by decide) rfl rfl rfl (by decide),
+        optimisticSwapPlan_dCv0 _ hpushstk]
+    rfl
+  rw [hplan] at hblock
+  simp only [hplan]
+  rw [show executePlan [StackOp.SOEmit "CALLVALUE", StackOp.SOSwap 1]
+      = executePlan [StackOp.SOEmit "CALLVALUE"] ++ executePlan [StackOp.SOSwap 1] from rfl] at hblock ⊢
+  obtain ⟨hb1, hb2⟩ := asmBlockAt_append hblock
+  have hnos' : ∀ o, alookup' ({ p with stack := p.stack ++ [Operand.Var "c"] } : PlanState).spilled o = none :=
+    fun o => hsd.noSpill o
+  have hstepEq : stepInstBase dCv0 v = ExecResult.OK (updateVar "c" v.callCtx.callvalue v) := rfl
+  have hfield : (fun (a : AsmState) => a.callCtx.callvalue) s
+      = (fun (w : VenomState) => w.callCtx.callvalue) v := by
+    obtain ⟨_, _, _, _, _, _, _, hCall, _, _, _, _⟩ := hrel
+    show s.callCtx.callvalue = _
+    rw [hCall]
+  obtain ⟨s1, hrun1, hrel1, hpc1⟩ := emit_ctx_push_sim (name := "CALLVALUE") (out := "c")
+    (fAsm := fun a => a.callCtx.callvalue) (fV := fun w => w.callCtx.callvalue)
+    hrel (by rw [hstk]; simp) (hsd.noSpill _) hb1
+    (fun h hg => asmStep_callvalue_ok h hg) hfield
+  have hswapEq : doSwap 1 ({ p with stack := p.stack ++ [Operand.Var "c"] } : PlanState)
+      = ([StackOp.SOSwap 1], { p with stack := [Operand.Var "a", Operand.Var "c", Operand.Var "b"] }) := by
+    rw [doSwap_one_eq]
+    have : stackSwap 1 ({ p with stack := p.stack ++ [Operand.Var "c"] } : PlanState).stack
+        = [Operand.Var "a", Operand.Var "c", Operand.Var "b"] := by
+      rw [hpushstk]; rfl
+    rw [this]
+  obtain ⟨s2, hrun2, hrel2, hpc2⟩ := doSwap_sim hswapEq
+    (by exact hrel1)
+    (by rw [hpushstk]; decide)
+    (by rw [hpc1]; exact hb2)
+    (fun h => absurd h (by omega))
+  have hrelR := releaseDeadSpills_sim (nextLiveness := ["c", "a", "b"]) hrel2
+  have hrunBoth : runAsm (executePlan [StackOp.SOEmit "CALLVALUE"] ++ executePlan [StackOp.SOSwap 1]).length
+      offsetToPc prog s = AsmResult.AsmOK s2 := by
+    rw [List.length_append]
+    exact runAsm_compose hrun1 hrun2
+  have hpcBoth : s2.pc = s.pc + (executePlan [StackOp.SOEmit "CALLVALUE"] ++ executePlan [StackOp.SOSwap 1]).length := by
+    rw [List.length_append, hpc2, hpc1]
+    omega
+  have hnos2 : ∀ o, alookup' ({ p with stack := [Operand.Var "a", Operand.Var "c", Operand.Var "b"] } : PlanState).spilled o = none :=
+    fun o => hsd.noSpill o
+  refine ⟨gvBodyStep_of_updateVar (idx := 2)
+    (plan := [StackOp.SOEmit "CALLVALUE", StackOp.SOSwap 1]) hstepEq
+    ⟨s2, hrunBoth, hrelR, hpcBoth⟩, ?_, ?_⟩
+  · refine ⟨?_, ?_, ?_⟩
+    · intro op
+      exact releaseDeadSpills_noSpill _ _ hnos2 op
+    · show (releaseDeadSpills ["c", "a", "b"] { p with stack := [Operand.Var "a", Operand.Var "c", Operand.Var "b"] }).stack.length + j ≤ 15
+      rw [releaseDeadSpills_stack]
+      have := hsd.shallow
+      simp only [hstk] at this
+      simp at this ⊢
+      omega
+    · intro z hz
+      rw [show (releaseDeadSpills ["c", "a", "b"] { p with stack := [Operand.Var "a", Operand.Var "c", Operand.Var "b"] }).stack
+          = [Operand.Var "a", Operand.Var "c", Operand.Var "b"] from releaseDeadSpills_stack _ _] at hz
+      have hgv : gvBodyStep (dCv0, 2) v = { updateVar "c" v.callCtx.callvalue v with instIdx := 3 } := by
+        unfold gvBodyStep; rw [hstepEq]
+      simp only [List.mem_cons, List.not_mem_nil, or_false] at hz
+      rcases hz with hz | hz | hz
+      · injection hz with hz'; subst hz'
+        obtain ⟨w, hw⟩ := hsd.defined "a" (by rw [hstk]; simp)
+        refine ⟨w, ?_⟩
+        show lookupVar "a" (gvBodyStep (dCv0, 2) v) = some w
+        rw [hgv]
+        rw [show lookupVar "a" ({ updateVar "c" v.callCtx.callvalue v with instIdx := 3 } : VenomState)
+            = lookupVar "a" (updateVar "c" v.callCtx.callvalue v) from rfl,
+          lookupVar_updateVar_ne _ _ _ _ (by decide)]
+        exact hw
+      · injection hz with hz'; subst hz'
+        refine ⟨v.callCtx.callvalue, ?_⟩
+        show lookupVar "c" (gvBodyStep (dCv0, 2) v) = _
+        rw [hgv]
+        exact lookupVar_updateVar_self _ _ _
+      · injection hz with hz'; subst hz'
+        obtain ⟨w, hw⟩ := hsd.defined "b" (by rw [hstk]; simp)
+        refine ⟨w, ?_⟩
+        show lookupVar "b" (gvBodyStep (dCv0, 2) v) = some w
+        rw [hgv]
+        rw [show lookupVar "b" ({ updateVar "c" v.callCtx.callvalue v with instIdx := 3 } : VenomState)
+            = lookupVar "b" (updateVar "c" v.callCtx.callvalue v) from rfl,
+          lookupVar_updateVar_ne _ _ _ _ (by decide)]
+        exact hw
+  · show (releaseDeadSpills ["c", "a", "b"] { p with stack := [Operand.Var "a", Operand.Var "c", Operand.Var "b"] }).stack
+        = (["a", "c", "b"] : List String).map Operand.Var
+    rw [releaseDeadSpills_stack]
+    rfl
+
+/-- **Fold step 3: `%d = ADD %a %b`, both operands DEAD and BURIED.** The two-swap reorder
+    positions the pair in TRUE order and the bare `ADD` consumes it: `["a","c","b"] ↦ ["c","d"]`.
+    The f1a payoff step. -/
+theorem bodyStepHTo_db3 {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat}
+    {prog : List AsmInst} :
+    BodyStepHTo lo offsetToPc prog dbGp 1 (dAdd, 3) ["a", "c", "b"] ["c", "d"] := by
+  intro p v s j hsd hsv hrel hblock
+  have hstk : p.stack = [Operand.Var "a", Operand.Var "c", Operand.Var "b"] := hsv
+  have hplan : dbGp (dAdd, 3) p
+      = ([StackOp.SOSwap 1, StackOp.SOSwap 2, StackOp.SOEmit "ADD"],
+         releaseDeadSpills ["c", "d"] { p with stack := [Operand.Var "c", Operand.Var "d"] }) := by
+    show generateRegularInstPlan dbLive dbDfg dbCfg deadBuriedFn dAdd ["c", "d"] true false "entry" p = _
+    rw [genRegularInstPlan_dAdd_buried_eq hstk (hsd.noSpill _) (hsd.noSpill _),
+        optimisticSwapPlan_dAdd_noop]
+    rfl
+  rw [hplan] at hblock
+  simp only [hplan]
+  rw [show executePlan [StackOp.SOSwap 1, StackOp.SOSwap 2, StackOp.SOEmit "ADD"]
+      = executePlan [StackOp.SOSwap 1] ++ (executePlan [StackOp.SOSwap 2] ++ executePlan [StackOp.SOEmit "ADD"]) from rfl] at hblock ⊢
+  obtain ⟨hb1, hb23⟩ := asmBlockAt_append hblock
+  have hswap1 : doSwap 1 p = ([StackOp.SOSwap 1], { p with stack := [Operand.Var "a", Operand.Var "b", Operand.Var "c"] }) := by
+    rw [doSwap_one_eq]
+    rw [show stackSwap 1 p.stack = [Operand.Var "a", Operand.Var "b", Operand.Var "c"] from by rw [hstk]; rfl]
+  obtain ⟨s1, hrun1, hrel1, hpc1⟩ := doSwap_sim hswap1 hrel
+    (by rw [hstk]; decide) hb1 (fun h => absurd h (by omega))
+  obtain ⟨hb2, hb3⟩ := asmBlockAt_append hb23
+  have hswap2 : doSwap 2 ({ p with stack := [Operand.Var "a", Operand.Var "b", Operand.Var "c"] } : PlanState)
+      = ([StackOp.SOSwap 2], { p with stack := [Operand.Var "c", Operand.Var "b", Operand.Var "a"] }) := by
+    rw [doSwap_two_eq]
+    rfl
+  obtain ⟨s2, hrun2, hrel2, hpc2⟩ := doSwap_sim hswap2 hrel1
+    (by simp) (by rw [hpc1]; exact hb2) (fun h => absurd h (by omega))
+  obtain ⟨wa, hwa⟩ := hsd.defined "a" (by rw [hstk]; simp)
+  obtain ⟨wb, hwb⟩ := hsd.defined "b" (by rw [hstk]; simp)
+  have htop : s2.stack = wa :: wb :: s2.stack.drop 2 := by
+    refine venomAsmRel_asmStack_top2 (p := Operand.Var "b") (q := Operand.Var "a")
+      hrel2 (base := [Operand.Var "c"]) rfl ?_ ?_
+    · exact hwb
+    · exact hwa
+  have hstepEq : stepInstBase dAdd v = ExecResult.OK (updateVar "d" (wa + wb) v) := by
+    show execPure2 (· + ·) dAdd v = _
+    unfold execPure2
+    simp only [dAdd, evalOperand, hwa, hwb]
+  obtain ⟨s3, hrun3, hrel3, hpc3⟩ := emit_binop_sim (name := "ADD") (out := "d")
+    (f := (· + ·)) hrel2 htop (by simp) (hsd.noSpill _)
+    (by rw [hpc2, hpc1]; exact hb3)
+    (fun h hg => asmStep_add_ok h hg)
+  have hrelR := releaseDeadSpills_sim (nextLiveness := ["c", "d"]) hrel3
+  have hrunAll : runAsm (executePlan [StackOp.SOSwap 1] ++ (executePlan [StackOp.SOSwap 2] ++ executePlan [StackOp.SOEmit "ADD"])).length
+      offsetToPc prog s = AsmResult.AsmOK s3 := by
+    simp only [List.length_append]
+    exact runAsm_compose hrun1 (runAsm_compose hrun2 hrun3)
+  have hpcAll : s3.pc = s.pc + (executePlan [StackOp.SOSwap 1] ++ (executePlan [StackOp.SOSwap 2] ++ executePlan [StackOp.SOEmit "ADD"])).length := by
+    simp only [List.length_append]
+    rw [hpc3, hpc2, hpc1]
+    omega
+  have hnos3 : ∀ o, alookup' ({ p with stack := [Operand.Var "c", Operand.Var "d"] } : PlanState).spilled o = none :=
+    fun o => hsd.noSpill o
+  refine ⟨gvBodyStep_of_updateVar (idx := 3)
+    (plan := [StackOp.SOSwap 1, StackOp.SOSwap 2, StackOp.SOEmit "ADD"]) hstepEq
+    ⟨s3, hrunAll, hrelR, hpcAll⟩, ?_, ?_⟩
+  · refine ⟨?_, ?_, ?_⟩
+    · intro op
+      exact releaseDeadSpills_noSpill _ _ hnos3 op
+    · show (releaseDeadSpills ["c", "d"] { p with stack := [Operand.Var "c", Operand.Var "d"] }).stack.length + j ≤ 15
+      rw [releaseDeadSpills_stack]
+      have := hsd.shallow
+      simp only [hstk] at this
+      simp at this ⊢
+      omega
+    · intro z hz
+      rw [show (releaseDeadSpills ["c", "d"] { p with stack := [Operand.Var "c", Operand.Var "d"] }).stack
+          = [Operand.Var "c", Operand.Var "d"] from releaseDeadSpills_stack _ _] at hz
+      have hgv : gvBodyStep (dAdd, 3) v = { updateVar "d" (wa + wb) v with instIdx := 4 } := by
+        unfold gvBodyStep; rw [hstepEq]
+      simp only [List.mem_cons, List.not_mem_nil, or_false] at hz
+      rcases hz with hz | hz
+      · injection hz with hz'; subst hz'
+        obtain ⟨w, hw⟩ := hsd.defined "c" (by rw [hstk]; simp)
+        refine ⟨w, ?_⟩
+        show lookupVar "c" (gvBodyStep (dAdd, 3) v) = some w
+        rw [hgv]
+        rw [show lookupVar "c" ({ updateVar "d" (wa + wb) v with instIdx := 4 } : VenomState)
+            = lookupVar "c" (updateVar "d" (wa + wb) v) from rfl,
+          lookupVar_updateVar_ne _ _ _ _ (by decide)]
+        exact hw
+      · injection hz with hz'; subst hz'
+        refine ⟨wa + wb, ?_⟩
+        show lookupVar "d" (gvBodyStep (dAdd, 3) v) = _
+        rw [hgv]
+        exact lookupVar_updateVar_self _ _ _
+  · show (releaseDeadSpills ["c", "d"] { p with stack := [Operand.Var "c", Operand.Var "d"] }).stack
+        = (["c", "d"] : List String).map Operand.Var
+    rw [releaseDeadSpills_stack]
+    rfl
+
+/-- **Fold step 4: `SSTORE %c %d`, swapped dead pair.** One `SWAP1` then the bare store:
+    `["c","d"] ↦ []`. -/
+theorem bodyStepHTo_db4 {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat}
+    {prog : List AsmInst} :
+    BodyStepHTo lo offsetToPc prog dbGp 1 (dStore, 4) ["c", "d"] [] := by
+  intro p v s j hsd hsv hrel hblock
+  have hstk : p.stack = [Operand.Var "c", Operand.Var "d"] := hsv
+  have hplan : dbGp (dStore, 4) p
+      = ([StackOp.SOSwap 1, StackOp.SOEmit "SSTORE"], releaseDeadSpills [] { p with stack := [] }) := by
+    show generateRegularInstPlan dbLive dbDfg dbCfg deadBuriedFn dStore [] true true "entry" p = _
+    rw [genRegularInstPlan_dStore_swapped_eq hstk (hsd.noSpill _) (hsd.noSpill _)]
+  rw [hplan] at hblock
+  simp only [hplan]
+  rw [show executePlan [StackOp.SOSwap 1, StackOp.SOEmit "SSTORE"]
+      = executePlan [StackOp.SOSwap 1] ++ executePlan [StackOp.SOEmit "SSTORE"] from rfl] at hblock ⊢
+  obtain ⟨hb1, hb2⟩ := asmBlockAt_append hblock
+  have hswap1 : doSwap 1 p = ([StackOp.SOSwap 1], { p with stack := [Operand.Var "d", Operand.Var "c"] }) := by
+    rw [doSwap_one_eq]
+    rw [show stackSwap 1 p.stack = [Operand.Var "d", Operand.Var "c"] from by rw [hstk]; rfl]
+  obtain ⟨s1, hrun1, hrel1, hpc1⟩ := doSwap_sim hswap1 hrel
+    (by rw [hstk]; decide) hb1 (fun h => absurd h (by omega))
+  obtain ⟨wc, hwc⟩ := hsd.defined "c" (by rw [hstk]; simp)
+  obtain ⟨wd, hwd⟩ := hsd.defined "d" (by rw [hstk]; simp)
+  have htop : s1.stack = wc :: wd :: s1.stack.drop 2 := by
+    refine venomAsmRel_asmStack_top2 (p := Operand.Var "d") (q := Operand.Var "c")
+      hrel1 (base := ([] : List Operand)) rfl ?_ ?_
+    · exact hwd
+    · exact hwc
+  have hstepEq : stepInstBase dStore v = ExecResult.OK (sstore wc wd v) := by
+    show execWrite2 (fun key val s => sstore key val s) dStore v = _
+    unfold execWrite2
+    simp only [dStore, evalOperand, hwc, hwd]
+  obtain ⟨s2, hrun2, hrel2, hpc2⟩ := emit_sstore_sim hrel1 htop
+    (by rw [hpc1]; exact hb2) (fun h hg => asmStep_sstore_ok h hg)
+  have hrelR := releaseDeadSpills_sim (nextLiveness := ([] : List String)) hrel2
+  have hrunAll : runAsm (executePlan [StackOp.SOSwap 1] ++ executePlan [StackOp.SOEmit "SSTORE"]).length
+      offsetToPc prog s = AsmResult.AsmOK s2 := by
+    simp only [List.length_append]
+    exact runAsm_compose hrun1 hrun2
+  have hpcAll : s2.pc = s.pc + (executePlan [StackOp.SOSwap 1] ++ executePlan [StackOp.SOEmit "SSTORE"]).length := by
+    simp only [List.length_append]
+    rw [hpc2, hpc1]
+    omega
+  have hnos4 : ∀ o, alookup' ({ p with stack := ([] : List Operand) } : PlanState).spilled o = none :=
+    fun o => hsd.noSpill o
+  refine ⟨gvBodyStep_of_ok (idx := 4)
+    (plan := [StackOp.SOSwap 1, StackOp.SOEmit "SSTORE"]) hstepEq
+    ⟨s2, hrunAll, hrelR, hpcAll⟩, ?_, ?_⟩
+  · refine ⟨?_, ?_, ?_⟩
+    · intro op
+      exact releaseDeadSpills_noSpill _ _ hnos4 op
+    · show (releaseDeadSpills [] { p with stack := ([] : List Operand) }).stack.length + j ≤ 15
+      rw [releaseDeadSpills_stack]
+      have := hsd.shallow
+      simp at this ⊢
+      omega
+    · intro z hz
+      rw [show (releaseDeadSpills [] { p with stack := ([] : List Operand) }).stack
+          = ([] : List Operand) from releaseDeadSpills_stack _ _] at hz
+      simp at hz
+  · show (releaseDeadSpills [] { p with stack := ([] : List Operand) }).stack
+        = ([] : List String).map Operand.Var
+    rw [releaseDeadSpills_stack]
+    rfl
+
+end Example
+
+
+/-! ## f1a stage 3: the gp-abstract STOP slice and the buried-dead-operand capstone -/
+
+/-- **`labelThenBody_simTo`, gp-abstract**: the label step then the body fold for an ARBITRARY
+    per-instruction generator `gp` (in particular one carrying per-instruction liveness and a
+    real dfg, as `deadBuriedFn`'s optimism-emitting body needs). The constant-`nextLiveness`
+    original is the `gp := generateRegularInstPlan … nextLiveness false true …` instance. -/
+theorem labelThenBody_simToG
+    {lo : AssocList String Nat} {o2pc : AssocList Nat Nat} {prog : List AsmInst}
+    {gp : Instruction × Nat → PlanState → List StackOp × PlanState}
+    {dem : Instruction × Nat → Nat}
+    {ps0 : PlanState} {asm : AsmState} {bb : BasicBlock}
+    {front : List Instruction} {s sEnd : VenomState} {S Sn : List String}
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hready : BodyStepsReadyHTo lo o2pc prog gp dem (front.zipIdx 0) S Sn)
+    (hsd : StackDiscH ((front.zipIdx 0).map dem).sum ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel : venomAsmRel lo ps0 { s with instIdx := 0 } asm)
+    (hbLabel : asmBlockAt prog asm.pc (executePlan [StackOp.SOLabel bb.label]))
+    (hblock : asmBlockAt prog (asm.pc + 1)
+      (executePlan ((front.zipIdx 0).foldl (fun acc x => (acc.1 ++ (gp x acc.2).1, (gp x acc.2).2)) ([], ps0)).1)) :
+    ∃ as' : AsmState,
+      runAsm (1 + (executePlan ((front.zipIdx 0).foldl (fun acc x => (acc.1 ++ (gp x acc.2).1, (gp x acc.2).2)) ([], ps0)).1).length)
+          o2pc prog asm = AsmResult.AsmOK as' ∧
+      venomAsmRel lo ((front.zipIdx 0).foldl (fun acc x => (acc.1 ++ (gp x acc.2).1, (gp x acc.2).2)) ([], ps0)).2 sEnd as' ∧
+      as'.pc = asm.pc + 1 + (executePlan ((front.zipIdx 0).foldl (fun acc x => (acc.1 ++ (gp x acc.2).1, (gp x acc.2).2)) ([], ps0)).1).length := by
+  obtain ⟨as1, hrun1, hrel1, hpc1⟩ :=
+    soLabel_sim (offsetToPc := o2pc) lo ps0 { s with instIdx := 0 } asm prog bb.label hrel hbLabel
+  have hlen1 : (executePlan [StackOp.SOLabel bb.label]).length = 1 := rfl
+  have hpc1' : as1.pc = asm.pc + 1 := by rw [hlen1] at hpc1; exact hpc1
+  rw [hlen1] at hrun1
+  have hblock1 : asmBlockAt prog as1.pc (executePlan ((front.zipIdx 0).foldl (fun acc x => (acc.1 ++ (gp x acc.2).1, (gp x acc.2).2)) ([], ps0)).1) := by
+    rw [hpc1']; exact hblock
+  obtain ⟨as', hrun, hrel', hpc', _, _⟩ := genBlockBodyHTo_sim_inv
+    gp dem (front.zipIdx 0) S Sn ps0 { s with instIdx := 0 } as1 hready hsd hsv hrel1 hblock1
+  have hgv : (front.zipIdx 0).foldl (fun v x => gvBodyStep x v) { s with instIdx := 0 } = sEnd :=
+    execBodyThread_eq_gvFold front 0 { s with instIdx := 0 } sEnd hthread
+  rw [hgv] at hrel'
+  refine ⟨as', ?_, hrel', by rw [hpc', hpc1']⟩
+  rw [runAsm_add_ok hrun1]; exact hrun
+
+/-- **The STOP slice, gp-abstract** — `hsupplyW_regularStopTo` for an arbitrary per-instruction
+    generator; the walk obligation for a STOP block whose body needs per-instruction liveness
+    (or a real, optimism-emitting dfg) in its fold. -/
+theorem hsupplyW_regularStopToG
+    {fn : IrFunction} {lo : AssocList String Nat} {o2pc : AssocList Nat Nat}
+    {offsets : AssocList String Nat} {prog : List AsmInst}
+    {pcOf : String → Nat} {psOf : String → PlanState} {wOf : String → Nat}
+    {gp : Instruction × Nat → PlanState → List StackOp × PlanState}
+    {dem : Instruction × Nat → Nat}
+    {ps0 : PlanState} {asm : AsmState} {restFuel : Nat} {ctx : VenomContext} {bb : BasicBlock}
+    {front : List Instruction} {stopI hd : Instruction} {tl : List Instruction}
+    {s sEnd : VenomState} {S Sn : List String}
+    (hbb : bb.instructions = front ++ [stopI]) (hstopop : stopI.opcode = Opcode.STOP)
+    (hcons : front ++ [stopI] = hd :: tl) (hphi : hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : execBodyThread front 0 { s with instIdx := 0 } = some sEnd)
+    (hready : BodyStepsReadyHTo lo o2pc prog gp dem (front.zipIdx 0) S Sn)
+    (hsd : StackDiscH ((front.zipIdx 0).map dem).sum ps0 { s with instIdx := 0 })
+    (hsv : StackIsVars S ps0)
+    (hrel : venomAsmRel lo ps0 { s with instIdx := 0 } asm)
+    (hbLabel : asmBlockAt prog asm.pc (executePlan [StackOp.SOLabel bb.label]))
+    (hblock : asmBlockAt prog (asm.pc + 1)
+      (executePlan ((front.zipIdx 0).foldl (fun acc x => (acc.1 ++ (gp x acc.2).1, (gp x acc.2).2)) ([], ps0)).1))
+    (hpc : asm.pc + 1 + (executePlan ((front.zipIdx 0).foldl (fun acc x => (acc.1 ++ (gp x acc.2).1, (gp x acc.2).2)) ([], ps0)).1).length < prog.length)
+    (hstop : prog.get ⟨asm.pc + 1 + (executePlan ((front.zipIdx 0).foldl (fun acc x => (acc.1 ++ (gp x acc.2).1, (gp x acc.2).2)) ([], ps0)).1).length, hpc⟩
+      = AsmInst.AsmOp "STOP")
+    (hw : 1 + (executePlan ((front.zipIdx 0).foldl (fun acc x => (acc.1 ++ (gp x acc.2).1, (gp x acc.2).2)) ([], ps0)).1).length + 1 ≤ wOf bb.label) :
+    ∃ (as' : AsmState) (ps' : PlanState) (vs' : VenomState) (bodyLen : Nat),
+      runAsm bodyLen o2pc prog asm = AsmResult.AsmOK as' ∧
+      TermRecipeW fn lo pcOf psOf wOf o2pc offsets prog as' ps' vs' bodyLen
+        (front.length + (restFuel + 1)) ctx bb s := by
+  obtain ⟨as', hbody, hrel', hpcas⟩ :=
+    labelThenBody_simToG (bb := bb) hthread hready hsd hsv hrel hbLabel hblock
+  have hlt : as'.pc < prog.length := by rw [hpcas]; exact hpc
+  have hst : prog.get ⟨as'.pc, hlt⟩ = AsmInst.AsmOp "STOP" := prog_get_transfer hpcas hstop
+  exact ⟨as', _, sEnd, _, hbody,
+    termRecipeW_stop_of_body hbb hstopop hcons hphi hnonterm hthread hrel' hw hlt hst⟩
+
+namespace Example
+
+/-- The five-step ready chain for `deadBuriedFn`'s body: the layouts thread
+    `[] → ["a"] → ["a","b"] → ["a","c","b"] → ["c","d"] → []`. -/
+theorem dbReady {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat} {prog : List AsmInst} :
+    BodyStepsReadyHTo lo offsetToPc prog dbGp (fun _ => 1)
+      ([dCv1, dCv2, dCv0, dAdd, dStore].zipIdx 0) [] [] :=
+  ⟨["a"], bodyStepHTo_db0,
+    ⟨["a", "b"], bodyStepHTo_db1,
+      ⟨["a", "c", "b"], bodyStepHTo_db2,
+        ⟨["c", "d"], bodyStepHTo_db3,
+          ⟨[], bodyStepHTo_db4, rfl⟩⟩⟩⟩⟩
+
+def dbCtx : VenomContext := { functions := [deadBuriedFn], entry := some "main" }
+
+abbrev dbA3 (s : VenomState) : VenomState :=
+  { updateVar "c" s.callCtx.callvalue { updateVar "b" s.callCtx.callvalue { updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 } with instIdx := 2 } with instIdx := 3 }
+
+abbrev dbA4 (s : VenomState) : VenomState :=
+  { updateVar "d" (s.callCtx.callvalue + s.callCtx.callvalue) (dbA3 s) with instIdx := 4 }
+
+abbrev dbSEnd (s : VenomState) : VenomState :=
+  { sstore s.callCtx.callvalue (s.callCtx.callvalue + s.callCtx.callvalue) (dbA4 s) with instIdx := 5 }
+
+theorem dbEntry_thread (s : VenomState) :
+    execBodyThread [dCv1, dCv2, dCv0, dAdd, dStore] 0 { s with instIdx := 0 } = some (dbSEnd s) := by
+  have ha3 : lookupVar "a" (dbA3 s) = some s.callCtx.callvalue := by
+    show lookupVar "a" (updateVar "c" s.callCtx.callvalue (updateVar "b" s.callCtx.callvalue (updateVar "a" s.callCtx.callvalue { s with instIdx := 0 }))) = _
+    rw [lookupVar_updateVar_ne _ _ _ _ (by decide), lookupVar_updateVar_ne _ _ _ _ (by decide),
+      lookupVar_updateVar_self]
+  have hb3 : lookupVar "b" (dbA3 s) = some s.callCtx.callvalue := by
+    show lookupVar "b" (updateVar "c" s.callCtx.callvalue (updateVar "b" s.callCtx.callvalue (updateVar "a" s.callCtx.callvalue { s with instIdx := 0 }))) = _
+    rw [lookupVar_updateVar_ne _ _ _ _ (by decide), lookupVar_updateVar_self]
+  have h4 : stepInstBase dAdd (dbA3 s)
+      = ExecResult.OK (updateVar "d" (s.callCtx.callvalue + s.callCtx.callvalue) (dbA3 s)) := by
+    show execPure2 (· + ·) dAdd (dbA3 s) = _
+    unfold execPure2
+    simp only [dAdd, evalOperand, ha3, hb3]
+  have hc4 : lookupVar "c" (dbA4 s) = some s.callCtx.callvalue := by
+    show lookupVar "c" (updateVar "d" (s.callCtx.callvalue + s.callCtx.callvalue) (dbA3 s)) = _
+    rw [lookupVar_updateVar_ne _ _ _ _ (by decide)]
+    show lookupVar "c" (updateVar "c" s.callCtx.callvalue (updateVar "b" s.callCtx.callvalue (updateVar "a" s.callCtx.callvalue { s with instIdx := 0 }))) = _
+    rw [lookupVar_updateVar_self]
+  have hd4 : lookupVar "d" (dbA4 s) = some (s.callCtx.callvalue + s.callCtx.callvalue) := by
+    show lookupVar "d" (updateVar "d" (s.callCtx.callvalue + s.callCtx.callvalue) (dbA3 s)) = _
+    rw [lookupVar_updateVar_self]
+  have h5 : stepInstBase dStore (dbA4 s)
+      = ExecResult.OK (sstore s.callCtx.callvalue (s.callCtx.callvalue + s.callCtx.callvalue) (dbA4 s)) := by
+    show execWrite2 (fun key val s => sstore key val s) dStore (dbA4 s) = _
+    unfold execWrite2
+    simp only [dStore, evalOperand, hc4, hd4]
+  have h1 : stepInstBase dCv1 { s with instIdx := 0 }
+      = ExecResult.OK (updateVar "a" s.callCtx.callvalue { s with instIdx := 0 }) := rfl
+  have h2 : stepInstBase dCv2 ({ updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 } : VenomState)
+      = ExecResult.OK (updateVar "b" s.callCtx.callvalue ({ updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 })) := rfl
+  have h3 : stepInstBase dCv0 ({ updateVar "b" s.callCtx.callvalue { updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 } with instIdx := 2 } : VenomState)
+      = ExecResult.OK (updateVar "c" s.callCtx.callvalue ({ updateVar "b" s.callCtx.callvalue { updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 } with instIdx := 2 })) := rfl
+  show (match stepInstBase dCv1 { s with instIdx := 0 } with
+        | ExecResult.OK s' => execBodyThread [dCv2, dCv0, dAdd, dStore] 1 { s' with instIdx := 1 } | _ => none)
+      = some (dbSEnd s)
+  rw [h1]
+  show (match stepInstBase dCv2 ({ updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 }) with
+        | ExecResult.OK s' => execBodyThread [dCv0, dAdd, dStore] 2 { s' with instIdx := 2 } | _ => none)
+      = some (dbSEnd s)
+  rw [h2]
+  show (match stepInstBase dCv0 ({ updateVar "b" s.callCtx.callvalue { updateVar "a" s.callCtx.callvalue { s with instIdx := 0 } with instIdx := 1 } with instIdx := 2 }) with
+        | ExecResult.OK s' => execBodyThread [dAdd, dStore] 3 { s' with instIdx := 3 } | _ => none)
+      = some (dbSEnd s)
+  rw [h3]
+  show (match stepInstBase dAdd (dbA3 s) with
+        | ExecResult.OK s' => execBodyThread [dStore] 4 { s' with instIdx := 4 } | _ => none)
+      = some (dbSEnd s)
+  rw [h4]
+  show (match stepInstBase dStore (dbA4 s) with
+        | ExecResult.OK s' => execBodyThread [] 5 { s' with instIdx := 5 } | _ => none)
+      = some (dbSEnd s)
+  rw [h5]
+  rfl
+
+theorem dbFn_halts (vs : VenomState) (hnh : vs.halted = false) :
+    ∃ vs', runContext 10 dbCtx vs = ExecResult.Halt vs' := by
+  have h0 : runContext 10 dbCtx vs
+      = runBlocks 10 dbCtx deadBuriedFn { vs with prevBb := none, currentBb := "entry", instIdx := 0 } := by
+    simp [runContext, runFunction, dbCtx, deadBuriedFn, lookupFunction, fnEntryLabel]
+  set s0 : VenomState := { vs with prevBb := none, currentBb := "entry", instIdx := 0 } with hs0
+  have hlk0 : lookupBlock s0.currentBb deadBuriedFn.blocks
+      = some { label := "entry", instructions := [dCv1, dCv2, dCv0, dAdd, dStore, stopInst] } := rfl
+  have hhalt : runBlock 9 dbCtx { label := "entry", instructions := [dCv1, dCv2, dCv0, dAdd, dStore, stopInst] } s0
+      = ExecResult.Halt (haltState (dbSEnd s0)) := by
+    rw [show (9 : Nat) = ([dCv1, dCv2, dCv0, dAdd, dStore] : List Instruction).length + (3 + 1) from rfl]
+    exact runBlock_body_stop dbCtx _ 3 [dCv1, dCv2, dCv0, dAdd, dStore] stopInst dCv1
+      [dCv2, dCv0, dAdd, dStore, stopInst] s0 (dbSEnd s0) rfl rfl rfl (by decide)
+      (by intro i hi; simp only [List.mem_cons, List.not_mem_nil, or_false] at hi
+          rcases hi with rfl | rfl | rfl | rfl | rfl <;> decide)
+      (dbEntry_thread s0)
+  rw [h0]
+  exact ⟨_, runBlocks_haltDirect_of_block hlk0 hhalt⟩
+
+set_option maxHeartbeats 1000000 in
+/-- **The buried-dead-operand capstone (f1a closed).** `codegen_correct` for `deadBuriedFn` —
+    `entry: %a=CV; %b=CV; %c=CV; %d=ADD %a %b; SSTORE %c %d; STOP` — the function whose emitted
+    program is the pinned `deadBuried_asm` swap chain: the third CALLVALUE's optimistic `SWAP1`,
+    the buried pair's `SWAP1;SWAP2` reorder before the bare `ADD`, and the store's `SWAP1`. The
+    fold runs the REAL analyses with PER-INSTRUCTION liveness (`dbGp`) through the gp-abstract
+    STOP slice. Storage carries `c ↦ d = 2·callvalue` into the halt state. -/
+theorem codegen_correct_deadBuriedFn_recipeW {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    (hvshalt : vs.halted = false)
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    (match runContext 10 dbCtx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  have hfnready : ∀ bb ∈ deadBuriedFn.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst := by
+    intro bb hbb inst hinst
+    simp only [deadBuriedFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    subst hbb
+    simp only [List.mem_cons, List.not_mem_nil, or_false] at hinst
+    rcases hinst with rfl | rfl | rfl | rfl | rfl | rfl <;> (unfold codegenReadyInst; decide)
+  have hgen : generateFnPlan deadBuriedFn 0 0
+      = some ((generateFnPlan deadBuriedFn 0 0).get!.1, (generateFnPlan deadBuriedFn 0 0).get!.2) := rfl
+  have hpsE : psOfFn (fnPlanFuel deadBuriedFn) deadBuriedFn 0 0 "entry" = initPlanState 0 :=
+    psOfFn_entry rfl hfnready (by simp only [fnPlanFuel]; omega)
+  refine codegen_correct_ofBlocks_recipeW_invCur (fun _ => True)
+    (lo := lo) (pcOf := pcOfLabel (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1)
+    (psOf := psOfFn (fnPlanFuel deadBuriedFn) deadBuriedFn 0 0)
+    (wOf := fun l => (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1 l)
+    (offsets := (computeLabelOffsets (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).2)
+    (fuel := 10) (ctx := dbCtx) (fn := deadBuriedFn) (fnEom := 0) (lblCtr := 0)
+    (entryName := "main") (entryLbl := "entry")
+    (ops := (generateFnPlan deadBuriedFn 0 0).get!.1) (psFinal := (generateFnPlan deadBuriedFn 0 0).get!.2)
+    hgen rfl rfl rfl ?_ ?_ (fun _ _ _ _ _ _ _ _ => trivial) ?_ trivial
+  case _ =>
+    intro bb hbb s
+    simp only [deadBuriedFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    subst hbb
+    simp [runBlock, evalPhis, execBlock, dCv1]
+  case _ =>
+    intro bb hbb s asm N k hE _ hlbleq
+    obtain ⟨⟨bb0, hlk_s, hvrel, hpc_asm⟩, hwN, hhalt⟩ := hE
+    simp only [deadBuriedFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    subst hbb
+    have hlbl : s.currentBb = "entry" := hlbleq
+    rw [hlbl] at hvrel hpc_asm
+    have hpc0 : asm.pc = 0 := by rw [hpc_asm]; exact pcOfLabel_entry_zero rfl hfnready hgen
+    have hnt : ∀ inst ∈ [dCv1, dCv2, dCv0, dAdd, dStore], isTerminator inst.opcode = false := by
+      intro i hi; simp only [List.mem_cons, List.not_mem_nil, or_false] at hi
+      rcases hi with rfl | rfl | rfl | rfl | rfl <;> decide
+    match k with
+    | 0 => exact Or.inl (runBlock_oof dbCtx _ 1 [dCv1, dCv2, dCv0, dAdd, dStore] stopInst dCv1
+             [dCv2, dCv0, dAdd, dStore, stopInst] s (dbSEnd s) rfl rfl (by decide) hnt (dbEntry_thread s) (by decide))
+    | 1 => exact Or.inl (runBlock_oof dbCtx _ 2 [dCv1, dCv2, dCv0, dAdd, dStore] stopInst dCv1
+             [dCv2, dCv0, dAdd, dStore, stopInst] s (dbSEnd s) rfl rfl (by decide) hnt (dbEntry_thread s) (by decide))
+    | 2 => exact Or.inl (runBlock_oof dbCtx _ 3 [dCv1, dCv2, dCv0, dAdd, dStore] stopInst dCv1
+             [dCv2, dCv0, dAdd, dStore, stopInst] s (dbSEnd s) rfl rfl (by decide) hnt (dbEntry_thread s) (by decide))
+    | 3 => exact Or.inl (runBlock_oof dbCtx _ 4 [dCv1, dCv2, dCv0, dAdd, dStore] stopInst dCv1
+             [dCv2, dCv0, dAdd, dStore, stopInst] s (dbSEnd s) rfl rfl (by decide) hnt (dbEntry_thread s) (by decide))
+    | 4 => exact Or.inl (runBlock_oof dbCtx _ 5 [dCv1, dCv2, dCv0, dAdd, dStore] stopInst dCv1
+             [dCv2, dCv0, dAdd, dStore, stopInst] s (dbSEnd s) rfl rfl (by decide) hnt (dbEntry_thread s) (by decide))
+    | (j+5) =>
+    rw [show j+5+1 = ([dCv1, dCv2, dCv0, dAdd, dStore] : List Instruction).length + (j+1) from by
+      simp only [List.length_cons, List.length_nil]; omega]
+    refine Or.inr (hsupplyW_regularStopToG
+      (gp := dbGp) (dem := fun _ => 1) (restFuel := j)
+      (front := [dCv1, dCv2, dCv0, dAdd, dStore]) (stopI := stopInst) (hd := dCv1)
+      (tl := [dCv2, dCv0, dAdd, dStore, stopInst])
+      (ps0 := initPlanState 0) (sEnd := dbSEnd s) (S := []) (Sn := [])
+      (hbb := rfl) (hstopop := rfl) (hcons := rfl) (hphi := by decide)
+      (hnonterm := hnt) (hthread := dbEntry_thread s)
+      (hready := dbReady)
+      (hsd := ⟨fun op => rfl, by simp [initPlanState], fun z hz => by simp [initPlanState] at hz⟩)
+      (hsv := rfl)
+      (hrel := by rw [hpsE] at hvrel; exact hvrel)
+      (hbLabel := by rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
+                     have hj2 : j < 1 := hj; interval_cases j; rfl)
+      (hblock := by rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
+                    have hj2 : j < 9 := hj; interval_cases j <;> rfl)
+      (hpc := by rw [hpc0]; decide)
+      (hstop := prog_get_transfer (by rw [hpc0]; decide)
+        (show (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1.get ⟨10, by decide⟩
+          = AsmInst.AsmOp "STOP" from rfl))
+      (hw := by decide))
+  case _ =>
+    refine ⟨⟨{ label := "entry", instructions := [dCv1, dCv2, dCv0, dAdd, dStore, stopInst] }, rfl, ?_, ?_⟩, ?_, hvshalt⟩
+    · show venomAsmRel lo (psOfFn (fnPlanFuel deadBuriedFn) deadBuriedFn 0 0 "entry") _ as
+      rw [hpsE]; exact hrel
+    · show as.pc = pcOfLabel (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1 "entry"
+      rw [haspc]; exact (pcOfLabel_entry_zero rfl hfnready hgen).symm
+    · show (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1 "entry" ≤ (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1.length
+      omega
+
+end Example
+
 end EvmYul.Venom.Hol.Codegen
