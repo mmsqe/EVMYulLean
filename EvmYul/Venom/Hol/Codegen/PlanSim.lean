@@ -167,26 +167,6 @@ theorem runAsm_succ_ok {offsetToPc prog s1 s2 n}
     runAsm (n + 1) offsetToPc prog s1 = runAsm n offsetToPc prog s2 := by
   simp only [show (n + 1) = Nat.succ n from rfl, runAsm, if_pos hpc, hstep]
 
-/-- Single-step `asmStep` on `AsmOp "POP"` yields `AsmOK` with stack popped
-    and `pc + 1`, provided the stack is non-empty (mirrors HOL
-    `asm_step_pop_ok`). -/
-theorem asmStep_pop_ok {offsetToPc prog s}
-    (hpc : s.pc < prog.length)
-    (hprog : prog.get ⟨s.pc, hpc⟩ = AsmInst.AsmOp "POP")
-    (hne : s.stack ≠ []) :
-    ∃ stk, asmStep offsetToPc prog s = AsmResult.AsmOK ({ (asmNext s) with stack := stk }) ∧
-           stk.length + 1 = s.stack.length := by
-  cases hs : s.stack with
-  | nil => exact absurd rfl (by rw [hs] at hne; exact hne)
-  | cons h stk =>
-    refine ⟨stk, ?_, ?_⟩
-    · -- asmStep dispatches on prog.get s.pc = AsmOp "POP" → asmPop
-      simp only [asmStep, hprog, hs, asmPop, asmNext]
-      split
-      · rfl
-      · exact absurd ‹s.pc < prog.length› (by assumption)
-    · simp [List.length_cons]
-
 -- Single-step `asmStep` on `AsmOp (swapName n)` (n ∈ [1,16]) dispatches to
 -- `asmSwap n s` (mirrors HOL `asm_step_swap_ok`). `asmSwap` internally
 -- produces `AsmOK ({asmNext s with stack := swapped})` when `0 < n` and
