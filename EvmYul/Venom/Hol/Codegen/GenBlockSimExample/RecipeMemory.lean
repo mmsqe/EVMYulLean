@@ -4749,6 +4749,115 @@ theorem hsupplyW_regularStopToG
   exact ⟨as', _, sEnd, _, hbody,
     termRecipeW_stop_of_body hbb hstopop hcons hphi hnonterm hthread hrel' hw hlt hst⟩
 
+/-- **Generic single-block-STOP capstone driver.** Every `entry: <one regular inst>; STOP` function
+    reaches `codegen_correct` from: the block shape, a body thread, a `BodyStepsReadyHTo` chain, and
+    the four program-layout facts. Dedups the bespoke drivers of `mcp` / `lg` / `deadBuried`. -/
+theorem codegen_correct_singleBlockStop
+    {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    {ctx : VenomContext} {fn : IrFunction} {entry : BasicBlock}
+    {front : List Instruction} {stopI : Instruction}
+    {gp : Instruction × Nat → PlanState → List StackOp × PlanState}
+    {dem : Instruction × Nat → Nat} {sEnd : VenomState → VenomState}
+    (hentryBlock : entryBlock fn = some entry)
+    (hlbl : entry.label = "entry")
+    (hinsts : entry.instructions = front ++ [stopI])
+    (hblocks : fn.blocks = [entry])
+    (hstopop : stopI.opcode = Opcode.STOP)
+    (hent : ctx.entry = some "main")
+    (hlk : lookupFunction "main" ctx.functions = some fn)
+    (hfel : fnEntryLabel fn = some "entry")
+    (hfnready : ∀ bb ∈ fn.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst)
+    (hfuel : 0 < fnPlanFuel fn)
+    (hcons : ∃ hd tl, front ++ [stopI] = hd :: tl ∧ hd.opcode ≠ Opcode.PHI)
+    (hnonterm : ∀ inst ∈ front, isTerminator inst.opcode = false)
+    (hthread : ∀ s : VenomState, execBodyThread front 0 { s with instIdx := 0 } = some (sEnd s))
+    (hrun0 : ∀ bb ∈ fn.blocks, ∀ s : VenomState, runBlock 0 ctx bb s = ExecResult.Error "out of fuel")
+    (hgen : generateFnPlan fn 0 0
+      = some ((generateFnPlan fn 0 0).get!.1, (generateFnPlan fn 0 0).get!.2))
+    (hready : BodyStepsReadyHTo lo (asmResolve (executePlan (generateFnPlan fn 0 0).get!.1)).2
+      (asmResolve (executePlan (generateFnPlan fn 0 0).get!.1)).1 gp dem (front.zipIdx 0) [] [])
+    (hsdsum : ((front.zipIdx 0).map dem).sum ≤ 15)
+    (hbLabel : asmBlockAt (asmResolve (executePlan (generateFnPlan fn 0 0).get!.1)).1 0
+      (executePlan [StackOp.SOLabel "entry"]))
+    (hblockAt : asmBlockAt (asmResolve (executePlan (generateFnPlan fn 0 0).get!.1)).1 (0 + 1)
+      (executePlan ((front.zipIdx 0).foldl
+        (fun acc x => (acc.1 ++ (gp x acc.2).1, (gp x acc.2).2)) ([], initPlanState 0)).1))
+    (hpclt : 0 + 1 + (executePlan ((front.zipIdx 0).foldl
+        (fun acc x => (acc.1 ++ (gp x acc.2).1, (gp x acc.2).2)) ([], initPlanState 0)).1).length
+      < (asmResolve (executePlan (generateFnPlan fn 0 0).get!.1)).1.length)
+    (hstopAt : (asmResolve (executePlan (generateFnPlan fn 0 0).get!.1)).1.get
+      ⟨0 + 1 + (executePlan ((front.zipIdx 0).foldl
+        (fun acc x => (acc.1 ++ (gp x acc.2).1, (gp x acc.2).2)) ([], initPlanState 0)).1).length, hpclt⟩
+      = AsmInst.AsmOp "STOP")
+    (hwbound : 1 + (executePlan ((front.zipIdx 0).foldl
+        (fun acc x => (acc.1 ++ (gp x acc.2).1, (gp x acc.2).2)) ([], initPlanState 0)).1).length + 1
+      ≤ (asmResolve (executePlan (generateFnPlan fn 0 0).get!.1)).1.length
+        - pcOfLabel (asmResolve (executePlan (generateFnPlan fn 0 0).get!.1)).1 "entry")
+    (hvshalt : vs.halted = false)
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    (match runContext 10 ctx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan fn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan fn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan fn 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan fn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan fn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan fn 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan fn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan fn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan fn 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  have hpsE : psOfFn (fnPlanFuel fn) fn 0 0 "entry" = initPlanState 0 := by
+    have := psOfFn_entry (fuel := fnPlanFuel fn) (fnEom := 0) (lblCtr := 0) hentryBlock hfnready hfuel
+    rw [hlbl] at this; rw [this]; rfl
+  have hpc0lbl : pcOfLabel (asmResolve (executePlan (generateFnPlan fn 0 0).get!.1)).1 "entry" = 0 := by
+    have hhd : fn.blocks.head? = some entry := by rw [hblocks]; rfl
+    have := pcOfLabel_entry_zero hhd hfnready hgen
+    rw [hlbl] at this; exact this
+  obtain ⟨hd, tl, hcons', hphi'⟩ := hcons
+  have hlkb : lookupBlock "entry" fn.blocks = some entry := by
+    rw [hblocks]; simp [lookupBlock, hlbl]
+  refine codegen_correct_ofBlocks_recipeW_invCur (fun _ => True)
+    (lo := lo) (pcOf := pcOfLabel (asmResolve (executePlan (generateFnPlan fn 0 0).get!.1)).1)
+    (psOf := psOfFn (fnPlanFuel fn) fn 0 0)
+    (wOf := fun l => (asmResolve (executePlan (generateFnPlan fn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan fn 0 0).get!.1)).1 l)
+    (offsets := (computeLabelOffsets (executePlan (generateFnPlan fn 0 0).get!.1)).2)
+    (fuel := 10) (ctx := ctx) (fn := fn) (fnEom := 0) (lblCtr := 0)
+    (entryName := "main") (entryLbl := "entry")
+    (ops := (generateFnPlan fn 0 0).get!.1) (psFinal := (generateFnPlan fn 0 0).get!.2)
+    hgen hent hlk hfel hrun0 ?_ (fun _ _ _ _ _ _ _ _ => trivial) ?_ trivial
+  case _ =>
+    intro bb hbb s asm N k hE _ hlbleq
+    obtain ⟨⟨bb0, hlk_s, hvrel, hpc_asm⟩, hwN, hhalt⟩ := hE
+    rw [hblocks] at hbb
+    simp only [List.mem_cons, List.not_mem_nil, or_false] at hbb
+    subst hbb
+    have hcur : s.currentBb = "entry" := by rw [hlbleq, hlbl]
+    rw [hcur] at hvrel hpc_asm
+    have hpc0 : asm.pc = 0 := by rw [hpc_asm]; exact hpc0lbl
+    by_cases hk : k + 1 ≤ front.length
+    · exact Or.inl (runBlock_oof ctx bb (k+1) front stopI hd tl s (sEnd s)
+        hinsts hcons' hphi' hnonterm (hthread s) hk)
+    · obtain ⟨j, hj⟩ : ∃ j, k + 1 = front.length + (j + 1) := ⟨k - front.length, by omega⟩
+      rw [hj]
+      refine Or.inr (hsupplyW_regularStopToG
+        (gp := gp) (dem := dem) (restFuel := j)
+        (front := front) (stopI := stopI) (hd := hd) (tl := tl)
+        (ps0 := initPlanState 0) (sEnd := sEnd s) (S := []) (Sn := [])
+        (hbb := hinsts) (hstopop := hstopop) (hcons := hcons') (hphi := hphi')
+        (hnonterm := hnonterm) (hthread := hthread s)
+        (hready := hready)
+        (hsd := ⟨fun op => rfl, by simpa [initPlanState] using hsdsum, fun z hz => by simp [initPlanState] at hz⟩)
+        (hsv := rfl)
+        (hrel := by rw [hpsE] at hvrel; exact hvrel)
+        (hbLabel := by rw [hpc0, hlbl]; exact hbLabel)
+        (hblock := by rw [hpc0]; exact hblockAt)
+        (hpc := by rw [hpc0]; exact hpclt)
+        (hstop := prog_get_transfer (by rw [hpc0]) hstopAt)
+        (hw := by rw [hlbl]; exact hwbound))
+  case _ =>
+    refine ⟨⟨entry, hlkb, ?_, ?_⟩, ?_, hvshalt⟩
+    · show venomAsmRel lo (psOfFn (fnPlanFuel fn) fn 0 0 "entry") _ as
+      rw [hpsE]; exact hrel
+    · show as.pc = pcOfLabel (asmResolve (executePlan (generateFnPlan fn 0 0).get!.1)).1 "entry"
+      rw [haspc, hpc0lbl]
+    · show (asmResolve (executePlan (generateFnPlan fn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan fn 0 0).get!.1)).1 "entry" ≤ (asmResolve (executePlan (generateFnPlan fn 0 0).get!.1)).1.length
+      omega
+
+
 namespace Example
 
 /-- The five-step ready chain for `deadBuriedFn`'s body: the layouts thread
@@ -4861,85 +4970,37 @@ theorem codegen_correct_deadBuriedFn_recipeW {lo : AssocList String Nat} {vs : V
      | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
      | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
      | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
-     | _ => True) := by
-  have hfnready : ∀ bb ∈ deadBuriedFn.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst := by
-    intro bb hbb inst hinst
-    simp only [deadBuriedFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
-    subst hbb
-    simp only [List.mem_cons, List.not_mem_nil, or_false] at hinst
-    rcases hinst with rfl | rfl | rfl | rfl | rfl | rfl <;> (unfold codegenReadyInst; decide)
-  have hgen : generateFnPlan deadBuriedFn 0 0
-      = some ((generateFnPlan deadBuriedFn 0 0).get!.1, (generateFnPlan deadBuriedFn 0 0).get!.2) := rfl
-  have hpsE : psOfFn (fnPlanFuel deadBuriedFn) deadBuriedFn 0 0 "entry" = initPlanState 0 :=
-    psOfFn_entry rfl hfnready (by simp only [fnPlanFuel]; omega)
-  refine codegen_correct_ofBlocks_recipeW_invCur (fun _ => True)
-    (lo := lo) (pcOf := pcOfLabel (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1)
-    (psOf := psOfFn (fnPlanFuel deadBuriedFn) deadBuriedFn 0 0)
-    (wOf := fun l => (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1 l)
-    (offsets := (computeLabelOffsets (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).2)
-    (fuel := 10) (ctx := dbCtx) (fn := deadBuriedFn) (fnEom := 0) (lblCtr := 0)
-    (entryName := "main") (entryLbl := "entry")
-    (ops := (generateFnPlan deadBuriedFn 0 0).get!.1) (psFinal := (generateFnPlan deadBuriedFn 0 0).get!.2)
-    hgen rfl rfl rfl ?_ ?_ (fun _ _ _ _ _ _ _ _ => trivial) ?_ trivial
-  case _ =>
-    intro bb hbb s
-    simp only [deadBuriedFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
-    subst hbb
-    simp [runBlock, evalPhis, execBlock, dCv1]
-  case _ =>
-    intro bb hbb s asm N k hE _ hlbleq
-    obtain ⟨⟨bb0, hlk_s, hvrel, hpc_asm⟩, hwN, hhalt⟩ := hE
-    simp only [deadBuriedFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
-    subst hbb
-    have hlbl : s.currentBb = "entry" := hlbleq
-    rw [hlbl] at hvrel hpc_asm
-    have hpc0 : asm.pc = 0 := by rw [hpc_asm]; exact pcOfLabel_entry_zero rfl hfnready hgen
-    have hnt : ∀ inst ∈ [dCv1, dCv2, dCv0, dAdd, dStore], isTerminator inst.opcode = false := by
-      intro i hi; simp only [List.mem_cons, List.not_mem_nil, or_false] at hi
-      rcases hi with rfl | rfl | rfl | rfl | rfl <;> decide
-    match k with
-    | 0 => exact Or.inl (runBlock_oof dbCtx _ 1 [dCv1, dCv2, dCv0, dAdd, dStore] stopInst dCv1
-             [dCv2, dCv0, dAdd, dStore, stopInst] s (dbSEnd s) rfl rfl (by decide) hnt (dbEntry_thread s) (by decide))
-    | 1 => exact Or.inl (runBlock_oof dbCtx _ 2 [dCv1, dCv2, dCv0, dAdd, dStore] stopInst dCv1
-             [dCv2, dCv0, dAdd, dStore, stopInst] s (dbSEnd s) rfl rfl (by decide) hnt (dbEntry_thread s) (by decide))
-    | 2 => exact Or.inl (runBlock_oof dbCtx _ 3 [dCv1, dCv2, dCv0, dAdd, dStore] stopInst dCv1
-             [dCv2, dCv0, dAdd, dStore, stopInst] s (dbSEnd s) rfl rfl (by decide) hnt (dbEntry_thread s) (by decide))
-    | 3 => exact Or.inl (runBlock_oof dbCtx _ 4 [dCv1, dCv2, dCv0, dAdd, dStore] stopInst dCv1
-             [dCv2, dCv0, dAdd, dStore, stopInst] s (dbSEnd s) rfl rfl (by decide) hnt (dbEntry_thread s) (by decide))
-    | 4 => exact Or.inl (runBlock_oof dbCtx _ 5 [dCv1, dCv2, dCv0, dAdd, dStore] stopInst dCv1
-             [dCv2, dCv0, dAdd, dStore, stopInst] s (dbSEnd s) rfl rfl (by decide) hnt (dbEntry_thread s) (by decide))
-    | (j+5) =>
-    rw [show j+5+1 = ([dCv1, dCv2, dCv0, dAdd, dStore] : List Instruction).length + (j+1) from by
-      simp only [List.length_cons, List.length_nil]; omega]
-    refine Or.inr (hsupplyW_regularStopToG
-      (gp := dbGp) (dem := fun _ => 1) (restFuel := j)
-      (front := [dCv1, dCv2, dCv0, dAdd, dStore]) (stopI := stopInst) (hd := dCv1)
-      (tl := [dCv2, dCv0, dAdd, dStore, stopInst])
-      (ps0 := initPlanState 0) (sEnd := dbSEnd s) (S := []) (Sn := [])
-      (hbb := rfl) (hstopop := rfl) (hcons := rfl) (hphi := by decide)
-      (hnonterm := hnt) (hthread := dbEntry_thread s)
-      (hready := dbReady)
-      (hsd := ⟨fun op => rfl, by simp [initPlanState], fun z hz => by simp [initPlanState] at hz⟩)
-      (hsv := rfl)
-      (hrel := by rw [hpsE] at hvrel; exact hvrel)
-      (hbLabel := by rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
-                     have hj2 : j < 1 := hj; interval_cases j; rfl)
-      (hblock := by rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
-                    have hj2 : j < 9 := hj; interval_cases j <;> rfl)
-      (hpc := by rw [hpc0]; decide)
-      (hstop := prog_get_transfer (by rw [hpc0]; decide)
-        (show (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1.get ⟨10, by decide⟩
-          = AsmInst.AsmOp "STOP" from rfl))
-      (hw := by decide))
-  case _ =>
-    refine ⟨⟨{ label := "entry", instructions := [dCv1, dCv2, dCv0, dAdd, dStore, stopInst] }, rfl, ?_, ?_⟩, ?_, hvshalt⟩
-    · show venomAsmRel lo (psOfFn (fnPlanFuel deadBuriedFn) deadBuriedFn 0 0 "entry") _ as
-      rw [hpsE]; exact hrel
-    · show as.pc = pcOfLabel (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1 "entry"
-      rw [haspc]; exact (pcOfLabel_entry_zero rfl hfnready hgen).symm
-    · show (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1 "entry" ≤ (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1.length
-      omega
-
+     | _ => True) :=
+  codegen_correct_singleBlockStop
+    (entry := { label := "entry", instructions := [dCv1, dCv2, dCv0, dAdd, dStore, stopInst] })
+    (front := [dCv1, dCv2, dCv0, dAdd, dStore]) (stopI := stopInst)
+    (gp := dbGp) (dem := fun _ => 1) (sEnd := dbSEnd)
+    rfl rfl rfl rfl rfl rfl rfl rfl
+    (by intro bb hbb inst hinst
+        simp only [deadBuriedFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+        subst hbb
+        simp only [List.mem_cons, List.not_mem_nil, or_false] at hinst
+        rcases hinst with rfl | rfl | rfl | rfl | rfl | rfl <;> (unfold codegenReadyInst; decide))
+    (by simp only [fnPlanFuel]; omega)
+    ⟨dCv1, [dCv2, dCv0, dAdd, dStore, stopInst], rfl, by decide⟩
+    (by intro i hi
+        simp only [List.mem_cons, List.not_mem_nil, or_false] at hi
+        rcases hi with rfl | rfl | rfl | rfl | rfl <;> decide)
+    dbEntry_thread
+    (by intro bb hbb s
+        simp only [deadBuriedFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+        subst hbb
+        simp [runBlock, evalPhis, execBlock, dCv1])
+    rfl
+    dbReady
+    (by decide)
+    (⟨by decide, fun j hj => by have hj2 : j < 1 := hj; interval_cases j; rfl⟩)
+    (⟨by decide, fun j hj => by have hj2 : j < 9 := hj; interval_cases j <;> rfl⟩)
+    (by decide)
+    (show (asmResolve (executePlan (generateFnPlan deadBuriedFn 0 0).get!.1)).1.get ⟨10, by decide⟩
+      = AsmInst.AsmOp "STOP" from rfl)
+    (by decide)
+    hvshalt hrel haspc
 end Example
 
 
@@ -5296,75 +5357,33 @@ theorem codegen_correct_mcpFn_recipeW {lo : AssocList String Nat} {vs : VenomSta
      | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
      | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
      | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
-     | _ => True) := by
-  have hfnready : ∀ bb ∈ mcpFn.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst := by
-    intro bb hbb inst hinst
-    simp only [mcpFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
-    subst hbb
-    simp only [mcpEntry, List.mem_cons, List.not_mem_nil, or_false] at hinst
-    rcases hinst with rfl | rfl <;> (unfold codegenReadyInst; decide)
-  have hgen : generateFnPlan mcpFn 0 0
-      = some ((generateFnPlan mcpFn 0 0).get!.1, (generateFnPlan mcpFn 0 0).get!.2) := rfl
-  have hpsE : psOfFn (fnPlanFuel mcpFn) mcpFn 0 0 "entry" = initPlanState 0 :=
-    psOfFn_entry rfl hfnready (by simp only [fnPlanFuel]; omega)
-  refine codegen_correct_ofBlocks_recipeW_invCur (fun _ => True)
-    (lo := lo) (pcOf := pcOfLabel (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1)
-    (psOf := psOfFn (fnPlanFuel mcpFn) mcpFn 0 0)
-    (wOf := fun l => (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1 l)
-    (offsets := (computeLabelOffsets (executePlan (generateFnPlan mcpFn 0 0).get!.1)).2)
-    (fuel := 10) (ctx := mcpCtx) (fn := mcpFn) (fnEom := 0) (lblCtr := 0)
-    (entryName := "main") (entryLbl := "entry")
-    (ops := (generateFnPlan mcpFn 0 0).get!.1) (psFinal := (generateFnPlan mcpFn 0 0).get!.2)
-    hgen rfl rfl rfl ?_ ?_ (fun _ _ _ _ _ _ _ _ => trivial) ?_ trivial
-  case _ =>
-    intro bb hbb s
-    simp only [mcpFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
-    subst hbb
-    simp [runBlock, evalPhis, execBlock, mcpEntry, mcpCopy]
-  case _ =>
-    intro bb hbb s asm N k hE _ hlbleq
-    obtain ⟨⟨bb0, hlk_s, hvrel, hpc_asm⟩, hwN, hhalt⟩ := hE
-    simp only [mcpFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
-    subst hbb
-    have hlbl : s.currentBb = "entry" := hlbleq
-    rw [hlbl] at hvrel hpc_asm
-    have hpc0 : asm.pc = 0 := by rw [hpc_asm]; exact pcOfLabel_entry_zero rfl hfnready hgen
-    have hnt : ∀ inst ∈ [mcpCopy], isTerminator inst.opcode = false := by
-      intro i hi; simp only [List.mem_singleton] at hi; subst hi; decide
-    match k with
-    | 0 => exact Or.inl (runBlock_oof mcpCtx _ 1 [mcpCopy] mcpStop mcpCopy [mcpStop] s (mcpSEnd s)
-             rfl rfl (by decide) hnt (mcpEntry_thread s) (by decide))
-    | (j+1) =>
-    rw [show j+1+1 = ([mcpCopy] : List Instruction).length + (j+1) from by
-      simp only [List.length_cons, List.length_nil]; omega]
-    refine Or.inr (hsupplyW_regularStopToG
-      (gp := mcpGp) (dem := fun _ => 3) (restFuel := j)
-      (front := [mcpCopy]) (stopI := mcpStop) (hd := mcpCopy) (tl := [mcpStop])
-      (ps0 := initPlanState 0) (sEnd := mcpSEnd s) (S := []) (Sn := [])
-      (hbb := rfl) (hstopop := rfl) (hcons := rfl) (hphi := by decide)
-      (hnonterm := hnt) (hthread := mcpEntry_thread s)
-      (hready := mcpReady)
-      (hsd := ⟨fun op => rfl, by simp [initPlanState], fun z hz => by simp [initPlanState] at hz⟩)
-      (hsv := rfl)
-      (hrel := by rw [hpsE] at hvrel; exact hvrel)
-      (hbLabel := by rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
-                     have hj2 : j < 1 := hj; interval_cases j; rfl)
-      (hblock := by rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
-                    have hj2 : j < 6 := hj; interval_cases j <;> rfl)
-      (hpc := by rw [hpc0]; decide)
-      (hstop := prog_get_transfer (by rw [hpc0]; decide)
-        (show (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1.get ⟨7, by decide⟩
-          = AsmInst.AsmOp "STOP" from rfl))
-      (hw := by decide))
-  case _ =>
-    refine ⟨⟨mcpEntry, rfl, ?_, ?_⟩, ?_, hvshalt⟩
-    · show venomAsmRel lo (psOfFn (fnPlanFuel mcpFn) mcpFn 0 0 "entry") _ as
-      rw [hpsE]; exact hrel
-    · show as.pc = pcOfLabel (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1 "entry"
-      rw [haspc]; exact (pcOfLabel_entry_zero rfl hfnready hgen).symm
-    · show (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1 "entry" ≤ (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1.length
-      omega
-
+     | _ => True) :=
+  codegen_correct_singleBlockStop (entry := mcpEntry) (front := [mcpCopy]) (stopI := mcpStop)
+    (gp := mcpGp) (dem := fun _ => 3) (sEnd := mcpSEnd)
+    rfl rfl rfl rfl rfl rfl rfl rfl
+    (by intro bb hbb inst hinst
+        simp only [mcpFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+        subst hbb
+        simp only [mcpEntry, List.mem_cons, List.not_mem_nil, or_false] at hinst
+        rcases hinst with rfl | rfl <;> (unfold codegenReadyInst; decide))
+    (by simp only [fnPlanFuel]; omega)
+    ⟨mcpCopy, [mcpStop], rfl, by decide⟩
+    (by intro i hi; simp only [List.mem_singleton] at hi; subst hi; decide)
+    mcpEntry_thread
+    (by intro bb hbb s
+        simp only [mcpFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+        subst hbb
+        simp [runBlock, evalPhis, execBlock, mcpEntry, mcpCopy])
+    rfl
+    mcpReady
+    (by decide)
+    (⟨by decide, fun j hj => by have hj2 : j < 1 := hj; interval_cases j; rfl⟩)
+    (⟨by decide, fun j hj => by have hj2 : j < 6 := hj; interval_cases j <;> rfl⟩)
+    (by decide)
+    (show (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1.get ⟨7, by decide⟩
+      = AsmInst.AsmOp "STOP" from rfl)
+    (by decide)
+    hvshalt hrel haspc
 /-! ## The LOG capstone: a codegen-ready, tracked-effect opcode (`lg`)
 
 LOG is codegen-READY, lowered via the `generateEmitOps` `none`-branch to `LOG{topicCount}`, and its
@@ -5533,75 +5552,33 @@ theorem codegen_correct_lgFn_recipeW {lo : AssocList String Nat} {vs : VenomStat
      | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
      | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
      | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
-     | _ => True) := by
-  have hfnready : ∀ bb ∈ lgFn.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst := by
-    intro bb hbb inst hinst
-    simp only [lgFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
-    subst hbb
-    simp only [lgEntry, List.mem_cons, List.not_mem_nil, or_false] at hinst
-    rcases hinst with rfl | rfl <;> (unfold codegenReadyInst; decide)
-  have hgen : generateFnPlan lgFn 0 0
-      = some ((generateFnPlan lgFn 0 0).get!.1, (generateFnPlan lgFn 0 0).get!.2) := rfl
-  have hpsE : psOfFn (fnPlanFuel lgFn) lgFn 0 0 "entry" = initPlanState 0 :=
-    psOfFn_entry rfl hfnready (by simp only [fnPlanFuel]; omega)
-  refine codegen_correct_ofBlocks_recipeW_invCur (fun _ => True)
-    (lo := lo) (pcOf := pcOfLabel (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1)
-    (psOf := psOfFn (fnPlanFuel lgFn) lgFn 0 0)
-    (wOf := fun l => (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1 l)
-    (offsets := (computeLabelOffsets (executePlan (generateFnPlan lgFn 0 0).get!.1)).2)
-    (fuel := 10) (ctx := lgCtx) (fn := lgFn) (fnEom := 0) (lblCtr := 0)
-    (entryName := "main") (entryLbl := "entry")
-    (ops := (generateFnPlan lgFn 0 0).get!.1) (psFinal := (generateFnPlan lgFn 0 0).get!.2)
-    hgen rfl rfl rfl ?_ ?_ (fun _ _ _ _ _ _ _ _ => trivial) ?_ trivial
-  case _ =>
-    intro bb hbb s
-    simp only [lgFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
-    subst hbb
-    simp [runBlock, evalPhis, execBlock, lgEntry, lgLog]
-  case _ =>
-    intro bb hbb s asm N k hE _ hlbleq
-    obtain ⟨⟨bb0, hlk_s, hvrel, hpc_asm⟩, hwN, hhalt⟩ := hE
-    simp only [lgFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
-    subst hbb
-    have hlbl : s.currentBb = "entry" := hlbleq
-    rw [hlbl] at hvrel hpc_asm
-    have hpc0 : asm.pc = 0 := by rw [hpc_asm]; exact pcOfLabel_entry_zero rfl hfnready hgen
-    have hnt : ∀ inst ∈ [lgLog], isTerminator inst.opcode = false := by
-      intro i hi; simp only [List.mem_singleton] at hi; subst hi; decide
-    match k with
-    | 0 => exact Or.inl (runBlock_oof lgCtx _ 1 [lgLog] lgStop lgLog [lgStop] s (lgSEnd s)
-             rfl rfl (by decide) hnt (lgEntry_thread s) (by decide))
-    | (j+1) =>
-    rw [show j+1+1 = ([lgLog] : List Instruction).length + (j+1) from by
-      simp only [List.length_cons, List.length_nil]; omega]
-    refine Or.inr (hsupplyW_regularStopToG
-      (gp := lgGp) (dem := fun _ => 2) (restFuel := j)
-      (front := [lgLog]) (stopI := lgStop) (hd := lgLog) (tl := [lgStop])
-      (ps0 := initPlanState 0) (sEnd := lgSEnd s) (S := []) (Sn := [])
-      (hbb := rfl) (hstopop := rfl) (hcons := rfl) (hphi := by decide)
-      (hnonterm := hnt) (hthread := lgEntry_thread s)
-      (hready := lgReady)
-      (hsd := ⟨fun op => rfl, by simp [initPlanState], fun z hz => by simp [initPlanState] at hz⟩)
-      (hsv := rfl)
-      (hrel := by rw [hpsE] at hvrel; exact hvrel)
-      (hbLabel := by rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
-                     have hj2 : j < 1 := hj; interval_cases j; rfl)
-      (hblock := by rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
-                    have hj2 : j < 4 := hj; interval_cases j <;> rfl)
-      (hpc := by rw [hpc0]; decide)
-      (hstop := prog_get_transfer (by rw [hpc0]; decide)
-        (show (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1.get ⟨5, by decide⟩
-          = AsmInst.AsmOp "STOP" from rfl))
-      (hw := by decide))
-  case _ =>
-    refine ⟨⟨lgEntry, rfl, ?_, ?_⟩, ?_, hvshalt⟩
-    · show venomAsmRel lo (psOfFn (fnPlanFuel lgFn) lgFn 0 0 "entry") _ as
-      rw [hpsE]; exact hrel
-    · show as.pc = pcOfLabel (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1 "entry"
-      rw [haspc]; exact (pcOfLabel_entry_zero rfl hfnready hgen).symm
-    · show (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1 "entry" ≤ (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1.length
-      omega
-
+     | _ => True) :=
+  codegen_correct_singleBlockStop (entry := lgEntry) (front := [lgLog]) (stopI := lgStop)
+    (gp := lgGp) (dem := fun _ => 2) (sEnd := lgSEnd)
+    rfl rfl rfl rfl rfl rfl rfl rfl
+    (by intro bb hbb inst hinst
+        simp only [lgFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+        subst hbb
+        simp only [lgEntry, List.mem_cons, List.not_mem_nil, or_false] at hinst
+        rcases hinst with rfl | rfl <;> (unfold codegenReadyInst; decide))
+    (by simp only [fnPlanFuel]; omega)
+    ⟨lgLog, [lgStop], rfl, by decide⟩
+    (by intro i hi; simp only [List.mem_singleton] at hi; subst hi; decide)
+    lgEntry_thread
+    (by intro bb hbb s
+        simp only [lgFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+        subst hbb
+        simp [runBlock, evalPhis, execBlock, lgEntry, lgLog])
+    rfl
+    lgReady
+    (by decide)
+    (⟨by decide, fun j hj => by have hj2 : j < 1 := hj; interval_cases j; rfl⟩)
+    (⟨by decide, fun j hj => by have hj2 : j < 4 := hj; interval_cases j <;> rfl⟩)
+    (by decide)
+    (show (asmResolve (executePlan (generateFnPlan lgFn 0 0).get!.1)).1.get ⟨5, by decide⟩
+      = AsmInst.AsmOp "STOP" from rfl)
+    (by decide)
+    hvshalt hrel haspc
 end Example
 
 end EvmYul.Venom.Hol.Codegen
