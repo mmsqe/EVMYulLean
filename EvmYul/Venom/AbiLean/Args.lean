@@ -24,10 +24,11 @@ def decodeArgs (ts : List Ty) (buf : List UInt8) : Option (TupleVal ts) :=
   EvmAbi.decode (.tuple ts) buf
 
 /-- **Function-call roundtrip**: an argument tuple decodes from its own
-encoding, under the same length bound as the library's `roundtrip`. -/
+encoding, under the same length bound as the library's `roundtrip` (the
+dynamic payload bounds are carried by the values themselves). -/
 theorem roundtrip_args (ts : List Ty) (hv : AllValid ts) (vs : TupleVal ts)
-    (hl : LenBound (.tuple ts) vs) (hb : (encodeArgs ts vs).length < 2 ^ 256) :
+    (hb : (encodeArgs ts vs).length < 2 ^ 256) :
     decodeArgs ts (encodeArgs ts vs) = some vs :=
-  EvmAbi.roundtrip (.tuple ts) hv vs hl hb
+  EvmAbi.roundtrip (.tuple ts) hv vs hb
 
 end EvmYul.Venom.AbiLean

@@ -44,9 +44,9 @@ def encodeF : (fuel : Nat) → (t : Ty) → t.Val → List UInt8
     | .bool, b => encodeBool b
     | .address, ⟨n, _⟩ => encodeAddress n
     | .bytesN _, ⟨bs, _⟩ => encodeBytesN bs
-    | .bytes, bs => encodeBytes bs
-    | .string, s => encodeString s
-    | .array t', vs => encodeUint vs.length ++ encodeParts (partsArrF f t' vs)
+    | .bytes, ⟨bs, _⟩ => encodeBytes bs
+    | .string, ⟨s, _⟩ => encodeString s
+    | .array t', ⟨vs, _⟩ => encodeUint vs.length ++ encodeParts (partsArrF f t' vs)
     | .fixedArray t' _, ⟨vs, _⟩ => encodeParts (partsArrF f t' vs)
     | .tuple ts, vs => encodeParts (partsTupF f ts vs)
 /-- Fuel-indexed mirror of `vs.map (partOf t)` (array/fixed-array elements). -/
@@ -78,7 +78,7 @@ def enoughE : (fuel : Nat) → (t : Ty) → t.Val → Bool
   | 0, _, _ => false
   | f+1, t, v =>
     match t, v with
-    | .array t', vs => enoughArrE f t' vs
+    | .array t', ⟨vs, _⟩ => enoughArrE f t' vs
     | .fixedArray t' _, ⟨vs, _⟩ => enoughArrE f t' vs
     | .tuple ts, vs => enoughTupE f ts vs
     | _, _ => true
@@ -121,9 +121,9 @@ theorem encodeF_eq_encode :
   · intro f v _; simp only [encodeF, encode]
   · intro f n hp _; simp only [encodeF, encode]
   · intro f bs _; simp only [encodeF, encode]
-  · intro f v _; simp only [encodeF, encode]
-  · intro f v _; simp only [encodeF, encode]
-  · intro f t' v ih h
+  · intro f v hp h; simp only [encodeF, encode]
+  · intro f v hp h; simp only [encodeF, encode]
+  · intro f t' v hp ih h
     simp only [enoughE] at h; simp only [encodeF, encode]; rw [ih h]
   · intro f t' vs ih h
     simp only [enoughE] at h; simp only [encodeF, encode]; rw [ih h]

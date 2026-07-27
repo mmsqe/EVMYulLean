@@ -204,13 +204,7 @@ theorem abiLean_transferArgs_roundtrip :
         (AbiLean.encodeArgs [.address, .uint 256]
           (⟨recvU.toNat, recvU_toNat_lt⟩, ⟨amtU.toNat, amtU_toNat_lt⟩, ⟨⟩))
       = some (⟨recvU.toNat, recvU_toNat_lt⟩, ⟨amtU.toNat, amtU_toNat_lt⟩, ⟨⟩) := by
-  apply AbiLean.roundtrip_args [.address, .uint 256] (by decide) _ ?hl
-  case hl =>
-    simp only [EvmAbi.Ty.LenBound]
-    repeat first
-      | rw [EvmAbi.Ty.TupleLenBounds.eq_2]
-      | rw [EvmAbi.Ty.TupleLenBounds.eq_1]
-    simp only [EvmAbi.Ty.LenBound]; decide
+  apply AbiLean.roundtrip_args [.address, .uint 256] (by decide) _
   rw [AbiLean.encodeArgs_eq_encodeF 100 _ _ (by rfl)]; decide +kernel
 
 set_option maxRecDepth 100000 in
@@ -237,7 +231,7 @@ semantics (each read via the proved `AbiBridge.calldataload_append_toBytes32`). 
 /-- evm-abi-lean's ABI encoding of `sum(uint256[])`'s `[10,20,30]` argument. -/
 def abiLeanSumArgs : Option (List UInt8) :=
   some (AbiLean.encodeArgs [.array (.uint 256)]
-     ([⟨10, by decide⟩, ⟨20, by decide⟩, ⟨30, by decide⟩], ⟨⟩))
+     (⟨[⟨10, by decide⟩, ⟨20, by decide⟩, ⟨30, by decide⟩], by decide⟩, ⟨⟩))
 
 /-- The native ABI head/tail word-chain: offset `0x20`, length `3`, elements. -/
 def sumNativeChain : Mem :=
@@ -317,7 +311,7 @@ elements; total `7 + 10 + 20 + 30 = 67` (`0x43`, venom_run's return). -/
 /-- evm-abi-lean's ABI encoding of `mixed(uint256, uint256[])`'s `(7,[10,20,30])`. -/
 def abiLeanMixedArgs : Option (List UInt8) :=
   some (AbiLean.encodeArgs [.uint 256, .array (.uint 256)]
-     (⟨7, by decide⟩, [⟨10, by decide⟩, ⟨20, by decide⟩, ⟨30, by decide⟩], ⟨⟩))
+     (⟨7, by decide⟩, ⟨[⟨10, by decide⟩, ⟨20, by decide⟩, ⟨30, by decide⟩], by decide⟩, ⟨⟩))
 
 /-- The native chain: static `7`, offset `0x40`, length `3`, then elements. -/
 def mixedNativeChain : Mem :=
@@ -420,8 +414,7 @@ theorem abiLean_decodes_returnWord (s : VenomState) (v : VarName) (hv : s.env v 
     rw [← AbiLean.encodeF_eq_encode 5 (.uint 256) ⟨amtU.toNat, amtU_toNat_lt⟩ (by rfl)]; decide +kernel
   have hlen : (EvmAbi.encode (.uint 256) ⟨amtU.toNat, amtU_toNat_lt⟩).length < 2 ^ 256 := by
     rw [← AbiLean.encodeF_eq_encode 5 (.uint 256) ⟨amtU.toNat, amtU_toNat_lt⟩ (by rfl)]; decide +kernel
-  rw [henc, EvmAbi.roundtrip (.uint 256) (by decide) ⟨amtU.toNat, amtU_toNat_lt⟩
-      (by simp only [EvmAbi.Ty.LenBound]) hlen]
+  rw [henc, EvmAbi.roundtrip (.uint 256) (by decide) ⟨amtU.toNat, amtU_toNat_lt⟩ hlen]
   rfl
 
 /-! ## Additional type-surface cross-validation
@@ -440,7 +433,7 @@ against EVMYulLean's byte layout — each `decide +kernel` (base axioms) through
 
 /-- `foo(bytes)` with the 3-byte value `0xaabbcc`. -/
 def abiLeanBytesArgs : Option (List UInt8) :=
-  some (AbiLean.encodeArgs [.bytes] (([0xaa, 0xbb, 0xcc] : List UInt8), ⟨⟩))
+  some (AbiLean.encodeArgs [.bytes] (⟨[0xaa, 0xbb, 0xcc], by decide⟩, ⟨⟩))
 
 /-- The native chain: offset `0x20`, length `3`, then the data right-padded to 32. -/
 def bytesNativeChain : Mem :=
@@ -457,7 +450,7 @@ theorem abiLeanBytesArgs_eq_native : abiLeanBytesArgs = some bytesNativeChain :=
 
 /-- `greet(string)` with `"abc"` (UTF-8 `0x61 0x62 0x63`). -/
 def abiLeanStringArgs : Option (List UInt8) :=
-  some (AbiLean.encodeArgs [.string] (("abc" : String), ⟨⟩))
+  some (AbiLean.encodeArgs [.string] (⟨"abc", by decide⟩, ⟨⟩))
 
 /-- The native chain: offset `0x20`, length `3`, UTF-8 bytes right-padded to 32. -/
 def stringNativeChain : Mem :=
