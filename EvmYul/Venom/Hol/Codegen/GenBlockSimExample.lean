@@ -38,4 +38,4 @@ Read them in order:
   6. `GenBlockSimExample/RecipeFinal` — the retracted recipe capstones and the closing block.
 -/
 
-import EvmYul.Venom.Hol.Codegen.GenBlockSimExample.RecipeFinal
+import EvmYul.Venom.Hol.Codegen.GenBlockSimExample.RecipeTernops
