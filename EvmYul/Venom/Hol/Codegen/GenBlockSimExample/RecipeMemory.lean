@@ -5581,4 +5581,86 @@ theorem codegen_correct_lgFn_recipeW {lo : AssocList String Nat} {vs : VenomStat
     hvshalt hrel haspc
 end Example
 
+
+/-! ## ISTORE groundwork: the zero-value witness
+
+`ISTORE` is codegen-READY and lowers to `SWAP1; MSTORE`, but Venom writes `immutables` (which
+`venomAsmRel` does not track) while the asm side writes memory — so `memoryRel` appeared to force
+either a new relation conjunct or a semantics change. It does not: with a **zero value** and empty
+memories each side reads `0` everywhere, so `memoryRel` survives untouched. These are the semantic
+pieces; the remaining work for a whole-function ISTORE capstone is plumbing the two `memory.size = 0`
+facts into the step, which the generic `BodyStepHTo` fold cannot carry (it sees only `StackDiscH` +
+`venomAsmRel`) — that needs the `mtp` route (`_invJ` + a currentBb-guarded `Inv2` + a bespoke supply). -/
+theorem toBytes'_zero : toBytes' 0 = [] := by unfold toBytes'; simp
+theorem toBytesBigEndian_zero : toBytesBigEndian 0 = [] := by
+  unfold toBytesBigEndian; simp [Function.comp, toBytes'_zero]
+theorem wordToBytes_zero_eq :
+    wordToBytes (EvmYul.UInt256.ofNat 0) = List.toByteArray (List.replicate 32 0) := by
+  unfold wordToBytes
+  rw [show (EvmYul.UInt256.ofNat 0).toNat = 0 from rfl, toBytesBigEndian_zero]; simp
+theorem wordToBytes_zero_size : (wordToBytes (EvmYul.UInt256.ofNat 0)).size = 32 := by
+  rw [wordToBytes_zero_eq]; rfl
+theorem wordToBytes_zero_getElem (j : Nat) :
+    (wordToBytes (EvmYul.UInt256.ofNat 0))[j]?.getD 0 = 0 := by
+  rw [wordToBytes_zero_eq]
+  by_cases h : j < 32
+  · interval_cases j <;> rfl
+  · rw [getElem?_neg]; · rfl
+    · show ¬ j < (List.toByteArray (List.replicate 32 (0:UInt8))).size
+      rw [show (List.toByteArray (List.replicate 32 (0:UInt8))).size = 32 from rfl]; exact h
+
+/-- **Writing a zero word leaves every byte reading zero** (given the destination already does).
+    The piece `readByte_write_congr` cannot supply: here only ONE side receives the write. -/
+theorem readByte_writeZeroWord (m : ByteArray) (i : Nat) (hm : ∀ j, readByte j m = 0) :
+    readByte i ((wordToBytes (EvmYul.UInt256.ofNat 0)).write 0 m 0 32) = 0 := by
+  have hsz : (wordToBytes (EvmYul.UInt256.ofNat 0)).size = 32 := wordToBytes_zero_size
+  by_cases hwin : 0 ≤ i ∧ i < 0 + 32
+  · rw [readByte_eq_getElem?_getD]
+    rw [show (32 : Nat) = (wordToBytes (EvmYul.UInt256.ofNat 0)).size from hsz.symm]
+    rw [byteArray_write_getElem?_inWindow _ m 0 i (by rw [hsz]; norm_num) (Nat.zero_le _)
+          (by rw [hsz]; exact ⟨hwin.1, by omega⟩)]
+    simpa using wordToBytes_zero_getElem (i - 0)
+  · have hge : 0 + 32 ≤ i := by omega
+    rw [show (32 : Nat) = (wordToBytes (EvmYul.UInt256.ofNat 0)).size from hsz.symm] at hge ⊢
+    rw [readByte_write_frame_ge (Nat.zero_le _) hge]
+    exact hm i
+
+
+theorem readByte_of_empty {m : ByteArray} (h : m.size = 0) (j : Nat) : readByte j m = 0 := by
+  unfold readByte; rw [dif_neg]; rw [h]; omega
+
+/-- The asm memory after a zero-word MSTORE at offset 0. -/
+abbrev zwMem (as : AsmState) : ByteArray :=
+  (wordToBytes (EvmYul.UInt256.ofNat 0)).write 0 (asmExpandMemory (0 + 32) as.memory) 0 32
+
+/-- **The zero-value ISTORE step + relation.** Venom writes `immutables` (untracked by
+    `venomAsmRel`) and leaves memory alone; the asm side MSTOREs 32 ZERO bytes. With both memories
+    empty each side reads 0 everywhere, so `memoryRel` survives — no relation or semantics change
+    is needed. This is what unblocks ISTORE. -/
+theorem asmIstore_zero_noSpill_rel {lo : AssocList String Nat} {ps : PlanState}
+    {vs : VenomState} {as : AsmState} {rest : List bytes32}
+    (hrel : venomAsmRel lo ps vs as)
+    (hstack : as.stack = (EvmYul.UInt256.ofNat 0) :: (EvmYul.UInt256.ofNat 0) :: rest)
+    (hvs0 : vs.memory.size = 0) (has0 : as.memory.size = 0)
+    (hnospill : ∀ op, alookup' ps.spilled op = none) :
+    asmMstore as = AsmResult.AsmOK { asmNext as with stack := rest, memory := zwMem as }
+    ∧ venomAsmRel lo { ps with stack := stackPop 2 ps.stack } { vs with immutables := ainsert vs.immutables 0 (EvmYul.UInt256.ofNat 0) } { asmNext as with stack := rest, memory := zwMem as } := by
+  have hro : ((0 + 32 + 31) / 32) * 32 < USize.size := by
+    rcases USize.size_eq with h | h <;> (rw [h]; decide)
+  constructor
+  · simp only [asmMstore, hstack, show (EvmYul.UInt256.ofNat 0).toNat = 0 from rfl]
+  · obtain ⟨hStk, hSpill, hMem, hAcc, hTrans, hRet, hLog, hCall, hTx, hBlk, hCode, hPrev⟩ := hrel
+    have hlen2 : 2 ≤ ps.stack.length := by rw [hStk.1, hstack]; simp
+    have hps := planStackRel_popN hStk hlen2
+    rw [hstack] at hps
+    refine ⟨hps, ?_, ?_, hAcc, hTrans, hRet, hLog, hCall, hTx, hBlk, hCode, hPrev⟩
+    · intro op off' hlook
+      rw [show AssocList.lookup Operand Nat ps.spilled op = alookup' ps.spilled op from rfl,
+          hnospill op] at hlook
+      exact absurd hlook (by simp)
+    · intro i _
+      rw [readByte_of_empty hvs0 i]
+      exact (readByte_writeZeroWord _ i
+        (fun j => by rw [readByte_asmExpandMemory j _ as.memory hro]; exact readByte_of_empty has0 j)).symm
+
 end EvmYul.Venom.Hol.Codegen
