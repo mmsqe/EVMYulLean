@@ -2,14 +2,23 @@ import Lake
 open Lake DSL System
 
 require mathlib from git
-  "https://github.com/leanprover-community/mathlib4.git"@"v4.22.0"
+  "https://github.com/leanprover-community/mathlib4.git"@"v4.31.0"
+
+-- In-tree ABI cross-validation (now that both repos pin Lean/mathlib v4.31.0):
+-- pull evm-abi-lean's computable keccak/encoder so the ERC-20 selector *values*
+-- are checked inside this build instead of only out-of-process (abi_crossval.sh).
+-- Pinned to a commit for reproducible verification (see the `AbiCrossval` target);
+-- `fix_roundtrip` drops the flawed unconditional dynamic roundtrips, so the whole
+-- evm-abi-lean library is sorry-free at this pin.
+require «abi-lean» from git
+  "https://github.com/yihuang/evm-abi-lean.git" @ "d5f903eb2b509ef4e77fb83d9550a80e1c45b7ee"
 
 package «evmyul» {
   moreLeanArgs := #["-DautoImplicit=false"]
   moreServerOptions := #[⟨`autoImplicit, false⟩]
 }
 
-def cloneWithCache (pkg : NPackage _package.name) (dirname url : String) : FetchM (Job GitRepo) := do
+def cloneWithCache (pkg : NPackage __name__) (dirname url : String) : FetchM (Job GitRepo) := do
   let repoDir : GitRepo := ⟨pkg.dir / dirname⟩
   if !(← repoDir.dir.pathExists) then dbg_trace s!"Cloning: {url}"; GitRepo.clone url repoDir
   return pure repoDir
@@ -71,12 +80,27 @@ extern_lib libleanffi pkg := do
         cwd := some pkg.dir }
 
   let name := nameToStaticLib "leanffi"
-  buildStaticLib (pkg.nativeLibDir / name) #[sha256O, keccak256, ffiO]
+  buildStaticLib (pkg.staticLibDir / name) #[sha256O, keccak256, ffiO]
 
-lean_lib «Conform»
+-- No `Conform.lean` root module exists; v4.31 Lake's default glob would flag the
+-- missing root as "bad imports", so glob the submodules explicitly.
+lean_lib «Conform» where
+  globs := #[.submodules `Conform]
 
 @[default_target]
 lean_lib «EvmYul»
+
+-- In-tree evm-abi-lean ↔ EVMYulLean selector cross-validation. Kept as its own
+-- target (not part of `EvmYul`) so the default build stays decoupled from the
+-- sibling `../evm-abi-lean` checkout; `lake build AbiCrossval` runs the check.
+lean_lib «AbiCrossval» where
+  globs := #[.one `EvmYul.Venom.AbiCrossval]
+
+-- Bridge from the native ABI dispatch front-end to the Hol codegen IR + the
+-- codegen-acceptance witness (a native_decide fact). Its own target so the
+-- computational axiom stays out of the core `EvmYul` audit.
+lean_lib «AbiCodegen» where
+  globs := #[.one `EvmYul.Venom.AbiCodegen]
 
 @[test_driver]
 lean_exe «conform» where

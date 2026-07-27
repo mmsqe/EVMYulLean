@@ -34,7 +34,10 @@ if echo "$OUT" | grep -q 'sorryAx'; then
 fi
 
 # 2. no axiom outside the allowlist
-ALLOW='propext|Classical\.choice|Quot\.sound|EvmYul\.M1\.ffi_zeroes_size|EvmYul\.M1\.ffi_zeroes_get'
+#    (v4.31 `#print axioms` prints the M1 FFI axioms with their short names under
+#    `open EvmYul.M1`, so both the qualified and bare forms are allowlisted; the
+#    isolation check in step 3 still pins them to the M1 / machine-memory results.)
+ALLOW='propext|Classical\.choice|Quot\.sound|EvmYul\.M1\.ffi_zeroes_size|EvmYul\.M1\.ffi_zeroes_get|ffi_zeroes_size|ffi_zeroes_get'
 BAD="$(echo "$NORM" \
   | grep -oE 'axioms: \[[^]]*\]' \
   | grep -oE '[A-Za-z][A-Za-z0-9._]*' \

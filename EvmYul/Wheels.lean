@@ -176,7 +176,7 @@ def getBlob? (s : String) : Except String Blob :=
     let rest := s.drop HexPrefix.length
     if rest.any (not ∘ isHexDigitChar)
     then .error "Blobs must consist of valid hex digits."
-    else .ok rest.toLower
+    else .ok rest.toString.toLower
   else .error "Input does not begin with 0x."
   where
     isHex (s : String) := s.startsWith HexPrefix

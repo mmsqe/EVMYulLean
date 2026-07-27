@@ -48,6 +48,7 @@ import EvmYul.State.TransactionOps
 import EvmYul.State.TrieRoot
 
 import EvmYul.Venom
+import EvmYul.Venom.Hol
 
 import EvmYul.Yul.Ast
 import EvmYul.Yul.Exception

@@ -36,7 +36,7 @@ open Lean (Json)
 
 /-! ## Hex helpers -/
 
-private def nibble (d : Nat) : Char := "0123456789abcdef".data.getD (d % 16) '0'
+private def nibble (d : Nat) : Char := "0123456789abcdef".toList.getD (d % 16) '0'
 
 private partial def natToHexAux : Nat → String
   | 0 => ""
@@ -63,9 +63,9 @@ private partial def bytesOfChars : List Char → List UInt8
 
 /-- Parse a `0x`-prefixed (or bare) hex string to a byte list. -/
 def hexToBytes (s0 : String) : Mem :=
-  let s := if s0.startsWith "0x" || s0.startsWith "0X" then s0.drop 2 else s0
+  let s := if s0.startsWith "0x" || s0.startsWith "0X" then (s0.drop 2).toString else s0
   let s := if s.length % 2 == 1 then "0" ++ s else s
-  bytesOfChars s.data
+  bytesOfChars s.toList
 
 /-! ## JSON field extraction -/
 

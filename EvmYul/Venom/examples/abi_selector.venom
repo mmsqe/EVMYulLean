@@ -1,0 +1,27 @@
+; ABI selector cross-validation example.
+; Given the ASCII bytes of a function signature as calldata, computes the
+; 4-byte selector the way the EVM does — keccak256(signature) >> 224 (Venom
+; spells keccak256 "sha3") — and returns it in the low 4 bytes.
+;
+; Driven by the same signature evm-abi-lean hashes in `functionSelector`, so a
+; matching value cross-validates that EVMYulLean's keccak and abi-lean's
+; selector derivation agree on the dispatch key:
+;
+;   printf '{"calldata":"0x%s"}' "$(printf 'transfer(address,uint256)' | xxd -p)" \
+;     | lake exe venom_run EvmYul/Venom/examples/abi_selector.venom
+;   => RETURN 0x…a9059cbb
+;
+; See scripts/abi_crossval.sh for the wired end-to-end check.
+function main {
+  entry:
+    %z = 0
+    %sz = calldatasize
+    calldatacopy %z, %z, %sz
+    %h = sha3 %z, %sz
+    %sh = 224
+    %sel = shr %sh, %h
+    %out = 0
+    mstore %out, %sel
+    %rsz = 0x20
+    return %out, %rsz
+}

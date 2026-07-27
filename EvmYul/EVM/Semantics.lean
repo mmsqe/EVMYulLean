@@ -1,5 +1,5 @@
 import Mathlib.Data.BitVec
-import Mathlib.Data.Array.Defs
+import Mathlib.Init
 import Mathlib.Data.Finmap
 import Mathlib.Data.List.Defs
 import EvmYul.Data.Stack
@@ -775,7 +775,7 @@ def Θ (fuel : Nat)
   let σ'₁ :=
     match σ.find? r with
       | none =>
-        if v != ⟨0⟩ then
+        if v != (⟨0⟩ : UInt256) then
           σ.insert r { (default : Account .EVM) with balance := v}
         else
           σ

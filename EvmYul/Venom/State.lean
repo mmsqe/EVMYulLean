@@ -135,6 +135,43 @@ def calldatacopy (s : VenomState) (dst off len : UInt256) : VenomState :=
 @[simp] theorem sstore_storage (s : VenomState) (key val : UInt256) :
     (s.sstore key val).storage = fun k => if k = key then val else s.storage k := rfl
 
+@[simp] theorem sstore_storage_apply (s : VenomState) (key val k : UInt256) :
+    (s.sstore key val).storage k = if k = key then val else s.storage k := rfl
+
+/-- Reading an SSA var through a `set` of a (possibly different) var. -/
+@[simp] theorem set_env (s : VenomState) (x y : VarName) (v : UInt256) :
+    (s.set x v).env y = if y = x then v else s.env y := rfl
+
+@[simp] theorem set_calldataload (s : VenomState) (x : VarName) (v off : UInt256) :
+    (s.set x v).calldataload off = s.calldataload off := rfl
+
+@[simp] theorem mstore_calldataload (s : VenomState) (a v off : UInt256) :
+    (s.mstore a v).calldataload off = s.calldataload off := rfl
+
+@[simp] theorem sstore_calldataload (s : VenomState) (k v off : UInt256) :
+    (s.sstore k v).calldataload off = s.calldataload off := rfl
+
+@[simp] theorem set_caller (s : VenomState) (x : VarName) (v : UInt256) :
+    (s.set x v).caller = s.caller := rfl
+
+@[simp] theorem mstore_caller (s : VenomState) (a v : UInt256) :
+    (s.mstore a v).caller = s.caller := rfl
+
+@[simp] theorem sstore_caller (s : VenomState) (k v : UInt256) :
+    (s.sstore k v).caller = s.caller := rfl
+
+@[simp] theorem calldatacopy_env (s : VenomState) (dst off len : UInt256) :
+    (s.calldatacopy dst off len).env = s.env := rfl
+
+@[simp] theorem calldatacopy_storage (s : VenomState) (dst off len : UInt256) :
+    (s.calldatacopy dst off len).storage = s.storage := rfl
+
+@[simp] theorem calldatacopy_calldata (s : VenomState) (dst off len : UInt256) :
+    (s.calldatacopy dst off len).calldata = s.calldata := rfl
+
+@[simp] theorem calldatacopy_caller (s : VenomState) (dst off len : UInt256) :
+    (s.calldatacopy dst off len).caller = s.caller := rfl
+
 end VenomState
 
 end EvmYul.Venom

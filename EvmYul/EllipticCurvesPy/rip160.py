@@ -1,7 +1,15 @@
 import sys
 import hashlib
-import ctypes
-ctypes.CDLL("libssl.so").OSSL_PROVIDER_load(None, b"legacy")
+# RIPEMD160 is gated behind OpenSSL 3's "legacy" provider. Only load it when the
+# hash is actually unavailable (e.g. Linux built against OpenSSL 3); if this
+# Python already exposes ripemd160 (e.g. macOS), skip the ctypes dance entirely —
+# hard-coding "libssl.so" fails to open on macOS, and dlopen'ing a duplicate
+# libssl there aborts the process with "loading libcrypto in an unsafe way".
+try:
+    hashlib.new("ripemd160")
+except (ValueError, TypeError):
+    import ctypes, ctypes.util
+    ctypes.CDLL(ctypes.util.find_library("ssl") or "libssl.so").OSSL_PROVIDER_load(None, b"legacy")
 
 from base_types import Bytes
 

@@ -164,7 +164,7 @@ theorem fromBytes'_append_zeros (xs : List UInt8) (k : Nat) :
     simp only [List.nil_append]
     induction k with
     | zero => rfl
-    | succ k ih => simp only [List.replicate, fromBytes']; simpa using ih
+    | succ k ih => simp [List.replicate, fromBytes', ih]
   | cons b bs ih => simp only [List.cons_append, fromBytes', ih]
 
 /-- A big-endian byte list ignores leading zero bytes. -/

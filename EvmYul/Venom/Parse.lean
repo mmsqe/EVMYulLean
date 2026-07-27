@@ -39,11 +39,11 @@ def stripComment (line : String) : String :=
 
 /-- Split on spaces/tabs and commas, dropping empties. -/
 def tokenize (s : String) : List String :=
-  (((s.replace "," " ").split (fun c => c == ' ' || c == '\t')).filter (· ≠ ""))
+  ((s.replace "," " ").split (fun c => c == ' ' || c == '\t')).toList.map (·.toString) |>.filter (· ≠ "")
 
 /-- Strip a surrounding pair of double quotes (escaped-string labels). -/
 def unquote (s : String) : String :=
-  if s.startsWith "\"" && s.endsWith "\"" then (s.drop 1).dropRight 1 else s
+  if s.startsWith "\"" && s.endsWith "\"" then ((s.drop 1).dropEnd 1).toString else s
 
 private def hexDigit? (c : Char) : Option Nat :=
   if c.isDigit then some (c.toNat - '0'.toNat)
@@ -56,27 +56,27 @@ private def hexToNat (s : String) : Nat :=
 
 /-- The magnitude of a (non-negative) numeric token. -/
 private def parseMag (t : String) : Nat :=
-  if t.startsWith "0x" || t.startsWith "0X" then hexToNat (t.drop 2)
+  if t.startsWith "0x" || t.startsWith "0X" then hexToNat (t.drop 2).toString
   else (t.toNat?).getD 0
 
 /-- Parse a constant token (`4`, `0x2a`, `-1`) to a `UInt256` (two's
 complement for negatives). -/
 def parseConst (t : String) : UInt256 :=
   if t.startsWith "-" then
-    let m := parseMag (t.drop 1) % UInt256.size
+    let m := parseMag (t.drop 1).toString % UInt256.size
     UInt256.ofNat ((UInt256.size - m) % UInt256.size)
   else UInt256.ofNat (parseMag t)
 
 /-- Parse a single operand token. -/
 def parseOperand (t : String) : Operand :=
   if t.startsWith "%" then .var t
-  else if t.startsWith "@" then .label (unquote (t.drop 1))
+  else if t.startsWith "@" then .label (unquote (t.drop 1).toString)
   else .lit (parseConst t)
 
 /-- Does a token denote an operand (vs an opcode mnemonic)? -/
 def isOperandTok (t : String) : Bool :=
   t.startsWith "%" || t.startsWith "@" || t.startsWith "0x" || t.startsWith "-" ||
-    (match t.data.head? with | some c => c.isDigit | none => false)
+    (match t.toList.head? with | some c => c.isDigit | none => false)
 
 /-! ## Opcode mnemonics -/
 
@@ -159,7 +159,7 @@ def PSt.flushFunc (st : PSt) : PSt :=
 
 /-- Process one source line. -/
 def PSt.step (st : PSt) (rawLine : String) : PSt :=
-  let l := (stripComment rawLine).trim
+  let l := (stripComment rawLine).trimAscii.toString
   if l == "" then st
   else if st.inData then (if l == "}" then { st with inData := false } else st)
   else if l.startsWith "data " || l == "data" then { st with inData := true }
@@ -171,7 +171,7 @@ def PSt.step (st : PSt) (rawLine : String) : PSt :=
   else if l == "}" then st.flushFunc
   else if l.endsWith ":" then
       let st := st.flushBlock
-      let lbl := unquote (l.dropRight 1).trim
+      let lbl := unquote ((l.dropEnd 1).toString.trimAscii.toString)
       { st with curLbl := some lbl, instrsRev := [] }
   else { st with instrsRev := parseStmt l :: st.instrsRev }
 

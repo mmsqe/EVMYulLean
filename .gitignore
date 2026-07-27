@@ -6,3 +6,5 @@ sha2/
 blake2/
 keccak256/
 out_*
+# scratch dumped by the conformance run's trie/precompile shims
+trieInput_*

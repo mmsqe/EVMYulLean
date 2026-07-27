@@ -1,0 +1,33 @@
+; ABI dynamic-array cross-validation example.
+; Decodes a `uint256[]` argument of `sum(uint256[])`. The ABI head at calldata
+; offset 4 is a 32-byte POINTER to the array data (relative to the args, i.e.
+; after the 4-byte selector); at that pointer sits the length, then the
+; elements. Follows the pointer, reads the (three) elements and returns their
+; sum.
+;
+; Driven by calldata evm-abi-lean encodes for sum([10,20,30]) — now that
+; abi-lean's dynamic-array roundtrip is proved — so a matching sum
+; (60 = 0x3c) cross-validates the dynamic offset/length/data layout.
+;
+;   printf '{"calldata":"<abi-lean sum([10,20,30]) calldata>"}' \
+;     | lake exe venom_run EvmYul/Venom/examples/abi_dynarray.venom
+;   => RETURN 0x…3c
+function main {
+  entry:
+    %c4 = 4
+    %off = calldataload %c4
+    %lenpos = add %c4, %off
+    %c32 = 32
+    %e0pos = add %lenpos, %c32
+    %e0 = calldataload %e0pos
+    %e1pos = add %e0pos, %c32
+    %e1 = calldataload %e1pos
+    %e2pos = add %e1pos, %c32
+    %e2 = calldataload %e2pos
+    %s01 = add %e0, %e1
+    %sum = add %s01, %e2
+    %z = 0
+    mstore %z, %sum
+    %rsz = 0x20
+    return %z, %rsz
+}

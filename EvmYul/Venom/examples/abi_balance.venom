@@ -1,0 +1,35 @@
+; ABI end-to-end execution cross-validation example.
+; A minimal ERC-20 mint-then-read: decodes the `address` (calldata offset 4)
+; and `uint256` (offset 36) arguments, writes `balanceOf[addr] = amount` at the
+; Solidity mapping slot keccak256(addr ++ slot0=0) (Venom spells keccak256
+; "sha3"), reads it back, and returns it.
+;
+; Driven by calldata evm-abi-lean encodes for transfer(addr, amount), so the
+; returned value AND the resulting storage cross-validate the whole loop:
+; abi-lean's encoding, EVMYulLean's calldata decoding, keccak slot derivation,
+; and SSTORE/SLOAD execution all agree.
+;
+;   printf '{"calldata":"<abi-lean transfer calldata>"}' \
+;     | lake exe venom_run EvmYul/Venom/examples/abi_balance.venom
+;   => RETURN amount, and storage[balanceOf[addr]] = amount
+;
+; See scripts/abi_crossval.sh for the wired end-to-end check.
+function main {
+  entry:
+    %caddr = 4
+    %addr = calldataload %caddr
+    %camt = 36
+    %amt = calldataload %camt
+    %z = 0
+    %p = 0x20
+    mstore %z, %addr
+    mstore %p, %z
+    %sz = 0x40
+    %slot = sha3 %z, %sz
+    sstore %slot, %amt
+    %r = sload %slot
+    %out = 0
+    mstore %out, %r
+    %rsz = 0x20
+    return %out, %rsz
+}

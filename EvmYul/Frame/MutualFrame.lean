@@ -495,7 +495,7 @@ theorem theta_σ'₁_ge
     let σ'₁ :=
       match σ.find? r with
         | none =>
-          if v != ⟨0⟩ then
+          if v != (⟨0⟩ : UInt256) then
             σ.insert r { (default : Account .EVM) with balance := v}
           else σ
         | some acc => σ.insert r { acc with balance := acc.balance + v}
@@ -1269,7 +1269,7 @@ theorem stateWF_lambda_σStar_some
       have : acc_a.balance.toNat + v.toNat ≤ ac.balance.toNat + acc_a.balance.toNat := by
         omega
       exact Nat.lt_of_le_of_lt this hPair
-    · push_neg at hFa
+    · push Not at hFa
       have hF : σ.find? a = none := by
         cases hFL : σ.find? a with
         | none => rfl
@@ -1384,7 +1384,7 @@ theorem stateWF_theta_σ₁
       (let σ'₁ :=
         match σ.find? r with
           | none =>
-            if v != ⟨0⟩ then
+            if v != (⟨0⟩ : UInt256) then
               σ.insert r { (default : Account .EVM) with balance := v}
             else σ
           | some acc => σ.insert r { acc with balance := acc.balance + v}
@@ -2210,7 +2210,7 @@ private theorem Θ_body_code
       · -- Then branch: heq reduces to .error OutOfFuel = .ok (...) → contradiction.
         subst hErr
         simp only [bind, Except.bind, pure, Except.pure] at heq
-        exact Except.noConfusion heq
+        contradiction
       · -- Else branch: heq reduces to .ok (cA, false, σ, 0, A, .empty) = .ok (...).
         have hBEq : (err == EVM.ExecutionException.OutOfFuel) = false := by
           cases err
@@ -2339,7 +2339,7 @@ private theorem Θ_balanceOf_ge_bdd
     set σ'₁ : AccountMap .EVM :=
       match σ.find? r with
         | none =>
-          if v != ⟨0⟩ then
+          if v != (⟨0⟩ : UInt256) then
             σ.insert r
               { nonce := (default : Account .EVM).nonce
                 balance := v
@@ -3301,7 +3301,7 @@ private theorem step_CREATE_arm
                 refine StateWF_insert_eq_bal σ Iₐ _ acc hFind ?_ hWF2
                 show (σ_Iₐ.balance : UInt256) = acc.balance
                 rw [hσIₐ_eq]
-              · push_neg at hFindIₐ
+              · push Not at hFindIₐ
                 have hFindNone : σ.find? Iₐ = none := by
                   match hF : σ.find? Iₐ with
                   | none => rfl
@@ -3486,7 +3486,7 @@ private theorem step_CREATE2_arm
                 refine StateWF_insert_eq_bal σ Iₐ _ acc hFind ?_ hWF2
                 show (σ_Iₐ.balance : UInt256) = acc.balance
                 rw [hσIₐ_eq]
-              · push_neg at hFindIₐ
+              · push Not at hFindIₐ
                 have hFindNone : σ.find? Iₐ = none := by
                   match hF : σ.find? Iₐ with
                   | none => rfl
@@ -4799,7 +4799,7 @@ private theorem X_inv_succ_content
       simp only [bind, Except.bind, pure, Except.pure] at hZ
       -- By-cases on each of the 11 Z throw-conditions.
       by_cases hc1 : evmState.gasAvailable.toNat < memoryExpansionCost evmState ((decode evmState.executionEnv.code evmState.pc).getD (Operation.STOP, none)).1
-      · rw [if_pos hc1] at hZ; exact Except.noConfusion hZ
+      · rw [if_pos hc1] at hZ; contradiction
       rw [if_neg hc1] at hZ
       set evmState' : EVM.State :=
         { evmState with gasAvailable := evmState.gasAvailable - UInt256.ofNat (memoryExpansionCost evmState ((decode evmState.executionEnv.code evmState.pc).getD (Operation.STOP, none)).1) } with hevmState'
@@ -4809,22 +4809,22 @@ private theorem X_inv_succ_content
       have h_cA     : evmState'.createdAccounts = evmState.createdAccounts := by rw [hevmState']
       -- Condition 2.
       by_cases hc2 : evmState'.gasAvailable.toNat < C' evmState' ((decode evmState.executionEnv.code evmState.pc).getD (Operation.STOP, none)).1
-      · rw [if_pos hc2] at hZ; exact Except.noConfusion hZ
+      · rw [if_pos hc2] at hZ; contradiction
       rw [if_neg hc2] at hZ
       -- Condition 3.
       by_cases hc3 : δ ((decode evmState.executionEnv.code evmState.pc).getD (Operation.STOP, none)).1 = none
-      · rw [if_pos hc3] at hZ; exact Except.noConfusion hZ
+      · rw [if_pos hc3] at hZ; contradiction
       rw [if_neg hc3] at hZ
       -- Condition 4.
       by_cases hc4 : evmState'.stack.length < (δ ((decode evmState.executionEnv.code evmState.pc).getD (Operation.STOP, none)).1).getD 0
-      · rw [if_pos hc4] at hZ; exact Except.noConfusion hZ
+      · rw [if_pos hc4] at hZ; contradiction
       rw [if_neg hc4] at hZ
       -- From here on we let `split_ifs at hZ` close each remaining `if` chain
       -- because the earlier simp has left hZ in a form where each if condition
       -- is a pure Prop that Lean's elab can dispatch via decidable instances.
       (split_ifs at hZ;
         first
-        | exact Except.noConfusion hZ
+        | contradiction
         | (injection hZ with h_inj
            injection h_inj with h_inj1 _
            subst h_inj1
@@ -5041,22 +5041,22 @@ private theorem X_inv_at_C_v0_holds
               evmStateZ = { evmState with gasAvailable := evmStateZ.gasAvailable } := by
             simp only [bind, Except.bind, pure, Except.pure] at hZ
             by_cases hc1 : evmState.gasAvailable.toNat < memoryExpansionCost evmState ((decode evmState.executionEnv.code evmState.pc).getD (Operation.STOP, none)).1
-            · rw [if_pos hc1] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc1] at hZ; contradiction
             rw [if_neg hc1] at hZ
             set evmState' : EVM.State :=
               { evmState with gasAvailable := evmState.gasAvailable - UInt256.ofNat (memoryExpansionCost evmState ((decode evmState.executionEnv.code evmState.pc).getD (Operation.STOP, none)).1) } with hevmState'
             by_cases hc2 : evmState'.gasAvailable.toNat < C' evmState' ((decode evmState.executionEnv.code evmState.pc).getD (Operation.STOP, none)).1
-            · rw [if_pos hc2] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc2] at hZ; contradiction
             rw [if_neg hc2] at hZ
             by_cases hc3 : δ ((decode evmState.executionEnv.code evmState.pc).getD (Operation.STOP, none)).1 = none
-            · rw [if_pos hc3] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc3] at hZ; contradiction
             rw [if_neg hc3] at hZ
             by_cases hc4 : evmState'.stack.length < (δ ((decode evmState.executionEnv.code evmState.pc).getD (Operation.STOP, none)).1).getD 0
-            · rw [if_pos hc4] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc4] at hZ; contradiction
             rw [if_neg hc4] at hZ
             (split_ifs at hZ;
               first
-              | exact Except.noConfusion hZ
+              | contradiction
               | (injection hZ with h_inj
                  injection h_inj with h_inj1 _
                  subst h_inj1
@@ -5344,22 +5344,22 @@ private theorem X_inv_at_C_general_holds
               evmStateZ = { evmState with gasAvailable := evmStateZ.gasAvailable } := by
             simp only [bind, Except.bind, pure, Except.pure] at hZ
             by_cases hc1 : evmState.gasAvailable.toNat < memoryExpansionCost evmState ((decode evmState.executionEnv.code evmState.pc).getD (Operation.STOP, none)).1
-            · rw [if_pos hc1] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc1] at hZ; contradiction
             rw [if_neg hc1] at hZ
             set evmState' : EVM.State :=
               { evmState with gasAvailable := evmState.gasAvailable - UInt256.ofNat (memoryExpansionCost evmState ((decode evmState.executionEnv.code evmState.pc).getD (Operation.STOP, none)).1) } with hevmState'
             by_cases hc2 : evmState'.gasAvailable.toNat < C' evmState' ((decode evmState.executionEnv.code evmState.pc).getD (Operation.STOP, none)).1
-            · rw [if_pos hc2] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc2] at hZ; contradiction
             rw [if_neg hc2] at hZ
             by_cases hc3 : δ ((decode evmState.executionEnv.code evmState.pc).getD (Operation.STOP, none)).1 = none
-            · rw [if_pos hc3] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc3] at hZ; contradiction
             rw [if_neg hc3] at hZ
             by_cases hc4 : evmState'.stack.length < (δ ((decode evmState.executionEnv.code evmState.pc).getD (Operation.STOP, none)).1).getD 0
-            · rw [if_pos hc4] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc4] at hZ; contradiction
             rw [if_neg hc4] at hZ
             (split_ifs at hZ;
               first
-              | exact Except.noConfusion hZ
+              | contradiction
               | (injection hZ with h_inj
                  injection h_inj with h_inj1 _
                  subst h_inj1
@@ -6055,7 +6055,7 @@ theorem theta_σ'₁_preserves_present
     let σ'₁ :=
       match σ.find? r with
         | none =>
-          if v != ⟨0⟩ then
+          if v != (⟨0⟩ : UInt256) then
             σ.insert r { (default : Account .EVM) with balance := v }
           else σ
         | some acc => σ.insert r { acc with balance := acc.balance + v }
@@ -6185,7 +6185,7 @@ theorem Θ_preserves_account_at_a
     set σ'₁ : AccountMap .EVM :=
       match σ.find? r with
         | none =>
-          if v != ⟨0⟩ then
+          if v != (⟨0⟩ : UInt256) then
             σ.insert r
               { nonce := (default : Account .EVM).nonce
                 balance := v
@@ -7176,7 +7176,7 @@ theorem X_preserves_account_at_a
             simp only [bind, Except.bind, pure, Except.pure] at hZ
             by_cases hc1 : s.gasAvailable.toNat <
                 memoryExpansionCost s ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1
-            · rw [if_pos hc1] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc1] at hZ; contradiction
             rw [if_neg hc1] at hZ
             set s' : EVM.State :=
               { s with gasAvailable := s.gasAvailable -
@@ -7184,19 +7184,19 @@ theorem X_preserves_account_at_a
                     ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1) } with hs'
             by_cases hc2 : s'.gasAvailable.toNat <
                 C' s' ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1
-            · rw [if_pos hc2] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc2] at hZ; contradiction
             rw [if_neg hc2] at hZ
             by_cases hc3 :
                 δ ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1 = none
-            · rw [if_pos hc3] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc3] at hZ; contradiction
             rw [if_neg hc3] at hZ
             by_cases hc4 : s'.stack.length <
                 (δ ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1).getD 0
-            · rw [if_pos hc4] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc4] at hZ; contradiction
             rw [if_neg hc4] at hZ
             (split_ifs at hZ;
               first
-              | exact Except.noConfusion hZ
+              | contradiction
               | (injection hZ with h_inj
                  injection h_inj with h_inj1 _
                  subst h_inj1
@@ -7316,7 +7316,7 @@ theorem X_preserves_account_at_a_universal
             simp only [bind, Except.bind, pure, Except.pure] at hZ
             by_cases hc1 : s.gasAvailable.toNat <
                 memoryExpansionCost s ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1
-            · rw [if_pos hc1] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc1] at hZ; contradiction
             rw [if_neg hc1] at hZ
             set s' : EVM.State :=
               { s with gasAvailable := s.gasAvailable -
@@ -7324,19 +7324,19 @@ theorem X_preserves_account_at_a_universal
                     ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1) } with hs'
             by_cases hc2 : s'.gasAvailable.toNat <
                 C' s' ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1
-            · rw [if_pos hc2] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc2] at hZ; contradiction
             rw [if_neg hc2] at hZ
             by_cases hc3 :
                 δ ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1 = none
-            · rw [if_pos hc3] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc3] at hZ; contradiction
             rw [if_neg hc3] at hZ
             by_cases hc4 : s'.stack.length <
                 (δ ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1).getD 0
-            · rw [if_pos hc4] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc4] at hZ; contradiction
             rw [if_neg hc4] at hZ
             (split_ifs at hZ;
               first
-              | exact Except.noConfusion hZ
+              | contradiction
               | (injection hZ with h_inj
                  injection h_inj with h_inj1 _
                  subst h_inj1
@@ -7467,7 +7467,7 @@ theorem Θ_preserves_account_at_a_bdd
   set σ'₁ : AccountMap .EVM :=
     match σ.find? r with
       | none =>
-        if v != ⟨0⟩ then
+        if v != (⟨0⟩ : UInt256) then
           σ.insert r
             { nonce := (default : Account .EVM).nonce
               balance := v
@@ -8330,7 +8330,7 @@ theorem X_preserves_account_at_a_bdd
             simp only [bind, Except.bind, pure, Except.pure] at hZ
             by_cases hc1 : s.gasAvailable.toNat <
                 memoryExpansionCost s ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1
-            · rw [if_pos hc1] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc1] at hZ; contradiction
             rw [if_neg hc1] at hZ
             set s' : EVM.State :=
               { s with gasAvailable := s.gasAvailable -
@@ -8338,19 +8338,19 @@ theorem X_preserves_account_at_a_bdd
                     ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1) } with hs'
             by_cases hc2 : s'.gasAvailable.toNat <
                 C' s' ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1
-            · rw [if_pos hc2] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc2] at hZ; contradiction
             rw [if_neg hc2] at hZ
             by_cases hc3 :
                 δ ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1 = none
-            · rw [if_pos hc3] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc3] at hZ; contradiction
             rw [if_neg hc3] at hZ
             by_cases hc4 : s'.stack.length <
                 (δ ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1).getD 0
-            · rw [if_pos hc4] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc4] at hZ; contradiction
             rw [if_neg hc4] at hZ
             (split_ifs at hZ;
               first
-              | exact Except.noConfusion hZ
+              | contradiction
               | (injection hZ with h_inj
                  injection h_inj with h_inj1 _
                  subst h_inj1
@@ -8459,7 +8459,7 @@ theorem X_preserves_account_at_a_bdd_universal
             simp only [bind, Except.bind, pure, Except.pure] at hZ
             by_cases hc1 : s.gasAvailable.toNat <
                 memoryExpansionCost s ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1
-            · rw [if_pos hc1] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc1] at hZ; contradiction
             rw [if_neg hc1] at hZ
             set s' : EVM.State :=
               { s with gasAvailable := s.gasAvailable -
@@ -8467,19 +8467,19 @@ theorem X_preserves_account_at_a_bdd_universal
                     ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1) } with hs'
             by_cases hc2 : s'.gasAvailable.toNat <
                 C' s' ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1
-            · rw [if_pos hc2] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc2] at hZ; contradiction
             rw [if_neg hc2] at hZ
             by_cases hc3 :
                 δ ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1 = none
-            · rw [if_pos hc3] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc3] at hZ; contradiction
             rw [if_neg hc3] at hZ
             by_cases hc4 : s'.stack.length <
                 (δ ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1).getD 0
-            · rw [if_pos hc4] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc4] at hZ; contradiction
             rw [if_neg hc4] at hZ
             (split_ifs at hZ;
               first
-              | exact Except.noConfusion hZ
+              | contradiction
               | (injection hZ with h_inj
                  injection h_inj with h_inj1 _
                  subst h_inj1
@@ -8748,7 +8748,7 @@ theorem X_preserves_account_at_a_bdd_op_conditional
             simp only [bind, Except.bind, pure, Except.pure] at hZ
             by_cases hc1 : s.gasAvailable.toNat <
                 memoryExpansionCost s ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1
-            · rw [if_pos hc1] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc1] at hZ; contradiction
             rw [if_neg hc1] at hZ
             set s' : EVM.State :=
               { s with gasAvailable := s.gasAvailable -
@@ -8756,19 +8756,19 @@ theorem X_preserves_account_at_a_bdd_op_conditional
                     ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1) } with hs'
             by_cases hc2 : s'.gasAvailable.toNat <
                 C' s' ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1
-            · rw [if_pos hc2] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc2] at hZ; contradiction
             rw [if_neg hc2] at hZ
             by_cases hc3 :
                 δ ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1 = none
-            · rw [if_pos hc3] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc3] at hZ; contradiction
             rw [if_neg hc3] at hZ
             by_cases hc4 : s'.stack.length <
                 (δ ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1).getD 0
-            · rw [if_pos hc4] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc4] at hZ; contradiction
             rw [if_neg hc4] at hZ
             (split_ifs at hZ;
               first
-              | exact Except.noConfusion hZ
+              | contradiction
               | (injection hZ with h_inj
                  injection h_inj with h_inj1 _
                  subst h_inj1
@@ -9221,7 +9221,7 @@ theorem X_preserves_account_at_a_bdd_op_conditional_with_pres_step
             simp only [bind, Except.bind, pure, Except.pure] at hZ
             by_cases hc1 : s.gasAvailable.toNat <
                 memoryExpansionCost s ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1
-            · rw [if_pos hc1] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc1] at hZ; contradiction
             rw [if_neg hc1] at hZ
             set s' : EVM.State :=
               { s with gasAvailable := s.gasAvailable -
@@ -9229,19 +9229,19 @@ theorem X_preserves_account_at_a_bdd_op_conditional_with_pres_step
                     ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1) } with hs'
             by_cases hc2 : s'.gasAvailable.toNat <
                 C' s' ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1
-            · rw [if_pos hc2] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc2] at hZ; contradiction
             rw [if_neg hc2] at hZ
             by_cases hc3 :
                 δ ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1 = none
-            · rw [if_pos hc3] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc3] at hZ; contradiction
             rw [if_neg hc3] at hZ
             by_cases hc4 : s'.stack.length <
                 (δ ((decode s.executionEnv.code s.pc).getD (Operation.STOP, none)).1).getD 0
-            · rw [if_pos hc4] at hZ; exact Except.noConfusion hZ
+            · rw [if_pos hc4] at hZ; contradiction
             rw [if_neg hc4] at hZ
             (split_ifs at hZ;
               first
-              | exact Except.noConfusion hZ
+              | contradiction
               | (injection hZ with h_inj
                  injection h_inj with h_inj1 _
                  subst h_inj1

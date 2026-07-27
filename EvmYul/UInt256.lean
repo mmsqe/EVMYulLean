@@ -132,7 +132,7 @@ def pow (b : UInt256) (n : UInt256) := powAux ⟨1⟩ b n.1
 instance : HPow UInt256 UInt256 UInt256 := ⟨pow⟩
 instance : AndOp UInt256 := ⟨UInt256.land⟩
 instance : OrOp UInt256 := ⟨UInt256.lor⟩
-instance : Xor UInt256 := ⟨UInt256.xor⟩
+instance : XorOp UInt256 := ⟨UInt256.xor⟩
 instance : ShiftLeft UInt256 := ⟨UInt256.shiftLeft⟩
 instance : ShiftRight UInt256 := ⟨UInt256.shiftRight⟩
 
@@ -301,7 +301,7 @@ private lemma fromBytes'_UInt256_le (h : bs.length = 32) : fromBytes' bs < 2^256
     exact h'
 
 -- | Convert a natural number into a list of bytes.
-private def toBytes' : ℕ → List UInt8
+def toBytes' : ℕ → List UInt8
   | 0 => []
   | n@(.succ n') =>
     let byte : UInt8 := ⟨Nat.mod n UInt8.size, Nat.mod_lt _ (by linarith)⟩
@@ -331,7 +331,7 @@ private lemma toBytes'_le {k : ℕ} (h : n < 2 ^ (8 * k)) : (toBytes' n).length 
       linarith
 
 -- | If n < 2²⁵⁶, then (toBytes' n).length ≤ 32.
-private lemma toBytes'_UInt256_le (h : n < UInt256.size) : (toBytes' n).length ≤ 32 := toBytes'_le h
+lemma toBytes'_UInt256_le (h : n < UInt256.size) : (toBytes' n).length ≤ 32 := toBytes'_le h
 
 -- | Zero-pad a list of bytes up to some length, adding the zeroes on the right.
 private def zeroPadBytes (n : ℕ) (bs : List UInt8) : List UInt8 :=
@@ -344,7 +344,7 @@ lemma zeroPadBytes_len (h : bs.length ≤ n) : (zeroPadBytes n bs).length = n :=
 
 -- | Appending a bunch of zeroes to a little-endian list of bytes doesn't change its value.
 @[simp]
-private lemma extend_bytes_zero : fromBytes' (bs ++ List.replicate n 0) = fromBytes' bs := by
+lemma extend_bytes_zero : fromBytes' (bs ++ List.replicate n 0) = fromBytes' bs := by
   induction bs with
   | nil =>
     simp [fromBytes']
@@ -359,7 +359,7 @@ private lemma fromBytes'_zeroPadBytes_32_eq : fromBytes' (zeroPadBytes 32 bs) = 
 
 -- | Casting a natural number to a list of bytes and back is the identity.
 @[simp]
-private lemma fromBytes'_toBytes' {x : ℕ} : fromBytes' (toBytes' x) = x := by
+lemma fromBytes'_toBytes' {x : ℕ} : fromBytes' (toBytes' x) = x := by
   match x with
   | .zero => simp [toBytes', fromBytes']
   | .succ n =>

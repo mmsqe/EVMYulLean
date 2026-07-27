@@ -237,7 +237,7 @@ theorem sim_spill_active (vs : VenomState) (es es1 es2 : EVM.State) (L : Layout)
     haddr hawbound hstk1 hmstore
   have hguard : ¬ (spill.toNat ≥ es2.toMachineState.memory.size
                    ∨ spill ≥ es2.toMachineState.activeWords * ⟨32⟩) := by
-    push_neg; exact ⟨hmem, hslot⟩
+    push Not; exact ⟨hmem, hslot⟩
   exact sim_spill vs es es1 es2 L a spill f cost argM haddr hpush hmstore hguard hsim
 
 /-- **Spill with the whole zero-guard discharged.** Both halves of `sim_spill`'s

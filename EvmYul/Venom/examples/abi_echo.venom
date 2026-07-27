@@ -1,0 +1,23 @@
+; ABI calldata cross-validation example.
+; Decodes the `uint256 amount` argument of an ERC-20-style
+; `transfer(address,uint256)` call — i.e. the word at calldata offset 36
+; (4-byte selector + 32-byte address) — and returns it.
+;
+; Driven by calldata generated *independently* by evm-abi-lean
+; (functionSelector + encodeArgs), so a matching return value cross-validates
+; that abi-lean's ABI encoding and EVMYulLean's calldata decoding agree:
+;
+;   printf '{"calldata":"0xa9059cbb%064x%064x"}' <addr> <amount> \
+;     | lake exe venom_run EvmYul/Venom/examples/abi_echo.venom
+;   => RETURN <amount>
+;
+; See scripts/abi_crossval.sh for the wired end-to-end check.
+function main {
+  entry:
+    %off = 36
+    %amt = calldataload %off
+    %z = 0
+    mstore %z, %amt
+    %rsz = 0x20
+    return %z, %rsz
+}

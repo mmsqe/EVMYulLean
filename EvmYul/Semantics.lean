@@ -22,7 +22,7 @@ import EvmYul.SpongeHash.Keccak256
 --
 
 import Mathlib.Data.BitVec
-import Mathlib.Data.Array.Defs
+import Mathlib.Init
 import Mathlib.Data.Finmap
 import Mathlib.Data.List.Defs
 import EvmYul.Data.Stack

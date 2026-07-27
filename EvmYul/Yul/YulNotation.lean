@@ -28,20 +28,19 @@ def idSubsequentChar : Array Char := Id.run <| do
   return arr.push '.'
 
 def idFn : ParserFn := fun c s => Id.run do
-  let input := c.input
   let start := s.pos
-  if h : input.atEnd start then
+  if h : c.atEnd start then
     s.mkEOIError
   else
-    let fst := input.get' start h
+    let fst := c.get' start h
     if not (idFirstChar.contains fst) then
       return s.mkError "yul identifier"
-    let s := takeWhileFn idSubsequentChar.contains c (s.next input start)
+    let s := takeWhileFn idSubsequentChar.contains c (s.next' c start h)
     let stop := s.pos
-    let name := .str .anonymous (input.extract start stop)
+    let name := .str .anonymous (c.extract start stop)
     if yulKeywords.contains name.lastComponentAsString then
       return s.mkError "yul identifier"
-    mkIdResult start none name c s
+    (mkIdResult start none name : ParserFn) c s
 
 def idNoAntiquot : Parser := { fn := idFn }
 
@@ -69,22 +68,27 @@ declare_syntax_cat stmt
 syntax identifier_list := ident,*
 syntax typed_identifier_list := ident,*
 syntax function_call := ident "(" expr,* ")"
-syntax block := "{" stmt* "}"
-syntax if' := "if" expr block
+-- v4.31: `block` as a named alias fails leading-token dispatch once `stmt` also
+-- carries the `expr` category coercion, so `{` never routes to a block. Inlining
+-- the `"{" stmt* "}"` production at every use site restores the dispatch.
+syntax if' := "if" expr "{" stmt* "}"
 syntax function_definition :=
   "function" ident "(" typed_identifier_list ")"
     ("->" typed_identifier_list)?
-    block
+    "{" stmt* "}"
 syntax params_list := "[" typed_identifier_list "]"
 syntax variable_declaration := "let" ident (":=" expr)?
 -- syntax let_str_literal := "let" ident ":=" str -- TODO(fix)
 syntax variable_declarations := "let" typed_identifier_list (":=" expr)?
-syntax for_loop := "for" block expr block block
+syntax for_loop := "for" "{" stmt* "}" expr "{" stmt* "}" "{" stmt* "}"
 syntax assignment := identifier_list ":=" expr
 
 syntax stmtlist := stmt*
 
-syntax block : stmt
+-- v4.31: a category coercion `syntax block : stmt` fails leading-token dispatch
+-- when `stmt` also has the `expr` coercion, so `{` never routes to the block
+-- alternative. Inlining the block production directly restores the dispatch.
+syntax "{" stmt* "}" : stmt
 syntax if' : stmt
 syntax function_definition : stmt
 syntax variable_declarations : stmt
@@ -127,7 +131,7 @@ partial def translatePrimOp (primOp : PrimOp) : TermElabM Term := do
   where
     familyAndInstr (primOp : PrimOp) : TermElabM (String × String) := do
       let family :: instr :: [] := toString primOp |>.splitOn | throwError s!"{primOp} shape not <family> <instruction>"
-      pure (family, instr.drop 1 |>.dropRight 1)
+      pure (family, (instr.drop 1 |>.dropEnd 1).toString)
     YulTag : Name := "EvmYul.OperationType.Yul".toName
 
 partial def translateIdent (idn : TSyntax `ident) : TSyntax `term :=

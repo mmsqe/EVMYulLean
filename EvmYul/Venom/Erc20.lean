@@ -141,7 +141,7 @@ theorem doTransfer_solvent (t t' : Token) (frm dst amt : UInt256)
     obtain ⟨hbal, hovf⟩ := hg
     exact transfer_preserves_solvent t.bal frm dst amt t.supply t.accts
       hfrm hdst hne hbal hovf hsol
-  · rw [if_neg hg] at hok; exact Option.noConfusion hok
+  · rw [if_neg hg] at hok; nomatch hok
 
 /-- **C1 — transferFrom precondition.** Succeeds *iff* the balance **and** the
 allowance cover `amt` (and `dst` does not overflow). -/
@@ -164,7 +164,7 @@ theorem doTransferFrom_consumes (t t' : Token) (sp frm dst amt : UInt256)
     injection hok with hok; subst hok
     show upd2 t.allow frm sp (t.allow frm sp - amt) frm sp = t.allow frm sp - amt
     exact upd2_self _ _ _ _
-  · rw [if_neg hg] at hok; exact Option.noConfusion hok
+  · rw [if_neg hg] at hok; nomatch hok
 
 /-- **C3 — transferFrom's balance effect is the verified `transfer`.** Everything
 proved about `transfer` (conservation, frame, no self-mint) therefore applies. -/
@@ -175,7 +175,7 @@ theorem doTransferFrom_bal (t t' : Token) (sp frm dst amt : UInt256)
   by_cases hg : amt ≤ t.bal frm ∧ amt ≤ t.allow frm sp
       ∧ (t.bal dst).toNat + amt.toNat < UInt256.size
   · rw [if_pos hg] at hok; injection hok with hok; subst hok; rfl
-  · rw [if_neg hg] at hok; exact Option.noConfusion hok
+  · rw [if_neg hg] at hok; nomatch hok
 
 /-- **C4 — transferFrom preserves solvency** between two distinct accounts —
 inherited from `transfer_preserves_solvent` via C3. -/
@@ -191,7 +191,7 @@ theorem doTransferFrom_solvent (t t' : Token) (sp frm dst amt : UInt256)
     obtain ⟨hbal, _, hovf⟩ := hg
     exact transfer_preserves_solvent t.bal frm dst amt t.supply t.accts
       hfrm hdst hne hbal hovf hsol
-  · rw [if_neg hg] at hok; exact Option.noConfusion hok
+  · rw [if_neg hg] at hok; nomatch hok
 
 /-! ## 4. Run — a concrete scenario, executed
 

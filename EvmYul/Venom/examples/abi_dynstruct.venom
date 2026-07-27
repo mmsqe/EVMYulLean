@@ -1,0 +1,35 @@
+; ABI mixed static+dynamic cross-validation example.
+; Decodes `mixed(uint256 x, uint256[] arr)`: the head area holds `x` inline at
+; calldata offset 4 and a 32-byte POINTER to `arr` at offset 36 (value 0x40,
+; relative to the args). Follows the pointer to the array's length+data and
+; returns x + sum(arr).
+;
+; Driven by calldata evm-abi-lean encodes for mixed(7, [10,20,30]); a matching
+; result (7 + 60 = 67 = 0x43) cross-validates the head-area layout — a static
+; field inline beside a dynamic-field pointer, i.e. the struct/tuple shape.
+;
+;   printf '{"calldata":"<abi-lean mixed(7,[10,20,30]) calldata>"}' \
+;     | lake exe venom_run EvmYul/Venom/examples/abi_dynstruct.venom
+;   => RETURN 0x…43
+function main {
+  entry:
+    %c4 = 4
+    %x = calldataload %c4
+    %c36 = 36
+    %off = calldataload %c36
+    %arrbase = add %c4, %off
+    %c32 = 32
+    %e0pos = add %arrbase, %c32
+    %e0 = calldataload %e0pos
+    %e1pos = add %e0pos, %c32
+    %e1 = calldataload %e1pos
+    %e2pos = add %e1pos, %c32
+    %e2 = calldataload %e2pos
+    %s01 = add %e0, %e1
+    %s012 = add %s01, %e2
+    %sum = add %x, %s012
+    %z = 0
+    mstore %z, %sum
+    %rsz = 0x20
+    return %z, %rsz
+}

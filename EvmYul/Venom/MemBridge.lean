@@ -54,8 +54,7 @@ def MemRefines (m : Mem) (ba : ByteArray) : Prop := ∀ i, Mem.getByte m i = baB
 everywhere. -/
 theorem refines_empty : MemRefines [] ByteArray.empty := by
   intro i
-  rw [Mem.getByte_past (by simp)]
-  simp [baByte, ByteArray.empty, ByteArray.emptyWithCapacity]
+  rw [Mem.getByte_past (by simp)]; exact UInt8.toNat_inj.mp rfl
 
 /-- The machine's word store (mirrors `MachineState.writeWord`): `v`'s 32
 big-endian bytes written at `a` via `ByteArray.write`. -/
@@ -247,9 +246,7 @@ theorem ltba_loop (l : List UInt8) (r : ByteArray) :
     rw [← Array.append_assoc]; congr 1
 
 theorem ltba_toList (l : List UInt8) : l.toByteArray.toList = l := by
-  rw [toList_eq_data, List.toByteArray, ltba_loop]
-  show (ByteArray.empty.data ++ l.toArray).toList = l
-  simp [ByteArray.empty, ByteArray.emptyWithCapacity]
+  rw [toList_eq_data, List.toByteArray, ltba_loop]; simp
 
 theorem ltba_size (l : List UInt8) : l.toByteArray.size = l.length := by
   rw [← toList_length, ltba_toList]
