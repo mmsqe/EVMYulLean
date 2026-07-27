@@ -1549,6 +1549,102 @@ theorem bodyStep_blockhash
     (hdispatch v) hops houts hxS houtS hlive hlivex hdisp (hoptnoop p) hrel hblock
   exact ⟨hsim, hsd', by rw [hout]; exact hsv'⟩
 
+/-- The `StackIsVars`-aware body step for BLOBHASH (block-env read): the twin of
+    `stackDisc_tload_step_S`, using `genRegularInstPlan_blobhash_sim` and the read-generic
+    `stackDisc_read1_preserve` / `genRegularInstPlan_read1_outStack`. -/
+theorem stackDisc_blobhash_step_S
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {ps : PlanState} {lo : AssocList String Nat} {vs : VenomState} {as : AsmState} {prog : List AsmInst}
+    {offsetToPc : AssocList Nat Nat}
+    {S : List String} {x out : String} {k idx : Nat}
+    (hsd : StackDiscH (k + 1) ps vs)
+    (hsv : StackIsVars S ps)
+    (hname : opcodeToEvmName inst.opcode = some "BLOBHASH")
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hdispatch : stepInstBase inst vs = execRead1 (fun v s => blobhashOf s.txCtx v.toNat) inst vs)
+    (hops : inst.operands = [Operand.Var x])
+    (houts : inst.outputs = [out])
+    (hxS : x ∈ S) (houtS : out ∉ S)
+    (hlive : nextLiveness.contains out = true)
+    (hlivex : nextLiveness.contains x = true)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp "BLOBHASH" →
+          asmStep offsetToPc prog s = asmStateUnop (fun v s => blobhashOf s.txCtx v.toNat) s)
+    (hoptnoop : optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+        { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+          stack := ps.stack ++ [Operand.Var out] }
+      = ([], { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness ps).2 with
+              stack := ps.stack ++ [Operand.Var out] }))
+    (hrel : venomAsmRel lo ps vs as)
+    (hblock : asmBlockAt prog as.pc
+      (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).1)) :
+    (∃ as', runAsm (executePlan (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+              nextIsTerminator curBbLabel ps).1).length offsetToPc prog as = AsmResult.AsmOK as' ∧
+            venomAsmRel lo (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+              nextIsTerminator curBbLabel ps).2 (gvBodyStep (inst, idx) vs) as' ∧
+            as'.pc = as.pc + (executePlan (generateRegularInstPlan liveness dfg cfg fn inst
+              nextLiveness false nextIsTerminator curBbLabel ps).1).length)
+    ∧ StackDiscH k (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).2 (gvBodyStep (inst, idx) vs)
+    ∧ StackIsVars (S ++ [out]) (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false
+        nextIsTerminator curBbLabel ps).2 := by
+  have hxmem : Operand.Var x ∈ ps.stack := stackIsVars_mem hsv hxS
+  have hfresh : ¬ Operand.Var out ∈ ps.stack := stackIsVars_not_mem hsv houtS
+  obtain ⟨dist, hdepth, hlen⟩ := stackGetDepth_of_mem hxmem
+  have hpeek : stackPeek dist ps.stack = Operand.Var x := stackGetDepth_peek hdepth
+  have hsmall : dist ≤ 15 := by have := hsd.shallow; omega
+  have hnospill : alookup' ps.spilled (Operand.Var x) = none := hsd.noSpill _
+  have hspill : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none := hsd.noSpill _
+  obtain ⟨w, hw⟩ := hsd.defined x hxmem
+  have hval : operandVal vs lo (Operand.Var x) = some w := hw
+  have hstepEq : stepInstBase inst vs = ExecResult.OK (updateVar out (blobhashOf vs.txCtx w.toNat) vs) := by
+    rw [hdispatch]; unfold execRead1; rw [hops, houts]; simp only [evalOperand, hw]
+  have hsim := genRegularInstPlan_blobhash_sim hname hnjmp hcompute hops houts rfl hlive hnospill hlivex
+    hdepth hsmall hpeek hlen hxmem hval hfresh hspill hdisp hoptnoop hrel hblock
+  refine ⟨gvBodyStep_of_updateVar (idx := idx) hstepEq hsim, ?_, ?_⟩
+  · exact stackDisc_read1_preserve (idx := idx) hsd hname hnjmp hcompute hops houts hlive hnospill
+      hlivex hdepth hsmall hpeek hfresh hstepEq hoptnoop
+  · show (generateRegularInstPlan liveness dfg cfg fn inst nextLiveness false nextIsTerminator
+      curBbLabel ps).2.stack = (S ++ [out]).map Operand.Var
+    rw [genRegularInstPlan_read1_outStack hname hnjmp hcompute hops houts hlive hnospill hlivex
+      hdepth hsmall hpeek hoptnoop, hsv, List.map_append]; rfl
+
+/-- **`BodyStep` for BLOBHASH.** The block-env-read body-fold producer; the twin of `bodyStep_sload`
+    via `stackDisc_blobhash_step_S`. -/
+theorem bodyStep_blobhash
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat} {prog : List AsmInst}
+    {inst : Instruction} {nextLiveness : List String} {nextIsTerminator : Bool} {curBbLabel : String}
+    {S : List String} {x out : String} {idx : Nat}
+    (hname : opcodeToEvmName inst.opcode = some "BLOBHASH")
+    (hnjmp : inst.opcode ≠ Opcode.JMP)
+    (hcompute : computeOperands inst = inst.operands.reverse)
+    (hdispatch : ∀ v, stepInstBase inst v = execRead1 (fun v s => blobhashOf s.txCtx v.toNat) inst v)
+    (hops : inst.operands = [Operand.Var x])
+    (houts : inst.outputs = [out])
+    (hxS : x ∈ S) (houtS : out ∉ S)
+    (hlive : nextLiveness.contains out = true)
+    (hlivex : nextLiveness.contains x = true)
+    (hdisp : ∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp "BLOBHASH" →
+          asmStep offsetToPc prog s = asmStateUnop (fun v s => blobhashOf s.txCtx v.toNat) s)
+    (hoptnoop : ∀ p : PlanState, optimisticSwapPlan dfg inst nextLiveness nextIsTerminator
+        { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness p).2 with
+          stack := p.stack ++ [Operand.Var out] }
+      = ([], { (emitInputPlan inst.opcode inst.operands.reverse nextLiveness p).2 with
+              stack := p.stack ++ [Operand.Var out] })) :
+    BodyStep lo offsetToPc prog
+      (fun w p => generateRegularInstPlan liveness dfg cfg fn w.1 nextLiveness false nextIsTerminator curBbLabel p)
+      (inst, idx) S := by
+  intro p v s j hsd hsv hrel hblock
+  have hout : outOf (inst, idx) = out := by simp [outOf, houts]
+  obtain ⟨hsim, hsd', hsv'⟩ := stackDisc_blobhash_step_S (idx := idx) hsd hsv hname hnjmp hcompute
+    (hdispatch v) hops houts hxS houtS hlive hlivex hdisp (hoptnoop p) hrel hblock
+  exact ⟨hsim, hsd', by rw [hout]; exact hsv'⟩
+
 /-- **Spill-aware body step for a spilled TLOAD.** The reroute of `stackDisc_tload_step_S` off
     `StackDiscH.noSpill`: when the operand `x` is *spilled*, `StackDiscHS (k+2)` drives the restore+dup
     emit, the transient-load, and the invariant re-establishment — bundling `StackDiscHS k` inside the

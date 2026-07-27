@@ -278,6 +278,15 @@ def RegularStepG (lo : AssocList String Nat) (nextLiveness : List String)
       (∀ (s : AsmState) (h : s.pc < prog.length),
         prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp "BLOCKHASH" →
           asmStep offsetToPc prog s = asmStateUnop (fun v s => s.blockCtx.blockhash v.toNat) s))
+  ∨ (∃ (x out : String),
+      opcodeToEvmName inst.opcode = some "BLOBHASH" ∧ inst.opcode ≠ Opcode.JMP ∧
+      computeOperands inst = inst.operands.reverse ∧
+      (∀ v, stepInstBase inst v = execRead1 (fun v s => blobhashOf s.txCtx v.toNat) inst v) ∧
+      inst.operands = [Operand.Var x] ∧ inst.outputs = [out] ∧ x ∈ S ∧ out ∉ S ∧
+      nextLiveness.contains out = true ∧ nextLiveness.contains x = true ∧
+      (∀ (s : AsmState) (h : s.pc < prog.length),
+        prog.get ⟨s.pc, h⟩ = AsmInst.AsmOp "BLOBHASH" →
+          asmStep offsetToPc prog s = asmStateUnop (fun v s => blobhashOf s.txCtx v.toNat) s))
 
 /-! ### Gap-B: deriving `RegularStepG` from a well-formedness predicate
 
@@ -817,6 +826,7 @@ theorem bodyStepG_of_regularStepG
     ⟨x, y, out, hop, hops, houts, hxy, hxS, hyS, houtS, hlive, hlivex, hlivey, hmemsafe, hdisp⟩ |
     ⟨x, out, hname, hnjmp, hcompute, hdispatch, hops, houts, hxS, houtS, hlive, hlivex, hdisp⟩ |
     ⟨x, out, hname, hnjmp, hcompute, hdispatch, hops, houts, hxS, houtS, hlive, hlivex, hdisp⟩
+    | ⟨x, out, hname, hnjmp, hcompute, hdispatch, hops, houts, hxS, houtS, hlive, hlivex, hdisp⟩
   · have hsingle : ∃ o, inst.outputs = [o] := by
       obtain ⟨o, _, ho, _⟩ := hreg; exact ⟨o, ho⟩
     obtain ⟨o, ho⟩ := hsingle
@@ -848,6 +858,9 @@ theorem bodyStepG_of_regularStepG
         hdisp (fun p => by simp [optimisticSwapPlan]))
   · exact bodyStepG_of_bodyStep (out := out) houts
       (bodyStep_blockhash (idx := k) hname hnjmp hcompute hdispatch hops houts hxS houtS hlive hlivex
+        hdisp (fun p => by simp [optimisticSwapPlan]))
+  · exact bodyStepG_of_bodyStep (out := out) houts
+      (bodyStep_blobhash (idx := k) hname hnjmp hcompute hdispatch hops houts hxS houtS hlive hlivex
         hdisp (fun p => by simp [optimisticSwapPlan]))
 
 /-- **N-instruction general body-fold readiness** (mixed 0/1-output). By induction, dispatching each

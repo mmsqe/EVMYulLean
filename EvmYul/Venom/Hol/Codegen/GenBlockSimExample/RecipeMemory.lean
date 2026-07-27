@@ -4942,4 +4942,393 @@ theorem codegen_correct_deadBuriedFn_recipeW {lo : AssocList String Nat} {vs : V
 
 end Example
 
+
+/-! ## The MCOPY capstone: the last memory op — degenerate zero-length copy (`mcp`)
+
+MCOPY is 0-output (store-class), 3-input. The `sz = 0` witness is a memory no-op on both
+sides (`mcopy_zero_noop` / `asmMcopy_zero_eq`); the emitted `SWAP2;SWAP1` reorder acts on
+three equal literals (identities, `asmStack_top3_zero`), run through the f1a gp-abstract
+STOP slice. Completes the memory-op family. -/
+
+theorem readWithoutPadding_zero (mem : ByteArray) (a : Nat) : (mem.readWithoutPadding a 0).size = 0 := by
+  unfold ByteArray.readWithoutPadding
+  split
+  · rfl
+  · simp
+
+theorem readWithPadding_zero (mem : ByteArray) (a : Nat) : (mem.readWithPadding a 0).size = 0 := by
+  unfold ByteArray.readWithPadding
+  rw [if_neg (by norm_num)]
+  rw [ByteArray.size_append, readWithoutPadding_zero, M1.ffi_zeroes_size]
+  simp
+
+theorem writeZero_id (src dest : ByteArray) (o : Nat) : src.write 0 dest o 0 = dest :=
+  ByteArray.ext rfl
+
+/-- **A zero-length `mcopy` is a no-op** (venom side). -/
+theorem mcopy_zero_noop (dst src : Nat) (s : VenomState) : mcopy dst src 0 s = s := by
+  have hw : (s.memory.readWithPadding src 0).write 0 s.memory dst (s.memory.readWithPadding src 0).size = s.memory := by
+    rw [readWithPadding_zero]; exact writeZero_id _ _ _
+  simp only [mcopy, readMemory, writeMemoryWithExpansion, hw]
+
+/-- `asmMcopy` with `sz = 0` on top leaves memory untouched and pops the three inputs. -/
+theorem asmMcopy_zero_eq {s : AsmState} {dst src : bytes32} {rest : List bytes32}
+    (hstack : s.stack = dst :: src :: (EvmYul.UInt256.ofNat 0) :: rest) :
+    asmMcopy s = AsmResult.AsmOK { asmNext s with stack := rest } := by
+  unfold asmMcopy
+  rw [hstack]
+  simp only [show (EvmYul.UInt256.ofNat 0).toNat = 0 from rfl, if_true, Nat.add_zero, writeZero_id,
+    asmNext]
+
+/-- **The no-spill zero-length MCOPY step + relation.** `sz = 0` ⇒ both memories untouched
+    (`asmMcopy_zero_eq` / `mcopy_zero_noop`), plan pops the three inputs, `planSpillRel` vacuous
+    under `noSpill` — so `venomAsmRel` survives with no coverage/`fnEom` obligation. The 3-input,
+    0-output memory sibling of `asmMstore_noSpill_rel`. -/
+theorem asmMcopy_zero_noSpill_rel {lo : AssocList String Nat} {ps : PlanState}
+    {vs : VenomState} {as : AsmState} {dst src : bytes32} {rest : List bytes32}
+    (hrel : venomAsmRel lo ps vs as)
+    (hstack : as.stack = dst :: src :: (EvmYul.UInt256.ofNat 0) :: rest)
+    (hnospill : ∀ op, alookup' ps.spilled op = none) :
+    asmMcopy as = AsmResult.AsmOK { asmNext as with stack := rest }
+    ∧ venomAsmRel lo { ps with stack := stackPop 3 ps.stack } (mcopy dst.toNat src.toNat 0 vs)
+        { asmNext as with stack := rest } := by
+  refine ⟨asmMcopy_zero_eq hstack, ?_⟩
+  rw [mcopy_zero_noop]
+  obtain ⟨hStk, hSpill, hMem, hAcc, hTrans, hRet, hLog, hCall, hTx, hBlk, hCode, hPrev⟩ := hrel
+  have hlen3 : 3 ≤ ps.stack.length := by rw [hStk.1, hstack]; simp
+  have hps := planStackRel_popN hStk hlen3
+  rw [hstack] at hps
+  refine ⟨by simpa using hps, ?_, hMem, hAcc, hTrans, hRet, hLog, hCall, hTx, hBlk, hCode, hPrev⟩
+  intro op off' hlook
+  rw [show AssocList.lookup Operand Nat ps.spilled op = alookup' ps.spilled op from rfl, hnospill op] at hlook
+  exact absurd hlook (by simp)
+
+
+abbrev L0 : Operand := Operand.Lit (EvmYul.UInt256.ofNat 0)
+
+/-- The triple-equal-literal reorder (on an empty base) emits `SWAP2;SWAP1` and leaves the
+    all-equal plan stack unchanged — every swap acts on equal literals. -/
+theorem reorderPlan_triple_lit0 (ps : PlanState) (hstack : ps.stack = [L0, L0, L0]) :
+    reorderPlan [L0, L0, L0] ps = ([StackOp.SOSwap 2, StackOp.SOSwap 1], { ps with stack := [L0, L0, L0] }) := by
+  have hstep0 : reorderOne () [L0, L0, L0] 0 L0 ps
+      = ([StackOp.SOSwap 2], { ps with stack := [L0, L0, L0] }) := by
+    have hd : stackGetDepth L0 ps.stack = some 0 := by rw [hstack]; rfl
+    have hsw : stackSwap 2 ps.stack = [L0, L0, L0] := by rw [hstack]; rfl
+    unfold reorderOne; simp [hd, doSwap, hsw]
+  have hstep1 : reorderOne () [L0, L0, L0] 1 L0 ({ ps with stack := [L0, L0, L0] } : PlanState)
+      = ([StackOp.SOSwap 1], { ps with stack := [L0, L0, L0] }) := by
+    have hd : stackGetDepth L0 ([L0, L0, L0] : List Operand) = some 0 := rfl
+    have hsw : stackSwap 1 ([L0, L0, L0] : List Operand) = [L0, L0, L0] := rfl
+    unfold reorderOne; simp [hd, doSwap, hsw]
+  have hstep2 : reorderOne () [L0, L0, L0] 2 L0 ({ ps with stack := [L0, L0, L0] } : PlanState)
+      = ([], { ps with stack := [L0, L0, L0] }) := by
+    have hd : stackGetDepth L0 ([L0, L0, L0] : List Operand) = some 0 := rfl
+    unfold reorderOne; simp [hd]
+  unfold reorderPlan
+  have henum : ([L0, L0, L0] : List Operand).enum = [(0, L0), (1, L0), (2, L0)] := rfl
+  rw [henum]
+  simp only [List.foldl_cons, List.foldl_nil, hstep0, hstep1, hstep2, List.nil_append,
+    List.append_nil, List.cons_append]
+
+/-- `emitInputPlan` for three literals: three `SOPush`, stack grows by the three lits. -/
+theorem emitInputPlan_triple_lit_eq (opc : Opcode) (nl : List String) (a b c : bytes32) (ps : PlanState) :
+    emitInputPlan opc [Operand.Lit a, Operand.Lit b, Operand.Lit c] nl ps
+      = ([StackOp.SOPush (Operand.Lit a), StackOp.SOPush (Operand.Lit b), StackOp.SOPush (Operand.Lit c)],
+         { ps with stack := ps.stack ++ [Operand.Lit a, Operand.Lit b, Operand.Lit c] }) := by
+  unfold emitInputPlan
+  simp only [List.foldl_cons, List.foldl_nil, emitOneInput_lit_eq, stackPush, List.nil_append,
+    List.append_assoc, List.cons_append]
+
+
+/-- **Asm stack top three = three zeros**, when the plan stack is exactly `[L0, L0, L0]`
+    (`operandVal` of `Lit 0` is `0`). The 3-input, all-`Lit 0` extraction the MCOPY step needs. -/
+theorem asmStack_top3_zero {lo : AssocList String Nat} {ps : PlanState} {vs : VenomState} {as : AsmState}
+    (hrel : venomAsmRel lo ps vs as) (hstack : ps.stack = [L0, L0, L0]) :
+    as.stack = EvmYul.UInt256.ofNat 0 :: EvmYul.UInt256.ofNat 0 :: EvmYul.UInt256.ofNat 0 :: as.stack.drop 3 := by
+  obtain ⟨hStk, _⟩ := hrel
+  have hlen : ps.stack.length = as.stack.length := hStk.1
+  have hge : 3 ≤ as.stack.length := by rw [← hlen, hstack]; simp
+  have hpk : ∀ d, d < 3 → as.stack[d]! = EvmYul.UInt256.ofNat 0 := by
+    intro d hd
+    have hp := planStackRel_peek hStk (dist := d) (by rw [hstack]; simpa using hd)
+    rw [hstack] at hp
+    have hpeek : stackPeek d ([L0, L0, L0] : List Operand) = L0 := by
+      interval_cases d <;> rfl
+    rw [hpeek, show operandVal vs lo L0 = some (EvmYul.UInt256.ofNat 0) from rfl] at hp
+    exact (Option.some.inj hp).symm
+  conv_lhs => rw [list_eq_get3 as.stack hge, hpk 0 (by norm_num), hpk 1 (by norm_num), hpk 2 (by norm_num)]
+
+namespace Example
+
+def mcpCopy : Instruction := { id := 0, opcode := Opcode.MCOPY, operands := [L0, L0, L0], outputs := [] }
+
+/-- Plan decomposition for `MCOPY (Lit 0)(Lit 0)(Lit 0)` on an empty stack: three `PUSH0`, the
+    `SWAP2;SWAP1` triple reorder (identities on equal literals), then the bare `MCOPY`. The
+    3-input, all-literal, 0-output sibling of `genRegularInstPlan_dStore_swapped_eq`. -/
+theorem genRegularInstPlan_mcpCopy_eq
+    {liveness : DfState (List String)} {dfg : DfgAnalysis} {cfg : CfgAnalysis} {fn : IrFunction}
+    {isHalting nextIsTerminator : Bool} {curBbLabel : String} {ps : PlanState}
+    (hstack : ps.stack = []) :
+    generateRegularInstPlan liveness dfg cfg fn mcpCopy [] isHalting nextIsTerminator curBbLabel ps
+      = ([StackOp.SOPush L0, StackOp.SOPush L0, StackOp.SOPush L0,
+          StackOp.SOSwap 2, StackOp.SOSwap 1, StackOp.SOEmit "MCOPY"],
+         releaseDeadSpills [] { ps with stack := [] }) := by
+  have hemit : emitInputPlan Opcode.MCOPY [L0, L0, L0] [] ps
+      = ([StackOp.SOPush L0, StackOp.SOPush L0, StackOp.SOPush L0], { ps with stack := [L0, L0, L0] }) := by
+    rw [emitInputPlan_triple_lit_eq]
+    rw [hstack]; rfl
+  have hro : reorderPlan [L0, L0, L0] ({ ps with stack := [L0, L0, L0] } : PlanState)
+      = ([StackOp.SOSwap 2, StackOp.SOSwap 1], { ps with stack := [L0, L0, L0] }) :=
+    reorderPlan_triple_lit0 _ rfl
+  unfold generateRegularInstPlan
+  simp [show computeOperands mcpCopy = [L0, L0, L0] from rfl,
+    show mcpCopy.opcode = Opcode.MCOPY from rfl, show mcpCopy.outputs = ([] : List String) from rfl,
+    hemit, hro, stackPop, isCommutative,
+    generateEmitOps_evmName (show opcodeToEvmName mcpCopy.opcode = some "MCOPY" from rfl)]
+
+
+def mcpStop : Instruction := { id := 1, opcode := Opcode.STOP, operands := [], outputs := [] }
+def mcpEntry : BasicBlock := { label := "entry", instructions := [mcpCopy, mcpStop] }
+def mcpFn : IrFunction := { name := "main", blocks := [mcpEntry] }
+def mcpCtx : VenomContext := { functions := [mcpFn], entry := some "main" }
+
+abbrev mcpLive : DfState (List String) := livenessAnalyzeFuel (fnPlanFuel mcpFn) mcpFn
+abbrev mcpDfg : DfgAnalysis := DfgAnalysis.buildFunction mcpFn
+abbrev mcpCfg : CfgAnalysis := cfgAnalyze mcpFn
+abbrev mcpGp : Instruction × Nat → PlanState → List StackOp × PlanState :=
+  fun z p => generateRegularInstPlan mcpLive mcpDfg mcpCfg mcpFn z.1 [] true true "entry" p
+
+theorem doSwap_two_eq' (p : PlanState) :
+    doSwap 2 p = ([StackOp.SOSwap 2], { p with stack := stackSwap 2 p.stack }) := by
+  unfold doSwap; simp
+
+theorem doSwap_one_eq' (p : PlanState) :
+    doSwap 1 p = ([StackOp.SOSwap 1], { p with stack := stackSwap 1 p.stack }) := by
+  unfold doSwap; simp
+
+/-- **The MCOPY fold step**: `MCOPY (Lit 0)(Lit 0)(Lit 0)` from an empty stack — three `PUSH0`, the
+    `SWAP2;SWAP1` identity reorder, and the zero-length copy (a memory no-op). `[] ↦ []`. Peak
+    growth 3 ⇒ demand 3. The 3-input, 0-output, all-literal memory sibling of f1a's swap steps. -/
+theorem bodyStepHTo_mcpCopy {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat}
+    {prog : List AsmInst} :
+    BodyStepHTo lo offsetToPc prog mcpGp 3 (mcpCopy, 0) [] [] := by
+  intro p v s j hsd hsv hrel hblock
+  have hstk : p.stack = [] := hsv
+  have hplan : mcpGp (mcpCopy, 0) p
+      = ([StackOp.SOPush L0, StackOp.SOPush L0, StackOp.SOPush L0,
+          StackOp.SOSwap 2, StackOp.SOSwap 1, StackOp.SOEmit "MCOPY"],
+         releaseDeadSpills [] { p with stack := [] }) := by
+    show generateRegularInstPlan mcpLive mcpDfg mcpCfg mcpFn mcpCopy [] true true "entry" p = _
+    rw [genRegularInstPlan_mcpCopy_eq hstk]
+  rw [hplan] at hblock
+  simp only [hplan]
+  rw [show executePlan [StackOp.SOPush L0, StackOp.SOPush L0, StackOp.SOPush L0,
+        StackOp.SOSwap 2, StackOp.SOSwap 1, StackOp.SOEmit "MCOPY"]
+      = executePlan [StackOp.SOPush L0] ++ (executePlan [StackOp.SOPush L0] ++ (executePlan [StackOp.SOPush L0]
+          ++ (executePlan [StackOp.SOSwap 2] ++ (executePlan [StackOp.SOSwap 1] ++ executePlan [StackOp.SOEmit "MCOPY"])))) from rfl] at hblock ⊢
+  obtain ⟨hbP1, hr1⟩ := asmBlockAt_append hblock
+  obtain ⟨hbP2, hr2⟩ := asmBlockAt_append hr1
+  obtain ⟨hbP3, hr3⟩ := asmBlockAt_append hr2
+  obtain ⟨hbS2, hr4⟩ := asmBlockAt_append hr3
+  obtain ⟨hbS1, hbMC⟩ := asmBlockAt_append hr4
+  -- three pushes
+  obtain ⟨s1, hrun1, hrel1, hpc1⟩ := emitOneInput_sim_lit_append (offsetToPc := offsetToPc) (opc := Opcode.MCOPY) (nl := ([] : List String))
+    (v := EvmYul.UInt256.ofNat 0) hrel hbP1
+  obtain ⟨s2, hrun2, hrel2, hpc2⟩ := emitOneInput_sim_lit_append (offsetToPc := offsetToPc) (opc := Opcode.MCOPY) (nl := ([] : List String))
+    (v := EvmYul.UInt256.ofNat 0) hrel1 (by rw [hpc1]; exact hbP2)
+  obtain ⟨s3, hrun3, hrel3, hpc3⟩ := emitOneInput_sim_lit_append (offsetToPc := offsetToPc) (opc := Opcode.MCOPY) (nl := ([] : List String))
+    (v := EvmYul.UInt256.ofNat 0) hrel2 (by rw [hpc2, hpc1]; exact hbP3)
+  -- collapse the three-push nested plan state to a clean `{ p with stack := [L0,L0,L0] }`
+  have hns : ({ { { p with stack := p.stack ++ [L0] } with stack := (p.stack ++ [L0]) ++ [L0] } with
+      stack := ((p.stack ++ [L0]) ++ [L0]) ++ [L0] } : PlanState) = { p with stack := [L0, L0, L0] } := by
+    rw [hstk]; rfl
+  rw [hns] at hrel3
+  have hasm3 : s3.stack = EvmYul.UInt256.ofNat 0 :: EvmYul.UInt256.ofNat 0 :: EvmYul.UInt256.ofNat 0 :: s3.stack.drop 3 :=
+    asmStack_top3_zero hrel3 rfl
+  -- SWAP2 then SWAP1, both identities on the equal zeros
+  have hswap2 : doSwap 2 ({ p with stack := [L0, L0, L0] } : PlanState)
+      = ([StackOp.SOSwap 2], { p with stack := [L0, L0, L0] }) := by
+    rw [doSwap_two_eq']; rfl
+  obtain ⟨s4, hrun4, hrel4, hpc4⟩ := doSwap_sim (offsetToPc := offsetToPc) hswap2 hrel3
+    (by rw [show ({ p with stack := [L0, L0, L0] } : PlanState).stack = [L0, L0, L0] from rfl]; decide)
+    (by rw [hpc3, hpc2, hpc1]; exact hbS2) (fun h => absurd h (by omega))
+  have hswap1 : doSwap 1 ({ p with stack := [L0, L0, L0] } : PlanState)
+      = ([StackOp.SOSwap 1], { p with stack := [L0, L0, L0] }) := by
+    rw [doSwap_one_eq']; rfl
+  obtain ⟨s5, hrun5, hrel5, hpc5⟩ := doSwap_sim (offsetToPc := offsetToPc) hswap1 hrel4
+    (by rw [show ({ p with stack := [L0, L0, L0] } : PlanState).stack = [L0, L0, L0] from rfl]; decide)
+    (by rw [hpc4, hpc3, hpc2, hpc1]; exact hbS1) (fun h => absurd h (by omega))
+  have hasm5 : s5.stack = EvmYul.UInt256.ofNat 0 :: EvmYul.UInt256.ofNat 0 :: EvmYul.UInt256.ofNat 0 :: s5.stack.drop 3 :=
+    asmStack_top3_zero hrel5 rfl
+  -- the zero-length MCOPY
+  have hnos : ∀ op, alookup' ({ p with stack := [L0, L0, L0] } : PlanState).spilled op = none :=
+    fun op => hsd.noSpill op
+  obtain ⟨hmc, hrelMC⟩ := asmMcopy_zero_noSpill_rel (lo := lo)
+    (ps := { p with stack := [L0, L0, L0] }) (vs := v) (as := s5)
+    (dst := EvmYul.UInt256.ofNat 0) (src := EvmYul.UInt256.ofNat 0) (rest := s5.stack.drop 3)
+    hrel5 hasm5 hnos
+  have hbMC' : asmBlockAt prog s5.pc (executePlan [StackOp.SOEmit "MCOPY"]) := by
+    rw [hpc5, hpc4, hpc3, hpc2, hpc1]; exact hbMC
+  obtain ⟨hltMC, hgetMC⟩ := asmBlockAt_one hbMC'
+  have hstepMC : asmStep offsetToPc prog s5 = asmMcopy s5 := asmStep_mcopy_ok hltMC hgetMC
+  set s6 : AsmState := { asmNext s5 with stack := s5.stack.drop 3 } with hs6def
+  have hstep6ok : asmStep offsetToPc prog s5 = AsmResult.AsmOK s6 := by rw [hstepMC, hmc]
+  have hrun6 : runAsm 1 offsetToPc prog s5 = AsmResult.AsmOK s6 := by
+    rw [runAsm_succ_ok hltMC hstep6ok]; rfl
+  have hpc6 : s6.pc = s5.pc + 1 := by rw [hs6def]; rfl
+  have hstepEq : stepInstBase mcpCopy v = ExecResult.OK (mcopy 0 0 0 v) := rfl
+  have hrelMC' : venomAsmRel lo { p with stack := ([] : List Operand) } (mcopy 0 0 0 v) s6 := hrelMC
+  have hrelR := releaseDeadSpills_sim (nextLiveness := ([] : List String)) hrelMC'
+  set EP : List (List AsmInst) := [executePlan [StackOp.SOPush L0], executePlan [StackOp.SOPush L0],
+    executePlan [StackOp.SOPush L0], executePlan [StackOp.SOSwap 2], executePlan [StackOp.SOSwap 1],
+    executePlan [StackOp.SOEmit "MCOPY"]] with hEP
+  have hrunAll : runAsm (executePlan [StackOp.SOPush L0] ++ (executePlan [StackOp.SOPush L0]
+      ++ (executePlan [StackOp.SOPush L0] ++ (executePlan [StackOp.SOSwap 2]
+      ++ (executePlan [StackOp.SOSwap 1] ++ executePlan [StackOp.SOEmit "MCOPY"]))))).length offsetToPc prog s
+      = AsmResult.AsmOK s6 := by
+    simp only [List.length_append]
+    exact runAsm_compose hrun1 (runAsm_compose hrun2 (runAsm_compose hrun3
+      (runAsm_compose hrun4 (runAsm_compose hrun5 hrun6))))
+  have hpcAll : s6.pc = s.pc + (executePlan [StackOp.SOPush L0] ++ (executePlan [StackOp.SOPush L0]
+      ++ (executePlan [StackOp.SOPush L0] ++ (executePlan [StackOp.SOSwap 2]
+      ++ (executePlan [StackOp.SOSwap 1] ++ executePlan [StackOp.SOEmit "MCOPY"]))))).length := by
+    simp only [List.length_append]
+    rw [hpc6, hpc5, hpc4, hpc3, hpc2, hpc1]
+    simp only [show (executePlan [StackOp.SOPush L0]).length = 1 from rfl,
+      show (executePlan [StackOp.SOSwap 2]).length = 1 from rfl,
+      show (executePlan [StackOp.SOSwap 1]).length = 1 from rfl,
+      show (executePlan [StackOp.SOEmit "MCOPY"]).length = 1 from rfl]
+  have hsplit : executePlan [StackOp.SOPush L0, StackOp.SOPush L0, StackOp.SOPush L0,
+      StackOp.SOSwap 2, StackOp.SOSwap 1, StackOp.SOEmit "MCOPY"]
+      = executePlan [StackOp.SOPush L0] ++ (executePlan [StackOp.SOPush L0]
+      ++ (executePlan [StackOp.SOPush L0] ++ (executePlan [StackOp.SOSwap 2]
+      ++ (executePlan [StackOp.SOSwap 1] ++ executePlan [StackOp.SOEmit "MCOPY"])))) := rfl
+  refine ⟨gvBodyStep_of_ok (idx := 0)
+    (plan := [StackOp.SOPush L0, StackOp.SOPush L0, StackOp.SOPush L0, StackOp.SOSwap 2, StackOp.SOSwap 1, StackOp.SOEmit "MCOPY"])
+    hstepEq ⟨s6, by rw [hsplit]; exact hrunAll, hrelR, by rw [hsplit]; exact hpcAll⟩, ?_, ?_⟩
+  · refine ⟨fun op => releaseDeadSpills_noSpill [] ({ p with stack := ([] : List Operand) }) (fun o => hsd.noSpill o) op, ?_, ?_⟩
+    · rw [releaseDeadSpills_stack]
+      have := hsd.shallow; rw [hstk] at this
+      show (({ p with stack := ([] : List Operand) } : PlanState)).stack.length + j ≤ 15
+      simp only [List.length_nil]; omega
+    · intro z hz
+      rw [releaseDeadSpills_stack] at hz
+      simp at hz
+  · show (releaseDeadSpills [] { p with stack := ([] : List Operand) }).stack = ([] : List String).map Operand.Var
+    rw [releaseDeadSpills_stack]; rfl
+
+/-- The body-end state as the RAW thread output (not simplified via `mcopy_zero_noop`), so
+    `mcpEntry_thread` — and hence the non-vacuity `mcpFn_halts` — is `rfl` and stays on the base
+    axioms only (matching `sh3Fn_halts`/`mldFn_halts`; the `mcopy_zero_noop` M1 dependency is
+    confined to the asm-side relation, where it belongs). -/
+abbrev mcpSEnd (s : VenomState) : VenomState :=
+  { mcopy 0 0 0 { s with instIdx := 0 } with instIdx := 1 }
+
+theorem mcpEntry_thread (s : VenomState) :
+    execBodyThread [mcpCopy] 0 { s with instIdx := 0 } = some (mcpSEnd s) := rfl
+
+theorem mcpReady {lo : AssocList String Nat} {offsetToPc : AssocList Nat Nat} {prog : List AsmInst} :
+    BodyStepsReadyHTo lo offsetToPc prog mcpGp (fun _ => 3) ([mcpCopy].zipIdx 0) [] [] :=
+  ⟨[], bodyStepHTo_mcpCopy, rfl⟩
+
+theorem mcpFn_halts (vs : VenomState) (_hnh : vs.halted = false) :
+    ∃ vs', runContext 10 mcpCtx vs = ExecResult.Halt vs' := by
+  have h0 : runContext 10 mcpCtx vs
+      = runBlocks 10 mcpCtx mcpFn { vs with prevBb := none, currentBb := "entry", instIdx := 0 } := by
+    simp [runContext, runFunction, mcpCtx, mcpFn, mcpEntry, lookupFunction, fnEntryLabel]
+  set s0 : VenomState := { vs with prevBb := none, currentBb := "entry", instIdx := 0 } with hs0
+  have hlk0 : lookupBlock s0.currentBb mcpFn.blocks = some mcpEntry := rfl
+  have hhalt : runBlock 9 mcpCtx mcpEntry s0 = ExecResult.Halt (haltState (mcpSEnd s0)) := by
+    rw [show (9 : Nat) = ([mcpCopy] : List Instruction).length + (7 + 1) from rfl]
+    exact runBlock_body_stop mcpCtx _ 7 [mcpCopy] mcpStop mcpCopy [mcpStop] s0 (mcpSEnd s0)
+      rfl rfl rfl (by decide)
+      (by intro i hi; simp only [List.mem_singleton] at hi; subst hi; decide)
+      (mcpEntry_thread s0)
+  rw [h0]
+  exact ⟨_, runBlocks_haltDirect_of_block hlk0 hhalt⟩
+
+set_option maxHeartbeats 1000000 in
+/-- **The MCOPY capstone.** `codegen_correct` for the single block
+    `entry: MCOPY (Lit 0)(Lit 0)(Lit 0); STOP` — the last memory op to reach a whole-function
+    capstone. The zero-length copy is a memory no-op on both sides; the emitted program's
+    `SWAP2;SWAP1` reorder acts on three equal literals (identities), and the fold runs it via the
+    f1a gp-abstract STOP slice. base + M1 FFI axioms. -/
+theorem codegen_correct_mcpFn_recipeW {lo : AssocList String Nat} {vs : VenomState} {as : AsmState}
+    (hvshalt : vs.halted = false)
+    (hrel : venomAsmRel lo (initPlanState 0) vs as) (haspc : as.pc = 0) :
+    (match runContext 10 mcpCtx vs with
+     | ExecResult.Halt vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1 as = AsmResult.AsmHalt as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.RevertAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1 as = AsmResult.AsmRevert as' ∧ finalStateRel vs' as'
+     | ExecResult.Abort AbortType.ExHaltAbort vs' => ∃ as', runAsm (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1.length (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).2 (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1 as = AsmResult.AsmFault as' ∧ finalStateRel vs' as'
+     | _ => True) := by
+  have hfnready : ∀ bb ∈ mcpFn.blocks, ∀ inst ∈ bb.instructions, codegenReadyInst inst := by
+    intro bb hbb inst hinst
+    simp only [mcpFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    subst hbb
+    simp only [mcpEntry, List.mem_cons, List.not_mem_nil, or_false] at hinst
+    rcases hinst with rfl | rfl <;> (unfold codegenReadyInst; decide)
+  have hgen : generateFnPlan mcpFn 0 0
+      = some ((generateFnPlan mcpFn 0 0).get!.1, (generateFnPlan mcpFn 0 0).get!.2) := rfl
+  have hpsE : psOfFn (fnPlanFuel mcpFn) mcpFn 0 0 "entry" = initPlanState 0 :=
+    psOfFn_entry rfl hfnready (by simp only [fnPlanFuel]; omega)
+  refine codegen_correct_ofBlocks_recipeW_invCur (fun _ => True)
+    (lo := lo) (pcOf := pcOfLabel (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1)
+    (psOf := psOfFn (fnPlanFuel mcpFn) mcpFn 0 0)
+    (wOf := fun l => (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1 l)
+    (offsets := (computeLabelOffsets (executePlan (generateFnPlan mcpFn 0 0).get!.1)).2)
+    (fuel := 10) (ctx := mcpCtx) (fn := mcpFn) (fnEom := 0) (lblCtr := 0)
+    (entryName := "main") (entryLbl := "entry")
+    (ops := (generateFnPlan mcpFn 0 0).get!.1) (psFinal := (generateFnPlan mcpFn 0 0).get!.2)
+    hgen rfl rfl rfl ?_ ?_ (fun _ _ _ _ _ _ _ _ => trivial) ?_ trivial
+  case _ =>
+    intro bb hbb s
+    simp only [mcpFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    subst hbb
+    simp [runBlock, evalPhis, execBlock, mcpEntry, mcpCopy]
+  case _ =>
+    intro bb hbb s asm N k hE _ hlbleq
+    obtain ⟨⟨bb0, hlk_s, hvrel, hpc_asm⟩, hwN, hhalt⟩ := hE
+    simp only [mcpFn, List.mem_cons, List.not_mem_nil, or_false] at hbb
+    subst hbb
+    have hlbl : s.currentBb = "entry" := hlbleq
+    rw [hlbl] at hvrel hpc_asm
+    have hpc0 : asm.pc = 0 := by rw [hpc_asm]; exact pcOfLabel_entry_zero rfl hfnready hgen
+    have hnt : ∀ inst ∈ [mcpCopy], isTerminator inst.opcode = false := by
+      intro i hi; simp only [List.mem_singleton] at hi; subst hi; decide
+    match k with
+    | 0 => exact Or.inl (runBlock_oof mcpCtx _ 1 [mcpCopy] mcpStop mcpCopy [mcpStop] s (mcpSEnd s)
+             rfl rfl (by decide) hnt (mcpEntry_thread s) (by decide))
+    | (j+1) =>
+    rw [show j+1+1 = ([mcpCopy] : List Instruction).length + (j+1) from by
+      simp only [List.length_cons, List.length_nil]; omega]
+    refine Or.inr (hsupplyW_regularStopToG
+      (gp := mcpGp) (dem := fun _ => 3) (restFuel := j)
+      (front := [mcpCopy]) (stopI := mcpStop) (hd := mcpCopy) (tl := [mcpStop])
+      (ps0 := initPlanState 0) (sEnd := mcpSEnd s) (S := []) (Sn := [])
+      (hbb := rfl) (hstopop := rfl) (hcons := rfl) (hphi := by decide)
+      (hnonterm := hnt) (hthread := mcpEntry_thread s)
+      (hready := mcpReady)
+      (hsd := ⟨fun op => rfl, by simp [initPlanState], fun z hz => by simp [initPlanState] at hz⟩)
+      (hsv := rfl)
+      (hrel := by rw [hpsE] at hvrel; exact hvrel)
+      (hbLabel := by rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
+                     have hj2 : j < 1 := hj; interval_cases j; rfl)
+      (hblock := by rw [hpc0]; refine ⟨by decide, fun j hj => ?_⟩
+                    have hj2 : j < 6 := hj; interval_cases j <;> rfl)
+      (hpc := by rw [hpc0]; decide)
+      (hstop := prog_get_transfer (by rw [hpc0]; decide)
+        (show (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1.get ⟨7, by decide⟩
+          = AsmInst.AsmOp "STOP" from rfl))
+      (hw := by decide))
+  case _ =>
+    refine ⟨⟨mcpEntry, rfl, ?_, ?_⟩, ?_, hvshalt⟩
+    · show venomAsmRel lo (psOfFn (fnPlanFuel mcpFn) mcpFn 0 0 "entry") _ as
+      rw [hpsE]; exact hrel
+    · show as.pc = pcOfLabel (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1 "entry"
+      rw [haspc]; exact (pcOfLabel_entry_zero rfl hfnready hgen).symm
+    · show (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1.length - pcOfLabel (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1 "entry" ≤ (asmResolve (executePlan (generateFnPlan mcpFn 0 0).get!.1)).1.length
+      omega
+
+end Example
+
 end EvmYul.Venom.Hol.Codegen

@@ -2216,6 +2216,66 @@ theorem emit_blockhash_sim {ps lo vs as prog key rest out}
   · exact venomAsmRel_blockhash hrel hstack hfresh hspill
   · rfl
 
+
+
+/-! ## BLOBHASH (a 1-input read of `txCtx.blobhashes`, the tx-context blob-hash list) -/
+
+/-- The BLOBHASH read value: the `idx`-th blob hash in the tx context (0 past the end).
+    Matches the venom `Opcode.BLOBHASH` semantics inline, so `execRead1`/the asm case unfold to it. -/
+def blobhashOf (tx : EvmYul.Venom.Hol.TxContext) (idx : Nat) : bytes32 :=
+  if h : idx < tx.blobhashes.length then tx.blobhashes.get ⟨idx, h⟩ else ⟨0⟩
+
+theorem asmStep_blobhash_ok {o2pc prog s} (hpc : s.pc < prog.length)
+    (hprog : prog.get ⟨s.pc, hpc⟩ = AsmInst.AsmOp "BLOBHASH") :
+    asmStep o2pc prog s = asmStateUnop (λ v s => blobhashOf s.txCtx v.toNat) s := by
+  unfold asmStep; rw [dif_pos hpc, hprog]; rfl
+
+theorem venomAsmRel_blobhash {lo ps vs as out} {key rest}
+    (hrel : venomAsmRel lo ps vs as)
+    (hstack : as.stack = key :: rest)
+    (hfresh : ¬ (Operand.Var out) ∈ ps.stack)
+    (hspill : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none) :
+    venomAsmRel lo { ps with stack := stackPush (Operand.Var out) (stackPop 1 ps.stack) }
+      (updateVar out (blobhashOf vs.txCtx key.toNat) vs)
+      { asmNext as with stack := blobhashOf as.txCtx key.toNat :: rest } := by
+  obtain ⟨hStk, hSpill, hMem, hAcc, hTrans, hRet, hLog, hCall, hTx, hBlk, hCode, hPrev⟩ := hrel
+  have hval : blobhashOf vs.txCtx key.toNat = blobhashOf as.txCtx key.toNat := by rw [hTx]
+  have hlen1 : 1 ≤ ps.stack.length := by rw [hStk.1, hstack]; simp
+  obtain ⟨hStk', hSpill', hMem', hAcc', hTrans', hRet', hLog', hCall', hTx', hBlk', hCode', hPrev'⟩ :=
+    venomAsmRel_updateVar lo ps vs as out (blobhashOf vs.txCtx key.toNat)
+      ⟨hStk, hSpill, hMem, hAcc, hTrans, hRet, hLog, hCall, hTx, hBlk, hCode, hPrev⟩ hfresh hspill
+  refine ⟨?_, hSpill', hMem', hAcc', hTrans', hRet', hLog', hCall', hTx', hBlk', hCode', hPrev'⟩
+  have hout : operandVal (updateVar out (blobhashOf vs.txCtx key.toNat) vs) lo (Operand.Var out)
+      = some (blobhashOf as.txCtx key.toNat) := by
+    simp only [operandVal, lookupVar_updateVar_self]; rw [hval]
+  have hps := planStackRel_unop hStk' hlen1 hout
+  rw [hstack] at hps
+  simpa using hps
+
+/-- The runnable compute-step sim for BLOBHASH; `hdisp` is supplied by `asmStep_blobhash_ok`. -/
+theorem emit_blobhash_sim {ps lo vs as prog key rest out}
+    (hrel : venomAsmRel lo ps vs as)
+    (hstack : as.stack = key :: rest)
+    (hfresh : ¬ (Operand.Var out) ∈ ps.stack)
+    (hspill : AssocList.lookup Operand Nat ps.spilled (Operand.Var out) = none)
+    (hblock : asmBlockAt prog as.pc (executePlan [StackOp.SOEmit "BLOBHASH"]))
+    (hdisp : ∀ (h : as.pc < prog.length), prog.get ⟨as.pc, h⟩ = AsmInst.AsmOp "BLOBHASH" →
+              asmStep offsetToPc prog as = asmStateUnop (fun v s => blobhashOf s.txCtx v.toNat) as) :
+    ∃ as', runAsm (executePlan [StackOp.SOEmit "BLOBHASH"]).length offsetToPc prog as
+             = AsmResult.AsmOK as' ∧
+           venomAsmRel lo { ps with stack := stackPush (Operand.Var out) (stackPop 1 ps.stack) }
+             (updateVar out (blobhashOf vs.txCtx key.toNat) vs) as' ∧
+           as'.pc = as.pc + (executePlan [StackOp.SOEmit "BLOBHASH"]).length := by
+  obtain ⟨hpc, hget⟩ := asmBlockAt_one hblock
+  have hstep : asmStep offsetToPc prog as
+      = AsmResult.AsmOK { asmNext as with stack := blobhashOf as.txCtx key.toNat :: rest } := by
+    rw [hdisp hpc hget]; exact asmStateUnop_ok hstack
+  refine ⟨{ asmNext as with stack := blobhashOf as.txCtx key.toNat :: rest }, ?_, ?_, ?_⟩
+  · show runAsm 1 offsetToPc prog as = _
+    rw [runAsm_succ_ok hpc hstep]; rfl
+  · exact venomAsmRel_blobhash hrel hstack hfresh hspill
+  · rfl
+
 /-! ## CALLDATALOAD (a 1-input read of `callCtx.calldata`)
 
 Like TLOAD, a 1-input read into a fresh output, but the read is a 32-byte word of `callCtx.calldata`
