@@ -20,7 +20,7 @@ require mathlib from git
 -- The library's own scope stays the codec roundtrip, so the dependency is plain
 -- upstream and reproducibly pinnable. `AbiCrossval` remains 0 `native_decide`.
 require «abi-lean» from git
-  "https://github.com/yihuang/evm-abi-lean.git" @ "03c3dbd6737eab9a8fb3b79dc182f5e5ab43a3c7"
+  "https://github.com/yihuang/evm-abi-lean.git" @ "04f8902f891350cbc8892516a20d0c007a763122"
 
 -- pull lean-endianness's verified BE/LE codecs (package `binary` since the
 -- Endianness -> Binary rename; same rev evm-abi-lean pins) so EVMYulLean's hand-rolled byte codecs

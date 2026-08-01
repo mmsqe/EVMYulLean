@@ -68,6 +68,7 @@ default `EvmYul` build stays decoupled from the ABI dependency.
 -/
 import EvmYul.Venom.AbiLean.Hash
 import EvmAbi.Codec
+import EvmAbi.Codec.Strict
 import EvmYul.Venom.AbiLean.CodecEval
 import EvmYul.Venom.AbiDispatch
 import EvmYul.Venom.AbiBridge
@@ -404,17 +405,19 @@ set_option maxRecDepth 100000 in
     Proved on base axioms (no `native_decide`): the amount `amtU` is a literal, so
     the `CodecEval` bridge rewrites `Abi.encodeUint256 amtU` (= `Mem.toBytes32`) to
     evm-abi-lean's `encode (.uint 256) …` (checked by `decide +kernel`), and the
-    library's own `roundtrip` closes `decode ∘ encode`. -/
+    library's own `decodeStrict_encode` closes `decodeStrict ∘ encode`.  Return
+    data is a whole buffer, so the strict decoder is the right one: it also
+    pins that the word consumes the buffer exactly. -/
 theorem abiLean_decodes_returnWord (s : VenomState) (v : VarName) (hv : s.env v = amtU) :
     (execBlock s (Abi.returnWord v)).2 = Control.halt (.ret (Abi.encodeUint256 amtU))
-  ∧ ((EvmAbi.decode (.uint 256) (Abi.encodeUint256 amtU)).map (·.val)
+  ∧ ((EvmAbi.decodeStrict (.uint 256) (Abi.encodeUint256 amtU)).map (·.val)
       == some amtU.toNat) := by
   refine ⟨by simp only [VenomState.execBlock_returnWord, hv], ?_⟩
   have henc : Abi.encodeUint256 amtU = EvmAbi.encode (.uint 256) ⟨amtU.toNat, amtU_toNat_lt⟩ := by
     rw [← AbiLean.encodeF_eq_encode 5 (.uint 256) ⟨amtU.toNat, amtU_toNat_lt⟩ (by rfl)]; decide +kernel
   have hlen : (EvmAbi.encode (.uint 256) ⟨amtU.toNat, amtU_toNat_lt⟩).length < 2 ^ 256 := by
     rw [← AbiLean.encodeF_eq_encode 5 (.uint 256) ⟨amtU.toNat, amtU_toNat_lt⟩ (by rfl)]; decide +kernel
-  rw [henc, EvmAbi.roundtrip (.uint 256) (by decide) ⟨amtU.toNat, amtU_toNat_lt⟩ hlen]
+  rw [henc, EvmAbi.decodeStrict_encode (.uint 256) (by decide) ⟨amtU.toNat, amtU_toNat_lt⟩ hlen]
   rfl
 
 /-! ## Additional type-surface cross-validation

@@ -59,13 +59,24 @@ def partsTupF : (fuel : Nat) → (ts : List Ty) → TupleVal ts → List Part
   | 0, _, _ => []
   | _+1, [], _ => []
   | f+1, t :: ts, (v, vs) => partOfF f t v :: partsTupF f ts vs
-/-- Fuel-indexed mirror of `partOf`. -/
+/-- Fuel-indexed mirror of `partOf`.  A `Part`'s sides are `Builder`s
+upstream; the mirror puts its bytes in with `Builder.ofList`, and
+`builder_ext_toList` below is what makes that the *same* `Part`. -/
 def partOfF : (fuel : Nat) → (t : Ty) → t.Val → Part
-  | 0, _, _ => ⟨[], [], false⟩
-  | f+1, t, v => match t.IsStatic with
-    | true => ⟨encodeF f t v, [], false⟩
-    | false => ⟨[], encodeF f t v, true⟩
+  | 0, _, _ => ⟨∅, ∅, false⟩
+  | f+1, t, v => match t.isStatic with
+    | true => ⟨Builder.ofList (encodeF f t v), ∅, false⟩
+    | false => ⟨∅, Builder.ofList (encodeF f t v), true⟩
 end
+
+/-- Upstream's `Builder` is a difference list, so it is determined by the
+bytes it denotes: two builders with the same `toList` are equal.  This is
+what lets the mirror rebuild a `Part` from bytes and land on the very
+`Part` `partOf` produces. -/
+theorem builder_ext_toList {a b : Builder} (h : a.toList = b.toList) : a = b := by
+  apply Builder.ext
+  intro rest
+  rw [← Builder.toList_invariant, ← Builder.toList_invariant, h]
 
 /-! ## Fuel sufficiency
 
@@ -116,19 +127,19 @@ theorem encodeF_eq_encode :
     (motive_3 := fun f t v => enoughPartE f t v = true → partOfF f t v = partOf t v)
     (motive_4 := fun f t vs => enoughArrE f t vs = true → partsArrF f t vs = vs.map (partOf t))
   · intro t v h; simp [enoughE] at h
-  · intro f m n hp _; simp only [encodeF, encode]
-  · intro f m i hp _; simp only [encodeF, encode]
-  · intro f v _; simp only [encodeF, encode]
-  · intro f n hp _; simp only [encodeF, encode]
-  · intro f bs _; simp only [encodeF, encode]
-  · intro f v hp h; simp only [encodeF, encode]
-  · intro f v hp h; simp only [encodeF, encode]
+  · intro f m n hp _; simp [encodeF, encode, put]
+  · intro f m i hp _; simp only [encodeF, encode, put, toList_putInt]
+  · intro f v _; simp [encodeF, encode, put]
+  · intro f n hp _; simp [encodeF, encode, put]
+  · intro f bs _; simp [encodeF, encode, put]
+  · intro f v hp h; simp [encodeF, encode, put]
+  · intro f v hp h; simp [encodeF, encode, put]
   · intro f t' v hp ih h
-    simp only [enoughE] at h; simp only [encodeF, encode]; rw [ih h]
+    simp only [enoughE] at h; simp [encodeF, encode, put, encodeParts]; rw [ih h]
   · intro f t' vs ih h
-    simp only [enoughE] at h; simp only [encodeF, encode]; rw [ih h]
+    simp only [enoughE] at h; simp [encodeF, encode, put, encodeParts]; rw [ih h]
   · intro f ts v ih h
-    simp only [enoughE] at h; simp only [encodeF, encode]; rw [ih h]
+    simp only [enoughE] at h; simp [encodeF, encode, put, encodeParts]; rw [ih h]
   · intro ts vs h
     cases ts with
     | nil => simp only [partsTupF, partsOfTuple]
@@ -139,9 +150,15 @@ theorem encodeF_eq_encode :
     simp only [partsTupF, partsOfTuple]; rw [ih3 h.1, ih2 h.2]
   · intro t v h; simp [enoughPartE] at h
   · intro f t v hs ih h
-    simp only [enoughPartE] at h; simp only [partOfF, partOf, hs]; rw [ih h]
+    simp only [enoughPartE] at h
+    simp only [partOfF, partOf, hs]
+    congr 1
+    exact builder_ext_toList (by simpa [encode] using ih h)
   · intro f t v hs ih h
-    simp only [enoughPartE] at h; simp only [partOfF, partOf, hs]; rw [ih h]
+    simp only [enoughPartE] at h
+    simp only [partOfF, partOf, hs]
+    congr 1
+    exact builder_ext_toList (by simpa [encode] using ih h)
   · intro t vs h
     cases vs with
     | nil => simp only [partsArrF, List.map_nil]
