@@ -137,9 +137,14 @@ fi
 # separate primitive from the codec and `encodeArgs` is definitionally the tuple
 # level. Those are covered in-build by `AbiCrossval` (proved, not merely checked)
 # and by the venom_run selector pass below, so the snippet here uses upstream API
-# only -- `encode`/`decode` at `.tuple` -- and therefore runs against ANY abi-lean
-# rev. That is the point: built with the checkout's own toolchain, it catches
-# drift between this repo's pinned rev and abi-lean's moving main.
+# only -- the specification codec at `.tuple` -- and therefore runs against any
+# abi-lean rev that still has it. That is the point: built with the checkout's
+# own toolchain, it catches drift between this repo's pinned rev and abi-lean's
+# moving main.
+#
+# `Spec.encode`/`Spec.decodeStrict`, not the unsuffixed pair: since the codec
+# grew a runtime layer, `encode`/`decode` are the `ValBA`/`ByteArray` ones and
+# the `List UInt8` API this harness compares against lives in `EvmAbi.Spec`.
 if [ -n "${ABI_LEAN:-}" ]; then
   echo "== re-derive argument regions via evm-abi-lean ($ABI_LEAN) =="
   [ -d "$ABI_LEAN" ] || { echo "FATAL: ABI_LEAN dir not found: $ABI_LEAN" >&2; exit 1; }
@@ -147,6 +152,7 @@ if [ -n "${ABI_LEAN:-}" ]; then
   trap 'rm -f "$GEN"' EXIT
   cat > "$GEN" <<'LEAN'
 import EvmAbi.Codec
+import EvmAbi.Codec.Strict
 open EvmAbi
 
 def u256 : Ty := .uint 256
@@ -165,21 +171,22 @@ def hexBytes (bs : List UInt8) : String :=
 
 -- An argument list is exactly the tuple of its types, so the argument region is
 -- `encode (.tuple ts)` -- no argument-level wrapper needed from the library.
-#eval IO.println ("ARGS "   ++ hexBytes (encode (.tuple [.address, u256]) (recipient, u 100, ⟨⟩)))
-#eval IO.println ("DYNARR " ++ hexBytes (encode (.tuple [.array u256]) (arr [u 10, u 20, u 30], ⟨⟩)))
-#eval IO.println ("MIXED "  ++ hexBytes (encode (.tuple [u256, .array u256]) (u 7, arr [u 10, u 20, u 30], ⟨⟩)))
+#eval IO.println ("ARGS "   ++ hexBytes (Spec.encode (.tuple [.address, u256]) (recipient, u 100, ⟨⟩)))
+#eval IO.println ("DYNARR " ++ hexBytes (Spec.encode (.tuple [.array u256]) (arr [u 10, u 20, u 30], ⟨⟩)))
+#eval IO.println ("MIXED "  ++ hexBytes (Spec.encode (.tuple [u256, .array u256]) (u 7, arr [u 10, u 20, u 30], ⟨⟩)))
 
 -- Roundtrip drift guard: encode -> decode -> re-encode is a byte fixpoint.
 #eval do
   let t : Ty := .tuple [.address, u256]
   let v : Ty.Val t := (recipient, u 100, ⟨⟩)
-  let args := encode t v
-  match decode t args with
-  | some v' => if encode t v' == args then IO.println "ROUNDTRIP OK"
+  let args := Spec.encode t v
+  -- calldata is a whole buffer, so the strict decoder is the right one here
+  match Spec.decodeStrict t args with
+  | some v' => if Spec.encode t v' == args then IO.println "ROUNDTRIP OK"
                else IO.eprintln "roundtrip re-encode mismatch"
   | none    => IO.eprintln "roundtrip decode failed"
 LEAN
-  ( cd "$ABI_LEAN" && lake build EvmAbi.Codec >/dev/null )
+  ( cd "$ABI_LEAN" && lake build EvmAbi.Codec EvmAbi.Codec.Strict >/dev/null )
   ABI_OUT="$( cd "$ABI_LEAN" && lake env lean "$GEN" )"
   # The pinned references carry a 4-byte selector prefix ("0x" + 8 hex chars);
   # the library re-derives only the argument region, so compare the suffix.
