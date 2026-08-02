@@ -13,22 +13,31 @@ require mathlib from git
 --   * `AbiLean.Hash`      -- pure-Lean keccak + the 4-byte selector (a hash is a
 --                            separate primitive from the codec, and it is this repo
 --                            that needs it kernel-reducible, unlike our `ffi.KEC`);
---   * `AbiLean.Args`      -- the function-argument level, definitionally the tuple
---                            level, so `roundtrip_args` is a one-line corollary;
---   * `AbiLean.CodecEval` -- the fuel-indexed `encodeF` mirror + `encodeF_eq_encode`
---                            bridge that makes a concrete `encode` kernel-reducible.
+--   * `AbiLean.Args`      -- retired: a signature's arguments are definitionally the
+--                            tuple of its types, which `abi_codec` compiles directly;
+--   * `AbiLean.CodecEval` -- retired: `abi_codec` (upstream `EvmAbi.Compile.Meta`)
+--                            compiles a codec for a fixed type, and compiled code has
+--                            no recursion in it, so the kernel evaluates it directly.
 -- The library's own scope stays the codec roundtrip, so the dependency is plain
 -- upstream and reproducibly pinnable. `AbiCrossval` remains 0 `native_decide`.
 require «abi-lean» from git
-  "https://github.com/yihuang/evm-abi-lean.git" @ "04f8902f891350cbc8892516a20d0c007a763122"
+  "https://github.com/yihuang/evm-abi-lean.git" @ "20bac1478367350f4fd42592569e3291f93cb24e"
 
 -- pull lean-endianness's verified BE/LE codecs (package `binary` since the
--- Endianness -> Binary rename; same rev evm-abi-lean pins) so EVMYulLean's hand-rolled byte codecs
+-- Endianness -> Binary rename) so EVMYulLean's hand-rolled byte codecs
 -- (fromBytesBigEndian / encodeNumBytes / Mem.toBytes32 — the PUSH-literal and EVM-word
 -- encoders every layout proof rests on) are cross-validated in-build against an
 -- independently verified implementation (see the `EndiannessCrossval` target).
+--
+-- This root pin is the one `abi-lean` is built against too, so it has to satisfy
+-- BOTH: `decodeBEBytesFrom` / `ByteArray.size_eq_toList_length`, which
+-- evm-abi-lean's windowed reads need, and `encodeBEMinU` / `minBytes`, which
+-- `EndiannessCrossval` needs for minimal-byte PUSH literals.  Upstream
+-- `yihuang/lean-binary` has only the first pair; this fork's `codec` branch is
+-- that upstream rev plus the minimal-length codecs, so it is the rev that has
+-- both.  Bumping `abi-lean` without bumping this fails inside the dependency.
 require «binary» from git
-  "https://github.com/mmsqe/lean-endianness.git" @ "f888569d7d51070886a36c406a58df8b1e0bff1d"
+  "https://github.com/mmsqe/lean-endianness.git" @ "58eede11d60410035bda452fe81b678743c3b47b"
 
 package «evmyul» {
   moreLeanArgs := #["-DautoImplicit=false"]

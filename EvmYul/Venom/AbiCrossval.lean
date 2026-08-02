@@ -29,39 +29,44 @@ with **zero `native_decide`**, matching the Venom codegen stack's footing. By se
   * Encoder/decoder agreement (`abiLeanTransferArgs_eq_native`, `abiLeanSumArgs_eq_native`,
     `abiLeanMixedArgs_eq_native`, and the additional type-surface checks
     `abiLeanBytesArgs_eq_native` / `..StringArgs..` / `..Bytes4Args..` / `..NegIntArgs..`)
-    — `decide +kernel`. The Ty-indexed `AbiLean.encodeArgs` is well-founded-recursive over
-    `Ty` (`termination_by`, so `Acc.rec`, kernel-opaque), so `AbiLean.CodecEval` adds a
-    kernel-reducible mirror `AbiLean.encodeF` (fuel-indexed, structural) with the bridge
-    `AbiLean.encodeArgs_eq_encodeF`: rewriting the wf `encodeArgs` to `encodeF` at a
-    concrete fuel lets the kernel evaluate it. The type-surface checks cover the layout
-    mechanisms the core sections don't: dynamic `bytes`/`string` (padded raw data),
-    static `bytesN` (left-aligned), and negative `int` (two's-complement sign extension).
+    — `decide +kernel`. `EvmAbi.encode` is well-founded-recursive over `Ty`
+    (`termination_by`, so `Acc.rec`, kernel-opaque), so each check goes through a
+    codec *compiled* for its signature: `abi_codec` (upstream `EvmAbi.Compile.Meta`)
+    emits an encoder specialised to one type plus `encode_eq`, the proof that it is
+    `EvmAbi.encode` there. Compiled code has no recursion left in it, so the kernel
+    evaluates it, and `rw [← foo.encode_eq]` carries the result back to the library
+    encoder the statement is about — with no mirror of the encoder to keep in step.
+    The type-surface checks cover the layout mechanisms the core sections don't:
+    dynamic `bytes`/`string` (padded raw data), static `bytesN` (left-aligned), and
+    negative `int` (two's-complement sign extension).
 
   * Roundtrips (`abiLean_transferArgs_roundtrip`, `..._roundtrip_bytes`) and the
-    return decode (`abiLean_decodes_returnWord`) — the library's own `roundtrip` /
-    `roundtrip_args` (base axioms) discharges `decode ∘ encode` abstractly, so the
-    wf-opaque `decode` is never evaluated; the `hb` length side-goal reduces via the
-    `encodeF` bridge. No `decodeF` mirror is needed — see `AbiLean/CodecEval.lean`.
+    return decode (`abiLean_decodes_returnWord`) — the compiled codec's `roundtrip`
+    is the library's capstone transported onto it, so the wf-opaque decoder is
+    never evaluated; only the `< 2 ^ 256` side-goal is, and the compiled encoder
+    reduces.
 
   * Venom-semantics decode (`abiLean_transfer_decodes`, `abiLean_dynarray_sum`,
     `abiLean_mixed_sum`) — kernel rewriting over the proved `AbiBridge` `calldataload`
     lemmas, composed with the `*_eq_native` agreement facts (all base axioms).
 
-Design note: the sibling `crossval-kernel` branch reached `decide +kernel` on the
-encoder theorems by making the ABIType encoder's `headSize` kernel-reducible. The
-Ty-indexed `main` design keeps a small, type-indexed wf-recursive codec AND regains
-kernel evaluation via the additive `AbiLean.encodeF` bridge (`AbiLean/CodecEval.lean`).
-Two things closed the last `native_decide` gaps: (1) the bridge for the encoder, and
-(2) defining the concrete address `recvU` from a pure byte `List` rather than a
-`ByteArray` (whose `@[extern]` `toList` was kernel-opaque) — so `recvU.toNat` reduces
-and the transfer checks join the rest on base axioms.
+Design note: the Ty-indexed codec upstream is wf-recursive and stays that way; what
+makes a concrete encoding kernel-checkable is compiling it. `abi_codec` walks the
+signature at elaboration time and emits code with no recursion in it, plus the
+theorem that the code is `EvmAbi.encode` at that type — so the kernel evaluates the
+compiled encoder and the statement remains about the library's. That replaced a
+fuel-indexed mirror of the encoder (`AbiLean/CodecEval.lean`, retired here) which
+had to be kept arm-for-arm in step with upstream by hand. The other thing that
+closed the last `native_decide` gap is unchanged: the concrete address `recvU` is
+built from a pure byte `List`, not a `ByteArray` whose `@[extern]` `toList` the
+kernel cannot reduce, so `recvU.toNat` reduces.
 
-Layout note: the selector/keccak (`AbiLean.Hash`), the function-argument level
-(`AbiLean.Args`) and the kernel-reducible mirror (`AbiLean.CodecEval`) live in THIS
-repo under `EvmYul/Venom/AbiLean/`, not in evm-abi-lean — that library's scope is the
-codec roundtrip, a hash is a separate primitive, and the argument level is
-definitionally the tuple level. Keeping them here leaves the dependency plain
-upstream, so it is pinned to a commit rather than a sibling path.
+Layout note: the selector/keccak (`AbiLean.Hash`) lives in THIS repo under
+`EvmYul/Venom/AbiLean/`, not in evm-abi-lean — that library's scope is the codec,
+and a hash is a separate primitive. The function-argument level used to live here
+too (`AbiLean.Args`); `abi_codec` supplies it now, since a signature's arguments
+are definitionally the tuple of its types. Keeping the hash here leaves the
+dependency plain upstream, so it is pinned to a commit rather than a sibling path.
 
 This module is built by the dedicated `AbiCrossval` lake target only, so the
 default `EvmYul` build stays decoupled from the ABI dependency.
@@ -69,7 +74,7 @@ default `EvmYul` build stays decoupled from the ABI dependency.
 import EvmYul.Venom.AbiLean.Hash
 import EvmAbi.Codec
 import EvmAbi.Codec.Strict
-import EvmYul.Venom.AbiLean.CodecEval
+import EvmAbi.Compile.Meta
 import EvmYul.Venom.AbiDispatch
 import EvmYul.Venom.AbiBridge
 import EvmYul.Venom.AbiSelector
@@ -155,21 +160,31 @@ theorem amtU_toNat_lt : amtU.toNat < 2 ^ 256 := by
   show (UInt256.ofNat 1000).toNat < 2 ^ 256
   rw [uint256_ofNat_toNat]; omega
 
+open EvmAbi.Compile.Meta
+
+-- The transfer argument list, compiled: `abi_codec` emits an encoder
+-- specialised to `(address, uint256)` together with `transferArgs.encode_eq`,
+-- the proof that it *is* `EvmAbi.encode` at that type.
+abi_codec transferArgs "transfer(address,uint256)"
+
 /-- evm-abi-lean's ABI-encoded `transfer(address,uint256)` arguments, as bytes. -/
 def abiLeanTransferArgs : Option (List UInt8) :=
-  some (AbiLean.encodeArgs [.address, .uint 256]
-     (⟨recvU.toNat, recvU_toNat_lt⟩, ⟨amtU.toNat, amtU_toNat_lt⟩, ⟨⟩))
+  some (EvmAbi.encode transferArgs.ty
+    (⟨recvU.toNat, recvU_toNat_lt⟩, ⟨amtU.toNat, amtU_toNat_lt⟩, ⟨⟩)).data.toList
 
-set_option maxRecDepth 100000 in
-/-- **Encoder agreement.** evm-abi-lean's `encodeArgs` produces byte-for-byte the
+/-- **Encoder agreement.** evm-abi-lean's encoder produces byte-for-byte the
     same argument region as EVMYulLean's native `encodeAddress ++ encodeUint256`
-    — two independent encoders, checked by `decide +kernel` (base axioms) via the
-    `AbiLean.encodeArgs_eq_encodeF` bridge.  `recvU` is `List`-based, so its address
-    bytes reduce in the kernel (the old `ByteArray` value was what forced `native_decide`). -/
+    — two independent encoders, checked by `decide +kernel` (base axioms).
+
+    The statement is about the *library's* `EvmAbi.encode`, which the kernel
+    cannot unfold (well-founded recursion over `Ty`); `transferArgs.encode_eq`
+    rewrites it to the compiled encoder, which has no recursion in it for this
+    fixed type and so reduces.  That is what the fuel-indexed `CodecEval` mirror
+    used to do, without a mirror to keep in step. -/
 theorem abiLeanTransferArgs_eq_native :
     abiLeanTransferArgs = some (Abi.encodeAddress recvU ++ Abi.encodeUint256 amtU) := by
   unfold abiLeanTransferArgs
-  rw [AbiLean.encodeArgs_eq_encodeF 100 _ _ (by rfl)]
+  rw [← transferArgs.encode_eq]
   decide +kernel
 
 /-- `transfer` calldata whose 64-byte argument region is evm-abi-lean's
@@ -194,30 +209,25 @@ theorem abiLean_transfer_decodes (s : VenomState) (selVal : UInt256)
   · exact VenomState.calldataload_transfer_amount s (Abi.selectorBytes selVal) [] recvU amtU
       (Asm.beBytesN_length 4 selVal (by decide)) (by rw [hcd]; simp [List.append_assoc])
 
-set_option maxRecDepth 100000 in
-/-- **Roundtrip, instantiated.** evm-abi-lean's argument roundtrip at the transfer signature
-    `(address, uint256)`: the encoded arguments decode back to exactly the original values.
-    Base axioms — an instance of the library's `roundtrip_args`; `decode` stays wf-opaque
-    (proved abstractly, not evaluated), and the `hb` length side-goal reduces via the
-    `encodeArgs_eq_encodeF` bridge. -/
-theorem abiLean_transferArgs_roundtrip :
-    AbiLean.decodeArgs [.address, .uint 256]
-        (AbiLean.encodeArgs [.address, .uint 256]
-          (⟨recvU.toNat, recvU_toNat_lt⟩, ⟨amtU.toNat, amtU_toNat_lt⟩, ⟨⟩))
-      = some (⟨recvU.toNat, recvU_toNat_lt⟩, ⟨amtU.toNat, amtU_toNat_lt⟩, ⟨⟩) := by
-  apply AbiLean.roundtrip_args [.address, .uint 256] (by decide) _
-  rw [AbiLean.encodeArgs_eq_encodeF 100 _ _ (by rfl)]; decide +kernel
+/-- The transfer arguments as a value of the compiled codec's type. -/
+def transferVal : EvmAbi.ValBA transferArgs.ty :=
+  (⟨recvU.toNat, recvU_toNat_lt⟩, ⟨amtU.toNat, amtU_toNat_lt⟩, ⟨⟩)
 
-set_option maxRecDepth 100000 in
-/-- **Roundtrip capstone, computed (concrete route).** Encode → decode → re-encode on the transfer
-    arguments is a byte-level fixpoint — base axioms, by rewriting with the roundtrip above. -/
+/-- **Roundtrip, instantiated.** evm-abi-lean's argument roundtrip at the transfer
+    signature `(address, uint256)`: the encoded arguments decode back to exactly the
+    original values.  Base axioms — `transferArgs.roundtrip` is the library's own
+    capstone transported onto the compiled codec, so the decoder is never evaluated;
+    only the `< 2 ^ 256` side-goal is, and the compiled encoder reduces. -/
+theorem abiLean_transferArgs_roundtrip :
+    transferArgs.decode (transferArgs.encode transferVal) = some transferVal :=
+  transferArgs.roundtrip transferVal (by decide +kernel)
+
+/-- **Roundtrip capstone, computed (concrete route).** Encode → decode → re-encode on
+    the transfer arguments is a byte-level fixpoint — base axioms, by rewriting with
+    the roundtrip above. -/
 theorem abiLean_transferArgs_roundtrip_bytes :
-    ((AbiLean.decodeArgs [.address, .uint 256]
-        (AbiLean.encodeArgs [.address, .uint 256]
-          (⟨recvU.toNat, recvU_toNat_lt⟩, ⟨amtU.toNat, amtU_toNat_lt⟩, ⟨⟩))).map
-        (AbiLean.encodeArgs [.address, .uint 256]))
-      = some (AbiLean.encodeArgs [.address, .uint 256]
-          (⟨recvU.toNat, recvU_toNat_lt⟩, ⟨amtU.toNat, amtU_toNat_lt⟩, ⟨⟩)) := by
+    ((transferArgs.decode (transferArgs.encode transferVal)).map transferArgs.encode)
+      = some (transferArgs.encode transferVal) := by
   rw [abiLean_transferArgs_roundtrip]; rfl
 
 /-! ## Dynamic-array calldata cross-validation (offset → length → data)
@@ -229,10 +239,12 @@ read the ABI pointer `off = calldataload 4`, then elements at `4 + off + 32·(i+
 — recovers the elements and sums to `60`, proved over the Venom `calldataload`
 semantics (each read via the proved `AbiBridge.calldataload_append_toBytes32`). -/
 
+abi_codec sumArgs "sum(uint256[])"
+
 /-- evm-abi-lean's ABI encoding of `sum(uint256[])`'s `[10,20,30]` argument. -/
 def abiLeanSumArgs : Option (List UInt8) :=
-  some (AbiLean.encodeArgs [.array (.uint 256)]
-     (⟨[⟨10, by decide⟩, ⟨20, by decide⟩, ⟨30, by decide⟩], by decide⟩, ⟨⟩))
+  some (EvmAbi.encode sumArgs.ty
+    (⟨[⟨10, by decide⟩, ⟨20, by decide⟩, ⟨30, by decide⟩], by decide⟩, ⟨⟩)).data.toList
 
 /-- The native ABI head/tail word-chain: offset `0x20`, length `3`, elements. -/
 def sumNativeChain : Mem :=
@@ -248,7 +260,7 @@ set_option maxRecDepth 100000 in
     at a concrete fuel, which the kernel then evaluates. -/
 theorem abiLeanSumArgs_eq_native : abiLeanSumArgs = some sumNativeChain := by
   unfold abiLeanSumArgs
-  rw [AbiLean.encodeArgs_eq_encodeF 100 _ _ (by decide)]
+  rw [← sumArgs.encode_eq]
   decide +kernel
 
 /-- `sum(uint256[])` calldata whose argument region is evm-abi-lean's encoding. -/
@@ -309,10 +321,13 @@ static and one dynamic field (matches `EvmYul/Venom/examples/abi_dynstruct.venom
 Decode reads the static uint at 4, follows the pointer at 36 to the array, then its
 elements; total `7 + 10 + 20 + 30 = 67` (`0x43`, venom_run's return). -/
 
+abi_codec mixedArgs "mixed(uint256,uint256[])"
+
 /-- evm-abi-lean's ABI encoding of `mixed(uint256, uint256[])`'s `(7,[10,20,30])`. -/
 def abiLeanMixedArgs : Option (List UInt8) :=
-  some (AbiLean.encodeArgs [.uint 256, .array (.uint 256)]
-     (⟨7, by decide⟩, ⟨[⟨10, by decide⟩, ⟨20, by decide⟩, ⟨30, by decide⟩], by decide⟩, ⟨⟩))
+  some (EvmAbi.encode mixedArgs.ty
+    (⟨7, by decide⟩, ⟨[⟨10, by decide⟩, ⟨20, by decide⟩, ⟨30, by decide⟩], by decide⟩,
+      ⟨⟩)).data.toList
 
 /-- The native chain: static `7`, offset `0x40`, length `3`, then elements. -/
 def mixedNativeChain : Mem :=
@@ -326,7 +341,7 @@ set_option maxRecDepth 100000 in
     `AbiLean.encodeArgs_eq_encodeF` bridge to the kernel-reducible `encodeF`. -/
 theorem abiLeanMixedArgs_eq_native : abiLeanMixedArgs = some mixedNativeChain := by
   unfold abiLeanMixedArgs
-  rw [AbiLean.encodeArgs_eq_encodeF 100 _ _ (by decide)]
+  rw [← mixedArgs.encode_eq]
   decide +kernel
 
 /-- `mixed(...)` calldata whose argument region is evm-abi-lean's encoding. -/
@@ -398,6 +413,8 @@ evm-abi-lean's `decode` recovers the original value from those bytes — closing
 other half of the loop (external-decode ↔ internal-encode). -/
 
 set_option maxRecDepth 100000 in
+abi_codec retWord "uint256"
+
 /-- **Return-side cross-validation.** For any state whose var `v` holds the
     concrete value `amtU`, running `Abi.returnWord v` halts with returndata
     `Abi.encodeUint256 amtU`, and evm-abi-lean's `decode` reads that back as
@@ -410,14 +427,16 @@ set_option maxRecDepth 100000 in
     pins that the word consumes the buffer exactly. -/
 theorem abiLean_decodes_returnWord (s : VenomState) (v : VarName) (hv : s.env v = amtU) :
     (execBlock s (Abi.returnWord v)).2 = Control.halt (.ret (Abi.encodeUint256 amtU))
-  ∧ ((EvmAbi.decodeStrict (.uint 256) (Abi.encodeUint256 amtU)).map (·.val)
+  ∧ ((EvmAbi.Spec.decodeStrict (.uint 256) (Abi.encodeUint256 amtU)).map (·.val)
       == some amtU.toNat) := by
   refine ⟨by simp only [VenomState.execBlock_returnWord, hv], ?_⟩
-  have henc : Abi.encodeUint256 amtU = EvmAbi.encode (.uint 256) ⟨amtU.toNat, amtU_toNat_lt⟩ := by
-    rw [← AbiLean.encodeF_eq_encode 5 (.uint 256) ⟨amtU.toNat, amtU_toNat_lt⟩ (by rfl)]; decide +kernel
-  have hlen : (EvmAbi.encode (.uint 256) ⟨amtU.toNat, amtU_toNat_lt⟩).length < 2 ^ 256 := by
-    rw [← AbiLean.encodeF_eq_encode 5 (.uint 256) ⟨amtU.toNat, amtU_toNat_lt⟩ (by rfl)]; decide +kernel
-  rw [henc, EvmAbi.decodeStrict_encode (.uint 256) (by decide) ⟨amtU.toNat, amtU_toNat_lt⟩ hlen]
+  have hval : EvmAbi.ValBA.toList (.uint 256) ⟨amtU.toNat, amtU_toNat_lt⟩
+      = ⟨amtU.toNat, amtU_toNat_lt⟩ := by rw [EvmAbi.ValBA.toList]
+  have henc : Abi.encodeUint256 amtU = EvmAbi.Spec.encode (.uint 256) ⟨amtU.toNat, amtU_toNat_lt⟩ := by
+    rw [← hval, ← EvmAbi.data_toList_encode, ← retWord.encode_eq]; decide +kernel
+  have hlen : (EvmAbi.Spec.encode (.uint 256) ⟨amtU.toNat, amtU_toNat_lt⟩).length < 2 ^ 256 := by
+    rw [← hval, ← EvmAbi.data_toList_encode, ← retWord.encode_eq]; decide +kernel
+  rw [henc, EvmAbi.Spec.decodeStrict_encode (.uint 256) (by decide) ⟨amtU.toNat, amtU_toNat_lt⟩ hlen]
   rfl
 
 /-! ## Additional type-surface cross-validation
@@ -434,9 +453,11 @@ against EVMYulLean's byte layout — each `decide +kernel` (base axioms) through
   * signed `int` at a negative value — two's-complement sign extension (all-`0xff`),
     which the non-negative `uint` cases never exercise. -/
 
+abi_codec bytesArgs "blob(bytes)"
+
 /-- `foo(bytes)` with the 3-byte value `0xaabbcc`. -/
 def abiLeanBytesArgs : Option (List UInt8) :=
-  some (AbiLean.encodeArgs [.bytes] (⟨[0xaa, 0xbb, 0xcc], by decide⟩, ⟨⟩))
+  some (EvmAbi.encode bytesArgs.ty (⟨⟨#[0xaa, 0xbb, 0xcc]⟩, by decide⟩, ⟨⟩)).data.toList
 
 /-- The native chain: offset `0x20`, length `3`, then the data right-padded to 32. -/
 def bytesNativeChain : Mem :=
@@ -448,12 +469,14 @@ set_option maxRecDepth 100000 in
     the raw bytes right-padded to a 32-byte boundary. -/
 theorem abiLeanBytesArgs_eq_native : abiLeanBytesArgs = some bytesNativeChain := by
   unfold abiLeanBytesArgs
-  rw [AbiLean.encodeArgs_eq_encodeF 100 _ _ (by rfl)]
+  rw [← bytesArgs.encode_eq]
   decide +kernel
+
+abi_codec stringArgs "greet(string)"
 
 /-- `greet(string)` with `"abc"` (UTF-8 `0x61 0x62 0x63`). -/
 def abiLeanStringArgs : Option (List UInt8) :=
-  some (AbiLean.encodeArgs [.string] (⟨"abc", by decide⟩, ⟨⟩))
+  some (EvmAbi.encode stringArgs.ty (⟨"abc", by decide⟩, ⟨⟩)).data.toList
 
 /-- The native chain: offset `0x20`, length `3`, UTF-8 bytes right-padded to 32. -/
 def stringNativeChain : Mem :=
@@ -465,12 +488,15 @@ set_option maxRecDepth 100000 in
     over its UTF-8 octets — same offset/length/right-padded-data layout. -/
 theorem abiLeanStringArgs_eq_native : abiLeanStringArgs = some stringNativeChain := by
   unfold abiLeanStringArgs
-  rw [AbiLean.encodeArgs_eq_encodeF 100 _ _ (by rfl)]
+  rw [← stringArgs.encode_eq]
   decide +kernel
+
+abi_codec bytes4Args "tag(bytes4)"
 
 /-- `tag(bytes4)` with `0xdeadbeef`. -/
 def abiLeanBytes4Args : Option (List UInt8) :=
-  some (AbiLean.encodeArgs [.bytesN 4] (⟨[0xde, 0xad, 0xbe, 0xef], by decide⟩, ⟨⟩))
+  some (EvmAbi.encode bytes4Args.ty
+    (⟨⟨#[0xde, 0xad, 0xbe, 0xef]⟩, by decide⟩, ⟨⟩)).data.toList
 
 /-- The native word: the 4 bytes LEFT-aligned, then 28 zero bytes. -/
 def bytes4NativeChain : Mem :=
@@ -482,12 +508,14 @@ set_option maxRecDepth 100000 in
     right-aligned (left-zero-padded). -/
 theorem abiLeanBytes4Args_eq_native : abiLeanBytes4Args = some bytes4NativeChain := by
   unfold abiLeanBytes4Args
-  rw [AbiLean.encodeArgs_eq_encodeF 100 _ _ (by rfl)]
+  rw [← bytes4Args.encode_eq]
   decide +kernel
+
+abi_codec negIntArgs "setDelta(int256)"
 
 /-- `setDelta(int256)` with `-1`. -/
 def abiLeanNegIntArgs : Option (List UInt8) :=
-  some (AbiLean.encodeArgs [.int 256] (⟨-1, by decide⟩, ⟨⟩))
+  some (EvmAbi.encode negIntArgs.ty (⟨-1, by decide⟩, ⟨⟩)).data.toList
 
 /-- The native word: two's-complement `-1` is all-`0xff` (32 bytes). -/
 def negIntNativeChain : Mem := List.replicate 32 (0xff : UInt8)
@@ -498,7 +526,7 @@ set_option maxRecDepth 100000 in
     `uint` cases never touch this path. -/
 theorem abiLeanNegIntArgs_eq_native : abiLeanNegIntArgs = some negIntNativeChain := by
   unfold abiLeanNegIntArgs
-  rw [AbiLean.encodeArgs_eq_encodeF 100 _ _ (by rfl)]
+  rw [← negIntArgs.encode_eq]
   decide +kernel
 
 end EvmYul.Venom.AbiCrossval
