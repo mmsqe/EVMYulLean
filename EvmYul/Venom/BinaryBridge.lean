@@ -16,13 +16,12 @@ namespace EvmYul.Venom
 
 open EvmYul
 
-/-- EVMYulLean's little-endian byte decoder agrees with lean-endianness'. -/
-theorem fromBytes'_eq_decodeLEU : ∀ bs : List UInt8, fromBytes' bs = Binary.decodeLEU bs
-  | [] => rfl
-  | b :: bs => by
-    simp only [fromBytes', Binary.decodeLEU, Binary.uint8ToNats, List.map_cons,
-      Binary.decodeLE, fromBytes'_eq_decodeLEU bs]
-    rfl
+/-- EVMYulLean's little-endian byte decoder agrees with lean-endianness'.
+Proved in `EvmYul.UInt256`, where the `@[csimp]` that redirects code generation
+at the library codec needs it; re-exported here under the name this layer has
+always used. -/
+theorem fromBytes'_eq_decodeLEU : ∀ bs : List UInt8, fromBytes' bs = Binary.decodeLEU bs :=
+  EvmYul.fromBytes'_eq_decodeLEU
 
 /-- EVMYulLean's big-endian byte decoder agrees with lean-endianness'. -/
 theorem fromBytesBigEndian_eq_decodeBEU (bs : List UInt8) :

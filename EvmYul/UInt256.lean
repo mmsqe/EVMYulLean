@@ -1,4 +1,5 @@
 import Init.Data.Nat.Div
+import Binary
 import Mathlib.Data.Nat.Basic
 import Mathlib.Data.Fin.Basic
 import Mathlib.Data.Vector.Basic
@@ -274,6 +275,32 @@ def fromBytes' : List UInt8 → ℕ
 | [] => 0
 | b :: bs => b.toFin.val + 2^8 * fromBytes' bs
 
+/-! ### the verified decoder underneath
+
+`fromBytes'` accumulates one byte at a time, so above `2 ^ 63` each step is a
+GMP call and one EVM word costs 32 of them.  `Binary.decodeLEU` is the same
+function — proved here, not assumed — and `Binary.decodeLEUFast` is the chunked
+implementation it is `@[csimp]`-equal to, taking eight bytes per bignum step.
+The definition, and every theorem stated about it, is untouched.
+
+Point at `decodeLEUFast`, not at `decodeLEU`: `@[csimp]` rewrites a call once
+rather than to a fixpoint, so redirecting at `decodeLEU` lands on the reference
+implementation and stops there — the generated C then calls `Binary_decodeLEU`
+and none of this buys anything.
+
+The attribute has to be in scope before the callers, which is why it sits here
+rather than in `Venom.BinaryBridge` — `EVM.Semantics` never imports that. -/
+
+theorem fromBytes'_eq_decodeLEU : ∀ bs : List UInt8, fromBytes' bs = Binary.decodeLEU bs
+  | [] => rfl
+  | b :: bs => by
+    simp only [fromBytes', Binary.decodeLEU, Binary.uint8ToNats, List.map_cons,
+      Binary.decodeLE, fromBytes'_eq_decodeLEU bs]
+    rfl
+
+@[csimp] theorem fromBytes'_eq_fast : @fromBytes' = @Binary.decodeLEUFast :=
+  (funext fromBytes'_eq_decodeLEU).trans Binary.decodeLEU_eq_fast
+
 def fromBytesBigEndian : List UInt8 → ℕ := fromBytes' ∘ List.reverse
 def fromByteArrayBigEndian (b : ByteArray) : ℕ := fromBytesBigEndian b.toList
 
@@ -310,6 +337,52 @@ def toBytes' : ℕ → List UInt8
       rw [h]
       apply Nat.div_lt_self <;> simp
     byte :: toBytes' (n / UInt8.size)
+
+/-! ### the verified encoder underneath
+
+`toBytes'` peels one byte at a time with `n % 256` / `n / 256`, so above
+`2 ^ 63` a full word costs 32 GMP calls — the same shape as `fromBytes'`, and
+the one `Binary.Fast` replaces with an eight-bytes-at-a-time chunked encoder.
+`BE` wraps this, and the state serialisation reaches for `BE` constantly.
+
+`toBytes'` and `Binary.encodeLE` peel identically; they differ only in what
+stops the recursion, the value here and the length there.  So they agree
+exactly at `len = minBytes n`, which is what the theorem below says.  `minBytes`
+itself is `n.log2 / 8 + 1`, a bit-length rather than a division loop, so
+computing the length does not cost back what the chunking saves. -/
+
+theorem toBytes'_eq_encodeLEU : ∀ n : ℕ, n ≠ 0 →
+    toBytes' n = Binary.encodeLEU (Binary.minBytes n) n := by
+  intro n
+  induction n using Nat.strong_induction_on with
+  | _ n ih =>
+    intro hn
+    obtain ⟨m, rfl⟩ : ∃ m, n = m + 1 := ⟨n - 1, by omega⟩
+    by_cases hlt : m + 1 < 256
+    · rw [Binary.minBytes_eq_one hlt]
+      have hdiv : (m + 1) / 256 = 0 := Nat.div_eq_of_lt hlt
+      rw [toBytes', hdiv]
+      simp [Binary.encodeLEU, Binary.encodeLE, Binary.natsToUInt8, toBytes',
+        UInt8.ofNatLT_eq_ofNat]
+      rfl
+    · have hge : 256 ≤ m + 1 := by omega
+      have hdiv0 : (m + 1) / 256 ≠ 0 := by
+        rw [Nat.div_ne_zero_iff]; omega
+      rw [Binary.minBytes_div hge, toBytes',
+        ih ((m + 1) / 256) (by omega) hdiv0]
+      simp [Binary.encodeLEU, Binary.encodeLE, Binary.natsToUInt8,
+        UInt8.ofNatLT_eq_ofNat]
+      rfl
+
+/-- `toBytes'` through the library's chunked encoder. -/
+def toBytesFast (n : ℕ) : List UInt8 :=
+  if n = 0 then [] else Binary.encodeLEUFast (Binary.minBytes n) n
+
+@[csimp] theorem toBytes'_eq_fast : @toBytes' = @toBytesFast := by
+  funext n
+  by_cases h : n = 0
+  · subst h; simp [toBytesFast, toBytes']
+  · rw [toBytesFast, if_neg h, ← Binary.encodeLEU_eq_fast, toBytes'_eq_encodeLEU n h]
 
 def toBytesBigEndian : ℕ → List UInt8 := List.reverse ∘ toBytes'
 
