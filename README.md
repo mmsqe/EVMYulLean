@@ -6,6 +6,11 @@ Everything here is work in progress and is subject to change therefore.
 # Requirements
 - Python packages: coincurve, typing-extensions, pycryptodome, eth-typing, py-ecc
 
+  Pin `coincurve==20.0.0`: 21.0.0 fails to build against current `cffi`
+  ("Expected exactly one LICENSE file in cffi distribution"). Without these,
+  `conform` panics at the first precompile via `unsafePerformIO`; with them, a
+  `Ξ_… failed` trace is an ordinary failed precompile call, not a setup problem.
+
 # Project structure
 
 ## Primops

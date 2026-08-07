@@ -160,6 +160,20 @@ theorem amtU_toNat_lt : amtU.toNat < 2 ^ 256 := by
   show (UInt256.ofNat 1000).toNat < 2 ^ 256
   rw [uint256_ofNat_toNat]; omega
 
+/-- The same amount as evm-abi-lean's word.  Since #38 `ValBA (.uint m)` carries
+a `Binary.UInt256` — four `UInt64` limbs — rather than a `Nat`, so the runtime
+value needs EVMYulLean's `Fin`-backed word carried across.  Only the *value*
+crosses: `Ty.Val` is still `Nat`-indexed, so every specification-side statement
+below is unchanged. -/
+def amtBin : Binary.UInt256 := Binary.UInt256.ofNat amtU.toNat
+
+@[simp] theorem amtBin_toNat : amtBin.toNat = amtU.toNat := by
+  rw [amtBin, Binary.UInt256.toNat_ofNat]
+  exact Nat.mod_eq_of_lt (by rw [Binary.UInt256.size]; exact amtU_toNat_lt)
+
+theorem amtBin_toNat_lt : amtBin.toNat < 2 ^ 256 := by
+  rw [amtBin_toNat]; exact amtU_toNat_lt
+
 open EvmAbi.Compile.Meta
 
 -- The transfer argument list, compiled: `abi_codec` emits an encoder
@@ -170,7 +184,7 @@ abi_codec transferArgs "transfer(address,uint256)"
 /-- evm-abi-lean's ABI-encoded `transfer(address,uint256)` arguments, as bytes. -/
 def abiLeanTransferArgs : Option (List UInt8) :=
   some (EvmAbi.encode transferArgs.ty
-    (⟨recvU.toNat, recvU_toNat_lt⟩, ⟨amtU.toNat, amtU_toNat_lt⟩, ⟨⟩)).data.toList
+    (⟨recvU.toNat, recvU_toNat_lt⟩, ⟨amtBin, amtBin_toNat_lt⟩, ⟨⟩)).data.toList
 
 /-- **Encoder agreement.** evm-abi-lean's encoder produces byte-for-byte the
     same argument region as EVMYulLean's native `encodeAddress ++ encodeUint256`
@@ -211,22 +225,26 @@ theorem abiLean_transfer_decodes (s : VenomState) (selVal : UInt256)
 
 /-- The transfer arguments as a value of the compiled codec's type. -/
 def transferVal : EvmAbi.ValBA transferArgs.ty :=
-  (⟨recvU.toNat, recvU_toNat_lt⟩, ⟨amtU.toNat, amtU_toNat_lt⟩, ⟨⟩)
+  (⟨recvU.toNat, recvU_toNat_lt⟩, ⟨amtBin, amtBin_toNat_lt⟩, ⟨⟩)
 
 /-- **Roundtrip, instantiated.** evm-abi-lean's argument roundtrip at the transfer
     signature `(address, uint256)`: the encoded arguments decode back to exactly the
     original values.  Base axioms — `transferArgs.roundtrip` is the library's own
     capstone transported onto the compiled codec, so the decoder is never evaluated;
-    only the `< 2 ^ 256` side-goal is, and the compiled encoder reduces. -/
+    only the `< 2 ^ 256` side-goal is, and the compiled encoder reduces.
+
+    `decodeStrict`, not `decode`: a compiled codec supplies all four names of the
+    runtime API, and calldata is a whole buffer — the strict decoder is the one
+    that also pins that the arguments consume it exactly. -/
 theorem abiLean_transferArgs_roundtrip :
-    transferArgs.decode (transferArgs.encode transferVal) = some transferVal :=
+    transferArgs.decodeStrict (transferArgs.encode transferVal) = some transferVal :=
   transferArgs.roundtrip transferVal (by decide +kernel)
 
 /-- **Roundtrip capstone, computed (concrete route).** Encode → decode → re-encode on
     the transfer arguments is a byte-level fixpoint — base axioms, by rewriting with
     the roundtrip above. -/
 theorem abiLean_transferArgs_roundtrip_bytes :
-    ((transferArgs.decode (transferArgs.encode transferVal)).map transferArgs.encode)
+    ((transferArgs.decodeStrict (transferArgs.encode transferVal)).map transferArgs.encode)
       = some (transferArgs.encode transferVal) := by
   rw [abiLean_transferArgs_roundtrip]; rfl
 
@@ -430,8 +448,9 @@ theorem abiLean_decodes_returnWord (s : VenomState) (v : VarName) (hv : s.env v 
   ∧ ((EvmAbi.Spec.decodeStrict (.uint 256) (Abi.encodeUint256 amtU)).map (·.val)
       == some amtU.toNat) := by
   refine ⟨by simp only [VenomState.execBlock_returnWord, hv], ?_⟩
-  have hval : EvmAbi.ValBA.toList (.uint 256) ⟨amtU.toNat, amtU_toNat_lt⟩
-      = ⟨amtU.toNat, amtU_toNat_lt⟩ := by rw [EvmAbi.ValBA.toList]
+  have hval : EvmAbi.ValBA.toList (.uint 256) ⟨amtBin, amtBin_toNat_lt⟩
+      = ⟨amtU.toNat, amtU_toNat_lt⟩ := by
+    rw [EvmAbi.ValBA.toList]; exact Subtype.ext amtBin_toNat
   have henc : Abi.encodeUint256 amtU = EvmAbi.Spec.encode (.uint 256) ⟨amtU.toNat, amtU_toNat_lt⟩ := by
     rw [← hval, ← EvmAbi.data_toList_encode, ← retWord.encode_eq]; decide +kernel
   have hlen : (EvmAbi.Spec.encode (.uint 256) ⟨amtU.toNat, amtU_toNat_lt⟩).length < 2 ^ 256 := by
