@@ -22,14 +22,19 @@ This file proves the two agree — as ∀-theorems, not samples:
 * `toBytes32_eq_encodeBEU` — the EVM-word encoder IS the verified fixed-width codec:
   `Mem.toBytes32 v = Binary.encodeBEU 32 v.toNat` (via `encodeBEU_decodeBEU`
   injectivity + the in-tree `fromBytesBigEndian_toBytes32` roundtrip).
+* `toSigned_eq_twosRep` / `fromSigned_eq_ofTwosNat` — the signed word, both ways:
+  what SDIV, SMOD and SIGNEXTEND produce and read is `Binary.twosRep` /
+  `Binary.ofTwosNat`.  Unconditionally, out of range included, where the two
+  constructions diverge in form but not in value.  The decoding direction needs
+  `xor_two_pow_sub_one`, complement-is-subtraction, which Mathlib does not have
+  and which is proved here through `BitVec.toNat_not`.
 
 No `native_decide`, no FFI axiom; the axiom footprint is
 [propext, Classical.choice, Quot.sound].
 
-⚠️ Toolchain note: lean-endianness declares lean4:v4.32.0 but compiles clean under
-this project's v4.31.0 (verified). `lake update` SILENTLY BUMPS the root
-lean-toolchain to a dependency's newer one — if you re-run `lake update`, check
-`git diff lean-toolchain` afterwards.
+⚠️ `lake update` SILENTLY BUMPS the root lean-toolchain to a dependency's newer
+one — if you re-run it, check `git diff lean-toolchain` afterwards.  (Both this
+project and lean-endianness are on v4.32.0, so there is no skew to absorb today.)
 -/
 import EvmYul.Venom.Hol.Codegen.PlanExec
 import EvmYul.Venom.VenomMemProps
@@ -114,5 +119,69 @@ theorem encodeNumBytes_eq_encodeBEMinU {n : Nat} (h : n ≠ 0) :
     `0`, where the library's codec emits one zero byte (`encodeBEMinU 0 = [0x00]`).
     That is why `encodeNumBytes_eq_encodeBEMinU` is hypothesised on `n ≠ 0`. -/
 theorem encodeNumBytes_zero : encodeNumBytes 0 = [] := by rw [encodeNumBytes]; simp
+
+/-! ## the signed word, cross-validated
+
+`toSigned` is what SDIV, SMOD and the other signed opcodes produce: an EVM word
+from a mathematical integer, two's complement, hand-rolled here as a match on
+`Int`'s constructors.  `Binary.twosRep` is the library's version of the same
+map, and the two agree.
+
+Unconditionally, which is the interesting part: out of range the constructions
+diverge in *form* but not in value, `toSigned` truncating `size - 1 - n` to `0`
+where `twosRep` takes `.toNat` of a negative and gets `0` too.  So no
+`InTwosRange` hypothesis is needed. -/
+
+/-- Stated over an abstract `S` so `omega` never meets `UInt256.size`'s
+    seventy-eight-digit literal. -/
+private theorem toNat_add_negSucc (S n : ℕ) :
+    ((S : ℤ) + Int.negSucc n).toNat = S - 1 - n := by omega
+
+/-- Bitwise complement within `n` bits is subtraction from all-ones.  Mathlib
+    has neither this nor the `testBit` rule for a truncated subtraction that the
+    direct proof would need; `BitVec.toNat_not` states exactly it, so the proof
+    goes through `BitVec` and comes back. -/
+theorem xor_two_pow_sub_one {n u : ℕ} (h : u < 2 ^ n) :
+    Nat.xor (2 ^ n - 1) u = 2 ^ n - 1 - u := by
+  have hu : (BitVec.ofNat n u).toNat = u := by
+    rw [BitVec.toNat_ofNat]; exact Nat.mod_eq_of_lt h
+  calc Nat.xor (2 ^ n - 1) u
+      = (BitVec.allOnes n).toNat ^^^ (BitVec.ofNat n u).toNat := by
+        rw [BitVec.toNat_allOnes, hu]; rfl
+    _ = (BitVec.allOnes n ^^^ BitVec.ofNat n u).toNat := by rw [BitVec.toNat_xor]
+    _ = (~~~ BitVec.ofNat n u).toNat := by rw [BitVec.allOnes_xor]
+    _ = 2 ^ n - 1 - u := by rw [BitVec.toNat_not, hu]
+
+/-- Stated over an abstract `S`, as `toNat_add_negSucc` is and for the same
+    reason. -/
+private theorem neg_complement_cast {S u : ℕ} (h : u < S) :
+    -((S - 1 - u : ℕ) : ℤ) - 1 = (u : ℤ) - (S : ℤ) := by omega
+
+/-- **The decoding direction**: EVMYulLean reads a signed word by complementing
+    with `xor`, the library by subtracting the modulus.  Same function. -/
+theorem fromSigned_eq_ofTwosNat (a : UInt256) :
+    UInt256.fromSigned a = Binary.ofTwosNat 32 a.toNat := by
+  have hsize : (256 ^ 32 : ℕ) = 2 ^ 256 := by rfl
+  have hsz : UInt256.size = 2 ^ 256 := by rfl
+  have hlt : a.toNat < 2 ^ 256 := lt_of_lt_of_eq a.val.isLt hsz
+  by_cases h : a.toNat < 2 ^ 255
+  · have h2 : 2 * a.toNat < 256 ^ 32 := by rw [hsize]; omega
+    rw [UInt256.fromSigned, if_pos h, Binary.ofTwosNat, if_pos h2]
+    rfl
+  · have h2 : ¬ (2 * a.toNat < 256 ^ 32) := by rw [hsize]; omega
+    -- `↑a.val` must go before `hsz`: `a.val : Fin UInt256.size` mentions the
+    -- very constant being rewritten, so the motive is otherwise ill-typed.
+    rw [UInt256.fromSigned, if_neg h, Binary.ofTwosNat, if_neg h2, hsize,
+      show ((a.val : ℕ)) = a.toNat from rfl, hsz, xor_two_pow_sub_one hlt,
+      neg_complement_cast hlt]
+
+theorem toSigned_eq_twosRep (i : ℤ) :
+    UInt256.toSigned i = UInt256.ofNat (Binary.twosRep 32 i) := by
+  have hsize : (256 ^ 32 : ℕ) = UInt256.size := by rfl
+  cases i with
+  | ofNat n => simp [UInt256.toSigned, Binary.twosRep]
+  | negSucc n =>
+      simp only [UInt256.toSigned, Binary.twosRep, hsize, Int.negSucc_not_nonneg,
+        if_false, toNat_add_negSucc]
 
 end EvmYul.Venom.EndiannessCrossval
